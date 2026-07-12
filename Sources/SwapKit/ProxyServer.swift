@@ -4,6 +4,51 @@ import NIOPosix
 import NIOHTTP1
 import AsyncHTTPClient
 
+enum ProxyRequestMode: Equatable, Sendable {
+    static let warmupHeader = "X-CodexSwap-Warmup-Account"
+
+    case normal
+    case warmup(alias: String)
+
+    init(headers: HTTPHeaders) {
+        if let alias = headers.first(name: Self.warmupHeader), !alias.isEmpty {
+            self = .warmup(alias: alias)
+        } else {
+            self = .normal
+        }
+    }
+
+    var isWarmup: Bool {
+        if case .warmup = self { return true }
+        return false
+    }
+}
+
+func selectProxyAccount(store: AccountStore, mode: ProxyRequestMode, now: Date = Date()) async -> Account? {
+    switch mode {
+    case .normal:
+        return await store.current(now: now)
+    case .warmup(let alias):
+        guard let account = await store.account(alias), account.isEligible(now: now) else { return nil }
+        return account
+    }
+}
+
+func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHeaders {
+    var headers = incoming
+    headers.remove(name: "Host")
+    headers.remove(name: "Connection")
+    headers.remove(name: "Proxy-Connection")
+    headers.remove(name: ProxyRequestMode.warmupHeader)
+    headers.replaceOrAdd(name: "Authorization", value: "Bearer \(account.accessToken)")
+    if !account.accountID.isEmpty {
+        headers.replaceOrAdd(name: "ChatGPT-Account-Id", value: account.accountID)
+    } else {
+        headers.remove(name: "ChatGPT-Account-Id")
+    }
+    return headers
+}
+
 public struct ProxyEvent: Sendable {
     public enum Kind: Sendable { case rotated, exhausted, needsLogin, refreshed, tokensUpdated }
     public let kind: Kind
@@ -186,11 +231,13 @@ public actor ProxyServer {
     ) async throws {
         let settings = await settingsProvider()
         let (rawPath, query) = splitPathQuery(head.uri)
+        let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
+        let mode = loopbackOnly ? ProxyRequestMode(headers: head.headers) : .normal
 
         // Round-robin load balancing: at each new turn (a model call after an idle gap), advance to the
         // next account so usage spreads across all of them. Codex is stateless (store=false, no
         // previous_response_id), so switching between turns never breaks the conversation.
-        if settings.rotationStrategy == .roundRobin, head.method == .POST, rawPath.hasSuffix("/responses") {
+        if !mode.isWarmup, settings.rotationStrategy == .roundRobin, head.method == .POST, rawPath.hasSuffix("/responses") {
             let now = Date()
             if let last = lastTurnAt, now.timeIntervalSince(last) > TimeInterval(settings.roundRobinTurnGapSeconds) {
                 await store.advanceRoundRobin(now: now)
@@ -198,7 +245,7 @@ public actor ProxyServer {
             lastTurnAt = now
         }
 
-        guard var account = await store.current() else {
+        guard var account = await selectProxyAccount(store: store, mode: mode) else {
             log("\(head.method.rawValue) \(rawPath) -> no eligible account")
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
@@ -231,6 +278,12 @@ public actor ProxyServer {
                     tokenRefreshed = true
                     continue
                 } catch RefreshError.sessionInvalidated {
+                    if mode.isWarmup {
+                        await store.markNeedsLoginOnly(account.alias)
+                        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
+                        try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in")
+                        return
+                    }
                     account = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
                     if account.needsLogin { return }
                     tokenRefreshed = false
@@ -246,6 +299,12 @@ public actor ProxyServer {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
                 if isSessionInvalidated(errBody) {
                     await burn.clear(alias: account.alias)
+                    if mode.isWarmup {
+                        await store.markNeedsLoginOnly(account.alias)
+                        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
+                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
+                        return
+                    }
                     if let next = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
                         tokenRefreshed = false
@@ -263,6 +322,11 @@ public actor ProxyServer {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
                 if bodyHasUsageLimit(errBody) {
                     let (limit, resetAt) = limitInfo(headers: resp.headers, body: errBody)
+                    if mode.isWarmup {
+                        await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
+                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
+                        return
+                    }
                     let result = await store.rotateFrom(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
                     if let next = result.next, result.rotated {
                         await sink.handle(ProxyEvent(kind: .rotated, from: account.alias, to: next.alias, limit: limit, resetAt: resetAt))
@@ -317,17 +381,7 @@ public actor ProxyServer {
     private func forward(head: HTTPRequestHead, body: Data, account: Account, target: URL) async throws -> HTTPClientResponse {
         var request = HTTPClientRequest(url: target.absoluteString)
         request.method = head.method
-        var headers = head.headers
-        headers.remove(name: "Host")
-        headers.remove(name: "Connection")
-        headers.remove(name: "Proxy-Connection")
-        headers.replaceOrAdd(name: "Authorization", value: "Bearer \(account.accessToken)")
-        if !account.accountID.isEmpty {
-            headers.replaceOrAdd(name: "ChatGPT-Account-Id", value: account.accountID)
-        } else {
-            headers.remove(name: "ChatGPT-Account-Id")
-        }
-        request.headers = headers
+        request.headers = proxyUpstreamHeaders(head.headers, account: account)
         if !body.isEmpty { request.body = .bytes(ByteBuffer(bytes: body)) }
         return try await httpClient.execute(request, timeout: .seconds(600))
     }

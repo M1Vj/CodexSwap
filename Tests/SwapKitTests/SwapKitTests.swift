@@ -179,6 +179,59 @@ final class RoutingEngineTests: XCTestCase {
     }
 }
 
+final class WarmupProxyTests: XCTestCase {
+    private func account(_ alias: String) -> Account {
+        Account(alias: alias, accountID: "id-\(alias)", accessToken: "token-\(alias)")
+    }
+
+    func testWarmupHeaderSelectsExactAccountWithoutChangingActiveAlias() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-proxy-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        _ = await store.setActive("a")
+        var headers = HTTPHeaders()
+        headers.add(name: ProxyRequestMode.warmupHeader, value: "b")
+
+        let mode = ProxyRequestMode(headers: headers)
+        let selected = await selectProxyAccount(store: store, mode: mode)
+        let active = await store.activeAlias()
+
+        XCTAssertEqual(mode, .warmup(alias: "b"))
+        XCTAssertEqual(selected?.alias, "b")
+        XCTAssertEqual(active, "a")
+    }
+
+    func testUpstreamHeadersStripWarmupSelectorAndReplaceCredentials() {
+        var headers = HTTPHeaders()
+        headers.add(name: ProxyRequestMode.warmupHeader, value: "b")
+        headers.add(name: "Authorization", value: "Bearer disposable")
+        let account = self.account("b")
+
+        let sanitized = proxyUpstreamHeaders(headers, account: account)
+
+        XCTAssertNil(sanitized.first(name: ProxyRequestMode.warmupHeader))
+        XCTAssertEqual(sanitized.first(name: "Authorization"), "Bearer token-b")
+        XCTAssertEqual(sanitized.first(name: "ChatGPT-Account-Id"), "id-b")
+    }
+
+    func testMarkLimitedDoesNotRotateActiveAccount() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-limit-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        _ = await store.setActive("a")
+        let reset = Date().addingTimeInterval(3600)
+
+        await store.markLimited("b", limit: "5h", resetAt: reset, fallbackCooldown: 18_000)
+        let active = await store.activeAlias()
+        let limited = await store.account("b")
+
+        XCTAssertEqual(active, "a")
+        XCTAssertEqual(limited?.disabledUntil["5h"], reset)
+    }
+}
+
 final class JWTTests: XCTestCase {
     private func makeToken(claims: [String: Any]) -> String {
         let header = Data("{}".utf8).base64EncodedString()
