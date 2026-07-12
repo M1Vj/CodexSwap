@@ -35,7 +35,7 @@ plist="$TMP/dist/CodexSwap.app/Contents/Info.plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" == "0.2.0" ]] || fail "bundle short version does not match VERSION"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "42" ]] || fail "bundle build number does not match BUILD_NUMBER"
 
-for script in build-universal.sh package-release.sh notarize-release.sh verify-release.sh; do
+for script in build-universal.sh package-release.sh notarize-release.sh verify-release.sh render-cask.sh verify-cask.sh; do
   bash "Scripts/$script" --help >/dev/null || fail "$script --help failed"
 done
 
@@ -46,5 +46,16 @@ grep -Fq 'lipo "$binary" -verify_arch arm64 x86_64' Scripts/verify-release.sh \
 
 expect_failure env RELEASE_TAG=v9.9.9 bash Scripts/package-release.sh --dry-run
 expect_failure env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_PATH bash Scripts/notarize-release.sh "$TMP/missing.zip"
+
+printf '%064d  CodexSwap-v0.2.0-macOS-universal.zip\n' 0 > "$TMP/release.sha256"
+bash Scripts/render-cask.sh --checksum "$TMP/release.sha256" --output "$TMP/codexswap.rb"
+bash Scripts/verify-cask.sh "$TMP/codexswap.rb"
+grep -Fq 'version "0.2.0"' "$TMP/codexswap.rb" || fail "rendered cask version is wrong"
+grep -Fq 'sha256 "0000000000000000000000000000000000000000000000000000000000000000"' "$TMP/codexswap.rb" || fail "rendered cask checksum is wrong"
+grep -Fq 'app "CodexSwap.app"' "$TMP/codexswap.rb" || fail "rendered cask does not install the app"
+grep -Fq 'macos: ">= :sonoma"' "$TMP/codexswap.rb" || fail "rendered cask has the wrong macOS requirement"
+grep -Fq 'Library/Application Support/CodexSwap' "$TMP/codexswap.rb" || fail "rendered cask is missing safe app-data cleanup"
+printf 'not-a-checksum\n' > "$TMP/bad.sha256"
+expect_failure bash Scripts/render-cask.sh --checksum "$TMP/bad.sha256" --output "$TMP/bad.rb"
 
 echo "release-tools tests passed"

@@ -1,0 +1,20 @@
+cask "codexswap" do
+  version "@@VERSION@@"
+  sha256 "@@SHA256@@"
+
+  url "https://github.com/M1Vj/CodexSwap/releases/download/v#{version}/CodexSwap-v#{version}-macOS-universal.zip"
+  name "CodexSwap"
+  desc "Switch and monitor local Codex accounts from the menu bar"
+  homepage "https://github.com/M1Vj/CodexSwap"
+
+  depends_on macos: ">= :sonoma"
+
+  app "CodexSwap.app"
+
+  uninstall quit: "com.codexswap.app"
+
+  zap trash: [
+    "~/Library/Application Support/CodexSwap",
+    "~/Library/Preferences/com.codexswap.app.plist",
+  ]
+end
