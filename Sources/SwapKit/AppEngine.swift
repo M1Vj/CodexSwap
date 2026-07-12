@@ -18,12 +18,15 @@ public struct EngineSnapshot: Sendable {
     public let lastActivityAt: Date?
     public let lastActivityAlias: String?
     public let routingState: CodexRoutingState
+    public let warmupSummary: WarmupSummary?
+    public let warmupInProgress: Bool
 
     public var isRunning: Bool { proxyURL != nil }
 
     public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy,
                 servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil,
-                routingState: CodexRoutingState = .disabled) {
+                routingState: CodexRoutingState = .disabled, warmupSummary: WarmupSummary? = nil,
+                warmupInProgress: Bool = false) {
         self.accounts = accounts
         self.activeAlias = activeAlias
         self.proxyURL = proxyURL
@@ -32,6 +35,8 @@ public struct EngineSnapshot: Sendable {
         self.lastActivityAt = lastActivityAt
         self.lastActivityAlias = lastActivityAlias
         self.routingState = routingState
+        self.warmupSummary = warmupSummary
+        self.warmupInProgress = warmupInProgress
     }
 }
 
@@ -40,26 +45,30 @@ public struct EngineSnapshot: Sendable {
 public actor AppEngine {
     private let store: AccountStore
     private let settingsStore: SettingsStore
-    private let usage: UsageClient
+    private let usage: any UsageFetching
     private let refresher: TokenRefresher
     private let configManager: CodexConfigManager
+    private let warmupService: QuotaWarmupService
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
     private var watcher: CodexBarWatcher?
+    private var warmupInProgress = false
 
     public init(
         store: AccountStore = AccountStore(),
         settingsStore: SettingsStore = SettingsStore(),
-        usage: UsageClient = UsageClient(),
+        usage: any UsageFetching = UsageClient(),
         refresher: TokenRefresher = TokenRefresher(),
-        configManager: CodexConfigManager = CodexConfigManager()
+        configManager: CodexConfigManager = CodexConfigManager(),
+        warmupService: QuotaWarmupService = QuotaWarmupService()
     ) {
         self.store = store
         self.settingsStore = settingsStore
         self.usage = usage
         self.refresher = refresher
         self.configManager = configManager
+        self.warmupService = warmupService
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -122,6 +131,7 @@ public actor AppEngine {
         let activity = await proxy?.activity()
         let settings = await settingsStore.get()
         let routingState = verifiedRoutingState(settings: settings)
+        let warmupSummary = await warmupService.lastSummary()
         return EngineSnapshot(
             accounts: await store.all(),
             activeAlias: await store.activeAlias(),
@@ -130,7 +140,9 @@ public actor AppEngine {
             servedCount: activity?.servedCount ?? 0,
             lastActivityAt: activity?.lastAt,
             lastActivityAlias: activity?.lastAlias,
-            routingState: routingState
+            routingState: routingState,
+            warmupSummary: warmupSummary,
+            warmupInProgress: warmupInProgress
         )
     }
 
@@ -163,6 +175,39 @@ public actor AppEngine {
         try configManager.repair(proxyURL: stableProxyURL(port: settings.proxyPort))
         _ = await settingsStore.update { $0.routeCodexAutomatically = true }
         emit(.snapshotChanged)
+    }
+
+    public func setAutomaticWarmup(_ enabled: Bool) async {
+        _ = await settingsStore.update { $0.automaticallyWarmAccounts = enabled }
+        emit(.snapshotChanged)
+        if enabled, let url = await proxy?.proxyURL() {
+            _ = await performWarmup(proxyURL: url, force: false)
+        }
+    }
+
+    public func warmAllAccountsNow(proxyURL override: URL? = nil) async -> WarmupSummary {
+        let runningURL: URL?
+        if let override {
+            runningURL = override
+        } else {
+            runningURL = await proxy?.proxyURL()
+        }
+        guard let url = runningURL else {
+            return WarmupSummary(startedAt: Date(), finishedAt: Date(), failed: ["all": "proxy not running"])
+        }
+        return await performWarmup(proxyURL: url, force: true)
+    }
+
+    private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
+        warmupInProgress = true
+        emit(.snapshotChanged)
+        let summary = await warmupService.run(accounts: await store.all(), proxyURL: proxyURL, force: force)
+        if !summary.warmed.isEmpty {
+            await pollUsage(activeOnly: false, aliases: Set(summary.warmed))
+        }
+        warmupInProgress = false
+        emit(.snapshotChanged)
+        return summary
     }
 
     private func stableProxyURL(port: Int) -> URL {
@@ -221,6 +266,11 @@ public actor AppEngine {
                 await self.expireCooldownsAndNotify()
                 await self.pollUsage(activeOnly: true)
                 await self.proactiveSwitchIfNeeded(settings: settings)
+                if settings.automaticallyWarmAccounts,
+                   let url = await self.proxy?.proxyURL(),
+                   await self.warmupService.hasDueAccount(in: await self.store.all()) {
+                    _ = await self.performWarmup(proxyURL: url, force: false)
+                }
                 await self.emitSnapshot()
                 try? await Task.sleep(nanoseconds: UInt64(max(15, settings.usagePollSeconds)) * 1_000_000_000)
             }
@@ -235,11 +285,12 @@ public actor AppEngine {
         for acc in reset { emit(.windowReset(alias: acc.alias)) }
     }
 
-    private func pollUsage(activeOnly: Bool) async {
+    private func pollUsage(activeOnly: Bool, aliases: Set<String>? = nil) async {
         let accounts = await store.all()
         let activeAlias = await store.activeAlias()
         for acc in accounts where !acc.accessToken.isEmpty {
             if activeOnly && acc.alias != activeAlias { continue }
+            if let aliases, !aliases.contains(acc.alias) { continue }
             guard !JWT.isStale(acc.accessToken) else { continue }
             if let windows = try? await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID) {
                 await store.updateUsage(acc.alias, windows: windows)

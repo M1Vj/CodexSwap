@@ -28,7 +28,7 @@ public actor QuotaWarmupService {
         self.ledger = ledger
     }
 
-    public func run(accounts: [Account], proxyURL: URL, now: Date = Date()) async -> WarmupSummary {
+    public func run(accounts: [Account], proxyURL: URL, force: Bool = false, now: Date = Date()) async -> WarmupSummary {
         guard !isRunning else {
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         }
@@ -42,7 +42,7 @@ public actor QuotaWarmupService {
                 continue
             }
             let key = account.id
-            if let record = await ledger.record(for: key), !record.isDue(at: now) {
+            if !force, let record = await ledger.record(for: key), !record.isDue(at: now) {
                 summary.skipped[account.alias] = "already warmed for this cycle"
                 continue
             }
@@ -66,6 +66,14 @@ public actor QuotaWarmupService {
     }
 
     public func lastSummary() async -> WarmupSummary? { await ledger.lastSummary() }
+
+    public func hasDueAccount(in accounts: [Account], now: Date = Date()) async -> Bool {
+        for account in accounts where skipReason(account, now: now) == nil {
+            guard let record = await ledger.record(for: account.id) else { return true }
+            if record.isDue(at: now) { return true }
+        }
+        return false
+    }
 
     private func skipReason(_ account: Account, now: Date) -> String? {
         if account.needsLogin { return "needs login" }
