@@ -40,6 +40,12 @@ cp "$BUILD_PRODUCTS_DIR/CodexSwapApp" "$CONTENTS/MacOS/$APP_NAME"
 cp "$BUILD_PRODUCTS_DIR/swapd" "$CONTENTS/MacOS/swapd"
 chmod 755 "$CONTENTS/MacOS/$APP_NAME" "$CONTENTS/MacOS/swapd"
 
+[[ -f "$ROOT/Assets/AppIcon.icns" ]] || {
+  echo "missing app icon: $ROOT/Assets/AppIcon.icns" >&2
+  exit 1
+}
+cp "$ROOT/Assets/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+
 PLIST="$CONTENTS/Info.plist"
 plutil -create xml1 "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$PLIST"
@@ -47,6 +53,7 @@ plutil -create xml1 "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $APP_NAME" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$PLIST"
