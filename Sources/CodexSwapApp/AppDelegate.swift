@@ -1,0 +1,304 @@
+import AppKit
+import UserNotifications
+import ServiceManagement
+import SwapKit
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let engine = AppEngine(settingsStore: SettingsStoreBridge.shared)
+    private var hasBundle: Bool { Bundle.main.bundleIdentifier != nil }
+    private var statusItem: NSStatusItem!
+    private let menu = NSMenu()
+    private var latest = EngineSnapshot(accounts: [], activeAlias: nil, proxyURL: nil, strategy: .priority)
+    private var settings = Settings.default
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle", accessibilityDescription: "CodexSwap")
+            button.image?.isTemplate = true
+        }
+        menu.delegate = self
+        statusItem.menu = menu
+        rebuildMenu()
+
+        if hasBundle {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+
+        engine.setEventHandler { [weak self] event in
+            Task { @MainActor in self?.handle(event: event) }
+        }
+
+        Task { @MainActor in
+            do { try await engine.start() } catch {
+                self.notify(title: "CodexSwap", body: "Failed to start proxy: \(error.localizedDescription)")
+            }
+            if self.latest.accounts.isEmpty { await self.engine.importAccounts() }
+            await self.refreshSnapshot()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        let sem = DispatchSemaphore(value: 0)
+        Task { await engine.stop(); sem.signal() }
+        _ = sem.wait(timeout: .now() + 2)
+    }
+
+    // MARK: - Snapshot / events
+
+    private func refreshSnapshot() async {
+        latest = await engine.snapshot()
+        settings = await SettingsStoreBridge.current()
+        rebuildMenu()
+    }
+
+    private func handle(event: AppEvent) {
+        switch event {
+        case let .rotated(from, to, limit, resetAt):
+            if settings.notifyOnRotate {
+                let when = resetAt.map { " (resets \(Self.shortTime($0)))" } ?? ""
+                notify(title: "Switched account", body: "\(from) hit \(limit) limit → now using \(to)\(when)")
+            }
+        case let .exhausted(limit):
+            if settings.notifyOnExhausted {
+                notify(title: "All accounts limited", body: "Every account is out on \(limit). Codex will error until one resets.")
+            }
+        case let .needsLogin(alias):
+            notify(title: "Account needs sign-in", body: "\(alias) was signed out. Re-add it via Add account…")
+        case let .windowReset(alias):
+            if settings.notifyOnWindowReset {
+                notify(title: "Quota reset", body: "\(alias) is back in rotation.")
+            }
+        case .refreshed, .snapshotChanged:
+            break
+        }
+        Task { @MainActor in await self.refreshSnapshot() }
+    }
+
+    // MARK: - Menu
+
+    private func rebuildMenu() {
+        menu.removeAllItems()
+
+        let active = latest.activeAlias ?? "none"
+        let header = NSMenuItem(title: "CodexSwap — active: \(active)", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        if latest.proxyURL == nil {
+            let warn = NSMenuItem(title: "⚠︎ proxy not running", action: nil, keyEquivalent: "")
+            warn.isEnabled = false
+            menu.addItem(warn)
+        }
+        menu.addItem(.separator())
+
+        if latest.accounts.isEmpty {
+            let empty = NSMenuItem(title: "No accounts — Import accounts below", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+
+        for acc in latest.accounts.sorted(by: { $0.priority > $1.priority }) {
+            let item = NSMenuItem(title: label(for: acc), action: #selector(switchAccount(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = acc.alias
+            item.state = acc.alias == latest.activeAlias ? .on : .off
+            item.submenu = accountSubmenu(acc)
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+        menu.addItem(strategyItem("Priority", .priority))
+        menu.addItem(strategyItem("Round-robin", .roundRobin))
+        menu.addItem(.separator())
+
+        addAction("Refresh usage now", #selector(refreshUsage))
+        addAction("Import accounts", #selector(importAccounts))
+        addAction("Add account (codex login)…", #selector(addAccount))
+        addAction("Install `codexswap` shim…", #selector(installShim))
+        menu.addItem(notifyToggles())
+        menu.addItem(launchAtLoginItem())
+        menu.addItem(.separator())
+        addAction("Quit CodexSwap", #selector(quit))
+    }
+
+    private func label(for acc: Account) -> String {
+        var parts = ["[p\(acc.priority)] \(acc.alias)"]
+        let u = acc.usage.map { "\($0.label) \($0.usedPercent)%" }.joined(separator: " · ")
+        if !u.isEmpty { parts.append(u) }
+        if let cd = acc.cooldownUntil(now: Date()) { parts.append("limited→\(Self.shortTime(cd))") }
+        if acc.needsLogin { parts.append("NEEDS-LOGIN") }
+        return parts.joined(separator: "  ")
+    }
+
+    private func accountSubmenu(_ acc: Account) -> NSMenu {
+        let sub = NSMenu()
+        let sw = NSMenuItem(title: "Switch to \(acc.alias)", action: #selector(switchAccount(_:)), keyEquivalent: "")
+        sw.target = self; sw.representedObject = acc.alias
+        sub.addItem(sw)
+        sub.addItem(.separator())
+        let pHeader = NSMenuItem(title: "Priority", action: nil, keyEquivalent: ""); pHeader.isEnabled = false
+        sub.addItem(pHeader)
+        for p in [0, 1, 2, 5, 10] {
+            let pi = NSMenuItem(title: "  \(p)", action: #selector(setPriority(_:)), keyEquivalent: "")
+            pi.target = self
+            pi.representedObject = PriorityChange(alias: acc.alias, priority: p)
+            pi.state = acc.priority == p ? .on : .off
+            sub.addItem(pi)
+        }
+        sub.addItem(.separator())
+        let rm = NSMenuItem(title: "Remove \(acc.alias)", action: #selector(removeAccount(_:)), keyEquivalent: "")
+        rm.target = self; rm.representedObject = acc.alias
+        sub.addItem(rm)
+        return sub
+    }
+
+    private func strategyItem(_ title: String, _ strategy: RotationStrategy) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(setStrategy(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = strategy.rawValue
+        item.state = latest.strategy == strategy ? .on : .off
+        return item
+    }
+
+    private func notifyToggles() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.addItem(toggle("On auto-switch", settings.notifyOnRotate, #selector(toggleNotifyRotate)))
+        sub.addItem(toggle("On all exhausted", settings.notifyOnExhausted, #selector(toggleNotifyExhausted)))
+        sub.addItem(toggle("On quota reset", settings.notifyOnWindowReset, #selector(toggleNotifyReset)))
+        parent.submenu = sub
+        return parent
+    }
+
+    private func launchAtLoginItem() -> NSMenuItem {
+        let item = toggle("Launch at login", settings.launchAtLogin, #selector(toggleLaunchAtLogin))
+        return item
+    }
+
+    private func toggle(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.state = on ? .on : .off
+        return item
+    }
+
+    private func addAction(_ title: String, _ action: Selector) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+    }
+
+    // MARK: - Actions
+
+    @objc private func switchAccount(_ sender: NSMenuItem) {
+        guard let alias = sender.representedObject as? String else { return }
+        Task { await engine.switchTo(alias); await refreshSnapshot() }
+    }
+
+    @objc private func setPriority(_ sender: NSMenuItem) {
+        guard let change = sender.representedObject as? PriorityChange else { return }
+        Task { await engine.setPriority(change.alias, priority: change.priority); await refreshSnapshot() }
+    }
+
+    @objc private func removeAccount(_ sender: NSMenuItem) {
+        guard let alias = sender.representedObject as? String else { return }
+        Task { await engine.remove(alias); await refreshSnapshot() }
+    }
+
+    @objc private func setStrategy(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let s = RotationStrategy(rawValue: raw) else { return }
+        Task { await engine.setStrategy(s); await refreshSnapshot() }
+    }
+
+    @objc private func refreshUsage() { Task { await engine.refreshAllUsage(); await refreshSnapshot() } }
+    @objc private func importAccounts() { Task { await engine.importAccounts(); await refreshSnapshot() } }
+
+    @objc private func addAccount() {
+        guard let codex = CodexLauncher.resolveCodexBinary() else {
+            notify(title: "CodexSwap", body: "codex binary not found on PATH.")
+            return
+        }
+        let script = "tell application \"Terminal\" to do script \"\(codex) login\""
+        runAppleScript(script)
+        notify(title: "CodexSwap", body: "Complete login in Terminal, then choose Import accounts.")
+    }
+
+    @objc private func installShim() {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("codexswap")
+        do {
+            try RuntimeHandoff.shimScript().write(to: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+            notify(title: "CodexSwap", body: "Installed shim at ~/.local/bin/codexswap. Run `codexswap` instead of `codex`.")
+        } catch {
+            notify(title: "CodexSwap", body: "Failed to install shim: \(error.localizedDescription)")
+        }
+    }
+
+    @objc private func toggleNotifyRotate() { updateSettings { $0.notifyOnRotate.toggle() } }
+    @objc private func toggleNotifyExhausted() { updateSettings { $0.notifyOnExhausted.toggle() } }
+    @objc private func toggleNotifyReset() { updateSettings { $0.notifyOnWindowReset.toggle() } }
+
+    @objc private func toggleLaunchAtLogin() {
+        let newValue = !settings.launchAtLogin
+        guard hasBundle else {
+            notify(title: "CodexSwap", body: "Launch-at-login needs the packaged .app (not the dev binary).")
+            return
+        }
+        do {
+            if newValue { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            updateSettings { $0.launchAtLogin = newValue }
+        } catch {
+            notify(title: "CodexSwap", body: "Launch-at-login change failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    private func updateSettings(_ mutate: @escaping @Sendable (inout Settings) -> Void) {
+        Task {
+            settings = await SettingsStoreBridge.update(mutate)
+            await refreshSnapshot()
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func notify(title: String, body: String) {
+        guard hasBundle else {
+            FileHandle.standardError.write("[notify] \(title): \(body)\n".data(using: .utf8)!)
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    private func runAppleScript(_ source: String) {
+        var error: NSDictionary?
+        NSAppleScript(source: source)?.executeAndReturnError(&error)
+    }
+
+    static func shortTime(_ date: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"; return f.string(from: date)
+    }
+
+    private struct PriorityChange { let alias: String; let priority: Int }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        Task { @MainActor in await refreshSnapshot() }
+    }
+}
+
+/// The SettingsStore is an actor; the menu needs its value synchronously-ish, so bridge through a shared instance.
+enum SettingsStoreBridge {
+    static let shared = SettingsStore()
+    static func current() async -> Settings { await shared.get() }
+    static func update(_ mutate: @escaping @Sendable (inout Settings) -> Void) async -> Settings { await shared.update(mutate) }
+}
