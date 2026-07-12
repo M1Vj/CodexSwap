@@ -223,6 +223,20 @@ public actor AppEngine {
         return await performWarmup(proxyURL: url, force: true)
     }
 
+    /// Warm-up eligibility must see the same credentials the proxy would use: adopt CodexBar's
+    /// fresher tokens for managed accounts so a stale store copy cannot silently starve warm-ups.
+    private func warmupCandidates() async -> [Account] {
+        var candidates: [Account] = []
+        for account in await store.all() {
+            if account.managedHomePath != nil, let hydrated = await store.hydrateFromManagedHome(account.alias) {
+                candidates.append(hydrated)
+            } else {
+                candidates.append(account)
+            }
+        }
+        return candidates
+    }
+
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
         guard !warmupInProgress else {
             let now = Date()
@@ -230,7 +244,7 @@ public actor AppEngine {
         }
         warmupInProgress = true
         emit(.snapshotChanged)
-        let summary = await warmupService.run(accounts: await store.all(), proxyURL: proxyURL, force: force)
+        let summary = await warmupService.run(accounts: await warmupCandidates(), proxyURL: proxyURL, force: force)
         if !summary.warmed.isEmpty {
             let aliases = Set(summary.warmed)
             await pollUsage(activeOnly: false, aliases: aliases)
@@ -300,7 +314,7 @@ public actor AppEngine {
                 await self.proactiveSwitchIfNeeded(settings: settings)
                 if settings.automaticallyWarmAccounts,
                    let url = await self.proxy?.proxyURL(),
-                   await self.warmupService.hasDueAccount(in: await self.store.all()) {
+                   await self.warmupService.hasDueAccount(in: await self.warmupCandidates()) {
                     _ = await self.performWarmup(proxyURL: url, force: false)
                 }
                 await self.emitSnapshot()
