@@ -25,9 +25,11 @@ struct AccountsSettingsView: View {
             }
 
             HStack {
-                Button("Open CodexBar to Add Account…", action: model.actions.openCodexBar)
+                Button("Add in CodexBar…", action: model.actions.openCodexBar)
                     .disabled(!model.codexBarInstalled)
-                Button("Add Standalone Account…", action: model.actions.addStandaloneAccount)
+                    .accessibilityLabel("Open CodexBar to add an account")
+                Button("Add Standalone…", action: model.actions.addStandaloneAccount)
+                    .accessibilityLabel("Add a standalone Codex account")
                 Button("Rescan Accounts", action: model.actions.importAccounts)
             }
 
@@ -75,12 +77,15 @@ private struct AccountSettingsRowView: View {
 
             if !account.isActive {
                 Button("Use", action: { model.actions.switchAccount(account.alias) })
+                    .accessibilityLabel("Use \(account.alias)")
             }
             if account.ownership == .codexBarManaged {
                 Button("Manage", action: model.actions.openCodexBar)
                     .help("Remove or reauthenticate this account in CodexBar")
+                    .accessibilityLabel("Manage \(account.alias) in CodexBar")
             } else {
                 Button("Remove", role: .destructive, action: { model.actions.removeAccount(account.alias) })
+                    .accessibilityLabel("Remove \(account.alias)")
             }
         }
         .padding(.vertical, 4)

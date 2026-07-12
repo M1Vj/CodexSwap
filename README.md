@@ -45,9 +45,9 @@ If the Codex provider config is edited externally while routing is enabled, Code
 
 ## Adding accounts
 
-CodexBar-managed accounts are preferred. In Settings → Accounts, choose **Open CodexBar to Add Account…**, then choose Add Account in CodexBar. CodexSwap watches CodexBar's managed roster and imports the new account automatically without copying ownership away from CodexBar.
+CodexBar-managed accounts are preferred. In Settings → Accounts, choose **Add in CodexBar…**, then choose Add Account in CodexBar. CodexSwap watches CodexBar's managed roster and imports the new account automatically without copying ownership away from CodexBar.
 
-If CodexBar is unavailable, choose **Add Standalone Account…**. This opens the standard `codex login` flow; return to Settings and choose **Rescan Accounts** afterward.
+If CodexBar is unavailable, choose **Add Standalone…**. This opens the standard `codex login` flow; return to Settings and choose **Rescan Accounts** afterward.
 
 ## Optional terminal shim
 
