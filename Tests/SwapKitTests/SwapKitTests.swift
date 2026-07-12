@@ -3,6 +3,516 @@ import NIOCore
 import NIOHTTP1
 @testable import SwapKit
 
+final class SettingsTests: XCTestCase {
+    func testNewAutomationSettingsDecodeWithSafeDefaults() throws {
+        let settings = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+
+        XCTAssertFalse(settings.routeCodexAutomatically)
+        XCTAssertFalse(settings.automaticallyWarmAccounts)
+        XCTAssertEqual(settings.proxyPort, Settings.defaultProxyPort)
+        XCTAssertEqual(settings.proxyPort, 58_432)
+    }
+
+    func testInvalidPersistedProxyPortFallsBackToSafeDefault() throws {
+        let zero = try JSONDecoder().decode(Settings.self, from: Data(#"{"proxyPort":0}"#.utf8))
+        let tooHigh = try JSONDecoder().decode(Settings.self, from: Data(#"{"proxyPort":70000}"#.utf8))
+
+        XCTAssertEqual(zero.proxyPort, Settings.defaultProxyPort)
+        XCTAssertEqual(tooHigh.proxyPort, Settings.defaultProxyPort)
+    }
+}
+
+final class CodexConfigManagerTests: XCTestCase {
+    private func fixture() throws -> (home: URL, support: URL, config: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("config-manager-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("codex")
+        let support = root.appendingPathComponent("support")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        return (home, support, home.appendingPathComponent("config.toml"))
+    }
+
+    func testEnableAndDisableRestoresExistingConfigByteForByte() throws {
+        let f = try fixture()
+        let original = """
+        model = "gpt-5.6"
+        chatgpt_base_url = "https://example.invalid/backend-api"
+        model_provider = "previous"
+
+        [model_providers.codexswap]
+        name = "Previous"
+        base_url = "https://example.invalid/codex"
+
+        [projects."/tmp/example"]
+        trust_level = "trusted"
+        """
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        let enabled = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertTrue(enabled.contains("# BEGIN CODEXSWAP MANAGED ROUTING"))
+        XCTAssertTrue(enabled.contains("base_url = \"http://127.0.0.1:58432/backend-api/codex\""))
+        XCTAssertTrue(enabled.contains("[model_providers.codexswap]"))
+        XCTAssertLessThan(enabled.range(of: "# BEGIN CODEXSWAP")!.lowerBound, enabled.range(of: "model = \"gpt-5.6\"")!.lowerBound)
+        XCTAssertFalse(enabled.contains("https://example.invalid"))
+        let manifestMode = try FileManager.default.attributesOfItem(atPath: f.support.appendingPathComponent("routing-restore.json").path)[.posixPermissions] as! NSNumber
+        let backup = try FileManager.default.contentsOfDirectory(at: f.support.appendingPathComponent("config-backups"), includingPropertiesForKeys: nil).first!
+        let backupMode = try FileManager.default.attributesOfItem(atPath: backup.path)[.posixPermissions] as! NSNumber
+        XCTAssertEqual(manifestMode.intValue, 0o600)
+        XCTAssertEqual(backupMode.intValue, 0o600)
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .disabled)
+    }
+
+    func testDisablePreservesUnrelatedEditsMadeWhileEnabled() throws {
+        let f = try fixture()
+        let original = "model_provider = \"previous\"\nmodel = \"gpt-5.6\"\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+
+        var changed = try String(contentsOf: f.config, encoding: .utf8)
+        changed = "analytics = { enabled = false }\n" + changed
+        try changed.write(to: f.config, atomically: true, encoding: .utf8)
+
+        try manager.disable()
+        let restored = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertTrue(restored.contains("analytics = { enabled = false }"))
+        XCTAssertTrue(restored.contains("model_provider = \"previous\""))
+        XCTAssertFalse(restored.contains("BEGIN CODEXSWAP"))
+    }
+
+    func testMissingOriginalConfigIsRemovedAfterDisable() throws {
+        let f = try fixture()
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: f.config.path))
+        try manager.disable()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.config.path))
+    }
+
+    func testEditedManagedBlockReportsNeedsRepair() throws {
+        let f = try fixture()
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+        var text = try String(contentsOf: f.config, encoding: .utf8)
+        text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
+        try text.write(to: f.config, atomically: true, encoding: .utf8)
+
+        guard case .needsRepair = try manager.state(proxyURL: proxy) else {
+            return XCTFail("Expected needsRepair")
+        }
+        XCTAssertThrowsError(try manager.disable())
+    }
+
+    func testRepairReinstallsManagedValuesAndKeepsRestorePoint() throws {
+        let f = try fixture()
+        let original = "model_provider = \"previous\"\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+        var text = try String(contentsOf: f.config, encoding: .utf8)
+        text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
+        try text.write(to: f.config, atomically: true, encoding: .utf8)
+
+        try manager.repair(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testExistingSingleLineProviderConfigIsDisplacedAndRestored() throws {
+        let f = try fixture()
+        let original = "model_providers.codexswap = { name = \"custom\" }\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testExistingModelProvidersTableRemainsValidAndIsRestored() throws {
+        let f = try fixture()
+        let original = """
+        [model_providers]
+        custom = { name = "Custom", base_url = "https://example.invalid" }
+        """
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        let enabled = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertTrue(enabled.contains("[model_providers.codexswap]"))
+        XCTAssertFalse(enabled.contains("model_providers.codexswap ="))
+        XCTAssertTrue(enabled.contains("[model_providers]"))
+        XCTAssertTrue(enabled.contains("custom = {"))
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testExactManagedBlockWithoutRestoreManifestNeedsRepair() throws {
+        let f = try fixture()
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+        try FileManager.default.removeItem(at: f.support.appendingPathComponent("routing-restore.json"))
+
+        guard case .needsRepair(let detail) = try manager.state(proxyURL: proxy) else {
+            return XCTFail("Expected missing manifest to need repair")
+        }
+        XCTAssertTrue(detail.contains("manifest"))
+        XCTAssertThrowsError(try manager.disable())
+    }
+}
+
+final class RoutingEngineTests: XCTestCase {
+    private func fixture() throws -> (engine: AppEngine, settings: SettingsStore, config: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("routing-engine-\(UUID().uuidString)")
+        let codexHome = root.appendingPathComponent("codex")
+        let support = root.appendingPathComponent("support")
+        try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
+        let settings = SettingsStore(url: support.appendingPathComponent("settings.json"))
+        let store = AccountStore(url: support.appendingPathComponent("accounts.json"))
+        let manager = CodexConfigManager(codexHome: codexHome, supportDir: support)
+        return (
+            AppEngine(store: store, settingsStore: settings, configManager: manager),
+            settings,
+            codexHome.appendingPathComponent("config.toml")
+        )
+    }
+
+    func testEnableAndDisableRoutingPersistsIntentAndRestoresConfig() async throws {
+        let f = try fixture()
+        let original = "model = \"gpt-5.6\"\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+
+        try await f.engine.setAutomaticRouting(true, proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        let enabledSettings = await f.settings.get()
+        let enabledSnapshot = await f.engine.snapshot()
+        XCTAssertTrue(enabledSettings.routeCodexAutomatically)
+        XCTAssertEqual(enabledSnapshot.routingState, .enabled)
+
+        try await f.engine.setAutomaticRouting(false)
+        let disabledSettings = await f.settings.get()
+        let disabledSnapshot = await f.engine.snapshot()
+        XCTAssertFalse(disabledSettings.routeCodexAutomatically)
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+        XCTAssertEqual(disabledSnapshot.routingState, .disabled)
+    }
+
+    func testExternalManagedBlockEditReportsRepairState() async throws {
+        let f = try fixture()
+        try await f.engine.setAutomaticRouting(true, proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        var text = try String(contentsOf: f.config, encoding: .utf8)
+        text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
+        try text.write(to: f.config, atomically: true, encoding: .utf8)
+
+        let snapshot = await f.engine.snapshot()
+        guard case .needsRepair = snapshot.routingState else {
+            return XCTFail("Expected needsRepair")
+        }
+
+        try await f.engine.repairAutomaticRouting(proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        let repaired = await f.engine.snapshot()
+        XCTAssertEqual(repaired.routingState, .enabled)
+    }
+
+    func testEnableRoutingWithoutRunningProxyDoesNotChangeConfig() async throws {
+        let f = try fixture()
+
+        do {
+            try await f.engine.setAutomaticRouting(true)
+            XCTFail("Expected routing enable to fail without a running proxy")
+        } catch {
+            // Expected.
+        }
+        let settings = await f.settings.get()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.config.path))
+        XCTAssertFalse(settings.routeCodexAutomatically)
+    }
+}
+
+final class WarmupProxyTests: XCTestCase {
+    private func account(_ alias: String) -> Account {
+        Account(alias: alias, accountID: "id-\(alias)", accessToken: "token-\(alias)")
+    }
+
+    func testWarmupHeaderSelectsExactAccountWithoutChangingActiveAlias() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-proxy-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        _ = await store.setActive("a")
+        var headers = HTTPHeaders()
+        headers.add(name: ProxyRequestMode.warmupHeader, value: "b")
+
+        let mode = ProxyRequestMode(headers: headers)
+        let selected = await selectProxyAccount(store: store, mode: mode)
+        let active = await store.activeAlias()
+
+        XCTAssertEqual(mode, .warmup(alias: "b"))
+        XCTAssertEqual(selected?.alias, "b")
+        XCTAssertEqual(active, "a")
+    }
+
+    func testUpstreamHeadersStripWarmupSelectorAndReplaceCredentials() {
+        var headers = HTTPHeaders()
+        headers.add(name: ProxyRequestMode.warmupHeader, value: "b")
+        headers.add(name: "Authorization", value: "Bearer disposable")
+        let account = self.account("b")
+
+        let sanitized = proxyUpstreamHeaders(headers, account: account)
+
+        XCTAssertNil(sanitized.first(name: ProxyRequestMode.warmupHeader))
+        XCTAssertEqual(sanitized.first(name: "Authorization"), "Bearer token-b")
+        XCTAssertEqual(sanitized.first(name: "ChatGPT-Account-Id"), "id-b")
+    }
+
+    func testWarmupSelectorIsOnlyHonoredForLoopbackResponsePosts() {
+        var headers = HTTPHeaders()
+        headers.add(name: ProxyRequestMode.warmupHeader, value: "b")
+
+        XCTAssertEqual(proxyRequestMode(headers: headers, method: .POST, path: "/backend-api/codex/responses", loopbackOnly: true), .warmup(alias: "b"))
+        XCTAssertEqual(proxyRequestMode(headers: headers, method: .GET, path: "/backend-api/wham/usage", loopbackOnly: true), .normal)
+        XCTAssertEqual(proxyRequestMode(headers: headers, method: .POST, path: "/backend-api/codex/responses", loopbackOnly: false), .normal)
+    }
+
+    func testMarkLimitedDoesNotRotateActiveAccount() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-limit-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        _ = await store.setActive("a")
+        let reset = Date().addingTimeInterval(3600)
+
+        await store.markLimited("b", limit: "5h", resetAt: reset, fallbackCooldown: 18_000)
+        let active = await store.activeAlias()
+        let limited = await store.account("b")
+
+        XCTAssertEqual(active, "a")
+        XCTAssertEqual(limited?.disabledUntil["5h"], reset)
+    }
+}
+
+private actor FakeWarmupRunner: WarmupCommandRunning {
+    private var aliases: [String] = []
+    private let failing: Set<String>
+
+    init(failing: Set<String> = []) { self.failing = failing }
+
+    func run(alias: String, proxyURL: URL) async throws {
+        aliases.append(alias)
+        if failing.contains(alias) { throw WarmupCommandError.failed("Bearer secret-token") }
+    }
+
+    func calls() -> [String] { aliases }
+}
+
+private actor BlockingWarmupRunner: WarmupCommandRunning {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var started = false
+
+    func run(alias: String, proxyURL: URL) async throws {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func hasStarted() -> Bool { started }
+
+    func finish() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor FakeUsageFetcher: UsageFetching {
+    private var accountIDs: [String] = []
+
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
+        accountIDs.append(accountID)
+        return [
+            UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000)),
+            UsageWindow(label: "Weekly", usedPercent: 1, windowSeconds: 604_800, resetAt: Date().addingTimeInterval(604_800)),
+        ]
+    }
+
+    func calls() -> [String] { accountIDs }
+}
+
+final class QuotaWarmupServiceTests: XCTestCase {
+    private func account(_ alias: String, now: Date, needsLogin: Bool = false) -> Account {
+        Account(
+            alias: alias,
+            accountID: "id-\(alias)",
+            accessToken: "token",
+            needsLogin: needsLogin,
+            usage: [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))]
+        )
+    }
+
+    func testRunsEligibleAccountsSequentiallyAndDeduplicatesCurrentCycle() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-service-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner()
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accounts = [account("a", now: now), account("b", now: now, needsLogin: true)]
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let first = await service.run(accounts: accounts, proxyURL: proxy, now: now)
+        let second = await service.run(accounts: accounts, proxyURL: proxy, now: now.addingTimeInterval(60))
+        let forced = await service.run(accounts: [accounts[0]], proxyURL: proxy, force: true, now: now.addingTimeInterval(120))
+        let calls = await runner.calls()
+
+        XCTAssertEqual(first.warmed, ["a"])
+        XCTAssertEqual(first.skipped["b"], "needs login")
+        XCTAssertEqual(second.skipped["a"], "already warmed for this cycle")
+        XCTAssertEqual(forced.warmed, ["a"])
+        XCTAssertEqual(calls, ["a", "a"])
+    }
+
+    func testRunsAgainAfterRecordedPrimaryResetAndRedactsFailures() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-reset-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner(failing: ["bad"])
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        let a = account("a", now: now)
+
+        _ = await service.run(accounts: [a], proxyURL: proxy, now: now)
+        let afterReset = await service.run(accounts: [a, account("bad", now: now)], proxyURL: proxy, now: now.addingTimeInterval(18_001))
+        let immediateRepeat = await service.run(accounts: [a], proxyURL: proxy, now: now.addingTimeInterval(18_002))
+
+        XCTAssertEqual(afterReset.warmed, ["a"])
+        XCTAssertNotNil(afterReset.failed["bad"])
+        XCTAssertFalse(afterReset.failed["bad"]!.contains("secret-token"))
+        XCTAssertEqual(immediateRepeat.skipped["a"], "already warmed for this cycle")
+    }
+
+    func testFailedAutomaticWarmupBacksOffBeforeRetrying() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-backoff-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner(failing: ["bad"])
+        let service = QuotaWarmupService(runner: runner, ledger: ledger, failureRetrySeconds: 300)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        let accounts = [account("bad", now: now)]
+
+        _ = await service.run(accounts: accounts, proxyURL: proxy, now: now)
+
+        let dueBeforeBackoff = await service.hasDueAccount(in: accounts, now: now.addingTimeInterval(299))
+        let dueAfterBackoff = await service.hasDueAccount(in: accounts, now: now.addingTimeInterval(300))
+        XCTAssertFalse(dueBeforeBackoff)
+        XCTAssertTrue(dueAfterBackoff)
+    }
+
+    func testFastWarmupProcessCannotMissTermination() async throws {
+        let runner = ProcessWarmupRunner(binary: "/usr/bin/true", timeoutSeconds: 1)
+        let clock = ContinuousClock()
+        let elapsed = try await clock.measure {
+            try await runner.run(alias: "fast", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        }
+
+        XCTAssertLessThan(elapsed, .milliseconds(500))
+    }
+}
+
+final class WarmupEngineTests: XCTestCase {
+    private func freshToken() -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: ["exp": Int(Date().addingTimeInterval(3600).timeIntervalSince1970)])
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(payload).sig"
+    }
+
+    func testManualWarmupForcesRunRefreshesUsageAndPublishesSummary() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        let settings = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let runner = FakeWarmupRunner()
+        let usage = FakeUsageFetcher()
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let warmup = QuotaWarmupService(runner: runner, ledger: ledger)
+        let engine = AppEngine(
+            store: store,
+            settingsStore: settings,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: warmup
+        )
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let summary = await engine.warmAllAccountsNow(proxyURL: proxy)
+        let usageCalls = await usage.calls()
+        let snapshot = await engine.snapshot()
+        let record = await ledger.record(for: "id-a")
+
+        XCTAssertEqual(summary.warmed, ["a"])
+        XCTAssertEqual(usageCalls, ["id-a"])
+        XCTAssertEqual(snapshot.warmupSummary?.warmed, ["a"])
+        XCTAssertFalse(snapshot.warmupInProgress)
+        XCTAssertNotNil(record?.secondaryResetAt)
+    }
+
+    func testAutomaticWarmupPreferencePersistsIndependently() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-setting-\(UUID().uuidString)")
+        let settings = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let engine = AppEngine(settingsStore: settings)
+
+        await engine.setAutomaticWarmup(true)
+        let enabled = await settings.get()
+        await engine.setAutomaticWarmup(false)
+        let disabled = await settings.get()
+
+        XCTAssertTrue(enabled.automaticallyWarmAccounts)
+        XCTAssertFalse(disabled.automaticallyWarmAccounts)
+    }
+
+    func testOverlappingWarmupDoesNotClearActiveProgress() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-overlap-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        let runner = BlockingWarmupRunner()
+        let warmup = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        )
+        let engine = AppEngine(store: store, warmupService: warmup)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let first = Task { await engine.warmAllAccountsNow(proxyURL: proxy) }
+        while !(await runner.hasStarted()) { await Task.yield() }
+
+        let overlapping = await engine.warmAllAccountsNow(proxyURL: proxy)
+        let duringOverlap = await engine.snapshot()
+        XCTAssertEqual(overlapping.skipped["all"], "warm-up already running")
+        XCTAssertTrue(duringOverlap.warmupInProgress)
+
+        await runner.finish()
+        _ = await first.value
+        let afterCompletion = await engine.snapshot()
+        XCTAssertFalse(afterCompletion.warmupInProgress)
+    }
+}
+
 final class JWTTests: XCTestCase {
     private func makeToken(claims: [String: Any]) -> String {
         let header = Data("{}".utf8).base64EncodedString()
@@ -192,6 +702,103 @@ final class RotationTests: XCTestCase {
     }
 }
 
+final class AccountOwnershipTests: XCTestCase {
+    func testManagedHomeDeterminesCodexBarOwnership() {
+        let managed = Account(alias: "managed", accountID: "managed", accessToken: "token", managedHomePath: "/tmp/codexbar-home")
+        let standalone = Account(alias: "standalone", accountID: "standalone", accessToken: "token")
+
+        XCTAssertEqual(AccountOwnership.classify(account: managed), .codexBarManaged)
+        XCTAssertEqual(AccountOwnership.classify(account: standalone), .standalone)
+    }
+}
+
+final class SettingsPresentationTests: XCTestCase {
+    func testAccountRowsExposeOwnershipActiveStateAndUsage() {
+        let managed = Account(
+            alias: "managed",
+            email: "managed@example.com",
+            accountID: "managed",
+            accessToken: "token",
+            priority: 10,
+            usage: [UsageWindow(label: "5h", usedPercent: 23, windowSeconds: 18_000, resetAt: nil)],
+            managedHomePath: "/tmp/codexbar-home"
+        )
+        let standalone = Account(alias: "standalone", accountID: "standalone", accessToken: "token", needsLogin: true)
+        let snapshot = EngineSnapshot(
+            accounts: [standalone, managed],
+            activeAlias: "managed",
+            proxyURL: URL(string: "http://127.0.0.1:58432"),
+            strategy: .priority,
+            routingState: .enabled
+        )
+
+        let presentation = SettingsPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(presentation.proxyAddress, "127.0.0.1:58432")
+        XCTAssertEqual(presentation.accounts.map(\.alias), ["managed", "standalone"])
+        XCTAssertEqual(presentation.accounts[0].ownership, .codexBarManaged)
+        XCTAssertTrue(presentation.accounts[0].isActive)
+        XCTAssertEqual(presentation.accounts[0].usageSummary, "5h 23%")
+        XCTAssertTrue(presentation.accounts[1].needsLogin)
+    }
+}
+
+final class ShimManagerTests: XCTestCase {
+    func testInstallAndUninstallOwnShim() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        let manager = ShimManager(url: url)
+
+        XCTAssertFalse(manager.isInstalled())
+        try manager.install()
+        XCTAssertTrue(manager.isInstalled())
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), RuntimeHandoff.shimScript())
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o755)
+
+        try manager.uninstall()
+        XCTAssertFalse(manager.isInstalled())
+    }
+
+    func testUninstallDoesNotRemoveParentDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        let manager = ShimManager(url: url)
+        try manager.install()
+        let sibling = url.deletingLastPathComponent().appendingPathComponent("other-tool")
+        try "keep".write(to: sibling, atomically: true, encoding: .utf8)
+
+        try manager.uninstall()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sibling.path))
+    }
+
+    func testUninstallRefusesForeignFileAtShimPath() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\necho foreign\n".write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try ShimManager(url: url).uninstall())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testInstallRefusesToOverwriteForeignFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let foreign = "#!/bin/sh\necho foreign\n"
+        try foreign.write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try ShimManager(url: url).install())
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), foreign)
+    }
+}
+
 final class CodexBarTests: XCTestCase {
     func testManagedAccountsParse() throws {
         let json = """
@@ -255,5 +862,28 @@ final class LauncherTests: XCTestCase {
         let url = URL(string: "http://127.0.0.1:5000")!
         let args = CodexLauncher.configArgs(proxyURL: url)
         XCTAssertTrue(args.contains("chatgpt_base_url=\"http://127.0.0.1:5000/backend-api\""))
+    }
+
+    func testWarmupArgsUseEphemeralReadOnlyTargetedProvider() {
+        let args = CodexLauncher.warmupArgs(proxyURL: URL(string: "http://127.0.0.1:58432")!, alias: "account-a")
+        let joined = args.joined(separator: " ")
+
+        XCTAssertEqual(args.first, "exec")
+        XCTAssertTrue(joined.contains("--ephemeral"))
+        XCTAssertTrue(joined.contains("read-only"))
+        XCTAssertTrue(joined.contains(ProxyRequestMode.warmupHeader))
+        XCTAssertTrue(joined.contains("account-a"))
+        XCTAssertTrue(joined.contains("CODEXSWAP_WARMUP_TOKEN"))
+    }
+
+    func testWarmupArgsEscapeAliasBeforeEmbeddingInToml() {
+        let args = CodexLauncher.warmupArgs(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            alias: "account\"\nmodel_provider=\"evil"
+        )
+        let provider = args.first(where: { $0.contains("model_providers.codexswap-warmup") })!
+
+        XCTAssertFalse(provider.contains("\n"))
+        XCTAssertTrue(provider.contains("account\\\"\\nmodel_provider=\\\"evil"))
     }
 }

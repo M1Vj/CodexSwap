@@ -17,6 +17,11 @@ public struct Settings: Codable, Sendable, Equatable {
     public var notifyOnExhausted: Bool
     public var notifyOnWindowReset: Bool
     public var launchAtLogin: Bool
+    public var routeCodexAutomatically: Bool
+    public var automaticallyWarmAccounts: Bool
+    public var proxyPort: Int
+
+    public static let defaultProxyPort = 58_432
 
     public static let `default` = Settings(
         rotationStrategy: .priority,
@@ -28,7 +33,10 @@ public struct Settings: Codable, Sendable, Equatable {
         notifyOnRotate: true,
         notifyOnExhausted: true,
         notifyOnWindowReset: true,
-        launchAtLogin: false
+        launchAtLogin: false,
+        routeCodexAutomatically: false,
+        automaticallyWarmAccounts: false,
+        proxyPort: defaultProxyPort
     )
 
     public init(
@@ -41,7 +49,10 @@ public struct Settings: Codable, Sendable, Equatable {
         notifyOnRotate: Bool,
         notifyOnExhausted: Bool,
         notifyOnWindowReset: Bool,
-        launchAtLogin: Bool
+        launchAtLogin: Bool,
+        routeCodexAutomatically: Bool,
+        automaticallyWarmAccounts: Bool,
+        proxyPort: Int
     ) {
         self.rotationStrategy = rotationStrategy
         self.primaryThresholdPercent = primaryThresholdPercent
@@ -53,6 +64,9 @@ public struct Settings: Codable, Sendable, Equatable {
         self.notifyOnExhausted = notifyOnExhausted
         self.notifyOnWindowReset = notifyOnWindowReset
         self.launchAtLogin = launchAtLogin
+        self.routeCodexAutomatically = routeCodexAutomatically
+        self.automaticallyWarmAccounts = automaticallyWarmAccounts
+        self.proxyPort = proxyPort
     }
 
     /// Tolerant decoder: missing keys fall back to defaults so new fields never invalidate an old file.
@@ -69,6 +83,10 @@ public struct Settings: Codable, Sendable, Equatable {
         notifyOnExhausted = try c.decodeIfPresent(Bool.self, forKey: .notifyOnExhausted) ?? d.notifyOnExhausted
         notifyOnWindowReset = try c.decodeIfPresent(Bool.self, forKey: .notifyOnWindowReset) ?? d.notifyOnWindowReset
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
+        routeCodexAutomatically = try c.decodeIfPresent(Bool.self, forKey: .routeCodexAutomatically) ?? d.routeCodexAutomatically
+        automaticallyWarmAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyWarmAccounts) ?? d.automaticallyWarmAccounts
+        let decodedPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
+        proxyPort = (1...65_535).contains(decodedPort) ? decodedPort : d.proxyPort
     }
 }
 
@@ -81,4 +99,5 @@ public enum AppPaths {
     public static func storeFile() -> URL { supportDir().appendingPathComponent("accounts.json") }
     public static func settingsFile() -> URL { supportDir().appendingPathComponent("settings.json") }
     public static func historyFile() -> URL { supportDir().appendingPathComponent("history.jsonl") }
+    public static func warmupFile() -> URL { supportDir().appendingPathComponent("warmup.json") }
 }

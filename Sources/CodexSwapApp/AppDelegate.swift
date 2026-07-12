@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menu = NSMenu()
     private var latest = EngineSnapshot(accounts: [], activeAlias: nil, proxyURL: nil, strategy: .priority)
     private var settings = Settings.default
+    private var settingsViewModel: SettingsViewModel!
+    private var settingsWindowController: SettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -20,17 +22,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.delegate = self
         statusItem.menu = menu
+        settingsViewModel = SettingsViewModel(
+            snapshot: latest,
+            settings: settings,
+            actions: makeSettingsActions()
+        )
         rebuildMenu()
 
         if hasBundle {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
 
-        engine.setEventHandler { [weak self] event in
-            Task { @MainActor in self?.handle(event: event) }
-        }
-
         Task { @MainActor in
+            await engine.setEventHandler { [weak self] event in
+                Task { @MainActor in self?.handle(event: event) }
+            }
             do { try await engine.start() } catch {
                 self.notify(title: "CodexSwap", body: "Failed to start proxy: \(error.localizedDescription)")
             }
@@ -50,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshSnapshot() async {
         latest = await engine.snapshot()
         settings = await SettingsStoreBridge.current()
+        settingsViewModel?.update(snapshot: latest, settings: settings)
         rebuildMenu()
     }
 
@@ -82,18 +89,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusIcon()
         menu.removeAllItems()
 
-        // Status line: is the proxy on, and is codex traffic actually flowing through it?
         let statusTitle: String
         if let port = latest.proxyURL?.port {
-            if latest.servedCount == 0 {
-                statusTitle = "● On — proxy :\(port) · waiting for codex"
-            } else if let last = latest.lastActivityAt, Date().timeIntervalSince(last) < 90 {
-                statusTitle = "● Working — routing \(latest.lastActivityAlias ?? "?") · \(Self.ago(last))"
-            } else {
-                statusTitle = "● On — proxy :\(port) · idle (\(latest.servedCount) served)"
+            switch latest.routingState {
+            case .disabled:
+                statusTitle = "● Proxy Ready — routing disabled"
+            case .needsRepair:
+                statusTitle = "⚠ Proxy Ready — routing needs repair"
+            case .enabled:
+                if latest.servedCount == 0 {
+                    statusTitle = "● Ready — waiting for Codex on :\(port)"
+                } else if let last = latest.lastActivityAt, Date().timeIntervalSince(last) < 90 {
+                    statusTitle = "● Working — \(latest.lastActivityAlias ?? "account") · \(Self.ago(last))"
+                } else {
+                    statusTitle = "● Ready — idle · \(latest.servedCount) served"
+                }
             }
         } else {
-            statusTitle = "○ Off — proxy not running"
+            statusTitle = "○ Offline — proxy not running"
         }
         let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
         status.isEnabled = false
@@ -103,21 +116,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         active.isEnabled = false
         menu.addItem(active)
 
-        if latest.proxyURL != nil && latest.servedCount == 0 {
-            let hint = NSMenuItem(title: "Run `codexswap` in your terminal to route codex here", action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            menu.addItem(hint)
-        }
         menu.addItem(.separator())
 
         if latest.accounts.isEmpty {
-            let empty = NSMenuItem(title: "No accounts — Import accounts below", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "No accounts — open Settings to add one", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
-        } else if latest.strategy == .priority && latest.accounts.count > 1 {
-            let hint = NSMenuItem(title: "Accounts (higher priority used first ↓)", action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            menu.addItem(hint)
         }
 
         for acc in latest.accounts.sorted(by: { $0.priority > $1.priority }) {
@@ -125,87 +129,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = acc.alias
             item.state = acc.alias == latest.activeAlias ? .on : .off
-            item.submenu = accountSubmenu(acc)
             menu.addItem(item)
         }
 
         menu.addItem(.separator())
-        let stratHeader = NSMenuItem(title: "Rotation strategy", action: nil, keyEquivalent: ""); stratHeader.isEnabled = false
-        menu.addItem(stratHeader)
-        menu.addItem(strategyItem("Priority (drain highest first)", .priority))
-        menu.addItem(strategyItem("Round-robin (balance evenly)", .roundRobin))
+        addAction("Refresh Usage", #selector(refreshUsage))
+        let warmTitle = latest.warmupInProgress ? "Warming Quota Windows…" : "Warm Quota Windows…"
+        let warm = NSMenuItem(title: warmTitle, action: #selector(warmAllAccountsNow), keyEquivalent: "")
+        warm.target = self
+        warm.isEnabled = !latest.warmupInProgress
+        menu.addItem(warm)
         menu.addItem(.separator())
-
-        addAction("Refresh usage now", #selector(refreshUsage))
-        addAction("Import accounts", #selector(importAccounts))
-        addAction("Add account (codex login)…", #selector(addAccount))
-        addAction("Install `codexswap` shim…", #selector(installShim))
-        menu.addItem(notifyToggles())
-        menu.addItem(launchAtLoginItem())
-        menu.addItem(.separator())
-        addAction("Quit CodexSwap", #selector(quit))
+        let preferences = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        preferences.target = self
+        preferences.keyEquivalentModifierMask = [.command]
+        menu.addItem(preferences)
+        let quitItem = NSMenuItem(title: "Quit CodexSwap", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        quitItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(quitItem)
     }
 
     private func label(for acc: Account) -> String {
-        var parts = ["priority \(acc.priority) · \(acc.alias)"]
+        var parts = [acc.alias]
         let u = acc.usage.map { "\($0.label) \($0.usedPercent)%" }.joined(separator: " · ")
         if !u.isEmpty { parts.append(u) }
         if let cd = acc.cooldownUntil(now: Date()) { parts.append("limited→\(Self.shortTime(cd))") }
         if acc.needsLogin { parts.append("NEEDS-LOGIN") }
         return parts.joined(separator: "  ")
-    }
-
-    private func accountSubmenu(_ acc: Account) -> NSMenu {
-        let sub = NSMenu()
-        let sw = NSMenuItem(title: "Switch to \(acc.alias)", action: #selector(switchAccount(_:)), keyEquivalent: "")
-        sw.target = self; sw.representedObject = acc.alias
-        sub.addItem(sw)
-        sub.addItem(.separator())
-        let pHeader = NSMenuItem(title: "Set priority (higher = used first)", action: nil, keyEquivalent: ""); pHeader.isEnabled = false
-        sub.addItem(pHeader)
-        let levels: [(Int, String)] = [(10, "10 — highest"), (5, "5 — high"), (2, "2"), (1, "1"), (0, "0 — lowest")]
-        for (p, title) in levels {
-            let pi = NSMenuItem(title: "  \(title)", action: #selector(setPriority(_:)), keyEquivalent: "")
-            pi.target = self
-            pi.representedObject = PriorityChange(alias: acc.alias, priority: p)
-            pi.state = acc.priority == p ? .on : .off
-            sub.addItem(pi)
-        }
-        sub.addItem(.separator())
-        let rm = NSMenuItem(title: "Remove \(acc.alias)", action: #selector(removeAccount(_:)), keyEquivalent: "")
-        rm.target = self; rm.representedObject = acc.alias
-        sub.addItem(rm)
-        return sub
-    }
-
-    private func strategyItem(_ title: String, _ strategy: RotationStrategy) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: #selector(setStrategy(_:)), keyEquivalent: "")
-        item.target = self
-        item.representedObject = strategy.rawValue
-        item.state = latest.strategy == strategy ? .on : .off
-        return item
-    }
-
-    private func notifyToggles() -> NSMenuItem {
-        let parent = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
-        sub.addItem(toggle("On auto-switch", settings.notifyOnRotate, #selector(toggleNotifyRotate)))
-        sub.addItem(toggle("On all exhausted", settings.notifyOnExhausted, #selector(toggleNotifyExhausted)))
-        sub.addItem(toggle("On quota reset", settings.notifyOnWindowReset, #selector(toggleNotifyReset)))
-        parent.submenu = sub
-        return parent
-    }
-
-    private func launchAtLoginItem() -> NSMenuItem {
-        let item = toggle("Launch at login", settings.launchAtLogin, #selector(toggleLaunchAtLogin))
-        return item
-    }
-
-    private func toggle(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        item.target = self
-        item.state = on ? .on : .off
-        return item
     }
 
     private func addAction(_ title: String, _ action: Selector) {
@@ -214,69 +165,231 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
 
+    private func makeSettingsActions() -> SettingsActions {
+        SettingsActions(
+            setRouting: { [weak self] enabled in self?.setAutomaticRouting(enabled) },
+            repairRouting: { [weak self] in self?.repairAutomaticRouting() },
+            setLaunchAtLogin: { [weak self] enabled in self?.setLaunchAtLogin(enabled) },
+            setStrategy: { [weak self] strategy in self?.changeStrategy(strategy) },
+            switchAccount: { [weak self] alias in self?.activateAccount(alias) },
+            setPriority: { [weak self] alias, priority in self?.changePriority(alias, priority: priority) },
+            removeAccount: { [weak self] alias in self?.removeStandaloneAccount(alias) },
+            importAccounts: { [weak self] in self?.rescanAccounts() },
+            openCodexBar: { [weak self] in self?.openCodexBarForAccount() },
+            addStandaloneAccount: { [weak self] in self?.addStandaloneAccount() },
+            setAutomaticWarmup: { [weak self] enabled in self?.setAutomaticWarmup(enabled) },
+            warmAllAccounts: { [weak self] in self?.requestWarmAllAccounts() },
+            setNotifyOnRotate: { [weak self] enabled in self?.updateSettings { $0.notifyOnRotate = enabled } },
+            setNotifyOnExhausted: { [weak self] enabled in self?.updateSettings { $0.notifyOnExhausted = enabled } },
+            setNotifyOnWindowReset: { [weak self] enabled in self?.updateSettings { $0.notifyOnWindowReset = enabled } },
+            installShim: { [weak self] in self?.setShimInstalled(true) },
+            uninstallShim: { [weak self] in self?.setShimInstalled(false) }
+        )
+    }
+
     // MARK: - Actions
+
+    @objc private func showSettings() {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController(viewModel: settingsViewModel)
+        }
+        settingsWindowController?.show()
+    }
 
     @objc private func switchAccount(_ sender: NSMenuItem) {
         guard let alias = sender.representedObject as? String else { return }
+        activateAccount(alias)
+    }
+
+    private func activateAccount(_ alias: String) {
         Task { await engine.switchTo(alias); await refreshSnapshot() }
     }
 
-    @objc private func setPriority(_ sender: NSMenuItem) {
-        guard let change = sender.representedObject as? PriorityChange else { return }
-        Task { await engine.setPriority(change.alias, priority: change.priority); await refreshSnapshot() }
+    private func changePriority(_ alias: String, priority: Int) {
+        Task { await engine.setPriority(alias, priority: priority); await refreshSnapshot() }
     }
 
-    @objc private func removeAccount(_ sender: NSMenuItem) {
-        guard let alias = sender.representedObject as? String else { return }
+    private func removeStandaloneAccount(_ alias: String) {
+        guard let account = latest.accounts.first(where: { $0.alias == alias }) else { return }
+        guard AccountOwnership.classify(account: account) == .standalone else {
+            openCodexBarForAccount()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Remove \(alias) from CodexSwap?"
+        alert.informativeText = "This removes the locally imported account from CodexSwap."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         Task { await engine.remove(alias); await refreshSnapshot() }
     }
 
-    @objc private func setStrategy(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let s = RotationStrategy(rawValue: raw) else { return }
-        Task { await engine.setStrategy(s); await refreshSnapshot() }
+    private func changeStrategy(_ strategy: RotationStrategy) {
+        Task { await engine.setStrategy(strategy); await refreshSnapshot() }
     }
 
     @objc private func refreshUsage() { Task { await engine.refreshAllUsage(); await refreshSnapshot() } }
-    @objc private func importAccounts() { Task { await engine.importAccounts(); await refreshSnapshot() } }
 
-    @objc private func addAccount() {
+    private func rescanAccounts() {
+        Task { await engine.importAccounts(); await refreshSnapshot() }
+    }
+
+    private func addStandaloneAccount() {
         guard let codex = CodexLauncher.resolveCodexBinary() else {
-            notify(title: "CodexSwap", body: "codex binary not found on PATH.")
+            presentMessage("Codex executable not found. Install the Codex CLI, then try again.")
             return
         }
         let script = "tell application \"Terminal\" to do script \"\(codex) login\""
         runAppleScript(script)
-        notify(title: "CodexSwap", body: "Complete login in Terminal, then choose Import accounts.")
+        presentMessage("Complete the standalone login in Terminal, then select Rescan Accounts.")
     }
 
-    @objc private func installShim() {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let path = dir.appendingPathComponent("codexswap")
-        do {
-            try RuntimeHandoff.shimScript().write(to: path, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
-            notify(title: "CodexSwap", body: "Installed shim at ~/.local/bin/codexswap. Run `codexswap` instead of `codex`.")
-        } catch {
-            notify(title: "CodexSwap", body: "Failed to install shim: \(error.localizedDescription)")
+    private func openCodexBarForAccount() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.steipete.codexbar") else {
+            presentMessage("CodexBar is not installed. Use Add Standalone Account instead.")
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { [weak self] _, error in
+            Task { @MainActor in
+                if let error {
+                    self?.presentMessage("Could not open CodexBar: \(error.localizedDescription)")
+                } else {
+                    let guidance = "In CodexBar, choose Add Account. CodexSwap will import it automatically."
+                    self?.settingsViewModel?.showMessage(guidance)
+                    self?.notify(title: "Add the account in CodexBar", body: guidance)
+                }
+            }
         }
     }
 
-    @objc private func toggleNotifyRotate() { updateSettings { $0.notifyOnRotate.toggle() } }
-    @objc private func toggleNotifyExhausted() { updateSettings { $0.notifyOnExhausted.toggle() } }
-    @objc private func toggleNotifyReset() { updateSettings { $0.notifyOnWindowReset.toggle() } }
+    private func presentMessage(_ message: String) {
+        if settingsWindowController?.window?.isVisible == true {
+            settingsViewModel?.showMessage(message)
+        } else {
+            notify(title: "CodexSwap", body: message)
+        }
+    }
 
-    @objc private func toggleLaunchAtLogin() {
-        let newValue = !settings.launchAtLogin
+    private func setShimInstalled(_ installed: Bool) {
+        do {
+            let manager = ShimManager()
+            if installed { try manager.install() } else { try manager.uninstall() }
+            presentMessage(installed
+                ? "Installed the optional shim at ~/.local/bin/codexswap."
+                : "Removed the CodexSwap shim. Automatic routing is unchanged.")
+            Task { await refreshSnapshot() }
+        } catch {
+            presentMessage(error.localizedDescription)
+        }
+    }
+
+    private func setAutomaticRouting(_ enabled: Bool) {
+        Task { @MainActor in
+            do {
+                if enabled {
+                    await enableLaunchAtLoginForRouting()
+                    try await engine.setAutomaticRouting(true)
+                    presentMessage("Routing enabled. Restart existing Codex sessions to apply automatic account routing.")
+                } else {
+                    try await engine.setAutomaticRouting(false)
+                    presentMessage("Routing disabled. Your previous Codex provider settings were restored.")
+                }
+            } catch {
+                presentMessage("Routing was not changed: \(error.localizedDescription)")
+            }
+            await refreshSnapshot()
+        }
+    }
+
+    private func repairAutomaticRouting() {
+        Task { @MainActor in
+            do {
+                try await engine.repairAutomaticRouting()
+                presentMessage("Routing repaired. Restart existing Codex sessions to apply it.")
+            } catch {
+                presentMessage("Routing was not repaired: \(error.localizedDescription)")
+            }
+            await refreshSnapshot()
+        }
+    }
+
+    private func setAutomaticWarmup(_ enabled: Bool) {
+        if !enabled {
+            Task { @MainActor in
+                await engine.setAutomaticWarmup(false)
+                presentMessage("Automatic warm-up disabled. Manual warm-up remains available.")
+                await refreshSnapshot()
+            }
+            return
+        }
+
+        guard confirmWarmup(
+            title: "Automatically warm every account?",
+            message: "CodexSwap will send one small, real Codex request per eligible account when a new 5-hour cycle is available. This consumes a small amount of quota. OpenAI does not guarantee that one request starts every displayed quota window.",
+            button: "Enable Automatic Warm-up"
+        ) else { return }
+
+        Task { @MainActor in
+            await engine.setAutomaticWarmup(true)
+            await refreshSnapshot()
+        }
+    }
+
+    @objc private func warmAllAccountsNow() {
+        requestWarmAllAccounts()
+    }
+
+    private func requestWarmAllAccounts() {
+        guard confirmWarmup(
+            title: "Warm all eligible accounts now?",
+            message: "This forces one small, real Codex request through each eligible account, even if it was already warmed during the current cycle.",
+            button: "Warm Accounts"
+        ) else { return }
+
+        Task { @MainActor in
+            let summary = await engine.warmAllAccountsNow()
+            notify(title: "Quota warm-up finished", body: summary.statusText)
+            await refreshSnapshot()
+        }
+    }
+
+    private func confirmWarmup(title: String, message: String, button: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func enableLaunchAtLoginForRouting() async {
+        guard !settings.launchAtLogin else { return }
         guard hasBundle else {
-            notify(title: "CodexSwap", body: "Launch-at-login needs the packaged .app (not the dev binary).")
+            notify(title: "Launch at login unavailable", body: "Install and open the packaged CodexSwap.app to enable launch at login.")
             return
         }
         do {
-            if newValue { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            updateSettings { $0.launchAtLogin = newValue }
+            try SMAppService.mainApp.register()
+            settings = await SettingsStoreBridge.update { $0.launchAtLogin = true }
         } catch {
-            notify(title: "CodexSwap", body: "Launch-at-login change failed: \(error.localizedDescription)")
+            notify(title: "Launch at login unchanged", body: error.localizedDescription)
+        }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        guard hasBundle else {
+            presentMessage("Launch at Login requires the packaged CodexSwap app.")
+            return
+        }
+        do {
+            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            updateSettings { $0.launchAtLogin = enabled }
+        } catch {
+            presentMessage("Launch at Login was unchanged: \(error.localizedDescription)")
         }
     }
 
@@ -322,14 +435,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusIcon() {
         guard let button = statusItem.button else { return }
-        let working = latest.isRunning && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
+        let routingEnabled = latest.routingState == .enabled
+        let working = routingEnabled && latest.isRunning && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
         let name = latest.isRunning ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle"
         button.image = NSImage(systemSymbolName: name, accessibilityDescription: "CodexSwap")
         button.image?.isTemplate = !working
         button.contentTintColor = working ? .systemGreen : nil
     }
 
-    private struct PriorityChange { let alias: String; let priority: Int }
 }
 
 extension AppDelegate: NSMenuDelegate {

@@ -7,3 +7,5 @@ Store/
 .netrc
 dist/
 .omc/
+.worktrees/
+.superpowers/

@@ -1,35 +1,137 @@
 # CodexSwap
 
-Seamless multi-account switching for the OpenAI Codex CLI on macOS. Rotate between multiple ChatGPT Plus accounts **without restarting Codex** — a local proxy injects the active account's credentials per request and rotates automatically when one hits its usage limit.
+[![CI](https://github.com/M1Vj/CodexSwap/actions/workflows/ci.yml/badge.svg)](https://github.com/M1Vj/CodexSwap/actions/workflows/ci.yml)
+[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-000000?logo=apple)](https://www.apple.com/macos/)
+[![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Why a proxy
+CodexSwap is a local macOS menu-bar app for switching and rotating multiple Codex accounts without restarting an active Codex session. It owns the routing layer, integrates with CodexBar-managed accounts, tracks quota windows, and can move to the next eligible account when one reaches a usage limit.
 
-Stock Codex caches its auth in memory at startup and will not reload a different account mid-session (its 401-reload path skips on `account_id` mismatch). So file-swap switchers require a restart. CodexSwap instead points Codex at a loopback proxy (`chatgpt_base_url` + a custom `model_provider`). The proxy overwrites the `Authorization` and `ChatGPT-Account-Id` headers on every request with whichever account is currently active, so switching is instant and invisible to the running Codex process.
+> [!IMPORTANT]
+> CodexSwap handles local Codex authentication tokens. It listens only on `127.0.0.1`, has no analytics or CodexSwap cloud service, and should only be installed from this repository's notarized releases. See [Security](SECURITY.md) and [Privacy](PRIVACY.md).
 
-## Features
+## Highlights
 
-- **Auto-detect + import** the account Codex is logged in as, plus any existing account bundles under `~/.codex/accounts/`.
-- **Priority ordering** — highest-priority eligible account is consumed first.
-- **Round-robin** rotation as an alternative strategy.
-- **Auto-switch on limit** — a `429 usage_limit_reached` disables that account until its window resets and rotates to the next eligible one, mid-session.
-- **Proactive pre-switching** at configurable usage thresholds so a nearly-exhausted window doesn't waste a failed request.
-- **Token refresh** handled inline (single owner of the refresh lifecycle — do not run another switcher's refresh daemon alongside it).
-- Conservative usage polling of the undocumented `wham/usage` endpoint.
+- Native Settings window and focused menu-bar controls—no terminal required for normal use.
+- Reversible **Route Codex through CodexSwap** setting with backups of displaced Codex configuration.
+- Independent **Launch at Login** setting, automatically suggested when routing is enabled.
+- CodexBar-first account onboarding, plus a standalone `codex login` fallback.
+- Priority or round-robin rotation and automatic switching after usage-limit responses.
+- Usage refresh, notifications, and optional automatic or manual quota warm-up.
+- Optional `codexswap` terminal shim for users who specifically want a wrapper command.
 
-## Layout
+## Install
 
-- `Sources/SwapKit` — core engine: account store, rotation, JWT/identity, usage client, token refresher, and the SwiftNIO proxy.
-- `Sources/swapd` — headless CLI for the engine (import/list/usage/priority/switch/proxy/run).
-- `Sources/CodexSwapApp` — the macOS menu-bar app (in progress).
+### Homebrew
+
+After the first signed and notarized release is published:
+
+```bash
+brew tap M1Vj/CodexSwap https://github.com/M1Vj/CodexSwap
+brew install --cask codexswap
+```
+
+The cask is generated from the notarized archive's exact SHA-256 checksum. Until that first release exists, Homebrew installation intentionally remains unavailable rather than distributing an ad-hoc-signed app.
+
+### GitHub release
+
+Download `CodexSwap-vX.Y.Z-macOS-universal.zip` from [Releases](https://github.com/M1Vj/CodexSwap/releases), open the archive, and move `CodexSwap.app` to `/Applications`. Public artifacts support both Apple silicon and Intel Macs and are accepted only after Developer ID signing, Apple notarization, ticket stapling, checksum validation, and Gatekeeper assessment.
+
+### Build from source
+
+Source builds are for development and are ad-hoc signed locally:
+
+```bash
+git clone https://github.com/M1Vj/CodexSwap.git
+cd CodexSwap
+swift test
+Scripts/build-universal.sh
+open dist/CodexSwap.app
+```
+
+Requires macOS 14 or newer and Xcode Command Line Tools with a Swift 6-compatible toolchain.
+
+## First run
+
+1. Open CodexSwap from `/Applications`; it appears in the menu bar rather than the Dock.
+2. Choose **Settings…** (`⌘,`).
+3. In **Accounts**, choose **Add in CodexBar…**. CodexSwap watches CodexBar's managed roster and imports the account automatically.
+4. If CodexBar is unavailable, choose **Add Standalone…**, complete `codex login`, then choose **Rescan Accounts**.
+5. In **General**, enable **Route Codex through CodexSwap**.
+6. Restart existing Codex CLI or desktop sessions once so they load the new provider configuration.
+
+Routing safely manages only CodexSwap's provider values in `~/.codex/config.toml`. The original content is recorded under `~/Library/Application Support/CodexSwap/` and restored when routing is disabled. If the managed block changes externally, Settings offers **Repair Routing…** instead of overwriting it silently.
+
+## Settings
+
+| Pane | Controls |
+| --- | --- |
+| **General** | Codex routing, Launch at Login, priority or round-robin rotation |
+| **Accounts** | Account ownership, quota state, priority, switching, adding, removal, rescanning |
+| **Automation** | Automatic quota warm-up, manual warm-up, rotation and limit notifications |
+| **Advanced** | Proxy diagnostics and safe installation or removal of the optional terminal shim |
+
+### Quota warm-up
+
+Usage polling does not start a quota window. Optional warm-up sends one small, real Codex request per eligible account when a new recorded five-hour cycle becomes available. **Warm all accounts now…** performs the same action manually after confirmation.
+
+Warm-up consumes a small amount of quota. OpenAI does not publicly guarantee that one request starts every displayed five-hour or weekly window, so CodexSwap refreshes usage afterward and reports only reset data returned by the service. The automatic setting is off by default.
+
+## How routing works
+
+Codex normally keeps authentication in memory for the lifetime of a process. Replacing an auth file therefore cannot reliably switch an already-running session. CodexSwap instead configures Codex to use a local provider and replaces the authorization headers for each proxied request.
+
+```mermaid
+flowchart LR
+    C["Codex CLI or app"] --> P["CodexSwap on 127.0.0.1"]
+    P --> R{"Eligible account"}
+    R --> B["CodexBar-managed auth"]
+    R --> S["Standalone Codex auth"]
+    B --> O["OpenAI Codex service"]
+    S --> O
+```
+
+CodexBar remains the credential owner for CodexBar-managed accounts. CodexSwap reads its roster and fresher tokens but does not register accounts by modifying CodexBar's private data.
+
+## Data and safety
+
+- Local settings, imported rotation state, usage observations, and warm-up history live in `~/Library/Application Support/CodexSwap/`.
+- Account records can contain access and refresh tokens and are restricted to the current user where macOS permits.
+- Proxy traffic binds to IPv4 loopback only; CodexSwap does not expose a LAN listener.
+- No account data, usage telemetry, or analytics are sent to the maintainer.
+- Never attach `auth.json`, `accounts.json`, tokens, account IDs, or verbose request headers to an issue.
+
+See [PRIVACY.md](PRIVACY.md) for the complete data model and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## Uninstall
+
+Disable **Route Codex through CodexSwap** in Settings first so the previous Codex provider configuration is restored. Then:
+
+```bash
+brew uninstall --cask --zap codexswap
+brew untap M1Vj/CodexSwap
+```
+
+For a manual installation, quit CodexSwap and move it from `/Applications` to Trash. Removing `~/Library/Application Support/CodexSwap/` deletes CodexSwap's imported state but does not delete `~/.codex`, CodexBar-managed homes, or revoke OpenAI sessions.
 
 ## Development
 
-```
-swift build
+```bash
+swift package resolve
 swift test
-swift run swapd import        # detect + import accounts
-swift run swapd list          # show accounts, priority, usage, cooldowns
-swift run swapd run -- exec "…"   # launch codex through the proxy
+swift build -c release
+Scripts/build-app.sh
 ```
 
-Set `CODEXSWAP_VERBOSE=1` to log proxy request routing. macOS-only.
+Repository layout:
+
+- `Sources/SwapKit` — account store, routing, quota, refresh, warm-up, settings, and proxy engine.
+- `Sources/swapd` — headless commands used for development and diagnostics.
+- `Sources/CodexSwapApp` — native menu-bar application and Settings UI.
+- `Scripts` — deterministic build, universal packaging, notarization, verification, and cask tooling.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md), [Troubleshooting](docs/TROUBLESHOOTING.md), and [Release process](docs/RELEASING.md) before making changes. Releases follow [Semantic Versioning](https://semver.org/) and are tracked in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+CodexSwap is available under the [MIT License](LICENSE).

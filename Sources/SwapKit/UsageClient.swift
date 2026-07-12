@@ -1,6 +1,10 @@
 import Foundation
 
-public struct UsageClient: Sendable {
+public protocol UsageFetching: Sendable {
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow]
+}
+
+public struct UsageClient: UsageFetching, Sendable {
     public static let endpoint = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
     public static let userAgent = "codex-swap/0.1"
 
