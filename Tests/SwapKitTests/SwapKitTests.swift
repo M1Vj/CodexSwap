@@ -680,6 +680,18 @@ final class ShimManagerTests: XCTestCase {
         XCTAssertThrowsError(try ShimManager(url: url).uninstall())
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
     }
+
+    func testInstallRefusesToOverwriteForeignFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let foreign = "#!/bin/sh\necho foreign\n"
+        try foreign.write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try ShimManager(url: url).install())
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), foreign)
+    }
 }
 
 final class CodexBarTests: XCTestCase {
