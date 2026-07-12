@@ -21,11 +21,17 @@ public enum WarmupCommandError: LocalizedError, Sendable {
 public actor QuotaWarmupService {
     private let runner: any WarmupCommandRunning
     private let ledger: WarmupLedgerStore
+    private let failureRetrySeconds: TimeInterval
     private var isRunning = false
 
-    public init(runner: any WarmupCommandRunning = ProcessWarmupRunner(), ledger: WarmupLedgerStore = WarmupLedgerStore()) {
+    public init(
+        runner: any WarmupCommandRunning = ProcessWarmupRunner(),
+        ledger: WarmupLedgerStore = WarmupLedgerStore(),
+        failureRetrySeconds: TimeInterval = 300
+    ) {
         self.runner = runner
         self.ledger = ledger
+        self.failureRetrySeconds = failureRetrySeconds
     }
 
     public func run(accounts: [Account], proxyURL: URL, force: Bool = false, now: Date = Date()) async -> WarmupSummary {
@@ -56,6 +62,15 @@ public actor QuotaWarmupService {
                 await ledger.setRecord(WarmupRecord(succeededAt: now, primaryResetAt: primary, secondaryResetAt: secondary), for: key)
                 summary.warmed.append(account.alias)
             } catch {
+                await ledger.setRecord(
+                    WarmupRecord(
+                        succeededAt: now,
+                        primaryResetAt: now,
+                        secondaryResetAt: nil,
+                        retryAfter: now.addingTimeInterval(failureRetrySeconds)
+                    ),
+                    for: key
+                )
                 summary.failed[account.alias] = error is WarmupCommandError
                     ? (error as? WarmupCommandError)?.errorDescription ?? "Warm-up failed"
                     : "Warm-up failed"
@@ -134,9 +149,15 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
             "CODEXSWAP_WARMUP_TOKEN": "local-loopback-only",
             "NO_COLOR": "1",
         ]
+        let termination = AsyncStream<Int32> { continuation in
+            process.terminationHandler = { completed in
+                continuation.yield(completed.terminationStatus)
+                continuation.finish()
+            }
+        }
         try process.run()
 
-        let status = try await wait(for: process)
+        let status = try await wait(for: process, termination: termination)
         guard status == 0 else {
             let data = (try? Data(contentsOf: errorURL)) ?? Data()
             let bounded = String(decoding: data.prefix(4_096), as: UTF8.self)
@@ -144,12 +165,11 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
         }
     }
 
-    private func wait(for process: Process) async throws -> Int32 {
+    private func wait(for process: Process, termination: AsyncStream<Int32>) async throws -> Int32 {
         try await withThrowingTaskGroup(of: Int32.self) { group in
             group.addTask {
-                await withCheckedContinuation { continuation in
-                    process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-                }
+                var iterator = termination.makeAsyncIterator()
+                return await iterator.next() ?? process.terminationStatus
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)

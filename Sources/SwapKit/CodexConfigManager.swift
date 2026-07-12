@@ -47,9 +47,13 @@ public struct CodexConfigManager: Sendable {
             }
             return .disabled
         case .some(let range):
-            return String(content[range]) == expected
-                ? .enabled
-                : .needsRepair("managed routing values were changed")
+            guard String(content[range]) == expected else {
+                return .needsRepair("managed routing values were changed")
+            }
+            guard fileManager.fileExists(atPath: manifestURL.path) else {
+                return .needsRepair("routing restore manifest is missing")
+            }
+            return .enabled
         }
     }
 
@@ -166,7 +170,12 @@ public struct CodexConfigManager: Sendable {
         \(Self.beginMarker)
         chatgpt_base_url = "\(root)/backend-api"
         model_provider = "codexswap"
-        model_providers.codexswap = { name = "CodexSwap", base_url = "\(root)/backend-api/codex", wire_api = "responses", requires_openai_auth = true }
+
+        [model_providers.codexswap]
+        name = "CodexSwap"
+        base_url = "\(root)/backend-api/codex"
+        wire_api = "responses"
+        requires_openai_auth = true
         \(Self.endMarker)
         """
     }
@@ -212,7 +221,9 @@ public struct CodexConfigManager: Sendable {
                 continue
             }
 
-            if currentTable == nil && isAssignment(trimmed, key: "model_providers.codexswap") {
+            if currentTable == "model_providers" && isAssignment(trimmed, key: "codexswap") {
+                throw CodexConfigManagerError.ambiguousConfig("codexswap entry inside [model_providers] table")
+            } else if currentTable == nil && isAssignment(trimmed, key: "model_providers.codexswap") {
                 guard trimmed.contains("{"), trimmed.contains("}") else {
                     throw CodexConfigManagerError.ambiguousConfig("multi-line codexswap provider declaration")
                 }

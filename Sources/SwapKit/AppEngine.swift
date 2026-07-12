@@ -224,6 +224,10 @@ public actor AppEngine {
     }
 
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
+        guard !warmupInProgress else {
+            let now = Date()
+            return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
+        }
         warmupInProgress = true
         emit(.snapshotChanged)
         let summary = await warmupService.run(accounts: await store.all(), proxyURL: proxyURL, force: force)
