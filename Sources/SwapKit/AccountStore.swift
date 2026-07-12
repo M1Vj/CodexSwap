@@ -190,6 +190,20 @@ public actor AccountStore {
         persist()
     }
 
+    /// Drop CodexBar-managed accounts whose accountID is no longer in CodexBar's roster.
+    /// Non-managed accounts (e.g. imported from live auth.json) are left untouched.
+    @discardableResult
+    public func reconcileManaged(present: Set<String>) -> [String] {
+        let removed = data.accounts
+            .filter { $0.managedHomePath != nil && !present.contains($0.accountID) }
+            .map { $0.alias }
+        guard !removed.isEmpty else { return [] }
+        data.accounts.removeAll { removed.contains($0.alias) }
+        if let active = data.activeAlias, removed.contains(active) { data.activeAlias = nil }
+        persist()
+        return removed
+    }
+
     /// Insert or update an account keyed by accountID (falling back to alias). Preserves priority on update.
     @discardableResult
     public func upsert(_ account: Account) -> Account {

@@ -188,6 +188,18 @@ final class CodexBarTests: XCTestCase {
         XCTAssertNil(accounts[2]["managedHomePath"])
     }
 
+    func testReconcileDropsRemovedManagedButKeepsLocal() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cs-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        await store.upsert(Account(alias: "keep", accountID: "acc-keep", accessToken: "t", managedHomePath: "/tmp/h1"))
+        await store.upsert(Account(alias: "gone", accountID: "acc-gone", accessToken: "t", managedHomePath: "/tmp/h2"))
+        await store.upsert(Account(alias: "local", accountID: "acc-local", accessToken: "t")) // no managed home
+        let removed = await store.reconcileManaged(present: ["acc-keep"])
+        XCTAssertEqual(removed, ["gone"])
+        let aliases = Set(await store.all().map { $0.alias })
+        XCTAssertEqual(aliases, ["keep", "local"])
+    }
+
     func testUpsertPreservesManagedHome() async {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("cs-\(UUID().uuidString).json")
         let store = AccountStore(url: url)

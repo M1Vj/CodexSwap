@@ -33,6 +33,7 @@ public actor AppEngine {
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
+    private var watcher: CodexBarWatcher?
 
     public init(
         store: AccountStore = AccountStore(),
@@ -67,15 +68,36 @@ public actor AppEngine {
         try await proxy.start()
         self.proxy = proxy
         if let url = await proxy.proxyURL() { RuntimeHandoff.writeProxyURL(url) }
+
+        await syncCodexBar()
+        if let current = AccountImporter.currentCodexAccount() { await store.upsert(current) }
+
+        if CodexBarBridge.isPresent() {
+            let watcher = CodexBarWatcher { [weak self] in
+                guard let self else { return }
+                Task { await self.syncCodexBar(); await self.emitSnapshot() }
+            }
+            watcher.start()
+            self.watcher = watcher
+        }
         startPoller()
     }
 
     public func stop() async {
+        watcher?.stop()
+        watcher = nil
         pollerTask?.cancel()
         pollerTask = nil
         RuntimeHandoff.clearProxyURL()
         await proxy?.stop()
         proxy = nil
+    }
+
+    /// Reconcile our roster with CodexBar's live account list: add new, drop removed, keep our overlay.
+    public func syncCodexBar() async {
+        guard CodexBarBridge.isPresent() else { return }
+        for acc in AccountImporter.codexBarAccounts() { await store.upsert(acc) }
+        await store.reconcileManaged(present: CodexBarBridge.rosterAccountIDs())
     }
 
     public func snapshot() async -> EngineSnapshot {
@@ -100,8 +122,7 @@ public actor AppEngine {
     }
 
     public func importAccounts() async {
-        // CodexBar-managed accounts first (freshest tokens + managed-home link), then any others.
-        for acc in AccountImporter.codexBarAccounts() { await store.upsert(acc) }
+        await syncCodexBar()
         if let current = AccountImporter.currentCodexAccount() { await store.upsert(current) }
         for acc in AccountImporter.existingCodexAuthAccounts() { await store.upsert(acc) }
         emit(.snapshotChanged)
@@ -136,6 +157,7 @@ public actor AppEngine {
             guard let self else { return }
             while !Task.isCancelled {
                 let settings = await self.settingsPoll()
+                await self.syncCodexBar()
                 await self.expireCooldownsAndNotify()
                 await self.pollUsage(activeOnly: true)
                 await self.proactiveSwitchIfNeeded(settings: settings)
