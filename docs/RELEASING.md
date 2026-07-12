@@ -50,7 +50,7 @@ Never reuse or move a published version tag.
 
 The tag workflow:
 
-1. Confirms the tag exactly matches `VERSION` and reruns repository/tooling tests.
+1. Confirms the annotated tag exactly matches `VERSION`, points to a commit on `main`, and reruns repository/tooling tests.
 2. Refuses to continue when any Developer ID or notarization input is absent.
 3. Builds `arm64` and `x86_64` products and combines them into one app.
 4. Signs nested executables and the app with Developer ID, hardened runtime, and a secure timestamp.

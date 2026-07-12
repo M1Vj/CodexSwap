@@ -28,6 +28,8 @@ grep -A2 -F 'REQUIRE_NOTARIZATION:' .github/workflows/release.yml | grep -Fq '"1
 grep -A2 -F 'REQUIRE_GATEKEEPER:' .github/workflows/release.yml | grep -Fq '"1"' || fail "Gatekeeper verification is not fail-closed"
 grep -Fq 'gh workflow run ci.yml' .github/workflows/release.yml || fail "generated cask does not receive an explicit CI run"
 grep -Fq 'gh run watch "$RUN_ID" --exit-status' .github/workflows/release.yml || fail "cask publication does not wait for CI"
+grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' .github/workflows/release.yml || fail "release tags are not restricted to main"
+grep -Fq 'git cat-file -t "refs/tags/$RELEASE_TAG"' .github/workflows/release.yml || fail "release workflow does not require annotated tags"
 if grep -Fq 'APPLE_APP_PASSWORD' .github/workflows/release.yml; then
   fail "release workflow must use a key file, not an Apple password in process arguments"
 fi

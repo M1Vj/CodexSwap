@@ -33,6 +33,9 @@ jobs:
           bash Scripts/test-repository-config.sh
           bash Scripts/test-release-tools.sh
           test "$RELEASE_TAG" = "v$(Scripts/version.sh VERSION)"
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
 
       - name: Require release credentials
         env:
