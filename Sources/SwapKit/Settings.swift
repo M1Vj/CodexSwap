@@ -98,4 +98,5 @@ public enum AppPaths {
     public static func storeFile() -> URL { supportDir().appendingPathComponent("accounts.json") }
     public static func settingsFile() -> URL { supportDir().appendingPathComponent("settings.json") }
     public static func historyFile() -> URL { supportDir().appendingPathComponent("history.jsonl") }
+    public static func warmupFile() -> URL { supportDir().appendingPathComponent("warmup.json") }
 }
