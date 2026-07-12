@@ -14,6 +14,101 @@ final class SettingsTests: XCTestCase {
     }
 }
 
+final class CodexConfigManagerTests: XCTestCase {
+    private func fixture() throws -> (home: URL, support: URL, config: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("config-manager-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("codex")
+        let support = root.appendingPathComponent("support")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        return (home, support, home.appendingPathComponent("config.toml"))
+    }
+
+    func testEnableAndDisableRestoresExistingConfigByteForByte() throws {
+        let f = try fixture()
+        let original = """
+        model = "gpt-5.6"
+        chatgpt_base_url = "https://example.invalid/backend-api"
+        model_provider = "previous"
+
+        [model_providers.codexswap]
+        name = "Previous"
+        base_url = "https://example.invalid/codex"
+
+        [projects."/tmp/example"]
+        trust_level = "trusted"
+        """
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        let enabled = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertTrue(enabled.contains("# BEGIN CODEXSWAP MANAGED ROUTING"))
+        XCTAssertTrue(enabled.contains("base_url = \"http://127.0.0.1:58432/backend-api/codex\""))
+        XCTAssertFalse(enabled.contains("https://example.invalid"))
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .disabled)
+    }
+
+    func testDisablePreservesUnrelatedEditsMadeWhileEnabled() throws {
+        let f = try fixture()
+        let original = "model_provider = \"previous\"\nmodel = \"gpt-5.6\"\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+
+        var changed = try String(contentsOf: f.config, encoding: .utf8)
+        changed = "analytics = { enabled = false }\n" + changed
+        try changed.write(to: f.config, atomically: true, encoding: .utf8)
+
+        try manager.disable()
+        let restored = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertTrue(restored.contains("analytics = { enabled = false }"))
+        XCTAssertTrue(restored.contains("model_provider = \"previous\""))
+        XCTAssertFalse(restored.contains("BEGIN CODEXSWAP"))
+    }
+
+    func testMissingOriginalConfigIsRemovedAfterDisable() throws {
+        let f = try fixture()
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: f.config.path))
+        try manager.disable()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.config.path))
+    }
+
+    func testEditedManagedBlockReportsNeedsRepair() throws {
+        let f = try fixture()
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+        var text = try String(contentsOf: f.config, encoding: .utf8)
+        text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
+        try text.write(to: f.config, atomically: true, encoding: .utf8)
+
+        guard case .needsRepair = try manager.state(proxyURL: proxy) else {
+            return XCTFail("Expected needsRepair")
+        }
+        XCTAssertThrowsError(try manager.disable())
+    }
+
+    func testAmbiguousInlineProviderConfigIsRejectedWithoutMutation() throws {
+        let f = try fixture()
+        let original = "model_providers.codexswap = { name = \"custom\" }\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+
+        XCTAssertThrowsError(try manager.enable(proxyURL: URL(string: "http://127.0.0.1:58432")!))
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+}
+
 final class JWTTests: XCTestCase {
     private func makeToken(claims: [String: Any]) -> String {
         let header = Data("{}".utf8).base64EncodedString()
