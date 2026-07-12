@@ -112,6 +112,7 @@ public actor ProxyServer {
     private var lastActivityAt: Date?
     private var lastActivityAlias: String?
     private var lastTurnAt: Date?
+    private var inflightRefresh: [String: Task<CodexTokens, Error>] = [:]
 
     public struct Activity: Sendable {
         public let servedCount: Int
@@ -258,11 +259,14 @@ public actor ProxyServer {
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
         var tokenRefreshed = false
-        while true {
+        var attempts = 0
+        // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
+        while attempts < 8 {
+            attempts += 1
             // Prefer CodexBar's fresher token for managed accounts before spending a refresh ourselves.
             if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
             if JWT.isStale(account.accessToken) {
-                if let refreshed = try? await refreshTokens(account, force: false) { account = refreshed }
+                if let refreshed = try? await refreshTokens(account) { account = refreshed }
             }
 
             let target = targetURL(for: rawPath, query: query)
@@ -279,7 +283,7 @@ public actor ProxyServer {
                await !burn.suppressed(alias: account.alias, refreshToken: account.refreshToken, now: Date()) {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
                 do {
-                    account = try await refreshTokens(account, force: true)
+                    account = try await refreshTokens(account)
                     tokenRefreshed = true
                     continue
                 } catch RefreshError.sessionInvalidated {
@@ -288,6 +292,13 @@ public actor ProxyServer {
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in")
                         return
+                    }
+                    // A CodexBar-managed account may have lost the refresh race to CodexBar itself;
+                    // adopt its rotated copy before condemning the account to needs-login.
+                    if let hydrated = await store.hydrateFromManagedHome(account.alias),
+                       hydrated.accessToken != account.accessToken, !JWT.isStale(hydrated.accessToken) {
+                        account = hydrated
+                        continue
                     }
                     account = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
                     if account.needsLogin { return }
@@ -347,12 +358,16 @@ public actor ProxyServer {
                 return
             }
 
-            await burn.clear(alias: account.alias)
+            // A 401 reaching here was suppressed by the burn guard; clearing would defeat it.
+            if resp.status != .unauthorized {
+                await burn.clear(alias: account.alias)
+            }
             recordActivity(account.alias)
             log("\(head.method.rawValue) \(rawPath) account=\(account.alias) -> \(resp.status.code)")
             try await streamResponse(outbound, response: resp)
             return
         }
+        try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
     }
 
     private enum FailoverReason { case needsLogin }
@@ -367,14 +382,31 @@ public actor ProxyServer {
         return next
     }
 
-    private func refreshTokens(_ account: Account, force: Bool) async throws -> Account {
-        let tokens = try await refresher.refresh(refreshToken: account.refreshToken)
-        await store.updateTokens(account.alias, tokens: tokens)
-        // Keep CodexBar's managed copy in sync so it doesn't later refresh an already-rotated token.
-        if let home = await store.managedHome(account.alias) {
-            CodexBarBridge.writeTokens(tokens, home: home)
+    /// Refreshes `account`'s tokens. Refresh tokens are single-use, so concurrent requests for the
+    /// same alias must never each spend one: a request first adopts a fresher store copy if another
+    /// request already refreshed, then joins any in-flight refresh instead of starting its own.
+    private func refreshTokens(_ account: Account) async throws -> Account {
+        if let current = await store.account(account.alias),
+           current.accessToken != account.accessToken, !JWT.isStale(current.accessToken) {
+            return current
         }
-        await sink.handle(ProxyEvent(kind: .refreshed, from: account.alias, to: nil, limit: nil, resetAt: nil))
+        let tokens: CodexTokens
+        if let running = inflightRefresh[account.alias] {
+            tokens = try await running.value
+        } else {
+            let refresher = self.refresher
+            let refreshToken = account.refreshToken
+            let task = Task { try await refresher.refresh(refreshToken: refreshToken) }
+            inflightRefresh[account.alias] = task
+            defer { inflightRefresh[account.alias] = nil }
+            tokens = try await task.value
+            await store.updateTokens(account.alias, tokens: tokens)
+            // Keep CodexBar's managed copy in sync so it doesn't later refresh an already-rotated token.
+            if let home = await store.managedHome(account.alias) {
+                CodexBarBridge.writeTokens(tokens, home: home)
+            }
+            await sink.handle(ProxyEvent(kind: .refreshed, from: account.alias, to: nil, limit: nil, resetAt: nil))
+        }
         var updated = account
         updated.idToken = tokens.idToken
         updated.accessToken = tokens.accessToken
