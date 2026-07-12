@@ -129,6 +129,18 @@ public actor AccountStore {
         return RotationResult(next: account(picked.alias), rotated: true)
     }
 
+    public func markLimited(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) {
+        guard let i = index(alias) else { return }
+        data.accounts[i].disabledUntil[limit] = resetAt ?? now.addingTimeInterval(fallbackCooldown)
+        persist()
+    }
+
+    public func markNeedsLoginOnly(_ alias: String) {
+        guard let i = index(alias) else { return }
+        data.accounts[i].needsLogin = true
+        persist()
+    }
+
     public func markNeedsLogin(_ alias: String, now: Date = Date()) -> RotationResult {
         if let i = index(alias) { data.accounts[i].needsLogin = true }
         let next: Account?

@@ -1,53 +1,83 @@
 #!/usr/bin/env bash
-# Builds CodexSwap.app (menu-bar accessory) into ./dist and ad-hoc code-signs it.
+# Builds and signs the CodexSwap menu-bar application bundle in ./dist.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
 APP_NAME="CodexSwap"
 BUNDLE_ID="com.codexswap.app"
-VERSION="0.1.0"
-BUILD="1"
-DIST="dist"
+VERSION="$(Scripts/version.sh VERSION)"
+BUILD_NUMBER="${BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-1}}"
+CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+DIST="${DIST_DIR:-dist}"
 APP="$DIST/$APP_NAME.app"
 CONTENTS="$APP/Contents"
 
-echo "› building release binaries…"
-swift build -c release --product CodexSwapApp
-swift build -c release --product swapd
+[[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+  echo "BUILD_NUMBER must be a positive integer: $BUILD_NUMBER" >&2
+  exit 1
+}
 
-echo "› assembling bundle…"
+if [[ -z "${BUILD_PRODUCTS_DIR:-}" ]]; then
+  echo "› building release binaries…"
+  swift build -c release --product CodexSwapApp
+  swift build -c release --product swapd
+  BUILD_PRODUCTS_DIR="$ROOT/.build/release"
+fi
+
+for product in CodexSwapApp swapd; do
+  [[ -x "$BUILD_PRODUCTS_DIR/$product" ]] || {
+    echo "missing release product: $BUILD_PRODUCTS_DIR/$product" >&2
+    exit 1
+  }
+done
+
+echo "› assembling $APP_NAME $VERSION ($BUILD_NUMBER)…"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
-cp .build/release/CodexSwapApp "$CONTENTS/MacOS/$APP_NAME"
-cp .build/release/swapd "$CONTENTS/MacOS/swapd"
-chmod +x "$CONTENTS/MacOS/$APP_NAME" "$CONTENTS/MacOS/swapd"
+cp "$BUILD_PRODUCTS_DIR/CodexSwapApp" "$CONTENTS/MacOS/$APP_NAME"
+cp "$BUILD_PRODUCTS_DIR/swapd" "$CONTENTS/MacOS/swapd"
+chmod 755 "$CONTENTS/MacOS/$APP_NAME" "$CONTENTS/MacOS/swapd"
 
-cat > "$CONTENTS/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key><string>$APP_NAME</string>
-    <key>CFBundleDisplayName</key><string>$APP_NAME</string>
-    <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-    <key>CFBundleExecutable</key><string>$APP_NAME</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>$BUILD</string>
-    <key>LSMinimumSystemVersion</key><string>14.0</string>
-    <key>LSUIElement</key><true/>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSSupportsAutomaticTermination</key><false/>
-    <key>NSSupportsSuddenTermination</key><false/>
-</dict>
-</plist>
-PLIST
+PLIST="$CONTENTS/Info.plist"
+plutil -create xml1 "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $APP_NAME" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 14.0" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.developer-tools" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :NSSupportsAutomaticTermination bool false" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :NSSupportsSuddenTermination bool false" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string Copyright © 2026 VJ Mabansag" "$PLIST"
+plutil -lint "$PLIST" >/dev/null
 
-echo "› ad-hoc code-signing…"
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP" >/dev/null 2>&1 || \
-codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
+SIGN_ARGS=(--force --sign "$CODE_SIGN_IDENTITY")
+if [[ "$CODE_SIGN_IDENTITY" == "-" ]]; then
+  SIGN_ARGS+=(--timestamp=none)
+  echo "› ad-hoc signing local build…"
+else
+  [[ -f "$ROOT/CodexSwap.entitlements" ]] || {
+    echo "CodexSwap.entitlements is required for Developer ID signing" >&2
+    exit 1
+  }
+  SIGN_ARGS+=(--options runtime --timestamp --entitlements "$ROOT/CodexSwap.entitlements")
+  echo "› Developer ID signing with hardened runtime…"
+fi
+
+codesign "${SIGN_ARGS[@]}" "$CONTENTS/MacOS/swapd"
+codesign "${SIGN_ARGS[@]}" "$CONTENTS/MacOS/$APP_NAME"
+codesign "${SIGN_ARGS[@]}" --identifier "$BUNDLE_ID" "$APP"
+codesign --verify --deep --strict "$APP"
 
 echo "✓ built $APP"
-codesign -dv "$APP" 2>&1 | grep -E "Identifier|Signature" || true
-echo
-echo "Install:  cp -R \"$APP\" /Applications/  &&  open /Applications/$APP_NAME.app"
+echo "  version: $VERSION ($BUILD_NUMBER)"
+echo "  identity: $CODE_SIGN_IDENTITY"
+echo "Install: ditto \"$APP\" /Applications/$APP_NAME.app && open /Applications/$APP_NAME.app"
