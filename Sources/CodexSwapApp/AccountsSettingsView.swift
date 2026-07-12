@@ -76,7 +76,12 @@ private struct AccountSettingsRowView: View {
             if !account.isActive {
                 Button("Use", action: { model.actions.switchAccount(account.alias) })
             }
-            Button("Remove", role: .destructive, action: { model.actions.removeAccount(account.alias) })
+            if account.ownership == .codexBarManaged {
+                Button("Manage", action: model.actions.openCodexBar)
+                    .help("Remove or reauthenticate this account in CodexBar")
+            } else {
+                Button("Remove", role: .destructive, action: { model.actions.removeAccount(account.alias) })
+            }
         }
         .padding(.vertical, 4)
     }
