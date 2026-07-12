@@ -164,6 +164,79 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
     }
 
+    func testUserTopLevelKeysAreNeverReparentedUnderManagedTables() throws {
+        let f = try fixture()
+        let original = """
+        model = "gpt-5.6"
+        approval_policy = "on-request"
+
+        [mcp_servers.example]
+        command = "example"
+        """
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        let enabled = try String(contentsOf: f.config, encoding: .utf8)
+
+        // The prepended routing region must contain no table header, or every user top-level
+        // key that follows it would be reparented into that table.
+        let begin = enabled.range(of: "# BEGIN CODEXSWAP MANAGED ROUTING")!
+        let end = enabled.range(of: "# END CODEXSWAP MANAGED ROUTING")!
+        let routingRegion = enabled[begin.lowerBound..<end.upperBound]
+        XCTAssertFalse(routingRegion.contains("["))
+
+        // The provider table must come after all user content so it cannot capture user keys.
+        let providerIdx = enabled.range(of: "[model_providers.codexswap]")!.lowerBound
+        XCTAssertLessThan(enabled.range(of: "model = \"gpt-5.6\"")!.lowerBound, providerIdx)
+        XCTAssertLessThan(enabled.range(of: "[mcp_servers.example]")!.lowerBound, providerIdx)
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testLegacySingleBlockLayoutIsMigratedByRepair() throws {
+        let f = try fixture()
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        let legacyBlock = """
+        # BEGIN CODEXSWAP MANAGED ROUTING
+        chatgpt_base_url = "http://127.0.0.1:58432/backend-api"
+        model_provider = "codexswap"
+
+        [model_providers.codexswap]
+        name = "CodexSwap"
+        base_url = "http://127.0.0.1:58432/backend-api/codex"
+        wire_api = "responses"
+        requires_openai_auth = true
+        # END CODEXSWAP MANAGED ROUTING
+        """
+        let legacyEnabled = legacyBlock + "\n\nmodel = \"gpt-5.6\"\n"
+        try legacyEnabled.write(to: f.config, atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: f.support, withIntermediateDirectories: true)
+        let legacyManifest: [String: Any] = [
+            "originalExisted": true,
+            "originalContent": "model = \"gpt-5.6\"\n",
+            "displacedContent": "",
+            "enabledContent": legacyEnabled,
+            "managedBlock": legacyBlock,
+        ]
+        let manifestData = try JSONSerialization.data(withJSONObject: legacyManifest)
+        try manifestData.write(to: f.support.appendingPathComponent("routing-restore.json"))
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+
+        guard case .needsRepair = try manager.state(proxyURL: proxy) else {
+            return XCTFail("Expected legacy layout to need repair")
+        }
+        try manager.repair(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        let repaired = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertLessThan(repaired.range(of: "model = \"gpt-5.6\"")!.lowerBound, repaired.range(of: "[model_providers.codexswap]")!.lowerBound)
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), "model = \"gpt-5.6\"\n")
+    }
+
     func testExactManagedBlockWithoutRestoreManifestNeedsRepair() throws {
         let f = try fixture()
         let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)

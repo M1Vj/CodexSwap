@@ -23,6 +23,9 @@ public enum CodexConfigManagerError: LocalizedError, Sendable {
 public struct CodexConfigManager: Sendable {
     private static let beginMarker = "# BEGIN CODEXSWAP MANAGED ROUTING"
     private static let endMarker = "# END CODEXSWAP MANAGED ROUTING"
+    private static let beginProviderMarker = "# BEGIN CODEXSWAP MANAGED PROVIDER"
+    private static let endProviderMarker = "# END CODEXSWAP MANAGED PROVIDER"
+    private static let allMarkers = [beginMarker, endMarker, beginProviderMarker, endProviderMarker]
 
     private let configURL: URL
     private let supportDir: URL
@@ -39,22 +42,26 @@ public struct CodexConfigManager: Sendable {
     public func state(proxyURL: URL) throws -> CodexRoutingState {
         guard fileManager.fileExists(atPath: configURL.path) else { return .disabled }
         let content = try String(contentsOf: configURL, encoding: .utf8)
-        let expected = managedBlock(proxyURL: proxyURL)
-        switch managedRange(in: content) {
-        case .none:
-            if content.contains(Self.beginMarker) || content.contains(Self.endMarker) {
+        let routingRange = region(Self.beginMarker, Self.endMarker, in: content)
+        let providerRange = region(Self.beginProviderMarker, Self.endProviderMarker, in: content)
+        if routingRange == nil, providerRange == nil {
+            if Self.allMarkers.contains(where: content.contains) {
                 return .needsRepair("managed routing markers are incomplete")
             }
             return .disabled
-        case .some(let range):
-            guard String(content[range]) == expected else {
-                return .needsRepair("managed routing values were changed")
-            }
-            guard fileManager.fileExists(atPath: manifestURL.path) else {
-                return .needsRepair("routing restore manifest is missing")
-            }
-            return .enabled
         }
+        guard let routing = routingRange, let provider = providerRange,
+              routing.upperBound <= provider.lowerBound else {
+            return .needsRepair("managed routing markers are incomplete")
+        }
+        guard String(content[routing]) == managedRoutingBlock(proxyURL: proxyURL),
+              String(content[provider]) == managedProviderBlock(proxyURL: proxyURL) else {
+            return .needsRepair("managed routing values were changed")
+        }
+        guard fileManager.fileExists(atPath: manifestURL.path) else {
+            return .needsRepair("routing restore manifest is missing")
+        }
+        return .enabled
     }
 
     public func enable(proxyURL: URL) throws {
@@ -67,8 +74,9 @@ public struct CodexConfigManager: Sendable {
         let originalExisted = fileManager.fileExists(atPath: configURL.path)
         let original = originalExisted ? try String(contentsOf: configURL, encoding: .utf8) : ""
         let stripped = try stripOwnedValues(from: original)
-        let block = managedBlock(proxyURL: proxyURL)
-        let enabled = insert(block: block, before: stripped.content)
+        let routing = managedRoutingBlock(proxyURL: proxyURL)
+        let provider = managedProviderBlock(proxyURL: proxyURL)
+        let enabled = compose(routing: routing, provider: provider, around: stripped.content)
 
         try fileManager.createDirectory(at: supportDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         if originalExisted {
@@ -84,7 +92,8 @@ public struct CodexConfigManager: Sendable {
             originalContent: original,
             displacedContent: stripped.displaced,
             enabledContent: enabled,
-            managedBlock: block
+            managedBlock: routing,
+            managedProviderBlock: provider
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -97,7 +106,7 @@ public struct CodexConfigManager: Sendable {
         guard fileManager.fileExists(atPath: manifestURL.path) else {
             if fileManager.fileExists(atPath: configURL.path) {
                 let content = try String(contentsOf: configURL, encoding: .utf8)
-                if content.contains(Self.beginMarker) || content.contains(Self.endMarker) {
+                if Self.allMarkers.contains(where: content.contains) {
                     throw CodexConfigManagerError.missingRestoreManifest
                 }
             }
@@ -116,11 +125,19 @@ public struct CodexConfigManager: Sendable {
                 try? fileManager.removeItem(at: configURL)
             }
         } else {
-            guard let range = managedRange(in: current), String(current[range]) == manifest.managedBlock else {
+            var restored = current
+            guard let routing = region(Self.beginMarker, Self.endMarker, in: restored),
+                  String(restored[routing]) == manifest.managedBlock else {
                 throw CodexConfigManagerError.damagedManagedBlock
             }
-            var restored = current
-            restored.removeSubrange(range)
+            restored.removeSubrange(routing)
+            if let expectedProvider = manifest.managedProviderBlock {
+                guard let provider = region(Self.beginProviderMarker, Self.endProviderMarker, in: restored),
+                      String(restored[provider]) == expectedProvider else {
+                    throw CodexConfigManagerError.damagedManagedBlock
+                }
+                restored.removeSubrange(provider)
+            }
             restored = restored.trimmingCharacters(in: .newlines)
             if !manifest.displacedContent.isEmpty {
                 restored = manifest.displacedContent.trimmingCharacters(in: .newlines)
@@ -146,51 +163,72 @@ public struct CodexConfigManager: Sendable {
                 throw CodexConfigManagerError.missingRestoreManifest
             }
             var content = try String(contentsOf: configURL, encoding: .utf8)
-            guard let range = managedRange(in: content) else {
+            if let routing = region(Self.beginMarker, Self.endMarker, in: content) {
+                content.removeSubrange(routing)
+            }
+            if let provider = region(Self.beginProviderMarker, Self.endProviderMarker, in: content) {
+                content.removeSubrange(provider)
+            }
+            guard !Self.allMarkers.contains(where: content.contains) else {
                 throw CodexConfigManagerError.damagedManagedBlock
             }
-            let block = managedBlock(proxyURL: proxyURL)
-            content.replaceSubrange(range, with: block)
+            let routing = managedRoutingBlock(proxyURL: proxyURL)
+            let provider = managedProviderBlock(proxyURL: proxyURL)
+            let rebuilt = compose(routing: routing, provider: provider, around: content)
             var manifest = try JSONDecoder().decode(RestoreManifest.self, from: Data(contentsOf: manifestURL))
-            manifest.enabledContent = content
-            manifest.managedBlock = block
+            manifest.enabledContent = rebuilt
+            manifest.managedBlock = routing
+            manifest.managedProviderBlock = provider
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: manifestURL.path)
-            try atomicWrite(content)
+            try atomicWrite(rebuilt)
         }
     }
 
     private var manifestURL: URL { supportDir.appendingPathComponent("routing-restore.json") }
 
-    private func managedBlock(proxyURL: URL) -> String {
+    /// Root-level keys only. Prepended before user content so they always parse in the root table.
+    private func managedRoutingBlock(proxyURL: URL) -> String {
         let root = proxyURL.absoluteString.trimmingTrailingSlash()
         return """
         \(Self.beginMarker)
         chatgpt_base_url = "\(root)/backend-api"
         model_provider = "codexswap"
+        \(Self.endMarker)
+        """
+    }
 
+    /// The provider table. Appended after user content: a table header ending the file cannot
+    /// reparent anything, whereas placing it before user content would capture the user's
+    /// top-level keys into `[model_providers.codexswap]`.
+    private func managedProviderBlock(proxyURL: URL) -> String {
+        let root = proxyURL.absoluteString.trimmingTrailingSlash()
+        return """
+        \(Self.beginProviderMarker)
         [model_providers.codexswap]
         name = "CodexSwap"
         base_url = "\(root)/backend-api/codex"
         wire_api = "responses"
         requires_openai_auth = true
-        \(Self.endMarker)
+        \(Self.endProviderMarker)
         """
     }
 
-    private func insert(block: String, before content: String) -> String {
+    private func compose(routing: String, provider: String, around content: String) -> String {
         let base = content.trimmingCharacters(in: .newlines)
-        return base.isEmpty ? block + "\n" : block + "\n\n" + base + "\n"
+        return base.isEmpty
+            ? routing + "\n\n" + provider + "\n"
+            : routing + "\n\n" + base + "\n\n" + provider + "\n"
     }
 
-    private func managedRange(in content: String) -> Range<String.Index>? {
-        guard let begin = content.range(of: Self.beginMarker),
-              let endMarkerRange = content.range(of: Self.endMarker, range: begin.upperBound..<content.endIndex) else { return nil }
+    private func region(_ beginMarker: String, _ endMarker: String, in content: String) -> Range<String.Index>? {
+        guard let begin = content.range(of: beginMarker),
+              let endMarkerRange = content.range(of: endMarker, range: begin.upperBound..<content.endIndex) else { return nil }
         let end = endMarkerRange.upperBound
-        guard content.range(of: Self.beginMarker, range: begin.upperBound..<content.endIndex) == nil,
-              content.range(of: Self.endMarker, range: end..<content.endIndex) == nil else { return nil }
+        guard content.range(of: beginMarker, range: begin.upperBound..<content.endIndex) == nil,
+              content.range(of: endMarker, range: end..<content.endIndex) == nil else { return nil }
         return begin.lowerBound..<end
     }
 
@@ -262,5 +300,7 @@ public struct CodexConfigManager: Sendable {
         var displacedContent: String
         var enabledContent: String
         var managedBlock: String
+        // Absent in manifests written before the managed block was split into two regions.
+        var managedProviderBlock: String?
     }
 }
