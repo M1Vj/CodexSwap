@@ -3,6 +3,17 @@ import NIOCore
 import NIOHTTP1
 @testable import SwapKit
 
+final class SettingsTests: XCTestCase {
+    func testNewAutomationSettingsDecodeWithSafeDefaults() throws {
+        let settings = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
+
+        XCTAssertFalse(settings.routeCodexAutomatically)
+        XCTAssertFalse(settings.automaticallyWarmAccounts)
+        XCTAssertEqual(settings.proxyPort, Settings.defaultProxyPort)
+        XCTAssertEqual(settings.proxyPort, 58_432)
+    }
+}
+
 final class JWTTests: XCTestCase {
     private func makeToken(claims: [String: Any]) -> String {
         let header = Data("{}".utf8).base64EncodedString()

@@ -67,9 +67,12 @@ public actor AppEngine {
         await store.setStrategy(settings.rotationStrategy)
 
         let sink = EngineSink(engine: self)
+        var proxyConfig = ProxyServer.Config()
+        proxyConfig.port = settings.proxyPort
         let proxy = ProxyServer(
             store: store,
             refresher: refresher,
+            config: proxyConfig,
             settingsProvider: { [settingsStore] in await settingsStore.get() },
             sink: sink,
             verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
