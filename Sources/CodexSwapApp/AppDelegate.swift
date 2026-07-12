@@ -26,11 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
 
-        engine.setEventHandler { [weak self] event in
-            Task { @MainActor in self?.handle(event: event) }
-        }
-
         Task { @MainActor in
+            await engine.setEventHandler { [weak self] event in
+                Task { @MainActor in self?.handle(event: event) }
+            }
             do { try await engine.start() } catch {
                 self.notify(title: "CodexSwap", body: "Failed to start proxy: \(error.localizedDescription)")
             }
@@ -146,6 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             warning.isEnabled = false
             menu.addItem(warning)
         }
+        menu.addItem(quotaWindowsItem())
         menu.addItem(notifyToggles())
         menu.addItem(launchAtLoginItem())
         menu.addItem(.separator())
@@ -218,6 +218,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             return item
         }
+    }
+
+    private func quotaWindowsItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Quota windows", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        let automatic = toggle("Automatically warm all accounts", settings.automaticallyWarmAccounts, #selector(toggleAutomaticWarmup))
+        automatic.isEnabled = !latest.warmupInProgress
+        sub.addItem(automatic)
+
+        let manualTitle = latest.warmupInProgress ? "Warming accounts…" : "Warm all accounts now…"
+        let manual = NSMenuItem(title: manualTitle, action: #selector(warmAllAccountsNow), keyEquivalent: "")
+        manual.target = self
+        manual.isEnabled = !latest.warmupInProgress
+        sub.addItem(manual)
+
+        if let summary = latest.warmupSummary {
+            sub.addItem(.separator())
+            let status = NSMenuItem(
+                title: "Last: \(summary.statusText) · \(Self.shortTime(summary.finishedAt))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            status.isEnabled = false
+            sub.addItem(status)
+        }
+        parent.submenu = sub
+        return parent
     }
 
     private func toggle(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
@@ -305,6 +332,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             await refreshSnapshot()
         }
+    }
+
+    @objc private func toggleAutomaticWarmup() {
+        if settings.automaticallyWarmAccounts {
+            Task { @MainActor in
+                await engine.setAutomaticWarmup(false)
+                notify(title: "Automatic warm-up disabled", body: "Manual warm-up remains available from the Quota windows menu.")
+                await refreshSnapshot()
+            }
+            return
+        }
+
+        guard confirmWarmup(
+            title: "Automatically warm every account?",
+            message: "CodexSwap will send one small, real Codex request per eligible account when a new 5-hour cycle is available. This consumes a small amount of quota. OpenAI does not guarantee that one request starts every displayed quota window.",
+            button: "Enable Automatic Warm-up"
+        ) else { return }
+
+        Task { @MainActor in
+            await engine.setAutomaticWarmup(true)
+            await refreshSnapshot()
+        }
+    }
+
+    @objc private func warmAllAccountsNow() {
+        guard confirmWarmup(
+            title: "Warm all eligible accounts now?",
+            message: "This forces one small, real Codex request through each eligible account, even if it was already warmed during the current cycle.",
+            button: "Warm Accounts"
+        ) else { return }
+
+        Task { @MainActor in
+            let summary = await engine.warmAllAccountsNow()
+            notify(title: "Quota warm-up finished", body: summary.statusText)
+            await refreshSnapshot()
+        }
+    }
+
+    private func confirmWarmup(title: String, message: String, button: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func enableLaunchAtLoginForRouting() async {

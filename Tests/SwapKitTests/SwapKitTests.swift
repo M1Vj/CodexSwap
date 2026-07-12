@@ -246,6 +246,17 @@ private actor FakeWarmupRunner: WarmupCommandRunning {
     func calls() -> [String] { aliases }
 }
 
+private actor FakeUsageFetcher: UsageFetching {
+    private var accountIDs: [String] = []
+
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
+        accountIDs.append(accountID)
+        return [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+    }
+
+    func calls() -> [String] { accountIDs }
+}
+
 final class QuotaWarmupServiceTests: XCTestCase {
     private func account(_ alias: String, now: Date, needsLogin: Bool = false) -> Account {
         Account(
@@ -268,12 +279,14 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         let first = await service.run(accounts: accounts, proxyURL: proxy, now: now)
         let second = await service.run(accounts: accounts, proxyURL: proxy, now: now.addingTimeInterval(60))
+        let forced = await service.run(accounts: [accounts[0]], proxyURL: proxy, force: true, now: now.addingTimeInterval(120))
         let calls = await runner.calls()
 
         XCTAssertEqual(first.warmed, ["a"])
         XCTAssertEqual(first.skipped["b"], "needs login")
         XCTAssertEqual(second.skipped["a"], "already warmed for this cycle")
-        XCTAssertEqual(calls, ["a"])
+        XCTAssertEqual(forced.warmed, ["a"])
+        XCTAssertEqual(calls, ["a", "a"])
     }
 
     func testRunsAgainAfterRecordedPrimaryResetAndRedactsFailures() async throws {
@@ -291,6 +304,58 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(afterReset.warmed, ["a"])
         XCTAssertNotNil(afterReset.failed["bad"])
         XCTAssertFalse(afterReset.failed["bad"]!.contains("secret-token"))
+    }
+}
+
+final class WarmupEngineTests: XCTestCase {
+    private func freshToken() -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: ["exp": Int(Date().addingTimeInterval(3600).timeIntervalSince1970)])
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(payload).sig"
+    }
+
+    func testManualWarmupForcesRunRefreshesUsageAndPublishesSummary() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        let settings = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let runner = FakeWarmupRunner()
+        let usage = FakeUsageFetcher()
+        let warmup = QuotaWarmupService(runner: runner, ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")))
+        let engine = AppEngine(
+            store: store,
+            settingsStore: settings,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: warmup
+        )
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let summary = await engine.warmAllAccountsNow(proxyURL: proxy)
+        let usageCalls = await usage.calls()
+        let snapshot = await engine.snapshot()
+
+        XCTAssertEqual(summary.warmed, ["a"])
+        XCTAssertEqual(usageCalls, ["id-a"])
+        XCTAssertEqual(snapshot.warmupSummary?.warmed, ["a"])
+        XCTAssertFalse(snapshot.warmupInProgress)
+    }
+
+    func testAutomaticWarmupPreferencePersistsIndependently() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-setting-\(UUID().uuidString)")
+        let settings = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let engine = AppEngine(settingsStore: settings)
+
+        await engine.setAutomaticWarmup(true)
+        let enabled = await settings.get()
+        await engine.setAutomaticWarmup(false)
+        let disabled = await settings.get()
+
+        XCTAssertTrue(enabled.automaticallyWarmAccounts)
+        XCTAssertFalse(disabled.automaticallyWarmAccounts)
     }
 }
 
