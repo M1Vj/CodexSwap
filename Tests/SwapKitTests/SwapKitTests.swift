@@ -98,6 +98,23 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.disable())
     }
 
+    func testRepairReinstallsManagedValuesAndKeepsRestorePoint() throws {
+        let f = try fixture()
+        let original = "model_provider = \"previous\"\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+        var text = try String(contentsOf: f.config, encoding: .utf8)
+        text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
+        try text.write(to: f.config, atomically: true, encoding: .utf8)
+
+        try manager.repair(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
     func testAmbiguousInlineProviderConfigIsRejectedWithoutMutation() throws {
         let f = try fixture()
         let original = "model_providers.codexswap = { name = \"custom\" }\n"
@@ -106,6 +123,59 @@ final class CodexConfigManagerTests: XCTestCase {
 
         XCTAssertThrowsError(try manager.enable(proxyURL: URL(string: "http://127.0.0.1:58432")!))
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+}
+
+final class RoutingEngineTests: XCTestCase {
+    private func fixture() throws -> (engine: AppEngine, settings: SettingsStore, config: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("routing-engine-\(UUID().uuidString)")
+        let codexHome = root.appendingPathComponent("codex")
+        let support = root.appendingPathComponent("support")
+        try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
+        let settings = SettingsStore(url: support.appendingPathComponent("settings.json"))
+        let store = AccountStore(url: support.appendingPathComponent("accounts.json"))
+        let manager = CodexConfigManager(codexHome: codexHome, supportDir: support)
+        return (
+            AppEngine(store: store, settingsStore: settings, configManager: manager),
+            settings,
+            codexHome.appendingPathComponent("config.toml")
+        )
+    }
+
+    func testEnableAndDisableRoutingPersistsIntentAndRestoresConfig() async throws {
+        let f = try fixture()
+        let original = "model = \"gpt-5.6\"\n"
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+
+        try await f.engine.setAutomaticRouting(true)
+        let enabledSettings = await f.settings.get()
+        let enabledSnapshot = await f.engine.snapshot()
+        XCTAssertTrue(enabledSettings.routeCodexAutomatically)
+        XCTAssertEqual(enabledSnapshot.routingState, .enabled)
+
+        try await f.engine.setAutomaticRouting(false)
+        let disabledSettings = await f.settings.get()
+        let disabledSnapshot = await f.engine.snapshot()
+        XCTAssertFalse(disabledSettings.routeCodexAutomatically)
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+        XCTAssertEqual(disabledSnapshot.routingState, .disabled)
+    }
+
+    func testExternalManagedBlockEditReportsRepairState() async throws {
+        let f = try fixture()
+        try await f.engine.setAutomaticRouting(true)
+        var text = try String(contentsOf: f.config, encoding: .utf8)
+        text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
+        try text.write(to: f.config, atomically: true, encoding: .utf8)
+
+        let snapshot = await f.engine.snapshot()
+        guard case .needsRepair = snapshot.routingState else {
+            return XCTFail("Expected needsRepair")
+        }
+
+        try await f.engine.repairAutomaticRouting()
+        let repaired = await f.engine.snapshot()
+        XCTAssertEqual(repaired.routingState, .enabled)
     }
 }
 

@@ -140,6 +140,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addAction("Import accounts", #selector(importAccounts))
         addAction("Add account (codex login)…", #selector(addAccount))
         addAction("Install `codexswap` shim…", #selector(installShim))
+        menu.addItem(automaticRoutingItem())
+        if latest.routingState == .enabled && !settings.launchAtLogin {
+            let warning = NSMenuItem(title: "⚠ Routing requires CodexSwap to be running", action: nil, keyEquivalent: "")
+            warning.isEnabled = false
+            menu.addItem(warning)
+        }
         menu.addItem(notifyToggles())
         menu.addItem(launchAtLoginItem())
         menu.addItem(.separator())
@@ -199,6 +205,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func launchAtLoginItem() -> NSMenuItem {
         let item = toggle("Launch at login", settings.launchAtLogin, #selector(toggleLaunchAtLogin))
         return item
+    }
+
+    private func automaticRoutingItem() -> NSMenuItem {
+        switch latest.routingState {
+        case .disabled:
+            return toggle("Route Codex through CodexSwap", false, #selector(toggleAutomaticRouting))
+        case .enabled:
+            return toggle("Route Codex through CodexSwap", true, #selector(toggleAutomaticRouting))
+        case .needsRepair:
+            let item = NSMenuItem(title: "Repair Codex routing…", action: #selector(toggleAutomaticRouting), keyEquivalent: "")
+            item.target = self
+            return item
+        }
     }
 
     private func toggle(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
@@ -265,6 +284,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleNotifyRotate() { updateSettings { $0.notifyOnRotate.toggle() } }
     @objc private func toggleNotifyExhausted() { updateSettings { $0.notifyOnExhausted.toggle() } }
     @objc private func toggleNotifyReset() { updateSettings { $0.notifyOnWindowReset.toggle() } }
+
+    @objc private func toggleAutomaticRouting() {
+        Task { @MainActor in
+            do {
+                switch latest.routingState {
+                case .enabled:
+                    try await engine.setAutomaticRouting(false)
+                    notify(title: "CodexSwap routing disabled", body: "Your previous Codex provider settings were restored.")
+                case .disabled:
+                    await enableLaunchAtLoginForRouting()
+                    try await engine.setAutomaticRouting(true)
+                    notify(title: "CodexSwap routing enabled", body: "Restart existing Codex sessions to apply automatic account routing.")
+                case .needsRepair:
+                    try await engine.repairAutomaticRouting()
+                    notify(title: "CodexSwap routing repaired", body: "Restart existing Codex sessions to apply the repaired configuration.")
+                }
+            } catch {
+                notify(title: "CodexSwap routing unchanged", body: error.localizedDescription)
+            }
+            await refreshSnapshot()
+        }
+    }
+
+    private func enableLaunchAtLoginForRouting() async {
+        guard !settings.launchAtLogin else { return }
+        guard hasBundle else {
+            notify(title: "Launch at login unavailable", body: "Install and open the packaged CodexSwap.app to enable launch at login.")
+            return
+        }
+        do {
+            try SMAppService.mainApp.register()
+            settings = await SettingsStoreBridge.update { $0.launchAtLogin = true }
+        } catch {
+            notify(title: "Launch at login unchanged", body: error.localizedDescription)
+        }
+    }
 
     @objc private func toggleLaunchAtLogin() {
         let newValue = !settings.launchAtLogin

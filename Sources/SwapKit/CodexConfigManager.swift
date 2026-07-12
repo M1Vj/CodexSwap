@@ -128,6 +128,33 @@ public struct CodexConfigManager: Sendable {
         try? fileManager.removeItem(at: manifestURL)
     }
 
+    public func repair(proxyURL: URL) throws {
+        switch try state(proxyURL: proxyURL) {
+        case .enabled:
+            return
+        case .disabled:
+            try enable(proxyURL: proxyURL)
+        case .needsRepair:
+            guard fileManager.fileExists(atPath: configURL.path),
+                  fileManager.fileExists(atPath: manifestURL.path) else {
+                throw CodexConfigManagerError.missingRestoreManifest
+            }
+            var content = try String(contentsOf: configURL, encoding: .utf8)
+            guard let range = managedRange(in: content) else {
+                throw CodexConfigManagerError.damagedManagedBlock
+            }
+            let block = managedBlock(proxyURL: proxyURL)
+            content.replaceSubrange(range, with: block)
+            var manifest = try JSONDecoder().decode(RestoreManifest.self, from: Data(contentsOf: manifestURL))
+            manifest.enabledContent = content
+            manifest.managedBlock = block
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+            try atomicWrite(content)
+        }
+    }
+
     private var manifestURL: URL { supportDir.appendingPathComponent("routing-restore.json") }
 
     private func managedBlock(proxyURL: URL) -> String {
