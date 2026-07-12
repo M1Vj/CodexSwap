@@ -17,11 +17,13 @@ public struct EngineSnapshot: Sendable {
     public let servedCount: Int
     public let lastActivityAt: Date?
     public let lastActivityAlias: String?
+    public let routingState: CodexRoutingState
 
     public var isRunning: Bool { proxyURL != nil }
 
     public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy,
-                servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil) {
+                servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil,
+                routingState: CodexRoutingState = .disabled) {
         self.accounts = accounts
         self.activeAlias = activeAlias
         self.proxyURL = proxyURL
@@ -29,6 +31,7 @@ public struct EngineSnapshot: Sendable {
         self.servedCount = servedCount
         self.lastActivityAt = lastActivityAt
         self.lastActivityAlias = lastActivityAlias
+        self.routingState = routingState
     }
 }
 
@@ -39,6 +42,7 @@ public actor AppEngine {
     private let settingsStore: SettingsStore
     private let usage: UsageClient
     private let refresher: TokenRefresher
+    private let configManager: CodexConfigManager
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
@@ -48,12 +52,14 @@ public actor AppEngine {
         store: AccountStore = AccountStore(),
         settingsStore: SettingsStore = SettingsStore(),
         usage: UsageClient = UsageClient(),
-        refresher: TokenRefresher = TokenRefresher()
+        refresher: TokenRefresher = TokenRefresher(),
+        configManager: CodexConfigManager = CodexConfigManager()
     ) {
         self.store = store
         self.settingsStore = settingsStore
         self.usage = usage
         self.refresher = refresher
+        self.configManager = configManager
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -114,6 +120,8 @@ public actor AppEngine {
 
     public func snapshot() async -> EngineSnapshot {
         let activity = await proxy?.activity()
+        let settings = await settingsStore.get()
+        let routingState = verifiedRoutingState(settings: settings)
         return EngineSnapshot(
             accounts: await store.all(),
             activeAlias: await store.activeAlias(),
@@ -121,7 +129,8 @@ public actor AppEngine {
             strategy: await store.strategy,
             servedCount: activity?.servedCount ?? 0,
             lastActivityAt: activity?.lastAt,
-            lastActivityAlias: activity?.lastAlias
+            lastActivityAlias: activity?.lastAlias,
+            routingState: routingState
         )
     }
 
@@ -135,6 +144,41 @@ public actor AppEngine {
         _ = await settingsStore.update { $0.rotationStrategy = s }
         await store.setStrategy(s)
         emit(.snapshotChanged)
+    }
+
+    public func setAutomaticRouting(_ enabled: Bool) async throws {
+        let settings = await settingsStore.get()
+        let url = stableProxyURL(port: settings.proxyPort)
+        if enabled {
+            try configManager.enable(proxyURL: url)
+        } else {
+            try configManager.disable()
+        }
+        _ = await settingsStore.update { $0.routeCodexAutomatically = enabled }
+        emit(.snapshotChanged)
+    }
+
+    public func repairAutomaticRouting() async throws {
+        let settings = await settingsStore.get()
+        try configManager.repair(proxyURL: stableProxyURL(port: settings.proxyPort))
+        _ = await settingsStore.update { $0.routeCodexAutomatically = true }
+        emit(.snapshotChanged)
+    }
+
+    private func stableProxyURL(port: Int) -> URL {
+        URL(string: "http://127.0.0.1:\(port)")!
+    }
+
+    private func verifiedRoutingState(settings: Settings) -> CodexRoutingState {
+        do {
+            let actual = try configManager.state(proxyURL: stableProxyURL(port: settings.proxyPort))
+            if settings.routeCodexAutomatically, actual == .disabled {
+                return .needsRepair("routing configuration is missing")
+            }
+            return actual
+        } catch {
+            return .needsRepair(error.localizedDescription)
+        }
     }
 
     public func importAccounts() async {
