@@ -34,7 +34,10 @@ func selectProxyAccount(store: AccountStore, mode: ProxyRequestMode, now: Date =
     case .normal:
         return await store.current(now: now)
     case .warmup(let alias):
-        guard let account = await store.account(alias), account.isEligible(now: now) else { return nil }
+        // Hydrate managed tokens before judging eligibility, exactly like normal traffic does:
+        // a stale store copy (old token, leftover needs-login flag) must not fail a warm-up
+        // that CodexBar's fresh credentials can serve.
+        guard let account = await store.hydrateFromManagedHome(alias), account.isEligible(now: now) else { return nil }
         return account
     }
 }

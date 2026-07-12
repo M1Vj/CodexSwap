@@ -364,6 +364,41 @@ final class WarmupProxyTests: XCTestCase {
         XCTAssertEqual(proxyRequestMode(headers: headers, method: .POST, path: "/backend-api/codex/responses", loopbackOnly: false), .normal)
     }
 
+    private func jwt(expiringIn seconds: TimeInterval) -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: ["exp": Int(Date().addingTimeInterval(seconds).timeIntervalSince1970)])
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(payload).sig"
+    }
+
+    func testWarmupSelectionHydratesManagedTokensBeforeEligibility() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-hydrate-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let fresh = jwt(expiringIn: 3600)
+        try CodexAuth.write(
+            CodexTokens(idToken: "", accessToken: fresh, refreshToken: "r2", accountId: "acc-m"),
+            to: home.appendingPathComponent("auth.json")
+        )
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "m",
+            accountID: "acc-m",
+            accessToken: jwt(expiringIn: -3600),
+            refreshToken: "r1",
+            needsLogin: true,
+            managedHomePath: home.path
+        ))
+
+        let selected = await selectProxyAccount(store: store, mode: .warmup(alias: "m"))
+
+        XCTAssertEqual(selected?.alias, "m")
+        XCTAssertEqual(selected?.accessToken, fresh)
+        XCTAssertEqual(selected?.needsLogin, false)
+    }
+
     func testMarkLimitedDoesNotRotateActiveAccount() async {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-limit-\(UUID().uuidString).json")
         let store = AccountStore(url: url)
@@ -543,6 +578,42 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(snapshot.warmupSummary?.warmed, ["a"])
         XCTAssertFalse(snapshot.warmupInProgress)
         XCTAssertNotNil(record?.secondaryResetAt)
+    }
+
+    func testWarmupHydratesManagedAccountsBeforeEligibility() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-managed-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        try CodexAuth.write(
+            CodexTokens(idToken: "", accessToken: freshToken(), refreshToken: "r2", accountId: "id-a"),
+            to: home.appendingPathComponent("auth.json")
+        )
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let stalePayload = try! JSONSerialization.data(withJSONObject: ["exp": Int(Date().addingTimeInterval(-3600).timeIntervalSince1970)])
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: "e30.\(stalePayload).sig",
+            refreshToken: "r1",
+            needsLogin: true,
+            managedHomePath: home.path
+        ))
+        let engine = AppEngine(
+            store: store,
+            settingsStore: SettingsStore(url: root.appendingPathComponent("settings.json")),
+            usage: FakeUsageFetcher(),
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(runner: FakeWarmupRunner(), ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")))
+        )
+
+        let summary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
+
+        XCTAssertEqual(summary.warmed, ["a"])
+        XCTAssertNil(summary.skipped["a"])
     }
 
     func testAutomaticWarmupPreferencePersistsIndependently() async {
