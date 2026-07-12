@@ -7,7 +7,9 @@ fail() { echo "repository-config test failed: $*" >&2; exit 1; }
 
 for file in .github/workflows/ci.yml .github/workflows/release.yml .github/CODEOWNERS \
   .github/dependabot.yml .github/pull_request_template.md \
-  .github/ISSUE_TEMPLATE/bug_report.yml .github/ISSUE_TEMPLATE/feature_request.yml; do
+  .github/ISSUE_TEMPLATE/bug_report.yml .github/ISSUE_TEMPLATE/feature_request.yml \
+  LICENSE SECURITY.md PRIVACY.md CONTRIBUTING.md CODE_OF_CONDUCT.md CHANGELOG.md \
+  docs/RELEASING.md docs/TROUBLESHOOTING.md; do
   [[ -f "$file" ]] || fail "missing $file"
 done
 
@@ -25,5 +27,9 @@ grep -A2 -F 'REQUIRE_GATEKEEPER:' .github/workflows/release.yml | grep -Fq '"1"'
 if grep -Fq 'APPLE_APP_PASSWORD' .github/workflows/release.yml; then
   fail "release workflow must use a key file, not an Apple password in process arguments"
 fi
+
+grep -Fq 'brew install --cask codexswap' README.md || fail "README has no Homebrew install command"
+grep -Fq 'Route Codex through CodexSwap' README.md || fail "README has no terminal-free setup path"
+grep -Fq 'REQUIRE_NOTARIZATION' docs/RELEASING.md || fail "release guide does not document fail-closed verification"
 
 echo "repository-config tests passed"

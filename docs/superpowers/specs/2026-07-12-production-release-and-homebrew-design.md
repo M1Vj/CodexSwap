@@ -33,7 +33,7 @@ The build scripts separate concerns:
 5. Submit with `notarytool`, wait for success, staple the app ticket, and rebuild the final ZIP.
 6. Verify the final artifact before uploading it.
 
-The signing workflow imports a base64-encoded Developer ID Application certificate into an ephemeral keychain. Notarization uses an Apple ID, Team ID, and app-specific password supplied only through GitHub Actions secrets. No credential values are logged or committed.
+The signing workflow imports a base64-encoded, passwordless Developer ID Application certificate into an ephemeral keychain. Notarization uses an App Store Connect API private-key file, key ID, and issuer ID supplied through GitHub Actions secrets and variables. Private key material is decoded only to a permission-restricted runner file and is never passed in process arguments. No credential values are logged or committed.
 
 ## Homebrew
 

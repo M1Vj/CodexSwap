@@ -116,7 +116,7 @@ Expected: failure because the release scripts do not exist.
 
 - [ ] **Step 4: Implement fail-closed notarization**
 
-`notarize-release.sh` requires `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD`, submits the pre-notarization ZIP with `xcrun notarytool --wait`, staples `CodexSwap.app`, validates stapling, and rebuilds the final ZIP/checksum. It never echoes credentials.
+`notarize-release.sh` requires `APPLE_API_KEY_PATH`, `APPLE_API_KEY_ID`, and `APPLE_API_ISSUER_ID`, submits the pre-notarization ZIP with `xcrun notarytool --wait`, staples `CodexSwap.app`, validates stapling, and rebuilds the final ZIP/checksum. Private key material remains in a permission-restricted file and is never placed in process arguments or echoed.
 
 - [ ] **Step 5: Implement artifact verification**
 
@@ -184,7 +184,7 @@ CI runs on pushes and pull requests using macOS 14, executes the shell contract 
 
 - [ ] **Step 2: Add fail-closed release automation**
 
-The release workflow runs on `v*` tags, verifies tag equals `v$(cat VERSION)`, imports the Developer ID P12 into an ephemeral keychain, builds universal binaries, signs with hardened runtime, notarizes and staples, verifies with Gatekeeper required, renders the exact cask checksum, uploads ZIP/checksum/cask with `gh release create`, and deletes the keychain in an `always()` step.
+The release workflow runs on `v*` tags, verifies tag equals `v$(cat VERSION)`, imports a passwordless Developer ID P12 into an ephemeral keychain, decodes the App Store Connect API key to a permission-restricted file, builds universal binaries, signs with hardened runtime, notarizes and staples, verifies with Gatekeeper required, renders the exact cask checksum, uploads ZIP/checksum/cask with `gh release create`, and deletes credentials and the keychain in an `always()` step.
 
 - [ ] **Step 3: Add repository contribution templates**
 
