@@ -79,16 +79,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Menu
 
     private func rebuildMenu() {
+        updateStatusIcon()
         menu.removeAllItems()
 
-        let active = latest.activeAlias ?? "none"
-        let header = NSMenuItem(title: "CodexSwap — active: \(active)", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        if latest.proxyURL == nil {
-            let warn = NSMenuItem(title: "⚠︎ proxy not running", action: nil, keyEquivalent: "")
-            warn.isEnabled = false
-            menu.addItem(warn)
+        // Status line: is the proxy on, and is codex traffic actually flowing through it?
+        let statusTitle: String
+        if let port = latest.proxyURL?.port {
+            if latest.servedCount == 0 {
+                statusTitle = "● On — proxy :\(port) · waiting for codex"
+            } else if let last = latest.lastActivityAt, Date().timeIntervalSince(last) < 90 {
+                statusTitle = "● Working — routing \(latest.lastActivityAlias ?? "?") · \(Self.ago(last))"
+            } else {
+                statusTitle = "● On — proxy :\(port) · idle (\(latest.servedCount) served)"
+            }
+        } else {
+            statusTitle = "○ Off — proxy not running"
+        }
+        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+
+        let active = NSMenuItem(title: "Active account: \(latest.activeAlias ?? "none")", action: nil, keyEquivalent: "")
+        active.isEnabled = false
+        menu.addItem(active)
+
+        if latest.proxyURL != nil && latest.servedCount == 0 {
+            let hint = NSMenuItem(title: "Run `codexswap` in your terminal to route codex here", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
         }
         menu.addItem(.separator())
 
@@ -290,6 +308,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static func shortTime(_ date: Date) -> String {
         let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"; return f.string(from: date)
+    }
+
+    static func ago(_ date: Date) -> String {
+        let s = Int(Date().timeIntervalSince(date))
+        if s < 5 { return "just now" }
+        if s < 60 { return "\(s)s ago" }
+        if s < 3600 { return "\(s / 60)m ago" }
+        return "\(s / 3600)h ago"
+    }
+
+    private func updateStatusIcon() {
+        guard let button = statusItem.button else { return }
+        let working = latest.isRunning && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
+        let name = latest.isRunning ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle"
+        button.image = NSImage(systemSymbolName: name, accessibilityDescription: "CodexSwap")
+        button.image?.isTemplate = !working
+        button.contentTintColor = working ? .systemGreen : nil
     }
 
     private struct PriorityChange { let alias: String; let priority: Int }

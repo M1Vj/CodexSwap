@@ -58,6 +58,23 @@ public actor ProxyServer {
     private var boundPort: Int?
     private var serving = false
     private let verbose: Bool
+    private var servedCount = 0
+    private var lastActivityAt: Date?
+    private var lastActivityAlias: String?
+
+    public struct Activity: Sendable {
+        public let servedCount: Int
+        public let lastAt: Date?
+        public let lastAlias: String?
+    }
+    public func activity() -> Activity {
+        Activity(servedCount: servedCount, lastAt: lastActivityAt, lastAlias: lastActivityAlias)
+    }
+    private func recordActivity(_ alias: String) {
+        servedCount += 1
+        lastActivityAt = Date()
+        lastActivityAlias = alias
+    }
 
     private func log(_ message: @autoclosure () -> String) {
         guard verbose else { return }
@@ -250,6 +267,7 @@ public actor ProxyServer {
             }
 
             await burn.clear(alias: account.alias)
+            recordActivity(account.alias)
             log("\(head.method.rawValue) \(rawPath) account=\(account.alias) -> \(resp.status.code)")
             try await streamResponse(outbound, response: resp)
             return
