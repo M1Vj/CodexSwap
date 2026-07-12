@@ -99,6 +99,18 @@ public actor AccountStore {
         persist()
     }
 
+    /// Round-robin load balancing: at a new turn, move to the next least-recently-used eligible
+    /// account so usage spreads evenly across all of them. Stays put if nothing else is eligible.
+    @discardableResult
+    public func advanceRoundRobin(now: Date = Date()) -> Account? {
+        if let next = lruEligible(now: now, excluding: data.activeAlias) {
+            activate(next.alias, now: now)
+            return account(next.alias)
+        }
+        if let active = data.activeAlias, let acc = account(active), acc.isEligible(now: now) { return acc }
+        return current(now: now)
+    }
+
     /// Disable `alias` for `limit` until `resetAt`, then pick the next eligible account.
     public func rotateFrom(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) -> RotationResult {
         if let i = index(alias) {

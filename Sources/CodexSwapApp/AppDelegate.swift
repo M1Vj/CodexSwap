@@ -130,8 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(strategyItem("Priority", .priority))
-        menu.addItem(strategyItem("Round-robin", .roundRobin))
+        let stratHeader = NSMenuItem(title: "Rotation strategy", action: nil, keyEquivalent: ""); stratHeader.isEnabled = false
+        menu.addItem(stratHeader)
+        menu.addItem(strategyItem("Priority (drain highest first)", .priority))
+        menu.addItem(strategyItem("Round-robin (balance evenly)", .roundRobin))
         menu.addItem(.separator())
 
         addAction("Refresh usage now", #selector(refreshUsage))

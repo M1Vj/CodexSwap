@@ -14,6 +14,9 @@
 ## CodexBar coexistence
 11. CodexBar (com.steipete.codexbar) manages accounts with per-account CODEX_HOME dirs at `~/Library/Application Support/CodexBar/managed-codex-homes/<uuid>/auth.json`, mapped by email/providerAccountID in `managed-codex-accounts.json` (version 3). It keeps these tokens fresh. CodexSwap reuses them: import sets `managedHomePath`; the proxy hydrates the freshest token from that home per request; on our own refresh we write the rotated tokens BACK to the managed home so CodexBar stays in sync. This revives accounts whose `~/.codex/accounts/` copies went stale and gives correct per-account usage. Requires CodexBar installed/running; degrade gracefully when absent.
 
+## Round-robin load balancing
+12. Codex's Responses API calls are STATELESS: request body has `store=false` and no `previous_response_id`; full `input`+`instructions` resent each turn (verified live). So switching accounts between (or even within) turns never breaks the conversation. Round-robin therefore balances usage by advancing to the next least-recently-used eligible account at each new turn — detected as a POST to `.../responses` arriving >`roundRobinTurnGapSeconds` (default 6s) after the previous one, so a turn's tool loop stays on one account. Priority strategy is unaffected. Only meaningful against the persistent app proxy (lastTurnAt lives in the proxy actor).
+
 ## Usage API
 8. `wham/usage` and friends are undocumented internal endpoints; poll conservatively (active account ~60s, backoff on 401) — aggressive polling risks account restrictions.
 
