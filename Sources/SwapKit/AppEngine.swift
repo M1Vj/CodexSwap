@@ -14,12 +14,21 @@ public struct EngineSnapshot: Sendable {
     public let activeAlias: String?
     public let proxyURL: URL?
     public let strategy: RotationStrategy
+    public let servedCount: Int
+    public let lastActivityAt: Date?
+    public let lastActivityAlias: String?
 
-    public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy) {
+    public var isRunning: Bool { proxyURL != nil }
+
+    public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy,
+                servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil) {
         self.accounts = accounts
         self.activeAlias = activeAlias
         self.proxyURL = proxyURL
         self.strategy = strategy
+        self.servedCount = servedCount
+        self.lastActivityAt = lastActivityAt
+        self.lastActivityAlias = lastActivityAlias
     }
 }
 
@@ -101,11 +110,15 @@ public actor AppEngine {
     }
 
     public func snapshot() async -> EngineSnapshot {
-        EngineSnapshot(
+        let activity = await proxy?.activity()
+        return EngineSnapshot(
             accounts: await store.all(),
             activeAlias: await store.activeAlias(),
             proxyURL: await proxy?.proxyURL(),
-            strategy: await store.strategy
+            strategy: await store.strategy,
+            servedCount: activity?.servedCount ?? 0,
+            lastActivityAt: activity?.lastAt,
+            lastActivityAlias: activity?.lastAlias
         )
     }
 
