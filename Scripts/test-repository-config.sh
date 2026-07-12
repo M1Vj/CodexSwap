@@ -21,6 +21,8 @@ grep -Fq 'permissions:' .github/workflows/ci.yml || fail "CI must declare least-
 grep -Fq 'contents: read' .github/workflows/ci.yml || fail "CI must only read repository contents"
 [[ "$(grep -F 'runs-on: macos-15' .github/workflows/ci.yml .github/workflows/release.yml | wc -l | tr -d ' ')" == "2" ]] \
   || fail "Swift 6 workflows must use the macOS 15 runner"
+[[ "$(grep -F 'uses: actions/checkout@v7' .github/workflows/ci.yml .github/workflows/release.yml | wc -l | tr -d ' ')" == "2" ]] \
+  || fail "workflows must use the Node 24 checkout action"
 grep -Fq 'contents: write' .github/workflows/release.yml || fail "release workflow must declare release permission"
 grep -Fq 'workflow_dispatch:' .github/workflows/ci.yml || fail "CI must support explicit cask validation"
 grep -Fq 'actions: write' .github/workflows/release.yml || fail "release workflow cannot dispatch cask CI"
