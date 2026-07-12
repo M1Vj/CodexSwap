@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Sign, notarize, and release
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and repository configuration
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          bash Scripts/test-repository-config.sh
+          bash Scripts/test-release-tools.sh
+          test "$RELEASE_TAG" = "v$(Scripts/version.sh VERSION)"
+
+      - name: Require release credentials
+        env:
+          DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ vars.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ vars.APPLE_API_ISSUER_ID }}
+          CODE_SIGN_IDENTITY: ${{ vars.CODE_SIGN_IDENTITY }}
+        run: |
+          test -n "$DEVELOPER_ID_CERTIFICATE_BASE64"
+          test -n "$APPLE_API_KEY_P8_BASE64"
+          test -n "$APPLE_API_KEY_ID"
+          test -n "$APPLE_API_ISSUER_ID"
+          test -n "$CODE_SIGN_IDENTITY"
+
+      - name: Install signing credentials
+        env:
+          DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          CODE_SIGN_IDENTITY: ${{ vars.CODE_SIGN_IDENTITY }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          KEYCHAIN_PATH="$RUNNER_TEMP/codexswap-signing.keychain-db"
+          printf '%s' "$DEVELOPER_ID_CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | /usr/bin/base64 -D > "$API_KEY_PATH"
+          chmod 600 "$CERTIFICATE_PATH" "$API_KEY_PATH"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -F "$CODE_SIGN_IDENTITY"
+
+      - name: Build signed universal app
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          CODE_SIGN_IDENTITY: ${{ vars.CODE_SIGN_IDENTITY }}
+        run: Scripts/build-universal.sh
+
+      - name: Package and notarize
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          APPLE_API_KEY_ID: ${{ vars.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ vars.APPLE_API_ISSUER_ID }}
+        run: |
+          Scripts/package-release.sh
+          Scripts/notarize-release.sh
+
+      - name: Verify public release artifact
+        env:
+          REQUIRE_NOTARIZATION: "1"
+          REQUIRE_GATEKEEPER: "1"
+        run: Scripts/verify-release.sh
+
+      - name: Render and verify Homebrew cask
+        run: |
+          Scripts/render-cask.sh
+          Scripts/verify-cask.sh Casks/codexswap.rb
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(Scripts/version.sh VERSION)"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/CodexSwap-v${VERSION}-macOS-universal.zip" \
+            "dist/CodexSwap-v${VERSION}-macOS-universal.zip.sha256" \
+            "Casks/codexswap.rb" \
+            --verify-tag \
+            --title "CodexSwap ${VERSION}" \
+            --generate-notes
+
+      - name: Open Homebrew cask update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="automation/cask-${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add Casks/codexswap.rb
+          git commit -m "chore: publish Homebrew cask for ${GITHUB_REF_NAME}"
+          git push origin "$BRANCH"
+          PR_URL="$(gh pr create --base main --head "$BRANCH" --title "chore: publish Homebrew cask for ${GITHUB_REF_NAME}" --body "Publishes the verified cask generated from the notarized ${GITHUB_REF_NAME} release artifact.")"
+          gh pr merge "$PR_URL" --squash --auto || echo "::warning::Enable auto-merge or merge the generated cask PR after CI passes."
+
+      - name: Remove release credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/codexswap-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/AuthKey.p8"
