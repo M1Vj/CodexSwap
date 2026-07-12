@@ -76,8 +76,10 @@ public enum CodexAuth {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
         let tmp = path.appendingPathExtension("tmp")
-        try data.write(to: tmp, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+        // Create with 0600 up front so the token file is never readable by others, even briefly.
+        guard FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
         _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
     }
