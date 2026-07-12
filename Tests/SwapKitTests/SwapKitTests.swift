@@ -232,6 +232,68 @@ final class WarmupProxyTests: XCTestCase {
     }
 }
 
+private actor FakeWarmupRunner: WarmupCommandRunning {
+    private var aliases: [String] = []
+    private let failing: Set<String>
+
+    init(failing: Set<String> = []) { self.failing = failing }
+
+    func run(alias: String, proxyURL: URL) async throws {
+        aliases.append(alias)
+        if failing.contains(alias) { throw WarmupCommandError.failed("Bearer secret-token") }
+    }
+
+    func calls() -> [String] { aliases }
+}
+
+final class QuotaWarmupServiceTests: XCTestCase {
+    private func account(_ alias: String, now: Date, needsLogin: Bool = false) -> Account {
+        Account(
+            alias: alias,
+            accountID: "id-\(alias)",
+            accessToken: "token",
+            needsLogin: needsLogin,
+            usage: [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))]
+        )
+    }
+
+    func testRunsEligibleAccountsSequentiallyAndDeduplicatesCurrentCycle() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-service-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner()
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accounts = [account("a", now: now), account("b", now: now, needsLogin: true)]
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let first = await service.run(accounts: accounts, proxyURL: proxy, now: now)
+        let second = await service.run(accounts: accounts, proxyURL: proxy, now: now.addingTimeInterval(60))
+        let calls = await runner.calls()
+
+        XCTAssertEqual(first.warmed, ["a"])
+        XCTAssertEqual(first.skipped["b"], "needs login")
+        XCTAssertEqual(second.skipped["a"], "already warmed for this cycle")
+        XCTAssertEqual(calls, ["a"])
+    }
+
+    func testRunsAgainAfterRecordedPrimaryResetAndRedactsFailures() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-reset-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner(failing: ["bad"])
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        let a = account("a", now: now)
+
+        _ = await service.run(accounts: [a], proxyURL: proxy, now: now)
+        let afterReset = await service.run(accounts: [a, account("bad", now: now)], proxyURL: proxy, now: now.addingTimeInterval(18_001))
+
+        XCTAssertEqual(afterReset.warmed, ["a"])
+        XCTAssertNotNil(afterReset.failed["bad"])
+        XCTAssertFalse(afterReset.failed["bad"]!.contains("secret-token"))
+    }
+}
+
 final class JWTTests: XCTestCase {
     private func makeToken(claims: [String: Any]) -> String {
         let header = Data("{}".utf8).base64EncodedString()
@@ -484,5 +546,17 @@ final class LauncherTests: XCTestCase {
         let url = URL(string: "http://127.0.0.1:5000")!
         let args = CodexLauncher.configArgs(proxyURL: url)
         XCTAssertTrue(args.contains("chatgpt_base_url=\"http://127.0.0.1:5000/backend-api\""))
+    }
+
+    func testWarmupArgsUseEphemeralReadOnlyTargetedProvider() {
+        let args = CodexLauncher.warmupArgs(proxyURL: URL(string: "http://127.0.0.1:58432")!, alias: "account-a")
+        let joined = args.joined(separator: " ")
+
+        XCTAssertEqual(args.first, "exec")
+        XCTAssertTrue(joined.contains("--ephemeral"))
+        XCTAssertTrue(joined.contains("read-only"))
+        XCTAssertTrue(joined.contains(ProxyRequestMode.warmupHeader))
+        XCTAssertTrue(joined.contains("account-a"))
+        XCTAssertTrue(joined.contains("CODEXSWAP_WARMUP_TOKEN"))
     }
 }
