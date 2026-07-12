@@ -30,7 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
 
         if hasBundle {
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                if !granted {
+                    FileHandle.standardError.write("[notify] notifications denied; menu-bar alerts will not be shown\n".data(using: .utf8)!)
+                }
+            }
         }
 
         Task { @MainActor in
@@ -46,8 +50,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Detached: a main-actor Task could never run while the semaphore blocks the main thread.
         let sem = DispatchSemaphore(value: 0)
-        Task { await engine.stop(); sem.signal() }
+        Task.detached { [engine] in
+            await engine.stop()
+            sem.signal()
+        }
         _ = sem.wait(timeout: .now() + 2)
     }
 
@@ -241,7 +249,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let script = "tell application \"Terminal\" to do script \"\(codex) login\""
-        runAppleScript(script)
+        guard runAppleScript(script) else {
+            presentMessage("Could not open Terminal for codex login. Allow CodexSwap to control Terminal in System Settings → Privacy & Security → Automation, then try again.")
+            return
+        }
         presentMessage("Complete the standalone login in Terminal, then select Rescan Accounts.")
     }
 
@@ -416,9 +427,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UNUserNotificationCenter.current().add(req)
     }
 
-    private func runAppleScript(_ source: String) {
+    private func runAppleScript(_ source: String) -> Bool {
+        guard let script = NSAppleScript(source: source) else { return false }
         var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
+        script.executeAndReturnError(&error)
+        return error == nil
     }
 
     static func shortTime(_ date: Date) -> String {
