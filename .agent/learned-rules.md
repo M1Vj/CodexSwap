@@ -29,3 +29,4 @@
 
 ## Token lifecycle (cont.)
 14. The proxy must never spend two refresh tokens for one alias concurrently: adopt a fresher store copy first, then join any in-flight refresh Task (`ProxyServer.inflightRefresh`). On `sessionInvalidated` for a CodexBar-managed account, re-hydrate from the managed home before marking needs-login — CodexBar may simply have won the rotation race. Never `burn.clear` on a 401 fall-through; that defeats the refresh-burn guard.
+15. Warm-up eligibility (proxy warm-up selection AND AppEngine's due-gate/run roster) must evaluate HYDRATED managed accounts, not the raw store copy — normal traffic hydrates CodexBar tokens per request, so warm-up judging the stale store copy silently starves automatic warm-up (skips write no ledger record and no notification) while manual clicks appear to "work" once sync clears the flags.
