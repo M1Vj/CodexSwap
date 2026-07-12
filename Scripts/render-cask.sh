@@ -10,7 +10,7 @@ EOF
 }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$($ROOT/Scripts/version.sh "$ROOT/VERSION")"
+VERSION="$("$ROOT/Scripts/version.sh" "$ROOT/VERSION")"
 CHECKSUM_FILE="$ROOT/dist/CodexSwap-v${VERSION}-macOS-universal.zip.sha256"
 OUTPUT="$ROOT/Casks/codexswap.rb"
 

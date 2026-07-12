@@ -7,11 +7,6 @@ func loadSettings() -> Settings {
     return s
 }
 
-func saveSettings(_ s: Settings) {
-    try? FileManager.default.createDirectory(at: AppPaths.supportDir(), withIntermediateDirectories: true)
-    if let data = try? JSONEncoder().encode(s) { try? data.write(to: AppPaths.settingsFile()) }
-}
-
 func fmtReset(_ d: Date?) -> String {
     guard let d else { return "-" }
     let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
@@ -74,12 +69,13 @@ case "usage":
 
 case "priority":
     guard args.count >= 3, let p = Int(args[2]) else { print("usage: swapd priority <alias> <int>"); break }
+    guard await store.account(args[1]) != nil else { print("no such account: \(args[1])"); exit(1) }
     await store.setPriority(args[1], priority: p)
     print("set \(args[1]) priority=\(p)")
 
 case "switch":
     guard args.count >= 2 else { print("usage: swapd switch <alias>"); break }
-    if let a = await store.setActive(args[1]) { print("active: \(a.alias)") } else { print("no such account") }
+    if let a = await store.setActive(args[1]) { print("active: \(a.alias)") } else { print("no such account: \(args[1])"); exit(1) }
 
 case "shim":
     print(RuntimeHandoff.shimScript())
@@ -118,7 +114,16 @@ case "run":
     await proxy.stop()
     exit(status)
 
+case "help", "--help", "-h":
+    printHelp()
+
 default:
+    FileHandle.standardError.write("unknown command: \(command)\n".data(using: .utf8)!)
+    printHelp()
+    exit(1)
+}
+
+func printHelp() {
     print("""
     swapd — CodexSwap headless proxy + account tool
       import           auto-detect and import codex accounts
@@ -126,7 +131,9 @@ default:
       usage            poll wham/usage for each account
       priority <a> <n> set account priority (higher consumed first)
       switch <a>       set active account
+      shim             print the codexswap shim script
       proxy            run the proxy only (prints URL + codex args)
       run [args...]    start proxy and launch codex through it
+      help             show this help
     """)
 }

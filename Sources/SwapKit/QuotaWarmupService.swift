@@ -55,11 +55,8 @@ public actor QuotaWarmupService {
 
             do {
                 try await runner.run(alias: account.alias, proxyURL: proxyURL)
-                let observedPrimary = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 })?.resetAt
-                let primary = observedPrimary.flatMap { $0 > now ? $0 : nil } ?? now.addingTimeInterval(18_000)
-                let observedSecondary = account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt
-                let secondary = observedSecondary.flatMap { $0 > now ? $0 : nil }
-                await ledger.setRecord(WarmupRecord(succeededAt: now, primaryResetAt: primary, secondaryResetAt: secondary), for: key)
+                let secondary = weeklyReset(account, after: now)
+                await ledger.setRecord(WarmupRecord(succeededAt: now, primaryResetAt: nextWarmDue(account, now: now), secondaryResetAt: secondary), for: key)
                 summary.warmed.append(account.alias)
             } catch {
                 await ledger.setRecord(
@@ -94,16 +91,28 @@ public actor QuotaWarmupService {
     public func updateObservedUsage(for accounts: [Account], now: Date = Date()) async {
         for account in accounts {
             guard var record = await ledger.record(for: account.id) else { continue }
-            if let primary = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 })?.resetAt,
-               primary > now {
-                record.primaryResetAt = primary
+            if !account.usage.isEmpty {
+                record.primaryResetAt = nextWarmDue(account, now: now)
             }
-            if let secondary = account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt,
-               secondary > now {
+            if let secondary = weeklyReset(account, after: now) {
                 record.secondaryResetAt = secondary
             }
             await ledger.setRecord(record, for: account.id)
         }
+    }
+
+    /// When the next warm-up can start a fresh quota cycle. Normally the short (5h) window's
+    /// reset; while that limit is suspended (only a weekly window reported) it is the weekly
+    /// reset — a 5h cadence would then only burn weekly quota with nothing to restart.
+    private func nextWarmDue(_ account: Account, now: Date) -> Date {
+        let short = account.usage.first { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
+        if let reset = short?.resetAt, reset > now { return reset }
+        if short == nil, let weekly = weeklyReset(account, after: now) { return weekly }
+        return now.addingTimeInterval(18_000)
+    }
+
+    private func weeklyReset(_ account: Account, after now: Date) -> Date? {
+        account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt.flatMap { $0 > now ? $0 : nil }
     }
 
     private func skipReason(_ account: Account, now: Date) -> String? {
