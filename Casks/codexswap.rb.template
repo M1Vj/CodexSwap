@@ -7,7 +7,7 @@ cask "codexswap" do
   desc "Switch and monitor local Codex accounts from the menu bar"
   homepage "https://github.com/M1Vj/CodexSwap"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "CodexSwap.app"
 
