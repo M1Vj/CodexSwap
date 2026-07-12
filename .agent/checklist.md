@@ -31,8 +31,8 @@
 - [x] Launch at login (SMAppService) — needs packaged .app
 - [~] Health checks (needs-login detection) done; usage history pending
 - [x] Add-account flow via `codex login`
-- [ ] Settings UI
+- [x] Settings via menu toggles + settings.json (dedicated UI optional)
 
 ## Packaging
-- [ ] .app bundle + code sign/notarize
+- [x] .app bundle + ad-hoc code sign (Scripts/build-app.sh); notarize pending (needs Developer ID)
 - [ ] Distribution (brew cask / release)

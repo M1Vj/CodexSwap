@@ -85,13 +85,11 @@ case "shim":
     print(RuntimeHandoff.shimScript())
 
 case "proxy":
-    var cfg = ProxyServer.Config()
     let proxy = ProxyServer(store: store, settingsProvider: settingsProvider, verbose: verboseEnabled)
     try await proxy.start()
     guard let url = await proxy.proxyURL() else { print("failed to bind"); exit(1) }
     print("proxy listening at \(url)")
     print("codex args:", CodexLauncher.configArgs(proxyURL: url).joined(separator: " "))
-    _ = cfg
     try await Task.sleep(nanoseconds: .max)
 
 case "run":
