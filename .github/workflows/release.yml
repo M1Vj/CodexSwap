@@ -22,9 +22,10 @@ jobs:
 
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate tag and repository configuration
         env:
@@ -87,6 +88,11 @@ jobs:
           Scripts/package-release.sh
           Scripts/notarize-release.sh
 
+      - name: Remove signing credentials after notarization
+        run: |
+          security delete-keychain "$RUNNER_TEMP/codexswap-signing.keychain-db"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/AuthKey.p8"
+
       - name: Verify public release artifact
         env:
           REQUIRE_NOTARIZATION: "1"
@@ -97,6 +103,15 @@ jobs:
         run: |
           Scripts/render-cask.sh
           Scripts/verify-cask.sh Casks/codexswap.rb
+          TEMP_TAP="codexswap/release-check"
+          cleanup_tap() { brew untap "$TEMP_TAP" >/dev/null 2>&1 || true; }
+          trap cleanup_tap EXIT
+          cleanup_tap
+          brew tap-new "$TEMP_TAP"
+          TAP_PATH="$(brew --repo "$TEMP_TAP")"
+          mkdir -p "$TAP_PATH/Casks"
+          cp Casks/codexswap.rb "$TAP_PATH/Casks/codexswap.rb"
+          HOMEBREW_STYLE=1 Scripts/verify-cask.sh "$TAP_PATH/Casks/codexswap.rb"
 
       - name: Publish GitHub release
         env:
@@ -118,6 +133,7 @@ jobs:
           BRANCH="automation/cask-${GITHUB_REF_NAME}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
           git switch -c "$BRANCH"
           git add Casks/codexswap.rb
           git commit -m "chore: publish Homebrew cask for ${GITHUB_REF_NAME}"
@@ -134,7 +150,7 @@ jobs:
           gh run watch "$RUN_ID" --exit-status
           gh pr merge "$PR_URL" --squash --delete-branch
 
-      - name: Remove release credentials
+      - name: Ensure release credentials are removed
         if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/codexswap-signing.keychain-db" 2>/dev/null || true

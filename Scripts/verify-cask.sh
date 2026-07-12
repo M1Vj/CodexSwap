@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -euo pipefail
 
 usage() {
@@ -19,7 +21,7 @@ CASK="${1:-$ROOT/Casks/codexswap.rb}"
 ruby -c "$CASK" >/dev/null
 grep -Eq 'sha256 "[0-9a-f]{64}"' "$CASK" || { echo "cask has no valid SHA-256" >&2; exit 1; }
 grep -Fq 'app "CodexSwap.app"' "$CASK" || { echo "cask does not install CodexSwap.app" >&2; exit 1; }
-grep -Fq 'depends_on macos: ">= :sonoma"' "$CASK" || { echo "cask has the wrong macOS requirement" >&2; exit 1; }
+grep -Fq 'depends_on macos: :sonoma' "$CASK" || { echo "cask has the wrong macOS requirement" >&2; exit 1; }
 if grep -Eq '@@(VERSION|SHA256)@@' "$CASK"; then
   echo "cask contains unresolved template placeholders" >&2
   exit 1

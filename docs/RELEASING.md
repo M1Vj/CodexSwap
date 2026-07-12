@@ -59,7 +59,9 @@ The tag workflow:
 7. Publishes the ZIP, checksum, and rendered cask as GitHub release assets.
 8. Opens a cask-update PR containing the exact notarized artifact checksum, dispatches CI for it, and merges it only after that run passes.
 
-Any failed validation stops publication. The workflow does not fall back to ad-hoc signing, skip notarization, or use an unchecked Homebrew checksum.
+Any failed validation through the public-artifact verification step stops the GitHub release from being published. The workflow does not fall back to ad-hoc signing, skip notarization, or use an unchecked Homebrew checksum.
+
+The GitHub release is created before the generated cask PR is tested and merged. If that later cask step fails, the signed release remains valid and downloadable but Homebrew installation is not yet available. Do not delete or recreate the release. Retrieve its `codexswap.rb` release asset, open a cask-only PR against `main`, let CI pass, and merge that PR to complete Homebrew publication.
 
 ## Homebrew cask completion
 
