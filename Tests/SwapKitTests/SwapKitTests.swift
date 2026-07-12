@@ -54,7 +54,7 @@ final class CodexConfigManagerTests: XCTestCase {
         let enabled = try String(contentsOf: f.config, encoding: .utf8)
         XCTAssertTrue(enabled.contains("# BEGIN CODEXSWAP MANAGED ROUTING"))
         XCTAssertTrue(enabled.contains("base_url = \"http://127.0.0.1:58432/backend-api/codex\""))
-        XCTAssertTrue(enabled.contains("model_providers.codexswap = {"))
+        XCTAssertTrue(enabled.contains("[model_providers.codexswap]"))
         XCTAssertLessThan(enabled.range(of: "# BEGIN CODEXSWAP")!.lowerBound, enabled.range(of: "model = \"gpt-5.6\"")!.lowerBound)
         XCTAssertFalse(enabled.contains("https://example.invalid"))
         let manifestMode = try FileManager.default.attributesOfItem(atPath: f.support.appendingPathComponent("routing-restore.json").path)[.posixPermissions] as! NSNumber
@@ -141,6 +141,41 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
         try manager.disable()
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testExistingModelProvidersTableRemainsValidAndIsRestored() throws {
+        let f = try fixture()
+        let original = """
+        [model_providers]
+        custom = { name = "Custom", base_url = "https://example.invalid" }
+        """
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        let enabled = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertTrue(enabled.contains("[model_providers.codexswap]"))
+        XCTAssertFalse(enabled.contains("model_providers.codexswap ="))
+        XCTAssertTrue(enabled.contains("[model_providers]"))
+        XCTAssertTrue(enabled.contains("custom = {"))
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testExactManagedBlockWithoutRestoreManifestNeedsRepair() throws {
+        let f = try fixture()
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        try manager.enable(proxyURL: proxy)
+        try FileManager.default.removeItem(at: f.support.appendingPathComponent("routing-restore.json"))
+
+        guard case .needsRepair(let detail) = try manager.state(proxyURL: proxy) else {
+            return XCTFail("Expected missing manifest to need repair")
+        }
+        XCTAssertTrue(detail.contains("manifest"))
+        XCTAssertThrowsError(try manager.disable())
     }
 }
 
@@ -287,6 +322,23 @@ private actor FakeWarmupRunner: WarmupCommandRunning {
     func calls() -> [String] { aliases }
 }
 
+private actor BlockingWarmupRunner: WarmupCommandRunning {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var started = false
+
+    func run(alias: String, proxyURL: URL) async throws {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func hasStarted() -> Bool { started }
+
+    func finish() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private actor FakeUsageFetcher: UsageFetching {
     private var accountIDs: [String] = []
 
@@ -351,6 +403,33 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertFalse(afterReset.failed["bad"]!.contains("secret-token"))
         XCTAssertEqual(immediateRepeat.skipped["a"], "already warmed for this cycle")
     }
+
+    func testFailedAutomaticWarmupBacksOffBeforeRetrying() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-backoff-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner(failing: ["bad"])
+        let service = QuotaWarmupService(runner: runner, ledger: ledger, failureRetrySeconds: 300)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        let accounts = [account("bad", now: now)]
+
+        _ = await service.run(accounts: accounts, proxyURL: proxy, now: now)
+
+        let dueBeforeBackoff = await service.hasDueAccount(in: accounts, now: now.addingTimeInterval(299))
+        let dueAfterBackoff = await service.hasDueAccount(in: accounts, now: now.addingTimeInterval(300))
+        XCTAssertFalse(dueBeforeBackoff)
+        XCTAssertTrue(dueAfterBackoff)
+    }
+
+    func testFastWarmupProcessCannotMissTermination() async throws {
+        let runner = ProcessWarmupRunner(binary: "/usr/bin/true", timeoutSeconds: 1)
+        let clock = ContinuousClock()
+        let elapsed = try await clock.measure {
+            try await runner.run(alias: "fast", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        }
+
+        XCTAssertLessThan(elapsed, .milliseconds(500))
+    }
 }
 
 final class WarmupEngineTests: XCTestCase {
@@ -405,6 +484,32 @@ final class WarmupEngineTests: XCTestCase {
 
         XCTAssertTrue(enabled.automaticallyWarmAccounts)
         XCTAssertFalse(disabled.automaticallyWarmAccounts)
+    }
+
+    func testOverlappingWarmupDoesNotClearActiveProgress() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-overlap-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        let runner = BlockingWarmupRunner()
+        let warmup = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        )
+        let engine = AppEngine(store: store, warmupService: warmup)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let first = Task { await engine.warmAllAccountsNow(proxyURL: proxy) }
+        while !(await runner.hasStarted()) { await Task.yield() }
+
+        let overlapping = await engine.warmAllAccountsNow(proxyURL: proxy)
+        let duringOverlap = await engine.snapshot()
+        XCTAssertEqual(overlapping.skipped["all"], "warm-up already running")
+        XCTAssertTrue(duringOverlap.warmupInProgress)
+
+        await runner.finish()
+        _ = await first.value
+        let afterCompletion = await engine.snapshot()
+        XCTAssertFalse(afterCompletion.warmupInProgress)
     }
 }
 
