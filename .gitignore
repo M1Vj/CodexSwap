@@ -1,0 +1,7 @@
+.build/
+*.xcodeproj
+.DS_Store
+*.swiftpm
+Store/
+*.log
+.netrc
