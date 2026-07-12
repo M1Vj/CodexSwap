@@ -61,6 +61,7 @@ public actor ProxyServer {
     private var servedCount = 0
     private var lastActivityAt: Date?
     private var lastActivityAlias: String?
+    private var lastTurnAt: Date?
 
     public struct Activity: Sendable {
         public let servedCount: Int
@@ -185,6 +186,17 @@ public actor ProxyServer {
     ) async throws {
         let settings = await settingsProvider()
         let (rawPath, query) = splitPathQuery(head.uri)
+
+        // Round-robin load balancing: at each new turn (a model call after an idle gap), advance to the
+        // next account so usage spreads across all of them. Codex is stateless (store=false, no
+        // previous_response_id), so switching between turns never breaks the conversation.
+        if settings.rotationStrategy == .roundRobin, head.method == .POST, rawPath.hasSuffix("/responses") {
+            let now = Date()
+            if let last = lastTurnAt, now.timeIntervalSince(last) > TimeInterval(settings.roundRobinTurnGapSeconds) {
+                await store.advanceRoundRobin(now: now)
+            }
+            lastTurnAt = now
+        }
 
         guard var account = await store.current() else {
             log("\(head.method.rawValue) \(rawPath) -> no eligible account")

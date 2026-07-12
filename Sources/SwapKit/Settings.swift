@@ -10,6 +10,9 @@ public struct Settings: Codable, Sendable, Equatable {
     public var usagePollSeconds: Int
     /// Fallback cooldown when a 429 gives no reset timestamp.
     public var defaultCooldownSeconds: Int
+    /// Round-robin: a model call arriving more than this many seconds after the previous one starts a
+    /// new turn and rotates to the next account. Keeps a single turn (and its tool loop) on one account.
+    public var roundRobinTurnGapSeconds: Int
     public var notifyOnRotate: Bool
     public var notifyOnExhausted: Bool
     public var notifyOnWindowReset: Bool
@@ -21,6 +24,7 @@ public struct Settings: Codable, Sendable, Equatable {
         secondaryThresholdPercent: 98,
         usagePollSeconds: 60,
         defaultCooldownSeconds: 18000,
+        roundRobinTurnGapSeconds: 6,
         notifyOnRotate: true,
         notifyOnExhausted: true,
         notifyOnWindowReset: true,
@@ -33,6 +37,7 @@ public struct Settings: Codable, Sendable, Equatable {
         secondaryThresholdPercent: Int,
         usagePollSeconds: Int,
         defaultCooldownSeconds: Int,
+        roundRobinTurnGapSeconds: Int,
         notifyOnRotate: Bool,
         notifyOnExhausted: Bool,
         notifyOnWindowReset: Bool,
@@ -43,10 +48,27 @@ public struct Settings: Codable, Sendable, Equatable {
         self.secondaryThresholdPercent = secondaryThresholdPercent
         self.usagePollSeconds = usagePollSeconds
         self.defaultCooldownSeconds = defaultCooldownSeconds
+        self.roundRobinTurnGapSeconds = roundRobinTurnGapSeconds
         self.notifyOnRotate = notifyOnRotate
         self.notifyOnExhausted = notifyOnExhausted
         self.notifyOnWindowReset = notifyOnWindowReset
         self.launchAtLogin = launchAtLogin
+    }
+
+    /// Tolerant decoder: missing keys fall back to defaults so new fields never invalidate an old file.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Settings.default
+        rotationStrategy = try c.decodeIfPresent(RotationStrategy.self, forKey: .rotationStrategy) ?? d.rotationStrategy
+        primaryThresholdPercent = try c.decodeIfPresent(Int.self, forKey: .primaryThresholdPercent) ?? d.primaryThresholdPercent
+        secondaryThresholdPercent = try c.decodeIfPresent(Int.self, forKey: .secondaryThresholdPercent) ?? d.secondaryThresholdPercent
+        usagePollSeconds = try c.decodeIfPresent(Int.self, forKey: .usagePollSeconds) ?? d.usagePollSeconds
+        defaultCooldownSeconds = try c.decodeIfPresent(Int.self, forKey: .defaultCooldownSeconds) ?? d.defaultCooldownSeconds
+        roundRobinTurnGapSeconds = try c.decodeIfPresent(Int.self, forKey: .roundRobinTurnGapSeconds) ?? d.roundRobinTurnGapSeconds
+        notifyOnRotate = try c.decodeIfPresent(Bool.self, forKey: .notifyOnRotate) ?? d.notifyOnRotate
+        notifyOnExhausted = try c.decodeIfPresent(Bool.self, forKey: .notifyOnExhausted) ?? d.notifyOnExhausted
+        notifyOnWindowReset = try c.decodeIfPresent(Bool.self, forKey: .notifyOnWindowReset) ?? d.notifyOnWindowReset
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
     }
 }
 

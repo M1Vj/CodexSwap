@@ -164,6 +164,32 @@ final class RotationTests: XCTestCase {
         let active = await store.activeAlias()
         XCTAssertEqual(active, "a")
     }
+
+    func testAdvanceRoundRobinCyclesAllAccounts() async {
+        let store = await tempStore([acct("a"), acct("b"), acct("c")], strategy: .roundRobin)
+        var visited: [String] = []
+        let first = await store.current()
+        visited.append(first!.alias)
+        for _ in 0..<5 {
+            let next = await store.advanceRoundRobin()
+            visited.append(next!.alias)
+        }
+        XCTAssertEqual(Set(visited), ["a", "b", "c"])
+        for i in 1..<visited.count { XCTAssertNotEqual(visited[i], visited[i - 1]) }
+    }
+
+    func testAdvanceRoundRobinSkipsCooledDown() async {
+        let store = await tempStore([
+            acct("a"),
+            acct("b", cooldown: Date().addingTimeInterval(3600)),
+            acct("c"),
+        ], strategy: .roundRobin)
+        _ = await store.current()
+        var seen = Set<String>()
+        for _ in 0..<4 { if let n = await store.advanceRoundRobin() { seen.insert(n.alias) } }
+        XCTAssertFalse(seen.contains("b"))
+        XCTAssertTrue(seen.isSubset(of: ["a", "c"]))
+    }
 }
 
 final class CodexBarTests: XCTestCase {
