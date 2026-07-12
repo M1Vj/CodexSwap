@@ -76,6 +76,9 @@ case "switch":
     guard args.count >= 2 else { print("usage: swapd switch <alias>"); break }
     if let a = await store.setActive(args[1]) { print("active: \(a.alias)") } else { print("no such account") }
 
+case "shim":
+    print(RuntimeHandoff.shimScript())
+
 case "proxy":
     var cfg = ProxyServer.Config()
     let proxy = ProxyServer(store: store, settingsProvider: settingsProvider, verbose: verboseEnabled)

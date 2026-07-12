@@ -16,21 +16,21 @@
 - [x] Unit tests (19, passing): JWT, usage parse, limit detection, rotation, launcher
 - [x] Live spike: real `codex exec` streamed through proxy with injected non-active account
 - [ ] Live spike: mid-session hot-swap on 429 rotation
-- [ ] Live spike: interactive TUI session
+- [x] Live spike via app proxy + codexswap shim (exec turn)
 
 ## swapd CLI
 - [x] import / list / usage / priority / switch / proxy / run
 
 ## Menu-bar app (CodexSwapApp)
-- [ ] Accessory-policy menu bar item (control panel, no usage-gauge duplication of CodexBar)
-- [ ] Account list with priority, active marker, per-window usage, cooldown timers
-- [ ] Manual switch / pin
-- [ ] Background proxy lifecycle + usage poller
-- [ ] Proactive threshold pre-switch
-- [ ] Native notifications (rotate / exhausted / window-reset), toggleable
-- [ ] Launch at login (SMAppService)
-- [ ] Health checks (needs-login detection) + usage history
-- [ ] Add-account flow via `codex login`
+- [x] Accessory-policy menu bar item (control panel, no usage-gauge duplication of CodexBar)
+- [x] Account list with priority, active marker, per-window usage, cooldown timers
+- [x] Manual switch
+- [x] Background proxy lifecycle + usage poller
+- [x] Proactive threshold pre-switch
+- [x] Native notifications (rotate / exhausted / window-reset), toggleable
+- [x] Launch at login (SMAppService) — needs packaged .app
+- [~] Health checks (needs-login detection) done; usage history pending
+- [x] Add-account flow via `codex login`
 - [ ] Settings UI
 
 ## Packaging
