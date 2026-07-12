@@ -1,5 +1,13 @@
 import Foundation
 
+public enum AppEngineError: LocalizedError, Sendable {
+    case proxyNotRunning
+
+    public var errorDescription: String? {
+        "CodexSwap proxy is not running on its configured port. Routing was not changed."
+    }
+}
+
 public enum AppEvent: Sendable {
     case rotated(from: String, to: String, limit: String, resetAt: Date?)
     case exhausted(limit: String)
@@ -158,10 +166,18 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
-    public func setAutomaticRouting(_ enabled: Bool) async throws {
+    public func setAutomaticRouting(_ enabled: Bool, proxyURL override: URL? = nil) async throws {
         let settings = await settingsStore.get()
-        let url = stableProxyURL(port: settings.proxyPort)
         if enabled {
+            let runningURL: URL?
+            if let override {
+                runningURL = override
+            } else {
+                runningURL = await proxy?.proxyURL()
+            }
+            guard let url = runningURL, url.host == "127.0.0.1", url.port == settings.proxyPort else {
+                throw AppEngineError.proxyNotRunning
+            }
             try configManager.enable(proxyURL: url)
         } else {
             try configManager.disable()
@@ -170,9 +186,18 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
-    public func repairAutomaticRouting() async throws {
+    public func repairAutomaticRouting(proxyURL override: URL? = nil) async throws {
         let settings = await settingsStore.get()
-        try configManager.repair(proxyURL: stableProxyURL(port: settings.proxyPort))
+        let runningURL: URL?
+        if let override {
+            runningURL = override
+        } else {
+            runningURL = await proxy?.proxyURL()
+        }
+        guard let url = runningURL, url.host == "127.0.0.1", url.port == settings.proxyPort else {
+            throw AppEngineError.proxyNotRunning
+        }
+        try configManager.repair(proxyURL: url)
         _ = await settingsStore.update { $0.routeCodexAutomatically = true }
         emit(.snapshotChanged)
     }
@@ -203,7 +228,10 @@ public actor AppEngine {
         emit(.snapshotChanged)
         let summary = await warmupService.run(accounts: await store.all(), proxyURL: proxyURL, force: force)
         if !summary.warmed.isEmpty {
-            await pollUsage(activeOnly: false, aliases: Set(summary.warmed))
+            let aliases = Set(summary.warmed)
+            await pollUsage(activeOnly: false, aliases: aliases)
+            let refreshed = await store.all().filter { aliases.contains($0.alias) }
+            await warmupService.updateObservedUsage(for: refreshed)
         }
         warmupInProgress = false
         emit(.snapshotChanged)

@@ -49,9 +49,10 @@ public actor QuotaWarmupService {
 
             do {
                 try await runner.run(alias: account.alias, proxyURL: proxyURL)
-                let primary = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 })?.resetAt
-                    ?? now.addingTimeInterval(18_000)
-                let secondary = account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt
+                let observedPrimary = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 })?.resetAt
+                let primary = observedPrimary.flatMap { $0 > now ? $0 : nil } ?? now.addingTimeInterval(18_000)
+                let observedSecondary = account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt
+                let secondary = observedSecondary.flatMap { $0 > now ? $0 : nil }
                 await ledger.setRecord(WarmupRecord(succeededAt: now, primaryResetAt: primary, secondaryResetAt: secondary), for: key)
                 summary.warmed.append(account.alias)
             } catch {
@@ -73,6 +74,21 @@ public actor QuotaWarmupService {
             if record.isDue(at: now) { return true }
         }
         return false
+    }
+
+    public func updateObservedUsage(for accounts: [Account], now: Date = Date()) async {
+        for account in accounts {
+            guard var record = await ledger.record(for: account.id) else { continue }
+            if let primary = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 })?.resetAt,
+               primary > now {
+                record.primaryResetAt = primary
+            }
+            if let secondary = account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt,
+               secondary > now {
+                record.secondaryResetAt = secondary
+            }
+            await ledger.setRecord(record, for: account.id)
+        }
     }
 
     private func skipReason(_ account: Account, now: Date) -> String? {

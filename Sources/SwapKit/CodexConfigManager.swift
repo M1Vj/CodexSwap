@@ -64,7 +64,7 @@ public struct CodexConfigManager: Sendable {
         let original = originalExisted ? try String(contentsOf: configURL, encoding: .utf8) : ""
         let stripped = try stripOwnedValues(from: original)
         let block = managedBlock(proxyURL: proxyURL)
-        let enabled = append(block: block, to: stripped.content)
+        let enabled = insert(block: block, before: stripped.content)
 
         try fileManager.createDirectory(at: supportDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         if originalExisted {
@@ -72,6 +72,7 @@ public struct CodexConfigManager: Sendable {
             try fileManager.createDirectory(at: backupDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let backup = backupDir.appendingPathComponent("config-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString).toml")
             try Data(original.utf8).write(to: backup, options: .atomic)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
         }
 
         let manifest = RestoreManifest(
@@ -84,6 +85,7 @@ public struct CodexConfigManager: Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: manifestURL.path)
         try atomicWrite(enabled)
     }
 
@@ -151,6 +153,7 @@ public struct CodexConfigManager: Sendable {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: manifestURL.path)
             try atomicWrite(content)
         }
     }
@@ -163,19 +166,14 @@ public struct CodexConfigManager: Sendable {
         \(Self.beginMarker)
         chatgpt_base_url = "\(root)/backend-api"
         model_provider = "codexswap"
-
-        [model_providers.codexswap]
-        name = "CodexSwap"
-        base_url = "\(root)/backend-api/codex"
-        wire_api = "responses"
-        requires_openai_auth = true
+        model_providers.codexswap = { name = "CodexSwap", base_url = "\(root)/backend-api/codex", wire_api = "responses", requires_openai_auth = true }
         \(Self.endMarker)
         """
     }
 
-    private func append(block: String, to content: String) -> String {
+    private func insert(block: String, before content: String) -> String {
         let base = content.trimmingCharacters(in: .newlines)
-        return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
+        return base.isEmpty ? block + "\n" : block + "\n\n" + base + "\n"
     }
 
     private func managedRange(in content: String) -> Range<String.Index>? {
@@ -188,12 +186,10 @@ public struct CodexConfigManager: Sendable {
     }
 
     private func stripOwnedValues(from content: String) throws -> (content: String, displaced: String) {
-        let ambiguous = content.split(separator: "\n", omittingEmptySubsequences: false).contains { rawLine in
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            return isAssignment(line, key: "model_providers.codexswap")
-                || (isAssignment(line, key: "model_providers") && line.contains("{"))
-        }
-        if ambiguous {
+        if content.split(separator: "\n", omittingEmptySubsequences: false).contains(where: {
+            let line = $0.trimmingCharacters(in: .whitespaces)
+            return isAssignment(line, key: "model_providers") && line.contains("{")
+        }) {
             throw CodexConfigManagerError.ambiguousConfig("inline codexswap provider declaration")
         }
 
@@ -216,7 +212,12 @@ public struct CodexConfigManager: Sendable {
                 continue
             }
 
-            if currentTable == nil && (isAssignment(trimmed, key: "chatgpt_base_url") || isAssignment(trimmed, key: "model_provider")) {
+            if currentTable == nil && isAssignment(trimmed, key: "model_providers.codexswap") {
+                guard trimmed.contains("{"), trimmed.contains("}") else {
+                    throw CodexConfigManagerError.ambiguousConfig("multi-line codexswap provider declaration")
+                }
+                displaced.append(line)
+            } else if currentTable == nil && (isAssignment(trimmed, key: "chatgpt_base_url") || isAssignment(trimmed, key: "model_provider")) {
                 displaced.append(line)
             } else {
                 kept.append(line)
