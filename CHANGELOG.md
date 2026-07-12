@@ -4,15 +4,12 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ## [Unreleased]
 
-### Added
-
-- Production release, notarization, Homebrew, and repository-governance infrastructure.
-
 ## [0.2.0] - Unreleased
 
 ### Added
 
 - Native four-pane Settings window.
+- Production release, notarization, Homebrew, and repository-governance infrastructure.
 - Menu-controlled automatic Codex routing and reversible config management.
 - CodexBar-first account onboarding with a standalone fallback.
 - Automatic and manual account quota warm-up.
