@@ -607,6 +607,37 @@ final class AccountOwnershipTests: XCTestCase {
     }
 }
 
+final class SettingsPresentationTests: XCTestCase {
+    func testAccountRowsExposeOwnershipActiveStateAndUsage() {
+        let managed = Account(
+            alias: "managed",
+            email: "managed@example.com",
+            accountID: "managed",
+            accessToken: "token",
+            priority: 10,
+            usage: [UsageWindow(label: "5h", usedPercent: 23, windowSeconds: 18_000, resetAt: nil)],
+            managedHomePath: "/tmp/codexbar-home"
+        )
+        let standalone = Account(alias: "standalone", accountID: "standalone", accessToken: "token", needsLogin: true)
+        let snapshot = EngineSnapshot(
+            accounts: [standalone, managed],
+            activeAlias: "managed",
+            proxyURL: URL(string: "http://127.0.0.1:58432"),
+            strategy: .priority,
+            routingState: .enabled
+        )
+
+        let presentation = SettingsPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(presentation.proxyAddress, "127.0.0.1:58432")
+        XCTAssertEqual(presentation.accounts.map(\.alias), ["managed", "standalone"])
+        XCTAssertEqual(presentation.accounts[0].ownership, .codexBarManaged)
+        XCTAssertTrue(presentation.accounts[0].isActive)
+        XCTAssertEqual(presentation.accounts[0].usageSummary, "5h 23%")
+        XCTAssertTrue(presentation.accounts[1].needsLogin)
+    }
+}
+
 final class ShimManagerTests: XCTestCase {
     func testInstallAndUninstallOwnShim() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
