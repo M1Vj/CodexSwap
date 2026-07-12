@@ -21,7 +21,7 @@ Configure these GitHub Actions variables:
 
 The certificate and API key are decoded only into permission-restricted files on the ephemeral macOS runner. The certificate is imported into a temporary keychain and all files and the keychain are removed in an `always()` cleanup step. The workflow intentionally uses a passwordless `.p12` stored as an encrypted GitHub secret so no certificate passphrase is exposed through a process argument.
 
-Allow GitHub Actions to create pull requests so the release workflow can open the checksum-pinned Homebrew cask update. Enabling repository auto-merge lets that cask PR merge automatically after CI; otherwise merge it after its checks pass.
+Allow GitHub Actions to create and merge pull requests so the release workflow can publish the checksum-pinned Homebrew cask update. The workflow explicitly dispatches CI for the generated cask commit, waits for that exact run to pass, and then merges the cask PR.
 
 ## Prepare a release
 
@@ -57,7 +57,7 @@ The tag workflow:
 5. Creates the ZIP, submits it to Apple's notary service, staples the ticket, and rebuilds the ZIP.
 6. Verifies the checksum, bundle ID, version, architectures, code signature, stapled ticket, and Gatekeeper assessment.
 7. Publishes the ZIP, checksum, and rendered cask as GitHub release assets.
-8. Opens a cask-update PR containing the exact notarized artifact checksum.
+8. Opens a cask-update PR containing the exact notarized artifact checksum, dispatches CI for it, and merges it only after that run passes.
 
 Any failed validation stops publication. The workflow does not fall back to ad-hoc signing, skip notarization, or use an unchecked Homebrew checksum.
 

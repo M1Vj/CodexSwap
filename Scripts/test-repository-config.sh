@@ -20,10 +20,14 @@ ruby -e 'require "yaml"; ARGV.each { |path| YAML.parse_file(path) }' \
 grep -Fq 'permissions:' .github/workflows/ci.yml || fail "CI must declare least-privilege permissions"
 grep -Fq 'contents: read' .github/workflows/ci.yml || fail "CI must only read repository contents"
 grep -Fq 'contents: write' .github/workflows/release.yml || fail "release workflow must declare release permission"
+grep -Fq 'workflow_dispatch:' .github/workflows/ci.yml || fail "CI must support explicit cask validation"
+grep -Fq 'actions: write' .github/workflows/release.yml || fail "release workflow cannot dispatch cask CI"
 grep -Fq 'DEVELOPER_ID_CERTIFICATE_BASE64' .github/workflows/release.yml || fail "release workflow has no Developer ID certificate input"
 grep -Fq 'APPLE_API_KEY_P8_BASE64' .github/workflows/release.yml || fail "release workflow has no notarization API key input"
 grep -A2 -F 'REQUIRE_NOTARIZATION:' .github/workflows/release.yml | grep -Fq '"1"' || fail "release verification is not fail-closed"
 grep -A2 -F 'REQUIRE_GATEKEEPER:' .github/workflows/release.yml | grep -Fq '"1"' || fail "Gatekeeper verification is not fail-closed"
+grep -Fq 'gh workflow run ci.yml' .github/workflows/release.yml || fail "generated cask does not receive an explicit CI run"
+grep -Fq 'gh run watch "$RUN_ID" --exit-status' .github/workflows/release.yml || fail "cask publication does not wait for CI"
 if grep -Fq 'APPLE_APP_PASSWORD' .github/workflows/release.yml; then
   fail "release workflow must use a key file, not an Apple password in process arguments"
 fi
