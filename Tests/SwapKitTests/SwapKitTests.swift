@@ -512,6 +512,52 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(immediateRepeat.skipped["a"], "already warmed for this cycle")
     }
 
+    func testWeeklyOnlyUsageSchedulesNextWarmAtWeeklyReset() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-weekly-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner()
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = now.addingTimeInterval(518_400)
+        let account = Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: "token",
+            usage: [UsageWindow(label: "Weekly", usedPercent: 3, windowSeconds: 604_800, resetAt: weeklyReset)]
+        )
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let first = await service.run(accounts: [account], proxyURL: proxy, now: now)
+        // With no short window to restart, a 5h cadence would only burn weekly quota.
+        let afterFiveHours = await service.run(accounts: [account], proxyURL: proxy, now: now.addingTimeInterval(18_001))
+        let dueBeforeWeeklyReset = await service.hasDueAccount(in: [account], now: now.addingTimeInterval(18_001))
+        let atWeeklyReset = await service.run(accounts: [account], proxyURL: proxy, now: weeklyReset)
+
+        XCTAssertEqual(first.warmed, ["a"])
+        XCTAssertEqual(afterFiveHours.skipped["a"], "already warmed for this cycle")
+        XCTAssertFalse(dueBeforeWeeklyReset)
+        XCTAssertEqual(atWeeklyReset.warmed, ["a"])
+    }
+
+    func testUpdateObservedUsageAdoptsWeeklyResetWhenShortWindowAbsent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-observe-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = now.addingTimeInterval(518_400)
+        let bare = Account(alias: "a", accountID: "id-a", accessToken: "token")
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [bare], proxyURL: proxy, now: now)
+        var observed = bare
+        observed.usage = [UsageWindow(label: "Weekly", usedPercent: 3, windowSeconds: 604_800, resetAt: weeklyReset)]
+        await service.updateObservedUsage(for: [observed], now: now.addingTimeInterval(5))
+
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.primaryResetAt, weeklyReset)
+        XCTAssertEqual(record?.secondaryResetAt, weeklyReset)
+    }
+
     func testFailedAutomaticWarmupBacksOffBeforeRetrying() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-backoff-\(UUID().uuidString)")
         let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
@@ -715,6 +761,22 @@ final class UsageParseTests: XCTestCase {
 
     func testParseEmpty() {
         XCTAssertTrue(UsageClient.parse(Data("{}".utf8)).isEmpty)
+    }
+
+    func testParseWeeklyOnlyPrimarySlotWithNullSecondary() {
+        // Shape observed while the 5h limit is suspended: the weekly window moves into the
+        // primary slot and secondary_window is null.
+        let json = """
+        {"rate_limit":{"allowed":true,"limit_reached":false,
+        "primary_window":{"used_percent":3,"limit_window_seconds":604800,"reset_after_seconds":599100,"reset_at":1784495815},
+        "secondary_window":null}}
+        """
+        let windows = UsageClient.parse(Data(json.utf8))
+        XCTAssertEqual(windows.count, 1)
+        XCTAssertEqual(windows[0].label, "Weekly")
+        XCTAssertEqual(windows[0].windowSeconds, 604_800)
+        XCTAssertEqual(windows[0].usedPercent, 3)
+        XCTAssertEqual(windows[0].resetAt, Date(timeIntervalSince1970: 1_784_495_815))
     }
 
     func testWindowLabels() {
