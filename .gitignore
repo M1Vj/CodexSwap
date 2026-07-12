@@ -6,3 +6,4 @@ Store/
 *.log
 .netrc
 dist/
+.omc/
