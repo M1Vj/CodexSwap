@@ -33,6 +33,6 @@ Never attach these files to an issue or discussion:
 - Files below `~/.codex/accounts/`
 - CodexBar managed-home `auth.json` files
 - `~/Library/Application Support/CodexSwap/accounts.json`
-- Signing certificates, Apple app-specific passwords, or GitHub tokens
+- Signing certificates, App Store Connect private keys, or GitHub tokens
 
 Sanitize logs before sharing them. CodexSwap's normal logs should not contain raw credentials, but request headers and verbose third-party output can still be sensitive.
