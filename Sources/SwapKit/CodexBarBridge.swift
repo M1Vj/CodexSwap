@@ -14,8 +14,17 @@ public enum CodexBarBridge {
             .appendingPathComponent("Library/Application Support/CodexBar", isDirectory: true)
     }
 
+    public static func accountsFile() -> URL {
+        supportDir().appendingPathComponent("managed-codex-accounts.json")
+    }
+
     public static func isPresent() -> Bool {
-        FileManager.default.fileExists(atPath: supportDir().appendingPathComponent("managed-codex-accounts.json").path)
+        FileManager.default.fileExists(atPath: accountsFile().path)
+    }
+
+    /// accountIDs currently in CodexBar's roster (used to drop accounts removed from CodexBar).
+    public static func rosterAccountIDs() -> Set<String> {
+        Set(managedAccounts().map { $0.accountID }.filter { !$0.isEmpty })
     }
 
     public static func managedAccounts() -> [ManagedAccount] {
