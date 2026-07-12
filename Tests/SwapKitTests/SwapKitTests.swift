@@ -12,6 +12,14 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(settings.proxyPort, Settings.defaultProxyPort)
         XCTAssertEqual(settings.proxyPort, 58_432)
     }
+
+    func testInvalidPersistedProxyPortFallsBackToSafeDefault() throws {
+        let zero = try JSONDecoder().decode(Settings.self, from: Data(#"{"proxyPort":0}"#.utf8))
+        let tooHigh = try JSONDecoder().decode(Settings.self, from: Data(#"{"proxyPort":70000}"#.utf8))
+
+        XCTAssertEqual(zero.proxyPort, Settings.defaultProxyPort)
+        XCTAssertEqual(tooHigh.proxyPort, Settings.defaultProxyPort)
+    }
 }
 
 final class CodexConfigManagerTests: XCTestCase {
@@ -46,7 +54,14 @@ final class CodexConfigManagerTests: XCTestCase {
         let enabled = try String(contentsOf: f.config, encoding: .utf8)
         XCTAssertTrue(enabled.contains("# BEGIN CODEXSWAP MANAGED ROUTING"))
         XCTAssertTrue(enabled.contains("base_url = \"http://127.0.0.1:58432/backend-api/codex\""))
+        XCTAssertTrue(enabled.contains("model_providers.codexswap = {"))
+        XCTAssertLessThan(enabled.range(of: "# BEGIN CODEXSWAP")!.lowerBound, enabled.range(of: "model = \"gpt-5.6\"")!.lowerBound)
         XCTAssertFalse(enabled.contains("https://example.invalid"))
+        let manifestMode = try FileManager.default.attributesOfItem(atPath: f.support.appendingPathComponent("routing-restore.json").path)[.posixPermissions] as! NSNumber
+        let backup = try FileManager.default.contentsOfDirectory(at: f.support.appendingPathComponent("config-backups"), includingPropertiesForKeys: nil).first!
+        let backupMode = try FileManager.default.attributesOfItem(atPath: backup.path)[.posixPermissions] as! NSNumber
+        XCTAssertEqual(manifestMode.intValue, 0o600)
+        XCTAssertEqual(backupMode.intValue, 0o600)
 
         try manager.disable()
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
@@ -115,13 +130,16 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
     }
 
-    func testAmbiguousInlineProviderConfigIsRejectedWithoutMutation() throws {
+    func testExistingSingleLineProviderConfigIsDisplacedAndRestored() throws {
         let f = try fixture()
         let original = "model_providers.codexswap = { name = \"custom\" }\n"
         try original.write(to: f.config, atomically: true, encoding: .utf8)
         let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
 
-        XCTAssertThrowsError(try manager.enable(proxyURL: URL(string: "http://127.0.0.1:58432")!))
+        try manager.enable(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        try manager.disable()
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
     }
 }
@@ -147,7 +165,7 @@ final class RoutingEngineTests: XCTestCase {
         let original = "model = \"gpt-5.6\"\n"
         try original.write(to: f.config, atomically: true, encoding: .utf8)
 
-        try await f.engine.setAutomaticRouting(true)
+        try await f.engine.setAutomaticRouting(true, proxyURL: URL(string: "http://127.0.0.1:58432")!)
         let enabledSettings = await f.settings.get()
         let enabledSnapshot = await f.engine.snapshot()
         XCTAssertTrue(enabledSettings.routeCodexAutomatically)
@@ -163,7 +181,7 @@ final class RoutingEngineTests: XCTestCase {
 
     func testExternalManagedBlockEditReportsRepairState() async throws {
         let f = try fixture()
-        try await f.engine.setAutomaticRouting(true)
+        try await f.engine.setAutomaticRouting(true, proxyURL: URL(string: "http://127.0.0.1:58432")!)
         var text = try String(contentsOf: f.config, encoding: .utf8)
         text = text.replacingOccurrences(of: "model_provider = \"codexswap\"", with: "model_provider = \"other\"")
         try text.write(to: f.config, atomically: true, encoding: .utf8)
@@ -173,9 +191,23 @@ final class RoutingEngineTests: XCTestCase {
             return XCTFail("Expected needsRepair")
         }
 
-        try await f.engine.repairAutomaticRouting()
+        try await f.engine.repairAutomaticRouting(proxyURL: URL(string: "http://127.0.0.1:58432")!)
         let repaired = await f.engine.snapshot()
         XCTAssertEqual(repaired.routingState, .enabled)
+    }
+
+    func testEnableRoutingWithoutRunningProxyDoesNotChangeConfig() async throws {
+        let f = try fixture()
+
+        do {
+            try await f.engine.setAutomaticRouting(true)
+            XCTFail("Expected routing enable to fail without a running proxy")
+        } catch {
+            // Expected.
+        }
+        let settings = await f.settings.get()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.config.path))
+        XCTAssertFalse(settings.routeCodexAutomatically)
     }
 }
 
@@ -215,6 +247,15 @@ final class WarmupProxyTests: XCTestCase {
         XCTAssertEqual(sanitized.first(name: "ChatGPT-Account-Id"), "id-b")
     }
 
+    func testWarmupSelectorIsOnlyHonoredForLoopbackResponsePosts() {
+        var headers = HTTPHeaders()
+        headers.add(name: ProxyRequestMode.warmupHeader, value: "b")
+
+        XCTAssertEqual(proxyRequestMode(headers: headers, method: .POST, path: "/backend-api/codex/responses", loopbackOnly: true), .warmup(alias: "b"))
+        XCTAssertEqual(proxyRequestMode(headers: headers, method: .GET, path: "/backend-api/wham/usage", loopbackOnly: true), .normal)
+        XCTAssertEqual(proxyRequestMode(headers: headers, method: .POST, path: "/backend-api/codex/responses", loopbackOnly: false), .normal)
+    }
+
     func testMarkLimitedDoesNotRotateActiveAccount() async {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-limit-\(UUID().uuidString).json")
         let store = AccountStore(url: url)
@@ -251,7 +292,10 @@ private actor FakeUsageFetcher: UsageFetching {
 
     func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
         accountIDs.append(accountID)
-        return [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        return [
+            UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000)),
+            UsageWindow(label: "Weekly", usedPercent: 1, windowSeconds: 604_800, resetAt: Date().addingTimeInterval(604_800)),
+        ]
     }
 
     func calls() -> [String] { accountIDs }
@@ -300,10 +344,12 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         _ = await service.run(accounts: [a], proxyURL: proxy, now: now)
         let afterReset = await service.run(accounts: [a, account("bad", now: now)], proxyURL: proxy, now: now.addingTimeInterval(18_001))
+        let immediateRepeat = await service.run(accounts: [a], proxyURL: proxy, now: now.addingTimeInterval(18_002))
 
         XCTAssertEqual(afterReset.warmed, ["a"])
         XCTAssertNotNil(afterReset.failed["bad"])
         XCTAssertFalse(afterReset.failed["bad"]!.contains("secret-token"))
+        XCTAssertEqual(immediateRepeat.skipped["a"], "already warmed for this cycle")
     }
 }
 
@@ -324,7 +370,8 @@ final class WarmupEngineTests: XCTestCase {
         let settings = SettingsStore(url: root.appendingPathComponent("settings.json"))
         let runner = FakeWarmupRunner()
         let usage = FakeUsageFetcher()
-        let warmup = QuotaWarmupService(runner: runner, ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")))
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let warmup = QuotaWarmupService(runner: runner, ledger: ledger)
         let engine = AppEngine(
             store: store,
             settingsStore: settings,
@@ -337,11 +384,13 @@ final class WarmupEngineTests: XCTestCase {
         let summary = await engine.warmAllAccountsNow(proxyURL: proxy)
         let usageCalls = await usage.calls()
         let snapshot = await engine.snapshot()
+        let record = await ledger.record(for: "id-a")
 
         XCTAssertEqual(summary.warmed, ["a"])
         XCTAssertEqual(usageCalls, ["id-a"])
         XCTAssertEqual(snapshot.warmupSummary?.warmed, ["a"])
         XCTAssertFalse(snapshot.warmupInProgress)
+        XCTAssertNotNil(record?.secondaryResetAt)
     }
 
     func testAutomaticWarmupPreferencePersistsIndependently() async {
@@ -623,5 +672,16 @@ final class LauncherTests: XCTestCase {
         XCTAssertTrue(joined.contains(ProxyRequestMode.warmupHeader))
         XCTAssertTrue(joined.contains("account-a"))
         XCTAssertTrue(joined.contains("CODEXSWAP_WARMUP_TOKEN"))
+    }
+
+    func testWarmupArgsEscapeAliasBeforeEmbeddingInToml() {
+        let args = CodexLauncher.warmupArgs(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            alias: "account\"\nmodel_provider=\"evil"
+        )
+        let provider = args.first(where: { $0.contains("model_providers.codexswap-warmup") })!
+
+        XCTAssertFalse(provider.contains("\n"))
+        XCTAssertTrue(provider.contains("account\\\"\\nmodel_provider=\\\"evil"))
     }
 }

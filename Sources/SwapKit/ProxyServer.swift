@@ -24,6 +24,11 @@ enum ProxyRequestMode: Equatable, Sendable {
     }
 }
 
+func proxyRequestMode(headers: HTTPHeaders, method: HTTPMethod, path: String, loopbackOnly: Bool) -> ProxyRequestMode {
+    guard loopbackOnly, method == .POST, path.hasSuffix("/responses") else { return .normal }
+    return ProxyRequestMode(headers: headers)
+}
+
 func selectProxyAccount(store: AccountStore, mode: ProxyRequestMode, now: Date = Date()) async -> Account? {
     switch mode {
     case .normal:
@@ -232,7 +237,7 @@ public actor ProxyServer {
         let settings = await settingsProvider()
         let (rawPath, query) = splitPathQuery(head.uri)
         let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
-        let mode = loopbackOnly ? ProxyRequestMode(headers: head.headers) : .normal
+        let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
 
         // Round-robin load balancing: at each new turn (a model call after an idle gap), advance to the
         // next account so usage spreads across all of them. Codex is stateless (store=false, no

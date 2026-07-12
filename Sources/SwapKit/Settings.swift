@@ -85,7 +85,8 @@ public struct Settings: Codable, Sendable, Equatable {
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         routeCodexAutomatically = try c.decodeIfPresent(Bool.self, forKey: .routeCodexAutomatically) ?? d.routeCodexAutomatically
         automaticallyWarmAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyWarmAccounts) ?? d.automaticallyWarmAccounts
-        proxyPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
+        let decodedPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
+        proxyPort = (1...65_535).contains(decodedPort) ? decodedPort : d.proxyPort
     }
 }
 
