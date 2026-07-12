@@ -6,6 +6,7 @@ on:
       - "v*"
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -119,7 +120,16 @@ jobs:
           git commit -m "chore: publish Homebrew cask for ${GITHUB_REF_NAME}"
           git push origin "$BRANCH"
           PR_URL="$(gh pr create --base main --head "$BRANCH" --title "chore: publish Homebrew cask for ${GITHUB_REF_NAME}" --body "Publishes the verified cask generated from the notarized ${GITHUB_REF_NAME} release artifact.")"
-          gh pr merge "$PR_URL" --squash --auto || echo "::warning::Enable auto-merge or merge the generated cask PR after CI passes."
+          gh workflow run ci.yml --ref "$BRANCH"
+          RUN_ID=""
+          for attempt in {1..30}; do
+            RUN_ID="$(gh run list --workflow ci.yml --branch "$BRANCH" --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            [[ -n "$RUN_ID" ]] && break
+            sleep 2
+          done
+          test -n "$RUN_ID"
+          gh run watch "$RUN_ID" --exit-status
+          gh pr merge "$PR_URL" --squash --delete-branch
 
       - name: Remove release credentials
         if: always()
