@@ -597,6 +597,60 @@ final class RotationTests: XCTestCase {
     }
 }
 
+final class AccountOwnershipTests: XCTestCase {
+    func testManagedHomeDeterminesCodexBarOwnership() {
+        let managed = Account(alias: "managed", accountID: "managed", accessToken: "token", managedHomePath: "/tmp/codexbar-home")
+        let standalone = Account(alias: "standalone", accountID: "standalone", accessToken: "token")
+
+        XCTAssertEqual(AccountOwnership.classify(account: managed), .codexBarManaged)
+        XCTAssertEqual(AccountOwnership.classify(account: standalone), .standalone)
+    }
+}
+
+final class ShimManagerTests: XCTestCase {
+    func testInstallAndUninstallOwnShim() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        let manager = ShimManager(url: url)
+
+        XCTAssertFalse(manager.isInstalled())
+        try manager.install()
+        XCTAssertTrue(manager.isInstalled())
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), RuntimeHandoff.shimScript())
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o755)
+
+        try manager.uninstall()
+        XCTAssertFalse(manager.isInstalled())
+    }
+
+    func testUninstallDoesNotRemoveParentDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        let manager = ShimManager(url: url)
+        try manager.install()
+        let sibling = url.deletingLastPathComponent().appendingPathComponent("other-tool")
+        try "keep".write(to: sibling, atomically: true, encoding: .utf8)
+
+        try manager.uninstall()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sibling.path))
+    }
+
+    func testUninstallRefusesForeignFileAtShimPath() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("codexswap-shim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("bin/codexswap")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\necho foreign\n".write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try ShimManager(url: url).uninstall())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+}
+
 final class CodexBarTests: XCTestCase {
     func testManagedAccountsParse() throws {
         let json = """
