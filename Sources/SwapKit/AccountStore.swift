@@ -37,8 +37,7 @@ public actor AccountStore {
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let tmp = url.appendingPathExtension("tmp")
-        guard (try? raw.write(to: tmp, options: .atomic)) != nil else { return }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+        guard FileManager.default.createFile(atPath: tmp.path, contents: raw, attributes: [.posixPermissions: 0o600]) else { return }
         _ = try? FileManager.default.replaceItemAt(url, withItemAt: tmp)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }

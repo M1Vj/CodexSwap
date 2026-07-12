@@ -164,6 +164,79 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
     }
 
+    func testUserTopLevelKeysAreNeverReparentedUnderManagedTables() throws {
+        let f = try fixture()
+        let original = """
+        model = "gpt-5.6"
+        approval_policy = "on-request"
+
+        [mcp_servers.example]
+        command = "example"
+        """
+        try original.write(to: f.config, atomically: true, encoding: .utf8)
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        try manager.enable(proxyURL: proxy)
+        let enabled = try String(contentsOf: f.config, encoding: .utf8)
+
+        // The prepended routing region must contain no table header, or every user top-level
+        // key that follows it would be reparented into that table.
+        let begin = enabled.range(of: "# BEGIN CODEXSWAP MANAGED ROUTING")!
+        let end = enabled.range(of: "# END CODEXSWAP MANAGED ROUTING")!
+        let routingRegion = enabled[begin.lowerBound..<end.upperBound]
+        XCTAssertFalse(routingRegion.contains("["))
+
+        // The provider table must come after all user content so it cannot capture user keys.
+        let providerIdx = enabled.range(of: "[model_providers.codexswap]")!.lowerBound
+        XCTAssertLessThan(enabled.range(of: "model = \"gpt-5.6\"")!.lowerBound, providerIdx)
+        XCTAssertLessThan(enabled.range(of: "[mcp_servers.example]")!.lowerBound, providerIdx)
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), original)
+    }
+
+    func testLegacySingleBlockLayoutIsMigratedByRepair() throws {
+        let f = try fixture()
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        let legacyBlock = """
+        # BEGIN CODEXSWAP MANAGED ROUTING
+        chatgpt_base_url = "http://127.0.0.1:58432/backend-api"
+        model_provider = "codexswap"
+
+        [model_providers.codexswap]
+        name = "CodexSwap"
+        base_url = "http://127.0.0.1:58432/backend-api/codex"
+        wire_api = "responses"
+        requires_openai_auth = true
+        # END CODEXSWAP MANAGED ROUTING
+        """
+        let legacyEnabled = legacyBlock + "\n\nmodel = \"gpt-5.6\"\n"
+        try legacyEnabled.write(to: f.config, atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: f.support, withIntermediateDirectories: true)
+        let legacyManifest: [String: Any] = [
+            "originalExisted": true,
+            "originalContent": "model = \"gpt-5.6\"\n",
+            "displacedContent": "",
+            "enabledContent": legacyEnabled,
+            "managedBlock": legacyBlock,
+        ]
+        let manifestData = try JSONSerialization.data(withJSONObject: legacyManifest)
+        try manifestData.write(to: f.support.appendingPathComponent("routing-restore.json"))
+        let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
+
+        guard case .needsRepair = try manager.state(proxyURL: proxy) else {
+            return XCTFail("Expected legacy layout to need repair")
+        }
+        try manager.repair(proxyURL: proxy)
+        XCTAssertEqual(try manager.state(proxyURL: proxy), .enabled)
+        let repaired = try String(contentsOf: f.config, encoding: .utf8)
+        XCTAssertLessThan(repaired.range(of: "model = \"gpt-5.6\"")!.lowerBound, repaired.range(of: "[model_providers.codexswap]")!.lowerBound)
+
+        try manager.disable()
+        XCTAssertEqual(try String(contentsOf: f.config, encoding: .utf8), "model = \"gpt-5.6\"\n")
+    }
+
     func testExactManagedBlockWithoutRestoreManifestNeedsRepair() throws {
         let f = try fixture()
         let manager = CodexConfigManager(codexHome: f.home, supportDir: f.support)
@@ -291,6 +364,41 @@ final class WarmupProxyTests: XCTestCase {
         XCTAssertEqual(proxyRequestMode(headers: headers, method: .POST, path: "/backend-api/codex/responses", loopbackOnly: false), .normal)
     }
 
+    private func jwt(expiringIn seconds: TimeInterval) -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: ["exp": Int(Date().addingTimeInterval(seconds).timeIntervalSince1970)])
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(payload).sig"
+    }
+
+    func testWarmupSelectionHydratesManagedTokensBeforeEligibility() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-hydrate-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let fresh = jwt(expiringIn: 3600)
+        try CodexAuth.write(
+            CodexTokens(idToken: "", accessToken: fresh, refreshToken: "r2", accountId: "acc-m"),
+            to: home.appendingPathComponent("auth.json")
+        )
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "m",
+            accountID: "acc-m",
+            accessToken: jwt(expiringIn: -3600),
+            refreshToken: "r1",
+            needsLogin: true,
+            managedHomePath: home.path
+        ))
+
+        let selected = await selectProxyAccount(store: store, mode: .warmup(alias: "m"))
+
+        XCTAssertEqual(selected?.alias, "m")
+        XCTAssertEqual(selected?.accessToken, fresh)
+        XCTAssertEqual(selected?.needsLogin, false)
+    }
+
     func testMarkLimitedDoesNotRotateActiveAccount() async {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-limit-\(UUID().uuidString).json")
         let store = AccountStore(url: url)
@@ -404,6 +512,52 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(immediateRepeat.skipped["a"], "already warmed for this cycle")
     }
 
+    func testWeeklyOnlyUsageSchedulesNextWarmAtWeeklyReset() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-weekly-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner()
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = now.addingTimeInterval(518_400)
+        let account = Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: "token",
+            usage: [UsageWindow(label: "Weekly", usedPercent: 3, windowSeconds: 604_800, resetAt: weeklyReset)]
+        )
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let first = await service.run(accounts: [account], proxyURL: proxy, now: now)
+        // With no short window to restart, a 5h cadence would only burn weekly quota.
+        let afterFiveHours = await service.run(accounts: [account], proxyURL: proxy, now: now.addingTimeInterval(18_001))
+        let dueBeforeWeeklyReset = await service.hasDueAccount(in: [account], now: now.addingTimeInterval(18_001))
+        let atWeeklyReset = await service.run(accounts: [account], proxyURL: proxy, now: weeklyReset)
+
+        XCTAssertEqual(first.warmed, ["a"])
+        XCTAssertEqual(afterFiveHours.skipped["a"], "already warmed for this cycle")
+        XCTAssertFalse(dueBeforeWeeklyReset)
+        XCTAssertEqual(atWeeklyReset.warmed, ["a"])
+    }
+
+    func testUpdateObservedUsageAdoptsWeeklyResetWhenShortWindowAbsent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-observe-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = now.addingTimeInterval(518_400)
+        let bare = Account(alias: "a", accountID: "id-a", accessToken: "token")
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [bare], proxyURL: proxy, now: now)
+        var observed = bare
+        observed.usage = [UsageWindow(label: "Weekly", usedPercent: 3, windowSeconds: 604_800, resetAt: weeklyReset)]
+        await service.updateObservedUsage(for: [observed], now: now.addingTimeInterval(5))
+
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.primaryResetAt, weeklyReset)
+        XCTAssertEqual(record?.secondaryResetAt, weeklyReset)
+    }
+
     func testFailedAutomaticWarmupBacksOffBeforeRetrying() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-backoff-\(UUID().uuidString)")
         let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
@@ -470,6 +624,42 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(snapshot.warmupSummary?.warmed, ["a"])
         XCTAssertFalse(snapshot.warmupInProgress)
         XCTAssertNotNil(record?.secondaryResetAt)
+    }
+
+    func testWarmupHydratesManagedAccountsBeforeEligibility() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-managed-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        try CodexAuth.write(
+            CodexTokens(idToken: "", accessToken: freshToken(), refreshToken: "r2", accountId: "id-a"),
+            to: home.appendingPathComponent("auth.json")
+        )
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let stalePayload = try! JSONSerialization.data(withJSONObject: ["exp": Int(Date().addingTimeInterval(-3600).timeIntervalSince1970)])
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: "e30.\(stalePayload).sig",
+            refreshToken: "r1",
+            needsLogin: true,
+            managedHomePath: home.path
+        ))
+        let engine = AppEngine(
+            store: store,
+            settingsStore: SettingsStore(url: root.appendingPathComponent("settings.json")),
+            usage: FakeUsageFetcher(),
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(runner: FakeWarmupRunner(), ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")))
+        )
+
+        let summary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
+
+        XCTAssertEqual(summary.warmed, ["a"])
+        XCTAssertNil(summary.skipped["a"])
     }
 
     func testAutomaticWarmupPreferencePersistsIndependently() async {
@@ -571,6 +761,22 @@ final class UsageParseTests: XCTestCase {
 
     func testParseEmpty() {
         XCTAssertTrue(UsageClient.parse(Data("{}".utf8)).isEmpty)
+    }
+
+    func testParseWeeklyOnlyPrimarySlotWithNullSecondary() {
+        // Shape observed while the 5h limit is suspended: the weekly window moves into the
+        // primary slot and secondary_window is null.
+        let json = """
+        {"rate_limit":{"allowed":true,"limit_reached":false,
+        "primary_window":{"used_percent":3,"limit_window_seconds":604800,"reset_after_seconds":599100,"reset_at":1784495815},
+        "secondary_window":null}}
+        """
+        let windows = UsageClient.parse(Data(json.utf8))
+        XCTAssertEqual(windows.count, 1)
+        XCTAssertEqual(windows[0].label, "Weekly")
+        XCTAssertEqual(windows[0].windowSeconds, 604_800)
+        XCTAssertEqual(windows[0].usedPercent, 3)
+        XCTAssertEqual(windows[0].resetAt, Date(timeIntervalSince1970: 1_784_495_815))
     }
 
     func testWindowLabels() {

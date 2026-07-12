@@ -23,3 +23,11 @@
 ## Build
 9. Swift 6 strict concurrency: no shared non-Sendable statics (formatters, JSONEncoder/Decoder) — use computed factories.
 10. Don't block the Swift concurrency executor with `Process.waitUntilExit()` while a NIO proxy Task must serve — await via `terminationHandler` + continuation.
+
+## Codex config.toml managed routing
+13. The managed routing config must be TWO regions: root-level keys (`chatgpt_base_url`, `model_provider`) prepended BEFORE all user content, and the `[model_providers.codexswap]` table appended at EOF. A single prepended block ending in a table header reparents the user's top-level keys into that table (TOML comments do not close tables). The dotted inline form (`model_providers.codexswap = {…}`) is also unsafe in config.toml: TOML forbids a later `[model_providers]` header once that table was defined via dotted key. Legacy single-block layouts surface as `needsRepair` and are migrated by `repair()`.
+
+## Token lifecycle (cont.)
+14. The proxy must never spend two refresh tokens for one alias concurrently: adopt a fresher store copy first, then join any in-flight refresh Task (`ProxyServer.inflightRefresh`). On `sessionInvalidated` for a CodexBar-managed account, re-hydrate from the managed home before marking needs-login — CodexBar may simply have won the rotation race. Never `burn.clear` on a 401 fall-through; that defeats the refresh-burn guard.
+15. Warm-up eligibility (proxy warm-up selection AND AppEngine's due-gate/run roster) must evaluate HYDRATED managed accounts, not the raw store copy — normal traffic hydrates CodexBar tokens per request, so warm-up judging the stale store copy silently starves automatic warm-up (skips write no ledger record and no notification) while manual clicks appear to "work" once sync clears the flags.
+16. While the 5h limit is suspended, wham/usage moves the WEEKLY window into the `primary_window` slot and sets `secondary_window: null`. Never key logic on slot names — key on `limit_window_seconds`. Warm-up scheduling: when no short (<604800s) window is reported, the next warm is due at the WEEKLY reset, not on a 5h fallback cadence (which would burn weekly quota with nothing to restart).
