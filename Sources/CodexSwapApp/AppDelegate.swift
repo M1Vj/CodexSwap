@@ -96,6 +96,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let empty = NSMenuItem(title: "No accounts — Import accounts below", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
+        } else if latest.strategy == .priority && latest.accounts.count > 1 {
+            let hint = NSMenuItem(title: "Accounts (higher priority used first ↓)", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
         }
 
         for acc in latest.accounts.sorted(by: { $0.priority > $1.priority }) {
@@ -123,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func label(for acc: Account) -> String {
-        var parts = ["[p\(acc.priority)] \(acc.alias)"]
+        var parts = ["priority \(acc.priority) · \(acc.alias)"]
         let u = acc.usage.map { "\($0.label) \($0.usedPercent)%" }.joined(separator: " · ")
         if !u.isEmpty { parts.append(u) }
         if let cd = acc.cooldownUntil(now: Date()) { parts.append("limited→\(Self.shortTime(cd))") }
@@ -137,10 +141,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sw.target = self; sw.representedObject = acc.alias
         sub.addItem(sw)
         sub.addItem(.separator())
-        let pHeader = NSMenuItem(title: "Priority", action: nil, keyEquivalent: ""); pHeader.isEnabled = false
+        let pHeader = NSMenuItem(title: "Set priority (higher = used first)", action: nil, keyEquivalent: ""); pHeader.isEnabled = false
         sub.addItem(pHeader)
-        for p in [0, 1, 2, 5, 10] {
-            let pi = NSMenuItem(title: "  \(p)", action: #selector(setPriority(_:)), keyEquivalent: "")
+        let levels: [(Int, String)] = [(10, "10 — highest"), (5, "5 — high"), (2, "2"), (1, "1"), (0, "0 — lowest")]
+        for (p, title) in levels {
+            let pi = NSMenuItem(title: "  \(title)", action: #selector(setPriority(_:)), keyEquivalent: "")
             pi.target = self
             pi.representedObject = PriorityChange(alias: acc.alias, priority: p)
             pi.state = acc.priority == p ? .on : .off
