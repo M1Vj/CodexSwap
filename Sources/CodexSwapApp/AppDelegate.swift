@@ -266,8 +266,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func presentMessage(_ message: String) {
-        settingsViewModel?.showMessage(message)
-        if settingsWindowController?.window?.isVisible != true {
+        if settingsWindowController?.window?.isVisible == true {
+            settingsViewModel?.showMessage(message)
+        } else {
             notify(title: "CodexSwap", body: message)
         }
     }
@@ -434,7 +435,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusIcon() {
         guard let button = statusItem.button else { return }
-        let working = latest.isRunning && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
+        let routingEnabled = latest.routingState == .enabled
+        let working = routingEnabled && latest.isRunning && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
         let name = latest.isRunning ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle"
         button.image = NSImage(systemSymbolName: name, accessibilityDescription: "CodexSwap")
         button.image?.isTemplate = !working

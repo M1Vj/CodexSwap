@@ -29,6 +29,9 @@ public struct ShimManager: Sendable {
     }
 
     public func install() throws {
+        if FileManager.default.fileExists(atPath: url.path), !isInstalled() {
+            throw ShimManagerError.foreignFile(url)
+        }
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: directory,
