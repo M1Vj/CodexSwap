@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate repository configuration
+        run: bash Scripts/test-repository-config.sh
+
+      - name: Validate release tooling
+        run: bash Scripts/test-release-tools.sh
+
+      - name: Run unit tests
+        run: swift test
+
+      - name: Build release products
+        run: swift build -c release
+
+      - name: Assemble local app bundle
+        run: Scripts/build-app.sh
