@@ -143,6 +143,25 @@ public actor AccountStore {
 
     // MARK: - Mutations
 
+    /// For CodexBar-managed accounts, adopt CodexBar's token if it's fresher than ours (CodexBar owns refresh).
+    public func hydrateFromManagedHome(_ alias: String) -> Account? {
+        guard let i = index(alias), let home = data.accounts[i].managedHomePath,
+              let tokens = CodexBarBridge.readTokens(home: home) else { return account(alias) }
+        let ours = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast
+        let theirs = JWT.expiry(tokens.accessToken) ?? .distantPast
+        if theirs > ours {
+            data.accounts[i].idToken = tokens.idToken
+            data.accounts[i].accessToken = tokens.accessToken
+            data.accounts[i].refreshToken = tokens.refreshToken
+            if !tokens.accountId.isEmpty { data.accounts[i].accountID = tokens.accountId }
+            data.accounts[i].needsLogin = false
+            persist()
+        }
+        return data.accounts[i]
+    }
+
+    public func managedHome(_ alias: String) -> String? { account(alias)?.managedHomePath }
+
     public func updateTokens(_ alias: String, tokens: CodexTokens, clearNeedsLogin: Bool = true) {
         guard let i = index(alias) else { return }
         data.accounts[i].idToken = tokens.idToken
@@ -181,6 +200,7 @@ public actor AccountStore {
             merged.alias = data.accounts[i].alias
             merged.disabledUntil = data.accounts[i].disabledUntil
             merged.lastUsedAt = data.accounts[i].lastUsedAt
+            merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
             // Keep whichever token bundle expires later so a stale on-disk copy never
             // clobbers a fresher one, independent of import order.
             let existingExp = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast

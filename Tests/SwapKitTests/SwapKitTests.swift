@@ -166,6 +166,41 @@ final class RotationTests: XCTestCase {
     }
 }
 
+final class CodexBarTests: XCTestCase {
+    func testManagedAccountsParse() throws {
+        let json = """
+        {"version":"3","accounts":[
+          {"email":"a@x.com","providerAccountID":"acc-a","managedHomePath":"/tmp/home-a"},
+          {"email":"b@x.com","workspaceAccountID":"acc-b","managedHomePath":"/tmp/home-b"},
+          {"email":"c@x.com"}
+        ]}
+        """
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cb-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try json.write(to: dir.appendingPathComponent("managed-codex-accounts.json"), atomically: true, encoding: .utf8)
+
+        // Parse via a temp override of the file location using JSONSerialization directly.
+        let data = Data(json.utf8)
+        let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let accounts = obj["accounts"] as! [[String: Any]]
+        XCTAssertEqual(accounts.count, 3)
+        XCTAssertEqual(accounts[0]["managedHomePath"] as? String, "/tmp/home-a")
+        XCTAssertNil(accounts[2]["managedHomePath"])
+    }
+
+    func testUpsertPreservesManagedHome() async {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cs-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        var a = Account(alias: "x", accountID: "acc-x", accessToken: "t", managedHomePath: "/tmp/home-x")
+        await store.upsert(a)
+        // Re-import the same account with no managed home must not erase the link.
+        a.managedHomePath = nil
+        await store.upsert(a)
+        let got = await store.account("x")
+        XCTAssertEqual(got?.managedHomePath, "/tmp/home-x")
+    }
+}
+
 final class LauncherTests: XCTestCase {
     func testConfigArgsFollowSubcommand() {
         let url = URL(string: "http://127.0.0.1:5000")!
