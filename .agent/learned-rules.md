@@ -11,6 +11,9 @@
 6. Refresh tokens are single-use/rotating. Only ONE tool may own refresh for an account, or the loser gets "refresh token already used". CodexSwap is the sole owner; codex-auth was removed from this machine.
 7. On import, when merging a duplicate account, keep the token bundle with the later JWT expiry so a stale on-disk copy never clobbers a fresher live one.
 
+## CodexBar coexistence
+11. CodexBar (com.steipete.codexbar) manages accounts with per-account CODEX_HOME dirs at `~/Library/Application Support/CodexBar/managed-codex-homes/<uuid>/auth.json`, mapped by email/providerAccountID in `managed-codex-accounts.json` (version 3). It keeps these tokens fresh. CodexSwap reuses them: import sets `managedHomePath`; the proxy hydrates the freshest token from that home per request; on our own refresh we write the rotated tokens BACK to the managed home so CodexBar stays in sync. This revives accounts whose `~/.codex/accounts/` copies went stale and gives correct per-account usage. Requires CodexBar installed/running; degrade gracefully when absent.
+
 ## Usage API
 8. `wham/usage` and friends are undocumented internal endpoints; poll conservatively (active account ~60s, backoff on 401) — aggressive polling risks account restrictions.
 

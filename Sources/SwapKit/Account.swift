@@ -39,6 +39,8 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var needsLogin: Bool
     public var lastUsedAt: Date?
     public var usage: [UsageWindow]
+    /// If set, this account's tokens are owned by CodexBar; read/write them at this managed CODEX_HOME.
+    public var managedHomePath: String?
 
     public var id: String { accountID.isEmpty ? alias : accountID }
 
@@ -54,7 +56,8 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         disabledUntil: [String: Date] = [:],
         needsLogin: Bool = false,
         lastUsedAt: Date? = nil,
-        usage: [UsageWindow] = []
+        usage: [UsageWindow] = [],
+        managedHomePath: String? = nil
     ) {
         self.alias = alias
         self.email = email
@@ -68,6 +71,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.needsLogin = needsLogin
         self.lastUsedAt = lastUsedAt
         self.usage = usage
+        self.managedHomePath = managedHomePath
     }
 
     public var tokens: CodexTokens {

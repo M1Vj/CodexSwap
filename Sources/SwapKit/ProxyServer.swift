@@ -178,6 +178,8 @@ public actor ProxyServer {
 
         var tokenRefreshed = false
         while true {
+            // Prefer CodexBar's fresher token for managed accounts before spending a refresh ourselves.
+            if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
             if JWT.isStale(account.accessToken) {
                 if let refreshed = try? await refreshTokens(account, force: false) { account = refreshed }
             }
@@ -269,6 +271,10 @@ public actor ProxyServer {
     private func refreshTokens(_ account: Account, force: Bool) async throws -> Account {
         let tokens = try await refresher.refresh(refreshToken: account.refreshToken)
         await store.updateTokens(account.alias, tokens: tokens)
+        // Keep CodexBar's managed copy in sync so it doesn't later refresh an already-rotated token.
+        if let home = await store.managedHome(account.alias) {
+            CodexBarBridge.writeTokens(tokens, home: home)
+        }
         await sink.handle(ProxyEvent(kind: .refreshed, from: account.alias, to: nil, limit: nil, resetAt: nil))
         var updated = account
         updated.idToken = tokens.idToken

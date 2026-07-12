@@ -100,6 +100,8 @@ public actor AppEngine {
     }
 
     public func importAccounts() async {
+        // CodexBar-managed accounts first (freshest tokens + managed-home link), then any others.
+        for acc in AccountImporter.codexBarAccounts() { await store.upsert(acc) }
         if let current = AccountImporter.currentCodexAccount() { await store.upsert(current) }
         for acc in AccountImporter.existingCodexAuthAccounts() { await store.upsert(acc) }
         emit(.snapshotChanged)

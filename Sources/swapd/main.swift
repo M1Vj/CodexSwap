@@ -30,6 +30,11 @@ switch command {
 case "import":
     let importer = AccountImporter.self
     var added = 0
+    for acc in importer.codexBarAccounts() {
+        await store.upsert(acc)
+        print("imported CodexBar-managed account: \(acc.alias) <\(acc.email)> plan=\(acc.planType ?? "?")")
+        added += 1
+    }
     if let current = importer.currentCodexAccount() {
         await store.upsert(current)
         print("imported active codex login: \(current.alias) <\(current.email)> plan=\(current.planType ?? "?")")
