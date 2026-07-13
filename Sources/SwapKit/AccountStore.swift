@@ -268,6 +268,10 @@ public actor AccountStore {
             merged.disabledUntil = data.accounts[i].disabledUntil
             merged.lastUsedAt = data.accounts[i].lastUsedAt
             merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
+            // Imported records never carry usage; the periodic CodexBar sync upserts every
+            // account, so dropping the stored windows here blanks the display (and the
+            // banked-window gate's input) for up to a poll interval each minute.
+            if merged.usage.isEmpty { merged.usage = data.accounts[i].usage }
             // Keep whichever token bundle expires later so a stale on-disk copy never
             // clobbers a fresher one, independent of import order.
             let existingExp = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast

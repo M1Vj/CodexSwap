@@ -466,6 +466,23 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertFalse(AppEngine.hasStartedWindow(account([])))
     }
 
+    func testUpsertWithoutUsagePreservesStoredReading() async throws {
+        let root = try temporaryDirectory(named: "upsert-preserves-usage")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let window = UsageWindow(label: "Weekly", usedPercent: 71, windowSeconds: 604_800, resetAt: nil)
+        await store.upsert(Account(alias: "synced", accountID: "acc-1", accessToken: "token", usage: [window]))
+
+        await store.upsert(Account(alias: "synced", accountID: "acc-1", accessToken: "token"))
+        let preserved = await store.account("synced")
+        XCTAssertEqual(preserved?.usage, [window])
+
+        let fresh = UsageWindow(label: "Weekly", usedPercent: 80, windowSeconds: 604_800, resetAt: nil)
+        await store.upsert(Account(alias: "synced", accountID: "acc-1", accessToken: "token", usage: [fresh]))
+        let replaced = await store.account("synced")
+        XCTAssertEqual(replaced?.usage, [fresh])
+    }
+
     func testUpdateUsageEmptyFetchKeepsExistingReading() async throws {
         let root = try temporaryDirectory(named: "usage-empty-fetch")
         defer { try? FileManager.default.removeItem(at: root) }
