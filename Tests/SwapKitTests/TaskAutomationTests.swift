@@ -466,6 +466,45 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertFalse(AppEngine.hasStartedWindow(account([])))
     }
 
+    func testPromptsMandateBatchingAndSingleFinalVerification() {
+        let task = makeTask()
+        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
+            XCTAssertTrue(prompt.contains("as many"), "batching mandate missing")
+            XCTAssertTrue(prompt.contains("full verification suite once"), "single-gate mandate missing")
+        }
+        XCTAssertTrue(TaskPrompt.continuation(task: task).contains("Spot-check only the most recently ticked items"))
+        XCTAssertFalse(TaskPrompt.continuation(task: task).contains("every ticked `- [x]` item still holds"))
+    }
+
+    func testPruneArtifactsKeepsNewestLogsAndFreshSessions() throws {
+        let root = try temporaryDirectory(named: "prune-artifacts")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let codexHome = root.appendingPathComponent("codex-home", isDirectory: true)
+        let sessions = codexHome.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        for n in 1...13 {
+            FileManager.default.createFile(atPath: root.appendingPathComponent("run-\(n).log").path, contents: Data("x".utf8))
+        }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = sessions.appendingPathComponent("old-rollout.jsonl")
+        let fresh = sessions.appendingPathComponent("fresh-rollout.jsonl")
+        FileManager.default.createFile(atPath: old.path, contents: Data())
+        FileManager.default.createFile(atPath: fresh.path, contents: Data())
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-8 * 86_400)], ofItemAtPath: old.path)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-3_600)], ofItemAtPath: fresh.path)
+
+        TaskRunner.pruneArtifacts(taskDir: root, codexHome: codexHome, keepLogs: 10, now: now)
+
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasSuffix(".log") }.sorted()
+        XCTAssertEqual(remaining.count, 10)
+        XCTAssertFalse(remaining.contains("run-1.log"))
+        XCTAssertFalse(remaining.contains("run-3.log"))
+        XCTAssertTrue(remaining.contains("run-13.log"))
+        XCTAssertTrue(remaining.contains("run-4.log"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
+    }
+
     func testIsStagnantContinueRequiresThreeIdenticalContinueRuns() {
         let progress = PlanProgress(done: 40, total: 44, status: "CONTINUE")
         func run(_ outcome: String, done: Int? = 40, total: Int? = 44, closed: Bool = true) -> TaskRunRecord {
