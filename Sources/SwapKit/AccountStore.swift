@@ -217,6 +217,9 @@ public actor AccountStore {
 
     public func updateUsage(_ alias: String, windows: [UsageWindow]) {
         guard let i = index(alias) else { return }
+        // wham/usage always reports at least one window for an entitled account; a transient
+        // empty response must not wipe a real reading off the display.
+        if windows.isEmpty, !data.accounts[i].usage.isEmpty { return }
         data.accounts[i].usage = windows
         // Fresh usage reporting headroom supersedes a recorded cooldown: a limit hit before
         // an early reset (or lifted upstream) must not park the account until the stale
