@@ -16,6 +16,10 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Structured automation trace log (`automation.log`, rotated) covering scheduling decisions, per-alias ineligibility reasons, launches, exits, and lifecycle events, with Logs and per-task Show Run Log actions on the board.
 - Crash and shutdown recovery: runs interrupted by quit or crash are closed as `interrupted` and resume automatically on the next quota window.
 
+### Changed
+
+- Task runs follow the same rotation settings as normal proxy traffic: the configured strategy (priority or round-robin), per-account priorities, and the pre-emptive usage thresholds. Tasks prefer accounts still under threshold and move off an account before it hard-limits, falling back to the best over-threshold account only when none has headroom.
+
 ### Fixed
 
 - A failed proxy port bind no longer crashes the app on AsyncHTTPClient shutdown.
