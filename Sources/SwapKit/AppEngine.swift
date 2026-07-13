@@ -691,6 +691,17 @@ public actor AppEngine {
     /// "Started" must be judged from whatever windows are actually reported: while the 5h limit
     /// is suspended only the weekly window exists, and demanding a started short window would
     /// park the account forever even though no banked short reset exists to preserve.
+    /// Stagnant = this run and the two previous closed runs all ended "continue" with the
+    /// exact same checklist state. Interruptions and failures break the pattern on purpose.
+    static func isStagnantContinue<Runs: Sequence>(previousRuns: Runs, progress: PlanProgress) -> Bool
+    where Runs.Element == TaskRunRecord {
+        let closed = previousRuns.filter { $0.finishedAt != nil }.suffix(2)
+        guard closed.count == 2 else { return false }
+        return closed.allSatisfy {
+            $0.outcome == "continue" && $0.planDone == progress.done && $0.planTotal == progress.total
+        }
+    }
+
     static func hasStartedWindow(_ account: Account) -> Bool {
         if let short = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }) {
             return short.usedPercent > 0
@@ -878,10 +889,21 @@ public actor AppEngine {
             task.column = .inProgress
             task.lastError = "Plan reports BLOCKED — see \(task.planRelativePath)"
             terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "blocked")
-        } else if exit.exitCode == 0, progress != nil {
-            outcome = "continue"
-            task.phase = .pausedQuota
-            task.column = .inProgress
+        } else if exit.exitCode == 0, let progress {
+            if Self.isStagnantContinue(previousRuns: task.runs.dropLast(), progress: progress) {
+                // Three consecutive sessions with identical checklist state means the run is
+                // spinning (e.g. waiting for an approval nobody can give) — surface it instead
+                // of burning the account's quota on the same loop.
+                outcome = "failed"
+                task.phase = .failed
+                task.column = .inProgress
+                task.lastError = "no checklist progress across 3 consecutive runs — see \(task.planRelativePath) and the run logs"
+                terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "stagnant")
+            } else {
+                outcome = "continue"
+                task.phase = .pausedQuota
+                task.column = .inProgress
+            }
         } else if exit.exitCode == 0 {
             // A clean exit that produced no plan document is not resumable work; rescheduling
             // it would hot-loop the same failing run until the account's quota is gone.
@@ -906,6 +928,8 @@ public actor AppEngine {
             task.runs[runIndex].finishedAt = now
             task.runs[runIndex].exitCode = exit.exitCode
             task.runs[runIndex].outcome = outcome
+            task.runs[runIndex].planDone = progress?.done
+            task.runs[runIndex].planTotal = progress?.total
         }
         task.updatedAt = now
         await taskStore.update(task)

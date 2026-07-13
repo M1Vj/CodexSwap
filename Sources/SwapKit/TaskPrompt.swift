@@ -11,6 +11,7 @@ public enum TaskPrompt {
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
         - Make small conventional commits as work progresses.
+        - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in the Work Log, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
 
         ## Plan-first protocol
 
@@ -44,6 +45,7 @@ public enum TaskPrompt {
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
         - Make small conventional commits as work progresses.
+        - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in the Work Log, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
 
         Read `\(task.planRelativePath)` before changing code. If it does not exist yet (an earlier session ended before planning), first create it with the task title, the original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it. Verify that every ticked `- [x]` item still holds, then continue from the first unchecked `- [ ]` item. Complete and verify items in order. After each item, tick it, append a dated `## Work Log` entry, and make a small conventional commit containing the related work and plan update.
 
@@ -86,7 +88,8 @@ public enum TaskPrompt {
         3. Make small conventional commits as work progresses.
         4. Maintain `\(task.planRelativePath)`. If no plan exists, first create it with the task title, original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it.
         5. Work through checklist items in order. Verify existing `- [x]` items, continue at the first `- [ ]` item, tick each completed item to `- [x]`, append a dated Work Log entry, and commit the related work and plan update.
-        6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.\(evergreenClause(task))
+        6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.
+        7. If you run unattended, never end a session asking for input or approval: pick the most reasonable default yourself, record the decision and rationale in the Work Log, and continue. `STATUS: BLOCKED` is only for genuinely external obstacles, never a design choice.\(evergreenClause(task))
         """
     }
 

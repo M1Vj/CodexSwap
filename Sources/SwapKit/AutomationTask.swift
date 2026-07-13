@@ -24,6 +24,8 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
     public var exitCode: Int32?
     public var outcome: String
     public var logFileName: String
+    public var planDone: Int?
+    public var planTotal: Int?
 
     public init(
         id: UUID = UUID(),
@@ -31,7 +33,9 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         finishedAt: Date? = nil,
         exitCode: Int32? = nil,
         outcome: String = "",
-        logFileName: String = ""
+        logFileName: String = "",
+        planDone: Int? = nil,
+        planTotal: Int? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -39,6 +43,8 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         self.exitCode = exitCode
         self.outcome = outcome
         self.logFileName = logFileName
+        self.planDone = planDone
+        self.planTotal = planTotal
     }
 
     public init(from decoder: Decoder) throws {
@@ -49,6 +55,8 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         exitCode = try c.decodeIfPresent(Int32.self, forKey: .exitCode)
         outcome = try c.decodeIfPresent(String.self, forKey: .outcome) ?? ""
         logFileName = try c.decodeIfPresent(String.self, forKey: .logFileName) ?? ""
+        planDone = try c.decodeIfPresent(Int.self, forKey: .planDone)
+        planTotal = try c.decodeIfPresent(Int.self, forKey: .planTotal)
     }
 }
 
