@@ -34,7 +34,7 @@ struct TaskBoardView: View {
         }
         .frame(minWidth: 1_000, minHeight: 620)
         .sheet(item: $editor) { presentation in
-            TaskEditorView(task: presentation.task, isNew: presentation.isNew) { task in
+            TaskEditorView(task: presentation.task, accounts: model.accounts, isNew: presentation.isNew) { task in
                 if presentation.isNew {
                     model.actions.addTask(task)
                 } else {
@@ -303,6 +303,9 @@ private struct TaskCardView: View {
             HStack(spacing: 6) {
                 TaskChip(text: task.model)
                 TaskChip(text: task.reasoningEffort.capitalized)
+                if !task.accountAliases.isEmpty {
+                    TaskChip(text: task.accountAliases.count == 1 ? task.accountAliases[0] : "\(task.accountAliases.count) acct")
+                }
             }
 
             HStack(spacing: 8) {
@@ -436,12 +439,13 @@ private struct TaskEditorView: View {
     @State private var customModel: String
     @State private var branchWasEdited: Bool
 
+    let accounts: [Account]
     let isNew: Bool
     let onSave: (AutomationTask) -> Void
 
     private static let builtInModels = ["gpt-5.6-sol", "gpt-5.6-codex", "gpt-5.5-codex"]
 
-    init(task: AutomationTask, isNew: Bool, onSave: @escaping (AutomationTask) -> Void) {
+    init(task: AutomationTask, accounts: [Account], isNew: Bool, onSave: @escaping (AutomationTask) -> Void) {
         _draft = State(initialValue: task)
         if Self.builtInModels.contains(task.model) {
             _modelSelection = State(initialValue: task.model)
@@ -451,6 +455,7 @@ private struct TaskEditorView: View {
             _customModel = State(initialValue: task.model)
         }
         _branchWasEdited = State(initialValue: !isNew && !task.branch.isEmpty)
+        self.accounts = accounts
         self.isNew = isNew
         self.onSave = onSave
     }
@@ -501,6 +506,42 @@ private struct TaskEditorView: View {
                     Text("Low").tag("low")
                     Text("Medium").tag("medium")
                     Text("High").tag("high")
+                    Text("X-High (model dependent)").tag("xhigh")
+                }
+
+                LabeledContent("Accounts") {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Menu {
+                            Button {
+                                draft.accountAliases = []
+                            } label: {
+                                Label(
+                                    "Use global selection",
+                                    systemImage: draft.accountAliases.isEmpty ? "checkmark" : "circle"
+                                )
+                            }
+                            Divider()
+                            if accounts.isEmpty {
+                                Text("No accounts available")
+                            } else {
+                                ForEach(accounts.sorted(by: { $0.alias.localizedStandardCompare($1.alias) == .orderedAscending })) { account in
+                                    Button {
+                                        toggleAccount(account.alias)
+                                    } label: {
+                                        Label(
+                                            account.alias,
+                                            systemImage: draft.accountAliases.contains(account.alias) ? "checkmark" : "circle"
+                                        )
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label(accountSelectionLabel, systemImage: "person.2")
+                        }
+                        Text("Empty = use the board's global account checklist.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -544,6 +585,12 @@ private struct TaskEditorView: View {
         modelSelection == "custom" ? customModel : modelSelection
     }
 
+    private var accountSelectionLabel: String {
+        if draft.accountAliases.isEmpty { return "Use global selection" }
+        if draft.accountAliases.count == 1 { return draft.accountAliases[0] }
+        return "\(draft.accountAliases.count) accounts"
+    }
+
     private var isValid: Bool {
         !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !draft.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -571,6 +618,14 @@ private struct TaskEditorView: View {
         panel.prompt = "Choose Repository"
         if panel.runModal() == .OK, let url = panel.url {
             draft.repoPath = url.path
+        }
+    }
+
+    private func toggleAccount(_ alias: String) {
+        if let index = draft.accountAliases.firstIndex(of: alias) {
+            draft.accountAliases.remove(at: index)
+        } else {
+            draft.accountAliases.append(alias)
         }
     }
 

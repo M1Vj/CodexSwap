@@ -80,6 +80,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var model: String
     public var reasoningEffort: String
     public var allowNetwork: Bool
+    public var accountAliases: [String]
     public var column: TaskColumn
     public var phase: TaskPhase
     public var orderIndex: Int
@@ -98,6 +99,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         model: String = "gpt-5.6-codex",
         reasoningEffort: String = "high",
         allowNetwork: Bool = false,
+        accountAliases: [String] = [],
         column: TaskColumn = .todo,
         phase: TaskPhase = .idle,
         orderIndex: Int = 0,
@@ -115,6 +117,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.allowNetwork = allowNetwork
+        self.accountAliases = accountAliases
         self.column = column
         self.phase = phase
         self.orderIndex = orderIndex
@@ -136,6 +139,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? "gpt-5.6-codex"
         reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort) ?? "high"
         allowNetwork = try c.decodeIfPresent(Bool.self, forKey: .allowNetwork) ?? false
+        accountAliases = try c.decodeIfPresent([String].self, forKey: .accountAliases) ?? []
         column = try c.decodeIfPresent(TaskColumn.self, forKey: .column) ?? .todo
         phase = try c.decodeIfPresent(TaskPhase.self, forKey: .phase) ?? .idle
         orderIndex = try c.decodeIfPresent(Int.self, forKey: .orderIndex) ?? 0

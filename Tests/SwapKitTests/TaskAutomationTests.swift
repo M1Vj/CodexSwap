@@ -358,4 +358,35 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertNil(task.lastError)
         XCTAssertNil(task.planProgress)
     }
+
+    func testAutomationTaskDecodeWithoutAccountAliasesDefaultsToEmpty() throws {
+        let json = #"{"title":"t","prompt":"p","repoPath":"/tmp","branch":"b"}"#
+
+        let task = try JSONDecoder().decode(AutomationTask.self, from: Data(json.utf8))
+
+        XCTAssertEqual(task.accountAliases, [])
+    }
+
+    func testAutomationTaskRoundTripPreservesAccountAliases() throws {
+        var task = makeTask()
+        task.accountAliases = ["work", "personal"]
+
+        let data = try JSONEncoder().encode(task)
+        let decoded = try JSONDecoder().decode(AutomationTask.self, from: data)
+
+        XCTAssertEqual(decoded, task)
+        XCTAssertEqual(decoded.accountAliases, ["work", "personal"])
+    }
+
+    func testAllowedAliasesUsesTaskOverrideAndFallsBackToGlobalSelection() {
+        var settings = Settings.default
+        settings.automationAccounts = ["global-a", "global-b"]
+        var task = makeTask()
+
+        XCTAssertEqual(AppEngine.allowedAliases(for: task, settings: settings), ["global-a", "global-b"])
+
+        task.accountAliases = ["task-only"]
+
+        XCTAssertEqual(AppEngine.allowedAliases(for: task, settings: settings), ["task-only"])
+    }
 }

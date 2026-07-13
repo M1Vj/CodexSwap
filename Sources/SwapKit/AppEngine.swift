@@ -254,12 +254,13 @@ public actor AppEngine {
 
         let settings = await settingsStore.get()
         let proxyURL = await proxy?.proxyURL()
+        let allowedAliases = Self.allowedAliases(for: task, settings: settings)
         let occupiedCount = runningIDs.count + schedulingTaskIDs.count - 1
         let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
         if let proxyURL,
-           !settings.automationAccounts.isEmpty,
+           !allowedAliases.isEmpty,
            occupiedCount < maximumConcurrent,
-           let account = await automationAccount(settings: settings, now: Date()) {
+           let account = await automationAccount(aliases: allowedAliases, settings: settings, now: Date()) {
             switch await startTask(
                 task,
                 account: account,
@@ -449,32 +450,61 @@ public actor AppEngine {
     public func automationTick() async {
         let settings = await settingsStore.get()
         guard settings.automationEnabled,
-              let proxyURL = await proxy?.proxyURL(),
-              !settings.automationAccounts.isEmpty else { return }
+              let proxyURL = await proxy?.proxyURL() else { return }
 
+        let runningIDs = await taskRunner.runningIDs()
+        let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
+        guard runningIDs.count + schedulingTaskIDs.count < maximumConcurrent else { return }
+
+        let paused = await taskStore.tasks(in: .inProgress)
+            .filter { $0.phase == .pausedQuota }
+        // Only idle queued tasks are schedulable: a failed launch (missing repo/binary) must
+        // not be retried in a tight loop — moving the card re-arms it via phase = .idle.
+        let queued = await taskStore.tasks(in: .queued)
+            .filter { $0.phase == .idle }
+        let waiting = (paused + queued).filter {
+            !runningIDs.contains($0.id) && !schedulingTaskIDs.contains($0.id)
+        }
+        guard !waiting.isEmpty,
+              !settings.automationAccounts.isEmpty || waiting.contains(where: { !$0.accountAliases.isEmpty }) else { return }
+
+        var didRefreshUsage = false
+        var candidates = waiting
         while true {
-            let runningIDs = await taskRunner.runningIDs()
-            let runningCount = runningIDs.count + schedulingTaskIDs.count
-            let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
-            guard runningCount < maximumConcurrent else { return }
+            var ineligibleTasks: [AutomationTask] = []
+            var candidateAliases: Set<String> = []
 
-            let paused = await taskStore.tasks(in: .inProgress)
-                .filter { $0.phase == .pausedQuota }
-            // Only idle queued tasks are schedulable: a failed launch (missing repo/binary) must
-            // not be retried in a tight loop — moving the card re-arms it via phase = .idle.
-            let queued = await taskStore.tasks(in: .queued)
-                .filter { $0.phase == .idle }
-            guard let task = (paused + queued).first(where: {
-                !runningIDs.contains($0.id) && !schedulingTaskIDs.contains($0.id)
-            }) else { return }
-            guard let account = await automationAccount(settings: settings, now: Date()) else { return }
-            _ = await startTask(task, account: account, settings: settings, proxyURL: proxyURL)
+            for task in candidates {
+                let currentRunningIDs = await taskRunner.runningIDs()
+                guard currentRunningIDs.count + schedulingTaskIDs.count < maximumConcurrent else { return }
+                guard !currentRunningIDs.contains(task.id), !schedulingTaskIDs.contains(task.id) else { continue }
+
+                let aliases = Self.allowedAliases(for: task, settings: settings)
+                guard !aliases.isEmpty,
+                      let account = await automationAccount(aliases: aliases, settings: settings, now: Date()) else {
+                    ineligibleTasks.append(task)
+                    candidateAliases.formUnion(aliases)
+                    continue
+                }
+                _ = await startTask(task, account: account, settings: settings, proxyURL: proxyURL)
+            }
+
+            let currentRunningIDs = await taskRunner.runningIDs()
+            guard currentRunningIDs.count + schedulingTaskIDs.count < maximumConcurrent,
+                  !didRefreshUsage, !ineligibleTasks.isEmpty, !candidateAliases.isEmpty else { return }
+            didRefreshUsage = true
+            await pollUsage(activeOnly: false, aliases: candidateAliases)
+            candidates = ineligibleTasks
         }
     }
 
-    private func automationAccount(settings: Settings, now: Date) async -> Account? {
+    static func allowedAliases(for task: AutomationTask, settings: Settings) -> [String] {
+        task.accountAliases.isEmpty ? settings.automationAccounts : task.accountAliases
+    }
+
+    private func automationAccount(aliases: [String], settings: Settings, now: Date) async -> Account? {
         var accounts: [Account] = []
-        for alias in settings.automationAccounts {
+        for alias in aliases {
             if let account = await store.hydrateFromManagedHome(alias) {
                 accounts.append(account)
             }
@@ -524,7 +554,7 @@ public actor AppEngine {
         do {
             try await taskRunner.start(
                 task: task,
-                allowedAliases: settings.automationAccounts,
+                allowedAliases: Self.allowedAliases(for: task, settings: settings),
                 proxyURL: proxyURL,
                 supportDir: AppPaths.supportDir()
             ) { [weak self] taskID, exit in
