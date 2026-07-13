@@ -109,6 +109,8 @@ public actor TaskRunner {
         }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
 
+        Self.pruneArtifacts(taskDir: taskDir, codexHome: codexHome, keepLogs: 10)
+
         let logHandle = try FileHandle(forWritingTo: logURL)
         do {
             try logHandle.truncate(atOffset: 0)
@@ -221,6 +223,32 @@ public actor TaskRunner {
                 if process.isRunning { process.terminate() }
                 group.cancelAll()
                 throw error
+            }
+        }
+    }
+
+    /// 24/7 operation accumulates run logs and codex session rollouts without bound;
+    /// keep the newest `keepLogs` run logs and drop session artifacts older than a week.
+    static func pruneArtifacts(taskDir: URL, codexHome: URL, keepLogs: Int, now: Date = Date()) {
+        let fm = FileManager.default
+        if let names = try? fm.contentsOfDirectory(atPath: taskDir.path) {
+            let runLogs = names
+                .compactMap { name -> (Int, String)? in
+                    guard name.hasPrefix("run-"), name.hasSuffix(".log"),
+                          let n = Int(name.dropFirst(4).dropLast(4)) else { return nil }
+                    return (n, name)
+                }
+                .sorted { $0.0 > $1.0 }
+            for (_, name) in runLogs.dropFirst(keepLogs) {
+                try? fm.removeItem(at: taskDir.appendingPathComponent(name))
+            }
+        }
+        let sessions = codexHome.appendingPathComponent("sessions", isDirectory: true)
+        let cutoff = now.addingTimeInterval(-7 * 86_400)
+        if let contents = try? fm.contentsOfDirectory(at: sessions, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            for item in contents {
+                let modified = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? now
+                if modified < cutoff { try? fm.removeItem(at: item) }
             }
         }
     }
