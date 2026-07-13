@@ -14,6 +14,10 @@ public enum AppEvent: Sendable {
     case needsLogin(alias: String)
     case windowReset(alias: String)
     case refreshed(alias: String)
+    case taskStarted(title: String, account: String?)
+    case taskCompleted(title: String)
+    case taskPausedQuota(title: String)
+    case taskFailed(title: String, reason: String)
     case snapshotChanged
 }
 
@@ -28,13 +32,16 @@ public struct EngineSnapshot: Sendable {
     public let routingState: CodexRoutingState
     public let warmupSummary: WarmupSummary?
     public let warmupInProgress: Bool
+    public let tasks: [AutomationTask]
+    public let runningTaskIDs: Set<UUID>
 
     public var isRunning: Bool { proxyURL != nil }
 
     public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy,
                 servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil,
                 routingState: CodexRoutingState = .disabled, warmupSummary: WarmupSummary? = nil,
-                warmupInProgress: Bool = false) {
+                warmupInProgress: Bool = false, tasks: [AutomationTask] = [],
+                runningTaskIDs: Set<UUID> = []) {
         self.accounts = accounts
         self.activeAlias = activeAlias
         self.proxyURL = proxyURL
@@ -45,7 +52,34 @@ public struct EngineSnapshot: Sendable {
         self.routingState = routingState
         self.warmupSummary = warmupSummary
         self.warmupInProgress = warmupInProgress
+        self.tasks = tasks
+        self.runningTaskIDs = runningTaskIDs
     }
+}
+
+private actor TaskStartGate {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending { continuation.resume() }
+    }
+}
+
+private enum TaskStartResult: Sendable {
+    case started
+    case unavailable
+    case failed
 }
 
 /// Orchestrates the proxy, the usage poller, proactive pre-switching, and cooldown expiry.
@@ -57,11 +91,14 @@ public actor AppEngine {
     private let refresher: TokenRefresher
     private let configManager: CodexConfigManager
     private let warmupService: QuotaWarmupService
+    private let taskStore: TaskStore
+    private let taskRunner: TaskRunner
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
     private var watcher: CodexBarWatcher?
     private var warmupInProgress = false
+    private var schedulingTaskIDs: Set<UUID> = []
 
     public init(
         store: AccountStore = AccountStore(),
@@ -69,7 +106,9 @@ public actor AppEngine {
         usage: any UsageFetching = UsageClient(),
         refresher: TokenRefresher = TokenRefresher(),
         configManager: CodexConfigManager = CodexConfigManager(),
-        warmupService: QuotaWarmupService = QuotaWarmupService()
+        warmupService: QuotaWarmupService = QuotaWarmupService(),
+        taskStore: TaskStore = TaskStore(),
+        taskRunner: TaskRunner = TaskRunner()
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -77,6 +116,8 @@ public actor AppEngine {
         self.refresher = refresher
         self.configManager = configManager
         self.warmupService = warmupService
+        self.taskStore = taskStore
+        self.taskRunner = taskRunner
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -150,8 +191,110 @@ public actor AppEngine {
             lastActivityAlias: activity?.lastAlias,
             routingState: routingState,
             warmupSummary: warmupSummary,
-            warmupInProgress: warmupInProgress
+            warmupInProgress: warmupInProgress,
+            tasks: await taskStore.all(),
+            runningTaskIDs: await taskRunner.runningIDs()
         )
+    }
+
+    public func tasks() async -> [AutomationTask] {
+        await taskStore.all()
+    }
+
+    public func addTask(_ task: AutomationTask) async {
+        await taskStore.add(task)
+        emit(.snapshotChanged)
+        await automationTick()
+    }
+
+    public func updateTask(_ task: AutomationTask) async {
+        await taskStore.update(task)
+        emit(.snapshotChanged)
+        await automationTick()
+    }
+
+    public func removeTask(id: UUID) async {
+        let wasRunning = await taskRunner.runningIDs().contains(id)
+        await taskStore.remove(id: id)
+        if wasRunning { await taskRunner.stop(taskID: id) }
+        emit(.snapshotChanged)
+    }
+
+    public func moveTask(id: UUID, to column: TaskColumn, index: Int) async {
+        let isRunning = await taskRunner.runningIDs().contains(id)
+        await taskStore.move(id: id, to: column, index: index)
+        if !isRunning, column == .todo || column == .queued,
+           var task = await taskStore.task(id: id) {
+            task.phase = .idle
+            task.updatedAt = Date()
+            await taskStore.update(task)
+        }
+        emit(.snapshotChanged)
+        await automationTick()
+    }
+
+    public func stopTask(id: UUID) async {
+        guard var task = await taskStore.task(id: id) else { return }
+        task.phase = .stopped
+        task.updatedAt = Date()
+        await taskStore.update(task)
+        await taskRunner.stop(taskID: id)
+        emit(.snapshotChanged)
+    }
+
+    public func runTaskNow(id: UUID) async {
+        guard let task = await taskStore.task(id: id) else { return }
+        let runningIDs = await taskRunner.runningIDs()
+        guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else { return }
+        schedulingTaskIDs.insert(id)
+        var reservationHeld = true
+        defer {
+            if reservationHeld { schedulingTaskIDs.remove(id) }
+        }
+
+        let settings = await settingsStore.get()
+        let proxyURL = await proxy?.proxyURL()
+        let occupiedCount = runningIDs.count + schedulingTaskIDs.count - 1
+        let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
+        if let proxyURL,
+           !settings.automationAccounts.isEmpty,
+           occupiedCount < maximumConcurrent,
+           let account = await automationAccount(settings: settings, now: Date()) {
+            switch await startTask(
+                task,
+                account: account,
+                settings: settings,
+                proxyURL: proxyURL,
+                reservationHeld: true
+            ) {
+            case .started:
+                schedulingTaskIDs.remove(id)
+                reservationHeld = false
+                await automationTick()
+                return
+            case .failed:
+                return
+            case .unavailable:
+                break
+            }
+        }
+
+        let queueIndex = await taskStore.tasks(in: .queued).count
+        await taskStore.move(id: id, to: .queued, index: queueIndex)
+        if var queued = await taskStore.task(id: id) {
+            queued.phase = .idle
+            queued.updatedAt = Date()
+            await taskStore.update(queued)
+        }
+        emit(.snapshotChanged)
+    }
+
+    public func exportPrompt(id: UUID) async -> String? {
+        guard let task = await taskStore.task(id: id) else { return nil }
+        let planURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
+            .appendingPathComponent(task.planRelativePath)
+        let planDoc = try? String(contentsOf: planURL, encoding: .utf8)
+        return TaskPrompt.export(task: task, planDoc: planDoc)
     }
 
     // MARK: - Actions
@@ -289,6 +432,9 @@ public actor AppEngine {
         case .rotated:
             emit(.rotated(from: event.from ?? "?", to: event.to ?? "?", limit: event.limit ?? "codex", resetAt: event.resetAt))
         case .exhausted:
+            for taskID in await taskRunner.runningIDs() {
+                await taskRunner.noteQuotaExhausted(taskID: taskID)
+            }
             emit(.exhausted(limit: event.limit ?? "codex"))
         case .needsLogin:
             emit(.needsLogin(alias: event.from ?? "?"))
@@ -298,6 +444,192 @@ public actor AppEngine {
             break
         }
         emit(.snapshotChanged)
+    }
+
+    public func automationTick() async {
+        let settings = await settingsStore.get()
+        guard settings.automationEnabled,
+              let proxyURL = await proxy?.proxyURL(),
+              !settings.automationAccounts.isEmpty else { return }
+
+        while true {
+            let runningIDs = await taskRunner.runningIDs()
+            let runningCount = runningIDs.count + schedulingTaskIDs.count
+            let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
+            guard runningCount < maximumConcurrent else { return }
+
+            let paused = await taskStore.tasks(in: .inProgress)
+                .filter { $0.phase == .pausedQuota }
+            // Only idle queued tasks are schedulable: a failed launch (missing repo/binary) must
+            // not be retried in a tight loop — moving the card re-arms it via phase = .idle.
+            let queued = await taskStore.tasks(in: .queued)
+                .filter { $0.phase == .idle }
+            guard let task = (paused + queued).first(where: {
+                !runningIDs.contains($0.id) && !schedulingTaskIDs.contains($0.id)
+            }) else { return }
+            guard let account = await automationAccount(settings: settings, now: Date()) else { return }
+            _ = await startTask(task, account: account, settings: settings, proxyURL: proxyURL)
+        }
+    }
+
+    private func automationAccount(settings: Settings, now: Date) async -> Account? {
+        var accounts: [Account] = []
+        for alias in settings.automationAccounts {
+            if let account = await store.hydrateFromManagedHome(alias) {
+                accounts.append(account)
+            }
+        }
+        return accounts
+            .filter { account in
+                guard account.isEligible(now: now) else { return false }
+                if settings.automationConsumeBankedWindow { return true }
+                return account.usage.contains {
+                    $0.windowSeconds > 0 && $0.windowSeconds < 604_800 && $0.usedPercent > 0
+                }
+            }
+            .sorted { lhs, rhs in
+                if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
+                let lhsLastUsed = lhs.lastUsedAt ?? .distantPast
+                let rhsLastUsed = rhs.lastUsedAt ?? .distantPast
+                if lhsLastUsed != rhsLastUsed { return lhsLastUsed < rhsLastUsed }
+                return lhs.alias < rhs.alias
+            }
+            .first
+    }
+
+    private func startTask(
+        _ task: AutomationTask,
+        account: Account,
+        settings: Settings,
+        proxyURL: URL,
+        reservationHeld: Bool = false
+    ) async -> TaskStartResult {
+        let ownsReservation: Bool
+        if reservationHeld {
+            guard schedulingTaskIDs.contains(task.id) else { return .unavailable }
+            ownsReservation = false
+        } else {
+            guard !schedulingTaskIDs.contains(task.id) else { return .unavailable }
+            schedulingTaskIDs.insert(task.id)
+            ownsReservation = true
+        }
+        defer {
+            if ownsReservation { schedulingTaskIDs.remove(task.id) }
+        }
+        let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
+        let runningCount = await taskRunner.runningIDs().count
+        guard runningCount + schedulingTaskIDs.count <= maximumConcurrent else { return .unavailable }
+
+        let startGate = TaskStartGate()
+        do {
+            try await taskRunner.start(
+                task: task,
+                allowedAliases: settings.automationAccounts,
+                proxyURL: proxyURL,
+                supportDir: AppPaths.supportDir()
+            ) { [weak self] taskID, exit in
+                await startGate.wait()
+                guard let self else { return }
+                await self.handleTaskExit(taskID: taskID, exit: exit)
+            }
+        } catch {
+            await failTaskLaunch(taskID: task.id, reason: error.localizedDescription)
+            return .failed
+        }
+
+        let now = Date()
+        let runNumber = task.runs.count + 1
+        var started = task
+        if task.column != .inProgress {
+            started.orderIndex = await taskStore.tasks(in: .inProgress).count
+        }
+        started.column = .inProgress
+        started.phase = task.runs.isEmpty ? .planning : .running
+        started.updatedAt = now
+        started.lastError = nil
+        started.runs.append(TaskRunRecord(
+            startedAt: now,
+            outcome: "",
+            logFileName: "run-\(runNumber).log"
+        ))
+        await taskStore.update(started)
+        guard await taskStore.task(id: task.id) != nil else {
+            await taskRunner.stop(taskID: task.id)
+            await startGate.release()
+            return .unavailable
+        }
+        emit(.taskStarted(title: task.title, account: account.alias))
+        emit(.snapshotChanged)
+        await startGate.release()
+        return .started
+    }
+
+    private func failTaskLaunch(taskID: UUID, reason: String) async {
+        guard var task = await taskStore.task(id: taskID) else { return }
+        if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
+            task.runs[runIndex].finishedAt = Date()
+            task.runs[runIndex].outcome = "failed"
+        }
+        task.phase = .failed
+        task.lastError = reason
+        task.updatedAt = Date()
+        await taskStore.update(task)
+        emit(.taskFailed(title: task.title, reason: reason))
+        emit(.snapshotChanged)
+    }
+
+    private func handleTaskExit(taskID: UUID, exit: TaskRunner.RunExit) async {
+        guard var task = await taskStore.task(id: taskID) else { return }
+        let now = Date()
+        let planURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
+            .appendingPathComponent(task.planRelativePath)
+        let planText = try? String(contentsOf: planURL, encoding: .utf8)
+        let progress = planText.flatMap(PlanDocParser.parse)
+        task.planProgress = progress
+
+        let outcome: String
+        var terminalEvent: AppEvent?
+        if task.phase == .stopped {
+            outcome = "stopped"
+            task.phase = .stopped
+            task.column = .inProgress
+        } else if exit.quotaExhausted {
+            outcome = "paused-quota"
+            task.phase = .pausedQuota
+            task.column = .inProgress
+            terminalEvent = .taskPausedQuota(title: task.title)
+        } else if progress?.status == "COMPLETE" {
+            outcome = "completed"
+            task.phase = .completed
+            task.column = .done
+            task.orderIndex = await taskStore.tasks(in: .done).count
+            terminalEvent = .taskCompleted(title: task.title)
+        } else if exit.exitCode == 0 {
+            outcome = "continue"
+            task.phase = .pausedQuota
+            task.column = .inProgress
+        } else {
+            outcome = "failed"
+            task.phase = .failed
+            task.column = .inProgress
+            task.lastError = exit.stderrTail
+            terminalEvent = .taskFailed(title: task.title, reason: exit.stderrTail)
+        }
+
+        if task.column == .inProgress,
+           !(await taskStore.tasks(in: .inProgress).contains(where: { $0.id == task.id })) {
+            task.orderIndex = await taskStore.tasks(in: .inProgress).count
+        }
+        if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
+            task.runs[runIndex].finishedAt = now
+            task.runs[runIndex].exitCode = exit.exitCode
+            task.runs[runIndex].outcome = outcome
+        }
+        task.updatedAt = now
+        await taskStore.update(task)
+        if let terminalEvent { emit(terminalEvent) }
+        emit(.snapshotChanged)
+        await automationTick()
     }
 
     // MARK: - Poller
@@ -312,6 +644,7 @@ public actor AppEngine {
                 await self.expireCooldownsAndNotify()
                 await self.pollUsage(activeOnly: true)
                 await self.proactiveSwitchIfNeeded(settings: settings)
+                await self.automationTick()
                 if settings.automaticallyWarmAccounts,
                    let url = await self.proxy?.proxyURL(),
                    await self.warmupService.hasDueAccount(in: await self.warmupCandidates()) {
@@ -329,6 +662,7 @@ public actor AppEngine {
     private func expireCooldownsAndNotify() async {
         let reset = await store.expireCooldowns()
         for acc in reset { emit(.windowReset(alias: acc.alias)) }
+        if !reset.isEmpty { await automationTick() }
     }
 
     private func pollUsage(activeOnly: Bool, aliases: Set<String>? = nil) async {
