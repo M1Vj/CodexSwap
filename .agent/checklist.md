@@ -33,6 +33,17 @@
 - [x] Add-account flow via `codex login`
 - [x] Settings via menu toggles + settings.json (dedicated UI optional)
 
+## Task board automation (feat/task-board-automation)
+- [x] AutomationTask model + TaskStore (tasks.json, tolerant decode, column ordering)
+- [x] Plan-first prompt protocol (PLAN.md checklist + STATUS contract) + portable export prompt
+- [x] Proxy task mode: X-CodexSwap-Task-Accounts subset selection/rotation, active alias untouched
+- [x] TaskRunner: sandboxed codex exec (workspace-write, never danger), isolated CODEX_HOME, per-run logs, 6h backstop
+- [x] AppEngine scheduler: quota-driven tick, pausedQuota resume, per-task account override, banked-window gate, usage-refresh retry
+- [x] Kanban board window (To Do / In Queue / In Progress / Done, drag-drop, editor, export, run/stop, status indicators)
+- [x] Menu-bar indicator + task notifications + Automation settings section
+- [x] Unit tests (24 new; suite 87 green)
+- [x] Live E2E through the packaged app on a scratch repo
+
 ## Packaging
 - [x] .app bundle + ad-hoc code sign (Scripts/build-app.sh); notarize pending (needs Developer ID)
 - [ ] Distribution (brew cask / release)

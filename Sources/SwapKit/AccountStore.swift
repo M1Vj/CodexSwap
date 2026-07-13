@@ -62,6 +62,20 @@ public actor AccountStore {
             }
     }
 
+    public func bestEligible(among aliases: [String], now: Date = Date()) -> Account? {
+        let allowed = Set(aliases)
+        return data.accounts
+            .filter { allowed.contains($0.alias) && $0.isEligible(now: now) }
+            .sorted { a, b in
+                if a.priority != b.priority { return a.priority > b.priority }
+                let la = a.lastUsedAt ?? .distantPast
+                let lb = b.lastUsedAt ?? .distantPast
+                if la != lb { return la < lb }
+                return a.alias < b.alias
+            }
+            .first
+    }
+
     private func lruEligible(now: Date, excluding: String? = nil) -> Account? {
         data.accounts
             .filter { $0.isEligible(now: now) && $0.alias != excluding }
@@ -95,6 +109,12 @@ public actor AccountStore {
     private func activate(_ alias: String, now: Date) {
         data.activeAlias = alias
         if let i = index(alias) { data.accounts[i].lastUsedAt = now }
+        persist()
+    }
+
+    public func touchLastUsed(_ alias: String, now: Date = Date()) {
+        guard let i = index(alias) else { return }
+        data.accounts[i].lastUsedAt = now
         persist()
     }
 
@@ -198,6 +218,13 @@ public actor AccountStore {
     public func updateUsage(_ alias: String, windows: [UsageWindow]) {
         guard let i = index(alias) else { return }
         data.accounts[i].usage = windows
+        // Fresh usage reporting headroom supersedes a recorded cooldown: a limit hit before
+        // an early reset (or lifted upstream) must not park the account until the stale
+        // resets_at. A limit that still holds re-establishes its cooldown on the next 429.
+        if !windows.isEmpty, windows.allSatisfy({ $0.usedPercent < 100 }),
+           !data.accounts[i].disabledUntil.isEmpty {
+            data.accounts[i].disabledUntil = [:]
+        }
         persist()
     }
 

@@ -6,13 +6,21 @@ import AsyncHTTPClient
 
 enum ProxyRequestMode: Equatable, Sendable {
     static let warmupHeader = "X-CodexSwap-Warmup-Account"
+    static let taskHeader = "X-CodexSwap-Task-Accounts"
 
     case normal
     case warmup(alias: String)
+    case task(allowed: [String])
 
     init(headers: HTTPHeaders) {
         if let alias = headers.first(name: Self.warmupHeader), !alias.isEmpty {
             self = .warmup(alias: alias)
+        } else if let value = headers.first(name: Self.taskHeader) {
+            let allowed = value
+                .split(separator: ",", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            self = allowed.isEmpty ? .normal : .task(allowed: allowed)
         } else {
             self = .normal
         }
@@ -20,6 +28,11 @@ enum ProxyRequestMode: Equatable, Sendable {
 
     var isWarmup: Bool {
         if case .warmup = self { return true }
+        return false
+    }
+
+    var isTask: Bool {
+        if case .task = self { return true }
         return false
     }
 }
@@ -39,6 +52,13 @@ func selectProxyAccount(store: AccountStore, mode: ProxyRequestMode, now: Date =
         // that CodexBar's fresh credentials can serve.
         guard let account = await store.hydrateFromManagedHome(alias), account.isEligible(now: now) else { return nil }
         return account
+    case .task(let allowed):
+        for alias in allowed {
+            _ = await store.hydrateFromManagedHome(alias)
+        }
+        guard let account = await store.bestEligible(among: allowed, now: now) else { return nil }
+        await store.touchLastUsed(account.alias, now: now)
+        return account
     }
 }
 
@@ -48,6 +68,7 @@ func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHead
     headers.remove(name: "Connection")
     headers.remove(name: "Proxy-Connection")
     headers.remove(name: ProxyRequestMode.warmupHeader)
+    headers.remove(name: ProxyRequestMode.taskHeader)
     headers.replaceOrAdd(name: "Authorization", value: "Bearer \(account.accessToken)")
     if !account.accountID.isEmpty {
         headers.replaceOrAdd(name: "ChatGPT-Account-Id", value: account.accountID)
@@ -246,7 +267,7 @@ public actor ProxyServer {
         // Round-robin load balancing: at each new turn (a model call after an idle gap), advance to the
         // next account so usage spreads across all of them. Codex is stateless (store=false, no
         // previous_response_id), so switching between turns never breaks the conversation.
-        if !mode.isWarmup, settings.rotationStrategy == .roundRobin, head.method == .POST, rawPath.hasSuffix("/responses") {
+        if mode == .normal, settings.rotationStrategy == .roundRobin, head.method == .POST, rawPath.hasSuffix("/responses") {
             let now = Date()
             if let last = lastTurnAt, now.timeIntervalSince(last) > TimeInterval(settings.roundRobinTurnGapSeconds) {
                 await store.advanceRoundRobin(now: now)
@@ -303,6 +324,14 @@ public actor ProxyServer {
                         account = hydrated
                         continue
                     }
+                    if mode.isTask {
+                        if let next = try await taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
+                            account = next
+                            tokenRefreshed = false
+                            continue
+                        }
+                        return
+                    }
                     account = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
                     if account.needsLogin { return }
                     tokenRefreshed = false
@@ -318,6 +347,20 @@ public actor ProxyServer {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
                 if isSessionInvalidated(errBody) {
                     await burn.clear(alias: account.alias)
+                    if mode.isTask {
+                        if let hydrated = await store.hydrateFromManagedHome(account.alias),
+                           hydrated.accessToken != account.accessToken, !JWT.isStale(hydrated.accessToken) {
+                            account = hydrated
+                            tokenRefreshed = false
+                            continue
+                        }
+                        if let next = try await taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
+                            account = next
+                            tokenRefreshed = false
+                            continue
+                        }
+                        return
+                    }
                     if mode.isWarmup {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
@@ -346,6 +389,17 @@ public actor ProxyServer {
                         try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
                         return
                     }
+                    if mode.isTask {
+                        await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
+                        if let next = await selectNextTaskAccount(mode: mode, excluding: account.alias) {
+                            account = next
+                            tokenRefreshed = false
+                            continue
+                        }
+                        await sink.handle(ProxyEvent(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt))
+                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
+                        return
+                    }
                     let result = await store.rotateFrom(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
                     if let next = result.next, result.rotated {
                         await sink.handle(ProxyEvent(kind: .rotated, from: account.alias, to: next.alias, limit: limit, resetAt: resetAt))
@@ -371,6 +425,22 @@ public actor ProxyServer {
             return
         }
         try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
+    }
+
+    private func selectNextTaskAccount(mode: ProxyRequestMode, excluding alias: String) async -> Account? {
+        guard let next = await selectProxyAccount(store: store, mode: mode), next.alias != alias else { return nil }
+        return next
+    }
+
+    private func taskFailover(from account: Account, mode: ProxyRequestMode, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, status: HTTPResponseStatus, headers: HTTPHeaders, errBody: ByteBuffer) async throws -> Account? {
+        await store.markNeedsLoginOnly(account.alias)
+        let next = await selectNextTaskAccount(mode: mode, excluding: account.alias)
+        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: next?.alias, limit: nil, resetAt: nil))
+        guard let next else {
+            try await deliverBuffered(outbound, status: status, headers: headers, body: errBody)
+            return nil
+        }
+        return next
     }
 
     private enum FailoverReason { case needsLogin }

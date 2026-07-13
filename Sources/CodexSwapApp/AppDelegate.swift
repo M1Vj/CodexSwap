@@ -13,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settings = Settings.default
     private var settingsViewModel: SettingsViewModel!
     private var settingsWindowController: SettingsWindowController?
+    private var taskBoardViewModel: TaskBoardViewModel!
+    private var taskBoardWindowController: TaskBoardWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -26,6 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             snapshot: latest,
             settings: settings,
             actions: makeSettingsActions()
+        )
+        taskBoardViewModel = TaskBoardViewModel(
+            snapshot: latest,
+            settings: settings,
+            actions: makeTaskBoardActions()
         )
         rebuildMenu()
 
@@ -65,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         latest = await engine.snapshot()
         settings = await SettingsStoreBridge.current()
         settingsViewModel?.update(snapshot: latest, settings: settings)
+        taskBoardViewModel?.update(snapshot: latest, settings: settings)
         rebuildMenu()
     }
 
@@ -84,6 +92,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case let .windowReset(alias):
             if settings.notifyOnWindowReset {
                 notify(title: "Quota reset", body: "\(alias) is back in rotation.")
+            }
+        case let .taskStarted(title, account):
+            if settings.notifyOnTaskEvents {
+                let body = account.map { "\(title) · \($0)" } ?? title
+                notify(title: "Task started", body: body)
+            }
+        case let .taskCompleted(title):
+            if settings.notifyOnTaskEvents {
+                notify(title: "Task completed", body: title)
+            }
+        case let .taskPausedQuota(title):
+            if settings.notifyOnTaskEvents {
+                notify(title: "Task waiting for quota", body: title)
+            }
+        case let .taskFailed(title, _):
+            if settings.notifyOnTaskEvents {
+                notify(title: "Task failed", body: title)
             }
         case .refreshed, .snapshotChanged:
             break
@@ -124,6 +149,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         active.isEnabled = false
         menu.addItem(active)
 
+        if !latest.tasks.isEmpty {
+            let queuedCount = latest.tasks.filter { $0.column == .queued }.count
+            let taskStatus = NSMenuItem(
+                title: "Tasks: \(latest.runningTaskIDs.count) running · \(queuedCount) queued",
+                action: nil,
+                keyEquivalent: ""
+            )
+            taskStatus.isEnabled = false
+            menu.addItem(taskStatus)
+        }
+
         menu.addItem(.separator())
 
         if latest.accounts.isEmpty {
@@ -148,6 +184,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         warm.isEnabled = !latest.warmupInProgress
         menu.addItem(warm)
         menu.addItem(.separator())
+        let taskBoard = NSMenuItem(title: "Task Board…", action: #selector(showTaskBoard), keyEquivalent: "t")
+        taskBoard.target = self
+        taskBoard.keyEquivalentModifierMask = [.command]
+        menu.addItem(taskBoard)
         let preferences = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         preferences.target = self
         preferences.keyEquivalentModifierMask = [.command]
@@ -190,18 +230,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setNotifyOnRotate: { [weak self] enabled in self?.updateSettings { $0.notifyOnRotate = enabled } },
             setNotifyOnExhausted: { [weak self] enabled in self?.updateSettings { $0.notifyOnExhausted = enabled } },
             setNotifyOnWindowReset: { [weak self] enabled in self?.updateSettings { $0.notifyOnWindowReset = enabled } },
+            setAutomationEnabled: { [weak self] enabled in self?.updateSettings { $0.automationEnabled = enabled } },
+            setNotifyOnTaskEvents: { [weak self] enabled in self?.updateSettings { $0.notifyOnTaskEvents = enabled } },
+            setAutomationConsumeBankedWindow: { [weak self] enabled in
+                self?.updateSettings { $0.automationConsumeBankedWindow = enabled }
+            },
+            setAutomationMaxConcurrent: { [weak self] value in
+                self?.updateSettings { $0.automationMaxConcurrent = max(1, min(4, value)) }
+            },
             installShim: { [weak self] in self?.setShimInstalled(true) },
             uninstallShim: { [weak self] in self?.setShimInstalled(false) }
         )
     }
 
+    private func makeTaskBoardActions() -> TaskBoardActions {
+        TaskBoardActions(
+            addTask: { [weak self] task in
+                guard let self else { return }
+                Task { await self.engine.addTask(task); await self.refreshSnapshot() }
+            },
+            updateTask: { [weak self] task in
+                guard let self else { return }
+                Task { await self.engine.updateTask(task); await self.refreshSnapshot() }
+            },
+            deleteTask: { [weak self] id in
+                guard let self else { return }
+                Task { await self.engine.removeTask(id: id); await self.refreshSnapshot() }
+            },
+            moveTask: { [weak self] id, column, index in
+                guard let self else { return }
+                Task { await self.engine.moveTask(id: id, to: column, index: index); await self.refreshSnapshot() }
+            },
+            runNow: { [weak self] id in
+                guard let self else { return }
+                Task { await self.engine.runTaskNow(id: id); await self.refreshSnapshot() }
+            },
+            stopTask: { [weak self] id in
+                guard let self else { return }
+                Task { await self.engine.stopTask(id: id); await self.refreshSnapshot() }
+            },
+            exportPrompt: { [weak self] id in
+                guard let self else { return }
+                Task { @MainActor in
+                    if let text = await self.engine.exportPrompt(id: id) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                        self.taskBoardViewModel.showMessage("Handoff prompt copied to clipboard.")
+                    }
+                    await self.refreshSnapshot()
+                }
+            },
+            openAutomationLog: { [weak self] in
+                self?.openAutomationLog()
+            },
+            openRunLog: { [weak self] id in
+                self?.openLatestRunLog(taskID: id)
+            },
+            setAutomationEnabled: { [weak self] enabled in
+                self?.updateSettings { $0.automationEnabled = enabled }
+            },
+            setAutomationAccounts: { [weak self] aliases in
+                self?.updateSettings { $0.automationAccounts = aliases }
+            },
+            setConsumeBanked: { [weak self] enabled in
+                self?.updateSettings { $0.automationConsumeBankedWindow = enabled }
+            },
+            setMaxConcurrent: { [weak self] value in
+                self?.updateSettings { $0.automationMaxConcurrent = max(1, min(4, value)) }
+            },
+            setNotifyOnTaskEvents: { [weak self] enabled in
+                self?.updateSettings { $0.notifyOnTaskEvents = enabled }
+            }
+        )
+    }
+
     // MARK: - Actions
+
+    @objc private func showTaskBoard() {
+        if taskBoardWindowController == nil {
+            taskBoardWindowController = TaskBoardWindowController(viewModel: taskBoardViewModel)
+        }
+        taskBoardWindowController?.show()
+    }
 
     @objc private func showSettings() {
         if settingsWindowController == nil {
             settingsWindowController = SettingsWindowController(viewModel: settingsViewModel)
         }
         settingsWindowController?.show()
+    }
+
+    private func openAutomationLog() {
+        let url = AppPaths.automationLogFile()
+        do {
+            let directory = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                guard FileManager.default.createFile(
+                    atPath: url.path,
+                    contents: nil,
+                    attributes: [.posixPermissions: 0o600]
+                ) else {
+                    presentMessage("Could not create the automation log.")
+                    return
+                }
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            if !NSWorkspace.shared.open(url) {
+                presentMessage("Could not open the automation log.")
+            }
+        } catch {
+            presentMessage("Could not open the automation log: \(error.localizedDescription)")
+        }
+    }
+
+    private func openLatestRunLog(taskID: UUID) {
+        guard let task = latest.tasks.first(where: { $0.id == taskID }),
+              let fileName = task.runs.last?.logFileName,
+              !fileName.isEmpty,
+              URL(fileURLWithPath: fileName).lastPathComponent == fileName else {
+            presentMessage("This task does not have a run log yet.")
+            return
+        }
+        let url = AppPaths.supportDir()
+            .appendingPathComponent("tasks", isDirectory: true)
+            .appendingPathComponent(task.id.uuidString, isDirectory: true)
+            .appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: url.path), NSWorkspace.shared.open(url) else {
+            presentMessage("The latest run log could not be opened.")
+            return
+        }
     }
 
     @objc private func switchAccount(_ sender: NSMenuItem) {
@@ -409,6 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateSettings(_ mutate: @escaping @Sendable (inout Settings) -> Void) {
         Task {
             settings = await SettingsStoreBridge.update(mutate)
+            await engine.automationTick()
             await refreshSnapshot()
         }
     }
@@ -449,8 +613,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusIcon() {
         guard let button = statusItem.button else { return }
         let routingEnabled = latest.routingState == .enabled
-        let working = routingEnabled && latest.isRunning && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
-        let name = latest.isRunning ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle"
+        let taskRunning = !latest.runningTaskIDs.isEmpty
+        let proxyWorking = routingEnabled && latest.isRunning
+            && latest.lastActivityAt.map { Date().timeIntervalSince($0) < 90 } == true
+        let working = proxyWorking || taskRunning
+        let name = taskRunning
+            ? "play.circle.fill"
+            : latest.isRunning ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle"
         button.image = NSImage(systemSymbolName: name, accessibilityDescription: "CodexSwap")
         button.image?.isTemplate = !working
         button.contentTintColor = working ? .systemGreen : nil
