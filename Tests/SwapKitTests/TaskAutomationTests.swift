@@ -452,6 +452,19 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(unchangedByEmptyUsage?.disabledUntil, ["premium": cooldown])
     }
 
+    func testUpdateUsageEmptyFetchKeepsExistingReading() async throws {
+        let root = try temporaryDirectory(named: "usage-empty-fetch")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let window = UsageWindow(label: "Weekly", usedPercent: 23, windowSeconds: 604_800, resetAt: nil)
+        await store.upsert(Account(alias: "busy", accessToken: "token", usage: [window]))
+
+        await store.updateUsage("busy", windows: [])
+
+        let account = await store.account("busy")
+        XCTAssertEqual(account?.usage, [window])
+    }
+
     func testAutomationLogWritesAndTailsLinesInOrder() async throws {
         let root = try temporaryDirectory(named: "automation-log-tail")
         defer { try? FileManager.default.removeItem(at: root) }

@@ -938,6 +938,7 @@ public actor AppEngine {
                 await self.syncCodexBar()
                 await self.expireCooldownsAndNotify()
                 await self.pollUsage(activeOnly: true)
+                await self.pollRunningTaskUsage(settings: settings)
                 await self.proactiveSwitchIfNeeded(settings: settings)
                 await self.automationTick()
                 if settings.automaticallyWarmAccounts,
@@ -949,6 +950,20 @@ public actor AppEngine {
                 try? await Task.sleep(nanoseconds: UInt64(max(15, settings.usagePollSeconds)) * 1_000_000_000)
             }
         }
+    }
+
+    /// Accounts consumed by running tasks are usually not the active account, so the
+    /// active-only poll never refreshes them and their quota display goes stale mid-run.
+    private func pollRunningTaskUsage(settings: Settings) async {
+        let runningIDs = await taskRunner.runningIDs()
+        guard !runningIDs.isEmpty else { return }
+        var aliases: Set<String> = []
+        for id in runningIDs {
+            guard let task = await taskStore.task(id: id) else { continue }
+            aliases.formUnion(Self.allowedAliases(for: task, settings: settings))
+        }
+        guard !aliases.isEmpty else { return }
+        await pollUsage(activeOnly: false, aliases: aliases)
     }
 
     private func settingsPoll() async -> Settings { await settingsStore.get() }
