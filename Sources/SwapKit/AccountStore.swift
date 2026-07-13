@@ -218,6 +218,13 @@ public actor AccountStore {
     public func updateUsage(_ alias: String, windows: [UsageWindow]) {
         guard let i = index(alias) else { return }
         data.accounts[i].usage = windows
+        // Fresh usage reporting headroom supersedes a recorded cooldown: a limit hit before
+        // an early reset (or lifted upstream) must not park the account until the stale
+        // resets_at. A limit that still holds re-establishes its cooldown on the next 429.
+        if !windows.isEmpty, windows.allSatisfy({ $0.usedPercent < 100 }),
+           !data.accounts[i].disabledUntil.isEmpty {
+            data.accounts[i].disabledUntil = [:]
+        }
         persist()
     }
 

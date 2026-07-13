@@ -389,4 +389,40 @@ final class TaskAutomationTests: XCTestCase {
 
         XCTAssertEqual(AppEngine.allowedAliases(for: task, settings: settings), ["task-only"])
     }
+
+    func testUpdateUsageWithHeadroomClearsStaleCooldown() async throws {
+        let root = try temporaryDirectory(named: "usage-clears-cooldown")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let staleCooldown = now.addingTimeInterval(5 * 86_400)
+        await store.upsert(Account(alias: "limited", accessToken: "token", disabledUntil: ["premium": staleCooldown]))
+
+        await store.updateUsage("limited", windows: [
+            UsageWindow(label: "Weekly", usedPercent: 6, windowSeconds: 604_800, resetAt: now.addingTimeInterval(6 * 86_400)),
+        ])
+
+        let account = await store.account("limited")
+        XCTAssertEqual(account?.disabledUntil, [:])
+        XCTAssertTrue(account?.isEligible(now: now) ?? false)
+    }
+
+    func testUpdateUsageKeepsCooldownWhileAnyWindowIsExhausted() async throws {
+        let root = try temporaryDirectory(named: "usage-keeps-cooldown")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cooldown = now.addingTimeInterval(3_600)
+        await store.upsert(Account(alias: "limited", accessToken: "token", disabledUntil: ["premium": cooldown]))
+
+        await store.updateUsage("limited", windows: [
+            UsageWindow(label: "Weekly", usedPercent: 100, windowSeconds: 604_800, resetAt: now.addingTimeInterval(3_600)),
+        ])
+        let stillLimited = await store.account("limited")
+        XCTAssertEqual(stillLimited?.disabledUntil, ["premium": cooldown])
+
+        await store.updateUsage("limited", windows: [])
+        let unchangedByEmptyUsage = await store.account("limited")
+        XCTAssertEqual(unchangedByEmptyUsage?.disabledUntil, ["premium": cooldown])
+    }
 }
