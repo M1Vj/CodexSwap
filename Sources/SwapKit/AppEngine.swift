@@ -93,12 +93,14 @@ public actor AppEngine {
     private let warmupService: QuotaWarmupService
     private let taskStore: TaskStore
     private let taskRunner: TaskRunner
+    private let autoLog: AutomationLog
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
     private var watcher: CodexBarWatcher?
     private var warmupInProgress = false
     private var schedulingTaskIDs: Set<UUID> = []
+    private var interruptingTaskIDs: Set<UUID> = []
 
     public init(
         store: AccountStore = AccountStore(),
@@ -108,7 +110,8 @@ public actor AppEngine {
         configManager: CodexConfigManager = CodexConfigManager(),
         warmupService: QuotaWarmupService = QuotaWarmupService(),
         taskStore: TaskStore = TaskStore(),
-        taskRunner: TaskRunner = TaskRunner()
+        taskRunner: TaskRunner? = nil,
+        autoLog: AutomationLog = AutomationLog()
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -117,7 +120,10 @@ public actor AppEngine {
         self.configManager = configManager
         self.warmupService = warmupService
         self.taskStore = taskStore
-        self.taskRunner = taskRunner
+        self.autoLog = autoLog
+        self.taskRunner = taskRunner ?? TaskRunner { [autoLog] category, message in
+            await autoLog.write(category, message)
+        }
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -163,6 +169,16 @@ public actor AppEngine {
             watcher.start()
             self.watcher = watcher
         }
+        let runningIDs = await taskRunner.runningIDs()
+        let storedTasks = await taskStore.all()
+        let reconciled = Self.interruptedTasks(in: storedTasks, running: runningIDs)
+        var recoveredCount = 0
+        for (before, after) in zip(storedTasks, reconciled) where before != after {
+            await taskStore.update(after)
+            recoveredCount += 1
+            await autoLog.write("lifecycle", "recovered interrupted task \(Self.taskLabel(after))")
+        }
+        await autoLog.write("lifecycle", "engine start reconciled \(recoveredCount) interrupted task(s)")
         startPoller()
     }
 
@@ -171,6 +187,21 @@ public actor AppEngine {
         watcher = nil
         pollerTask?.cancel()
         pollerTask = nil
+        let runningIDs = await taskRunner.runningIDs()
+        interruptingTaskIDs.formUnion(runningIDs)
+        let now = Date()
+        var pausedCount = 0
+        for taskID in runningIDs {
+            await taskRunner.stop(taskID: taskID)
+            guard let task = await taskStore.task(id: taskID),
+                  let interrupted = Self.interruptedTasks(in: [task], running: [], now: now).first,
+                  interrupted != task else { continue }
+            await taskStore.update(interrupted)
+            pausedCount += 1
+            await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
+        }
+        interruptingTaskIDs.subtract(runningIDs)
+        await autoLog.write("lifecycle", "engine stop: paused \(pausedCount) running task(s) for shutdown")
         RuntimeHandoff.clearProxyURL()
         await proxy?.stop()
         proxy = nil
@@ -208,26 +239,89 @@ public actor AppEngine {
         await taskStore.all()
     }
 
+    static func interruptedTasks(
+        in tasks: [AutomationTask],
+        running runningIDs: Set<UUID>,
+        now: Date = Date()
+    ) -> [AutomationTask] {
+        tasks.map { task in
+            guard task.column == .inProgress,
+                  task.phase == .planning || task.phase == .running,
+                  !runningIDs.contains(task.id),
+                  let runIndex = task.runs.indices.last,
+                  task.runs[runIndex].finishedAt == nil else {
+                return task
+            }
+            var recovered = task
+            recovered.runs[runIndex].finishedAt = now
+            recovered.runs[runIndex].outcome = "interrupted"
+            recovered.phase = .pausedQuota
+            recovered.updatedAt = now
+            return recovered
+        }
+    }
+
+    private static func shortID(_ id: UUID) -> String {
+        String(id.uuidString.lowercased().prefix(8))
+    }
+
+    private static func oneLine(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func taskLabel(_ task: AutomationTask) -> String {
+        "\(oneLine(task.title)) [\(shortID(task.id))]"
+    }
+
+    private static func aliasList(_ aliases: [String]) -> String {
+        aliases.map(oneLine).joined(separator: ", ")
+    }
+
+    private static func shortDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d HH:mm"
+        return formatter.string(from: date)
+    }
+
+    private static func errorExcerpt(_ value: String) -> String {
+        String(oneLine(value).prefix(120))
+    }
+
     public func addTask(_ task: AutomationTask) async {
+        await autoLog.write("api", "addTask \(Self.taskLabel(task))")
         await taskStore.add(task)
         emit(.snapshotChanged)
         await automationTick()
     }
 
     public func updateTask(_ task: AutomationTask) async {
+        await autoLog.write("api", "updateTask \(Self.taskLabel(task))")
         await taskStore.update(task)
         emit(.snapshotChanged)
         await automationTick()
     }
 
     public func removeTask(id: UUID) async {
+        let task = await taskStore.task(id: id)
+        if let task {
+            await autoLog.write("api", "removeTask \(Self.taskLabel(task))")
+        }
         let wasRunning = await taskRunner.runningIDs().contains(id)
         await taskStore.remove(id: id)
         if wasRunning { await taskRunner.stop(taskID: id) }
+        if let task {
+            try? FileManager.default.removeItem(at: task.taskDirURL(supportDir: AppPaths.supportDir()))
+        }
         emit(.snapshotChanged)
     }
 
     public func moveTask(id: UUID, to column: TaskColumn, index: Int) async {
+        if let task = await taskStore.task(id: id) {
+            await autoLog.write("api", "moveTask \(Self.taskLabel(task)) to \(column.rawValue)")
+        }
         let isRunning = await taskRunner.runningIDs().contains(id)
         await taskStore.move(id: id, to: column, index: index)
         if !isRunning, column == .todo || column == .queued,
@@ -242,6 +336,7 @@ public actor AppEngine {
 
     public func stopTask(id: UUID) async {
         guard var task = await taskStore.task(id: id) else { return }
+        await autoLog.write("api", "stopTask \(Self.taskLabel(task))")
         task.phase = .stopped
         task.updatedAt = Date()
         await taskStore.update(task)
@@ -251,6 +346,7 @@ public actor AppEngine {
 
     public func runTaskNow(id: UUID) async {
         guard let task = await taskStore.task(id: id) else { return }
+        await autoLog.write("api", "runTaskNow \(Self.taskLabel(task))")
         let runningIDs = await taskRunner.runningIDs()
         guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else { return }
         schedulingTaskIDs.insert(id)
@@ -264,10 +360,12 @@ public actor AppEngine {
         let allowedAliases = Self.allowedAliases(for: task, settings: settings)
         let occupiedCount = runningIDs.count + schedulingTaskIDs.count - 1
         let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
+        let now = Date()
+        let hydratedAccounts = await hydratedAutomationAccounts(aliases: allowedAliases)
         if let proxyURL,
            !allowedAliases.isEmpty,
            occupiedCount < maximumConcurrent,
-           let account = await automationAccount(aliases: allowedAliases, settings: settings, now: Date()) {
+           let account = Self.automationAccount(from: hydratedAccounts, settings: settings, now: now) {
             switch await startTask(
                 task,
                 account: account,
@@ -285,6 +383,17 @@ public actor AppEngine {
             case .unavailable:
                 break
             }
+        } else if !allowedAliases.isEmpty {
+            let reasons = Self.accountEligibilityReasons(
+                aliases: allowedAliases,
+                accounts: hydratedAccounts,
+                settings: settings,
+                now: now
+            )
+            await autoLog.write(
+                "tick",
+                "\(Self.taskLabel(task)) no eligible account among [\(Self.aliasList(allowedAliases))] (reasons per alias: \(reasons))"
+            )
         }
 
         let queueIndex = await taskStore.tasks(in: .queued).count
@@ -436,6 +545,26 @@ public actor AppEngine {
     }
 
     fileprivate func forwardProxyEvent(_ event: ProxyEvent) async {
+        let runningIDs = await taskRunner.runningIDs()
+        if !runningIDs.isEmpty || !schedulingTaskIDs.isEmpty {
+            switch event.kind {
+            case .exhausted:
+                let resetAt = event.resetAt.map(Self.shortDate) ?? "unknown"
+                await autoLog.write(
+                    "proxy",
+                    "exhausted alias \(Self.oneLine(event.from ?? "unknown")) limit \(Self.oneLine(event.limit ?? "codex")) resetAt \(resetAt)"
+                )
+            case .needsLogin:
+                await autoLog.write("proxy", "needsLogin alias \(Self.oneLine(event.from ?? "unknown"))")
+            case .rotated:
+                await autoLog.write(
+                    "proxy",
+                    "rotated \(Self.oneLine(event.from ?? "unknown")) to \(Self.oneLine(event.to ?? "unknown")) limit \(Self.oneLine(event.limit ?? "codex"))"
+                )
+            case .refreshed, .tokensUpdated:
+                break
+            }
+        }
         switch event.kind {
         case .rotated:
             emit(.rotated(from: event.from ?? "?", to: event.to ?? "?", limit: event.limit ?? "codex", resetAt: event.resetAt))
@@ -456,13 +585,7 @@ public actor AppEngine {
 
     public func automationTick() async {
         let settings = await settingsStore.get()
-        guard settings.automationEnabled,
-              let proxyURL = await proxy?.proxyURL() else { return }
-
         let runningIDs = await taskRunner.runningIDs()
-        let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
-        guard runningIDs.count + schedulingTaskIDs.count < maximumConcurrent else { return }
-
         let paused = await taskStore.tasks(in: .inProgress)
             .filter { $0.phase == .pausedQuota }
         // Only idle queued tasks are schedulable: a failed launch (missing repo/binary) must
@@ -472,8 +595,31 @@ public actor AppEngine {
         let waiting = (paused + queued).filter {
             !runningIDs.contains($0.id) && !schedulingTaskIDs.contains($0.id)
         }
-        guard !waiting.isEmpty,
-              !settings.automationAccounts.isEmpty || waiting.contains(where: { !$0.accountAliases.isEmpty }) else { return }
+        await autoLog.write(
+            "tick",
+            "entering running \(runningIDs.count) scheduling \(schedulingTaskIDs.count) waiting \(waiting.count)"
+        )
+        guard settings.automationEnabled else {
+            await autoLog.write("tick", "early-out: disabled")
+            return
+        }
+        guard let proxyURL = await proxy?.proxyURL() else {
+            await autoLog.write("tick", "early-out: no proxy")
+            return
+        }
+        let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
+        guard runningIDs.count + schedulingTaskIDs.count < maximumConcurrent else {
+            await autoLog.write("tick", "early-out: concurrency full")
+            return
+        }
+        guard !waiting.isEmpty else {
+            await autoLog.write("tick", "early-out: no waiting tasks")
+            return
+        }
+        guard !settings.automationAccounts.isEmpty || waiting.contains(where: { !$0.accountAliases.isEmpty }) else {
+            await autoLog.write("tick", "early-out: no accounts configured")
+            return
+        }
 
         var didRefreshUsage = false
         var candidates = waiting
@@ -483,12 +629,31 @@ public actor AppEngine {
 
             for task in candidates {
                 let currentRunningIDs = await taskRunner.runningIDs()
-                guard currentRunningIDs.count + schedulingTaskIDs.count < maximumConcurrent else { return }
+                guard currentRunningIDs.count + schedulingTaskIDs.count < maximumConcurrent else {
+                    await autoLog.write("tick", "early-out: concurrency full")
+                    return
+                }
                 guard !currentRunningIDs.contains(task.id), !schedulingTaskIDs.contains(task.id) else { continue }
 
                 let aliases = Self.allowedAliases(for: task, settings: settings)
+                let now = Date()
+                let hydratedAccounts = await hydratedAutomationAccounts(aliases: aliases)
                 guard !aliases.isEmpty,
-                      let account = await automationAccount(aliases: aliases, settings: settings, now: Date()) else {
+                      let account = Self.automationAccount(
+                        from: hydratedAccounts,
+                        settings: settings,
+                        now: now
+                      ) else {
+                    let reasons = Self.accountEligibilityReasons(
+                        aliases: aliases,
+                        accounts: hydratedAccounts,
+                        settings: settings,
+                        now: now
+                    )
+                    await autoLog.write(
+                        "tick",
+                        "\(Self.taskLabel(task)) no eligible account among [\(Self.aliasList(aliases))] (reasons per alias: \(reasons))"
+                    )
                     ineligibleTasks.append(task)
                     candidateAliases.formUnion(aliases)
                     continue
@@ -500,6 +665,10 @@ public actor AppEngine {
             guard currentRunningIDs.count + schedulingTaskIDs.count < maximumConcurrent,
                   !didRefreshUsage, !ineligibleTasks.isEmpty, !candidateAliases.isEmpty else { return }
             didRefreshUsage = true
+            await autoLog.write(
+                "tick",
+                "usage-refresh retry trigger for aliases [\(Self.aliasList(candidateAliases.sorted()))]"
+            )
             await pollUsage(activeOnly: false, aliases: candidateAliases)
             candidates = ineligibleTasks
         }
@@ -509,13 +678,17 @@ public actor AppEngine {
         task.accountAliases.isEmpty ? settings.automationAccounts : task.accountAliases
     }
 
-    private func automationAccount(aliases: [String], settings: Settings, now: Date) async -> Account? {
+    private func hydratedAutomationAccounts(aliases: [String]) async -> [Account] {
         var accounts: [Account] = []
         for alias in aliases {
             if let account = await store.hydrateFromManagedHome(alias) {
                 accounts.append(account)
             }
         }
+        return accounts
+    }
+
+    private static func automationAccount(from accounts: [Account], settings: Settings, now: Date) -> Account? {
         return accounts
             .filter { account in
                 guard account.isEligible(now: now) else { return false }
@@ -532,6 +705,30 @@ public actor AppEngine {
                 return lhs.alias < rhs.alias
             }
             .first
+    }
+
+    private static func accountEligibilityReasons(
+        aliases: [String],
+        accounts: [Account],
+        settings: Settings,
+        now: Date
+    ) -> String {
+        let byAlias = Dictionary(uniqueKeysWithValues: accounts.map { ($0.alias, $0) })
+        return aliases.map { alias in
+            let safeAlias = oneLine(alias)
+            guard let account = byAlias[alias] else { return "\(safeAlias)=unknown-alias" }
+            if account.needsLogin || account.accessToken.isEmpty { return "\(safeAlias)=needs-login" }
+            if let cooldown = account.cooldownUntil(now: now) {
+                return "\(safeAlias)=cooldown until \(shortDate(cooldown))"
+            }
+            if !settings.automationConsumeBankedWindow,
+               !account.usage.contains(where: {
+                   $0.windowSeconds > 0 && $0.windowSeconds < 604_800 && $0.usedPercent > 0
+               }) {
+                return "\(safeAlias)=banked-unstarted"
+            }
+            return "\(safeAlias)=eligible"
+        }.joined(separator: "; ")
     }
 
     private func startTask(
@@ -595,6 +792,10 @@ public actor AppEngine {
             await startGate.release()
             return .unavailable
         }
+        await autoLog.write(
+            "tick",
+            "started task \(Self.taskLabel(started)) on alias \(Self.oneLine(account.alias)) (run \(runNumber))"
+        )
         emit(.taskStarted(title: task.title, account: account.alias))
         emit(.snapshotChanged)
         await startGate.release()
@@ -603,6 +804,10 @@ public actor AppEngine {
 
     private func failTaskLaunch(taskID: UUID, reason: String) async {
         guard var task = await taskStore.task(id: taskID) else { return }
+        await autoLog.write(
+            "run",
+            "failTaskLaunch \(Self.taskLabel(task)) reason \(Self.oneLine(reason))"
+        )
         if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
             task.runs[runIndex].finishedAt = Date()
             task.runs[runIndex].outcome = "failed"
@@ -616,7 +821,21 @@ public actor AppEngine {
     }
 
     private func handleTaskExit(taskID: UUID, exit: TaskRunner.RunExit) async {
+        guard !interruptingTaskIDs.contains(taskID) else {
+            await autoLog.write(
+                "lifecycle",
+                "deferred shutdown exit for task [\(Self.shortID(taskID))]"
+            )
+            return
+        }
         guard var task = await taskStore.task(id: taskID) else { return }
+        guard let lastRun = task.runs.last, lastRun.finishedAt == nil else {
+            await autoLog.write(
+                "lifecycle",
+                "ignored late exit for \(Self.taskLabel(task)); run already closed"
+            )
+            return
+        }
         let now = Date()
         let planURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             .appendingPathComponent(task.planRelativePath)
@@ -635,6 +854,13 @@ public actor AppEngine {
             task.phase = .pausedQuota
             task.column = .inProgress
             terminalEvent = .taskPausedQuota(title: task.title)
+        } else if progress?.status == "COMPLETE", task.isEvergreen {
+            // Evergreen tasks never retire: even a COMPLETE plan re-enters the rotation so the
+            // next quota window starts a fresh improvement cycle.
+            outcome = "cycle-complete"
+            task.phase = .pausedQuota
+            task.column = .inProgress
+            terminalEvent = .taskCompleted(title: task.title)
         } else if progress?.status == "COMPLETE" {
             outcome = "completed"
             task.phase = .completed
@@ -678,6 +904,24 @@ public actor AppEngine {
         }
         task.updatedAt = now
         await taskStore.update(task)
+        let progressText = "done \(progress?.done ?? 0) total \(progress?.total ?? 0) status \(progress?.status ?? "none")"
+        let nextState: String
+        switch task.phase {
+        case .completed:
+            nextState = "done"
+        case .pausedQuota:
+            nextState = "pausedQuota"
+        case .failed:
+            nextState = "failed error \(Self.errorExcerpt(task.lastError ?? exit.stderrTail))"
+        case .stopped:
+            nextState = "stopped"
+        case .idle, .planning, .running:
+            nextState = task.phase.rawValue
+        }
+        await autoLog.write(
+            "run",
+            "exit \(Self.taskLabel(task)) code \(exit.exitCode) outcome \(outcome) plan \(progressText) next \(nextState)"
+        )
         if let terminalEvent { emit(terminalEvent) }
         emit(.snapshotChanged)
         await automationTick()

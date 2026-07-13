@@ -80,6 +80,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var model: String
     public var reasoningEffort: String
     public var allowNetwork: Bool
+    /// Evergreen tasks loop forever: a COMPLETE plan re-queues the task for the next quota
+    /// window instead of retiring it to Done.
+    public var isEvergreen: Bool
     public var accountAliases: [String]
     public var column: TaskColumn
     public var phase: TaskPhase
@@ -99,6 +102,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         model: String = "gpt-5.6-sol",
         reasoningEffort: String = "high",
         allowNetwork: Bool = false,
+        isEvergreen: Bool = false,
         accountAliases: [String] = [],
         column: TaskColumn = .todo,
         phase: TaskPhase = .idle,
@@ -117,6 +121,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.allowNetwork = allowNetwork
+        self.isEvergreen = isEvergreen
         self.accountAliases = accountAliases
         self.column = column
         self.phase = phase
@@ -139,6 +144,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? "gpt-5.6-sol"
         reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort) ?? "high"
         allowNetwork = try c.decodeIfPresent(Bool.self, forKey: .allowNetwork) ?? false
+        isEvergreen = try c.decodeIfPresent(Bool.self, forKey: .isEvergreen) ?? false
         accountAliases = try c.decodeIfPresent([String].self, forKey: .accountAliases) ?? []
         column = try c.decodeIfPresent(TaskColumn.self, forKey: .column) ?? .todo
         phase = try c.decodeIfPresent(TaskPhase.self, forKey: .phase) ?? .idle

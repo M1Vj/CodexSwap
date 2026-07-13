@@ -280,6 +280,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await self.refreshSnapshot()
                 }
             },
+            openAutomationLog: { [weak self] in
+                self?.openAutomationLog()
+            },
+            openRunLog: { [weak self] id in
+                self?.openLatestRunLog(taskID: id)
+            },
             setAutomationEnabled: { [weak self] enabled in
                 self?.updateSettings { $0.automationEnabled = enabled }
             },
@@ -312,6 +318,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsWindowController = SettingsWindowController(viewModel: settingsViewModel)
         }
         settingsWindowController?.show()
+    }
+
+    private func openAutomationLog() {
+        let url = AppPaths.automationLogFile()
+        do {
+            let directory = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                guard FileManager.default.createFile(
+                    atPath: url.path,
+                    contents: nil,
+                    attributes: [.posixPermissions: 0o600]
+                ) else {
+                    presentMessage("Could not create the automation log.")
+                    return
+                }
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            if !NSWorkspace.shared.open(url) {
+                presentMessage("Could not open the automation log.")
+            }
+        } catch {
+            presentMessage("Could not open the automation log: \(error.localizedDescription)")
+        }
+    }
+
+    private func openLatestRunLog(taskID: UUID) {
+        guard let task = latest.tasks.first(where: { $0.id == taskID }),
+              let fileName = task.runs.last?.logFileName,
+              !fileName.isEmpty,
+              URL(fileURLWithPath: fileName).lastPathComponent == fileName else {
+            presentMessage("This task does not have a run log yet.")
+            return
+        }
+        let url = AppPaths.supportDir()
+            .appendingPathComponent("tasks", isDirectory: true)
+            .appendingPathComponent(task.id.uuidString, isDirectory: true)
+            .appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: url.path), NSWorkspace.shared.open(url) else {
+            presentMessage("The latest run log could not be opened.")
+            return
+        }
     }
 
     @objc private func switchAccount(_ sender: NSMenuItem) {

@@ -30,7 +30,7 @@ public enum TaskPrompt {
 
         ## Original prompt
 
-        \(fencedBlock(task.prompt))
+        \(fencedBlock(task.prompt))\(evergreenClause(task))
         """
     }
 
@@ -57,7 +57,7 @@ public enum TaskPrompt {
 
         ## Original prompt
 
-        \(fencedBlock(task.prompt))
+        \(fencedBlock(task.prompt))\(evergreenClause(task))
         """
     }
 
@@ -86,7 +86,18 @@ public enum TaskPrompt {
         3. Make small conventional commits as work progresses.
         4. Maintain `\(task.planRelativePath)`. If no plan exists, first create it with the task title, original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it.
         5. Work through checklist items in order. Verify existing `- [x]` items, continue at the first `- [ ]` item, tick each completed item to `- [x]`, append a dated Work Log entry, and commit the related work and plan update.
-        6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.
+        6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.\(evergreenClause(task))
+        """
+    }
+
+    static func evergreenClause(_ task: AutomationTask) -> String {
+        guard task.isEvergreen else { return "" }
+        return """
+
+
+        ## Evergreen task
+
+        This task loops forever. NEVER write `STATUS: COMPLETE`. End every session with `STATUS: CONTINUE` and append fresh, prioritized unchecked checklist items for the next session so the checklist never runs dry.
         """
     }
 

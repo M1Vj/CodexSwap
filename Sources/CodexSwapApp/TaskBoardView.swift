@@ -25,6 +25,7 @@ struct TaskBoardView: View {
                         runNow: model.actions.runNow,
                         stopTask: model.actions.stopTask,
                         exportPrompt: model.actions.exportPrompt,
+                        openRunLog: model.actions.openRunLog,
                         editTask: { showEditor(for: $0) },
                         deleteTask: { taskToDelete = $0 }
                     )
@@ -85,6 +86,10 @@ struct TaskBoardView: View {
                 .help("Allows automation to spend a banked 5-hour reset when starting a task.")
 
             Spacer(minLength: 8)
+
+            Button("Logs", systemImage: "doc.text.magnifyingglass", action: model.actions.openAutomationLog)
+                .controlSize(.small)
+                .accessibilityLabel("Open automation log")
 
             Button("Add Task", systemImage: "plus", action: showAddEditor)
         }
@@ -228,6 +233,7 @@ private struct TaskColumnView: View {
     let runNow: (UUID) -> Void
     let stopTask: (UUID) -> Void
     let exportPrompt: (UUID) -> Void
+    let openRunLog: (UUID) -> Void
     let editTask: (AutomationTask) -> Void
     let deleteTask: (AutomationTask) -> Void
 
@@ -255,6 +261,7 @@ private struct TaskColumnView: View {
                             runNow: { runNow(task.id) },
                             stopTask: { stopTask(task.id) },
                             exportPrompt: { exportPrompt(task.id) },
+                            openRunLog: { openRunLog(task.id) },
                             editTask: { editTask(task) },
                             deleteTask: { deleteTask(task) }
                         )
@@ -281,6 +288,7 @@ private struct TaskCardView: View {
     let runNow: () -> Void
     let stopTask: () -> Void
     let exportPrompt: () -> Void
+    let openRunLog: () -> Void
     let editTask: () -> Void
     let deleteTask: () -> Void
     @State private var isHovering = false
@@ -303,6 +311,7 @@ private struct TaskCardView: View {
             HStack(spacing: 6) {
                 TaskChip(text: task.model)
                 TaskChip(text: task.reasoningEffort.capitalized)
+                if task.isEvergreen { TaskChip(text: "∞ evergreen") }
                 if !task.accountAliases.isEmpty {
                     TaskChip(text: task.accountAliases.count == 1 ? task.accountAliases[0] : "\(task.accountAliases.count) acct")
                 }
@@ -341,6 +350,8 @@ private struct TaskCardView: View {
                 .disabled(!isRunning)
             Divider()
             Button(action: exportPrompt) { Label("Export Prompt", systemImage: "doc.on.clipboard") }
+            Button(action: openRunLog) { Label("Show Run Log", systemImage: "doc.text.magnifyingglass") }
+                .disabled(task.runs.isEmpty)
             Button(action: editTask) { Label("Edit…", systemImage: "pencil") }
             Divider()
             Button(role: .destructive, action: deleteTask) { Label("Delete", systemImage: "trash") }
@@ -443,7 +454,7 @@ private struct TaskEditorView: View {
     let isNew: Bool
     let onSave: (AutomationTask) -> Void
 
-    private static let builtInModels = ["gpt-5.6-sol", "gpt-5.6-codex-sol", "gpt-5.6-terra", "gpt-5.5-codex"]
+    private static let builtInModels = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
     init(task: AutomationTask, accounts: [Account], isNew: Bool, onSave: @escaping (AutomationTask) -> Void) {
         _draft = State(initialValue: task)
@@ -542,6 +553,13 @@ private struct TaskEditorView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Toggle("Evergreen (loop forever)", isOn: $draft.isEvergreen)
+                    Text("The task never retires to Done: every session ends with new checklist items and re-queues for the next quota window.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 VStack(alignment: .leading, spacing: 5) {

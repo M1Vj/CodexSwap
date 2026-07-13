@@ -11,6 +11,8 @@ struct TaskBoardActions {
     let runNow: (UUID) -> Void
     let stopTask: (UUID) -> Void
     let exportPrompt: (UUID) -> Void
+    let openAutomationLog: () -> Void
+    let openRunLog: (UUID) -> Void
     let setAutomationEnabled: (Bool) -> Void
     let setAutomationAccounts: ([String]) -> Void
     let setConsumeBanked: (Bool) -> Void

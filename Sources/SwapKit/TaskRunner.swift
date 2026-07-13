@@ -37,8 +37,11 @@ public actor TaskRunner {
 
     private static let timeoutNanoseconds: UInt64 = 6 * 60 * 60 * 1_000_000_000
     private var running: [UUID: RunningTask] = [:]
+    private let logSink: (@Sendable (String, String) async -> Void)?
 
-    public init() {}
+    public init(logSink: (@Sendable (String, String) async -> Void)? = nil) {
+        self.logSink = logSink
+    }
 
     public static func launchArgs(task: AutomationTask, proxyURL: URL, allowedAliases: [String]) -> [String] {
         let baseURL = proxyURL.absoluteString.trimmingTrailingSlash() + "/backend-api/codex"
@@ -72,7 +75,7 @@ public actor TaskRunner {
         proxyURL: URL,
         supportDir: URL,
         onExit: @escaping @Sendable (UUID, RunExit) async -> Void
-    ) throws {
+    ) async throws {
         guard running[task.id] == nil else { throw TaskRunnerError.alreadyRunning }
 
         var isDirectory: ObjCBool = false
@@ -130,6 +133,10 @@ public actor TaskRunner {
                     continuation.finish()
                 }
             }
+            await log(
+                "runner",
+                "launch task \(Self.shortID(task.id)) run \(runNumber) binary \(binary) cwd \(task.repoPath) model \(task.model) allowNetwork \(task.allowNetwork) allowedAliases \(allowedAliases.count)"
+            )
             try process.run()
             running[task.id] = RunningTask(process: process, logURL: logURL, quotaExhausted: false)
 
@@ -138,6 +145,7 @@ public actor TaskRunner {
                 do {
                     exitCode = try await Self.wait(for: process, termination: termination)
                 } catch TaskRunnerError.timedOut {
+                    await self?.log("runner", "timeout hit for task \(Self.shortID(task.id))")
                     exitCode = 124
                 } catch {
                     exitCode = 1
@@ -151,7 +159,8 @@ public actor TaskRunner {
         }
     }
 
-    public func stop(taskID: UUID) {
+    public func stop(taskID: UUID) async {
+        await log("runner", "stop() called for task \(Self.shortID(taskID))")
         guard let process = running[taskID]?.process, process.isRunning else { return }
         process.terminate()
     }
@@ -160,9 +169,10 @@ public actor TaskRunner {
         Set(running.keys)
     }
 
-    public func noteQuotaExhausted(taskID: UUID) {
+    public func noteQuotaExhausted(taskID: UUID) async {
         guard running[taskID] != nil else { return }
         running[taskID]?.quotaExhausted = true
+        await log("runner", "noteQuotaExhausted for task \(Self.shortID(taskID))")
     }
 
     private func finish(
@@ -178,7 +188,19 @@ public actor TaskRunner {
             || lowercasedTail.contains("usage_limit_reached")
             || lowercasedTail.contains("429")
         let stderrTail = String(decoding: tail.suffix(2_048), as: UTF8.self)
+        await log(
+            "runner",
+            "exit task \(Self.shortID(taskID)) code \(exitCode) quotaExhausted \(quotaExhausted) log \(run.logURL.lastPathComponent)"
+        )
         await onExit(taskID, RunExit(exitCode: exitCode, quotaExhausted: quotaExhausted, stderrTail: stderrTail))
+    }
+
+    private func log(_ category: String, _ message: String) async {
+        await logSink?(category, message)
+    }
+
+    private static func shortID(_ id: UUID) -> String {
+        String(id.uuidString.lowercased().prefix(8))
     }
 
     private static func wait(for process: Process, termination: AsyncStream<Int32>) async throws -> Int32 {

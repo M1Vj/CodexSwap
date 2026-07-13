@@ -390,6 +390,32 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(AppEngine.allowedAliases(for: task, settings: settings), ["task-only"])
     }
 
+    func testEvergreenDefaultsFalseAndDecodesFromJSON() throws {
+        let minimal = try JSONDecoder().decode(
+            AutomationTask.self,
+            from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","title":"t","prompt":"p","repoPath":"/tmp","branch":"b"}"#.utf8)
+        )
+        XCTAssertFalse(minimal.isEvergreen)
+
+        let evergreen = try JSONDecoder().decode(
+            AutomationTask.self,
+            from: Data(#"{"id":"00000000-0000-0000-0000-000000000002","title":"t","prompt":"p","repoPath":"/tmp","branch":"b","isEvergreen":true}"#.utf8)
+        )
+        XCTAssertTrue(evergreen.isEvergreen)
+    }
+
+    func testEvergreenClauseAppearsInAllPromptsOnlyWhenEnabled() {
+        var task = makeTask()
+        XCTAssertFalse(TaskPrompt.firstRun(task: task).contains("Evergreen task"))
+        XCTAssertFalse(TaskPrompt.continuation(task: task).contains("Evergreen task"))
+        XCTAssertFalse(TaskPrompt.export(task: task, planDoc: nil).contains("Evergreen task"))
+
+        task.isEvergreen = true
+        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
+            XCTAssertTrue(prompt.contains("NEVER write `STATUS: COMPLETE`"))
+        }
+    }
+
     func testUpdateUsageWithHeadroomClearsStaleCooldown() async throws {
         let root = try temporaryDirectory(named: "usage-clears-cooldown")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -424,5 +450,95 @@ final class TaskAutomationTests: XCTestCase {
         await store.updateUsage("limited", windows: [])
         let unchangedByEmptyUsage = await store.account("limited")
         XCTAssertEqual(unchangedByEmptyUsage?.disabledUntil, ["premium": cooldown])
+    }
+
+    func testAutomationLogWritesAndTailsLinesInOrder() async throws {
+        let root = try temporaryDirectory(named: "automation-log-tail")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("automation.log")
+        let log = AutomationLog(url: url)
+
+        await log.write("tick", "first decision")
+        await log.write("run", "second decision")
+        let lines = await log.tail(maxLines: 10)
+
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertTrue(lines[0].contains("[tick] first decision"))
+        XCTAssertTrue(lines[1].contains("[run] second decision"))
+    }
+
+    func testAutomationLogRotatesAndRestartsMainFile() async throws {
+        let root = try temporaryDirectory(named: "automation-log-rotation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("automation.log")
+        let rotatedURL = root.appendingPathComponent("automation.log.1")
+        let log = AutomationLog(url: url, maxBytes: 90)
+
+        for index in 0..<12 {
+            await log.write("tick", "rotation entry \(index)")
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rotatedURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let mainLines = await log.tail(maxLines: 50)
+        XCTAssertFalse(mainLines.isEmpty)
+        let mainSize = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber
+        ).intValue
+        XCTAssertLessThanOrEqual(mainSize, 90)
+    }
+
+    func testInterruptedTasksPausesLivePlanningAndRunningTasks() throws {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        var planning = makeTask(title: "Planning", column: .inProgress)
+        planning.phase = .planning
+        planning.runs = [TaskRunRecord(startedAt: now.addingTimeInterval(-60), logFileName: "run-1.log")]
+        var running = makeTask(title: "Running", column: .inProgress)
+        running.phase = .running
+        running.runs = [TaskRunRecord(startedAt: now.addingTimeInterval(-30), logFileName: "run-2.log")]
+
+        let recovered = AppEngine.interruptedTasks(in: [planning, running], running: [], now: now)
+
+        XCTAssertEqual(recovered.map(\.phase), [.pausedQuota, .pausedQuota])
+        XCTAssertEqual(recovered.map { $0.runs.last?.outcome }, ["interrupted", "interrupted"])
+        XCTAssertEqual(recovered.map { $0.runs.last?.finishedAt }, [now, now])
+        XCTAssertEqual(recovered.map { $0.runs.last?.exitCode }, [nil, nil])
+    }
+
+    func testInterruptedTasksLeavesNonLiveAndAlreadyClosedRunsUntouched() {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        var queued = makeTask(title: "Queued", column: .queued)
+        queued.phase = .idle
+        var done = makeTask(title: "Done", column: .done)
+        done.phase = .completed
+        var paused = makeTask(title: "Paused", column: .inProgress)
+        paused.phase = .pausedQuota
+        var failed = makeTask(title: "Failed", column: .inProgress)
+        failed.phase = .failed
+        var closed = makeTask(title: "Closed", column: .inProgress)
+        closed.phase = .running
+        closed.runs = [TaskRunRecord(
+            startedAt: now.addingTimeInterval(-60),
+            finishedAt: now.addingTimeInterval(-30),
+            exitCode: 1,
+            outcome: "failed",
+            logFileName: "run-1.log"
+        )]
+        let original = [queued, done, paused, failed, closed]
+
+        let recovered = AppEngine.interruptedTasks(in: original, running: [], now: now)
+
+        XCTAssertEqual(recovered, original)
+    }
+
+    func testInterruptedTasksLeavesCurrentlyRunningTaskUntouched() {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        var task = makeTask(title: "Still running", column: .inProgress)
+        task.phase = .running
+        task.runs = [TaskRunRecord(startedAt: now.addingTimeInterval(-30), logFileName: "run-1.log")]
+
+        let recovered = AppEngine.interruptedTasks(in: [task], running: [task.id], now: now)
+
+        XCTAssertEqual(recovered, [task])
     }
 }
