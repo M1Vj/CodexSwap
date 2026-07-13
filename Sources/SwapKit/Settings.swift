@@ -46,7 +46,7 @@ public struct Settings: Codable, Sendable, Equatable {
         automationAccounts: [],
         automationMaxConcurrent: 1,
         automationConsumeBankedWindow: false,
-        automationDefaultModel: "gpt-5.6-codex",
+        automationDefaultModel: "gpt-5.6-sol",
         notifyOnTaskEvents: true,
         proxyPort: defaultProxyPort
     )

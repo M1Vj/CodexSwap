@@ -443,7 +443,7 @@ private struct TaskEditorView: View {
     let isNew: Bool
     let onSave: (AutomationTask) -> Void
 
-    private static let builtInModels = ["gpt-5.6-sol", "gpt-5.6-codex", "gpt-5.5-codex"]
+    private static let builtInModels = ["gpt-5.6-sol", "gpt-5.6-codex-sol", "gpt-5.6-terra", "gpt-5.5-codex"]
 
     init(task: AutomationTask, accounts: [Account], isNew: Bool, onSave: @escaping (AutomationTask) -> Void) {
         _draft = State(initialValue: task)

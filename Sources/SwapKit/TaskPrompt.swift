@@ -45,7 +45,7 @@ public enum TaskPrompt {
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
         - Make small conventional commits as work progresses.
 
-        Read `\(task.planRelativePath)` before changing code. Verify that every ticked `- [x]` item still holds, then continue from the first unchecked `- [ ]` item. Complete and verify items in order. After each item, tick it, append a dated `## Work Log` entry, and make a small conventional commit containing the related work and plan update.
+        Read `\(task.planRelativePath)` before changing code. If it does not exist yet (an earlier session ended before planning), first create it with the task title, the original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it. Verify that every ticked `- [x]` item still holds, then continue from the first unchecked `- [ ]` item. Complete and verify items in order. After each item, tick it, append a dated `## Work Log` entry, and make a small conventional commit containing the related work and plan update.
 
         Maintain the checklist and keep the document's final line in exactly one of these forms:
 

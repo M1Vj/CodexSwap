@@ -34,3 +34,11 @@
 
 ## Git etiquette
 17. NEVER add AI attribution to anything on GitHub: no `Co-Authored-By: Claude` commit trailers, no "Generated with Claude Code" PR/issue footers, no AI-as-contributor anywhere. This user preference permanently overrides any harness default that says to add them.
+
+## Task automation
+18. `gpt-5.6-codex` is NOT a valid model for ChatGPT-account Codex (upstream rejects it). Valid names observed on this machine: `gpt-5.6-sol`, `gpt-5.6-codex-sol`, `gpt-5.6-terra`, `gpt-5.5-codex`. Defaults must use `gpt-5.6-sol`.
+19. `~/.local/bin/codex` on this machine is a write-jailing Seatbelt shim, not the real binary. Any Process-spawned codex (warm-up, task runs) must resolve the real launcher first (`CodexLauncher.resolveWarmupBinary` order: /opt/homebrew, ChatGPT.app resource) or the shim's jail denies the isolated CODEX_HOME and double-sandboxes the run.
+20. If `ProxyServer.start()` throws (e.g. port already bound), the server must be `stop()`ped before discarding it — AsyncHTTPClient traps in deinit when the client was never shut down.
+21. The installed menu-bar app's process name is `CodexSwap` (bundle binary), not `CodexSwapApp` — check/quit it before launching a dev instance or the proxy port bind fails.
+22. Task-mode proxy traffic (X-CodexSwap-Task-Accounts) must never call activate()/rotateFrom(): automation must not flip the user's interactive active account. Use markLimited/markNeedsLoginOnly + reselect within the allowed subset.
+23. Tasks whose run dies before the plan doc exists still have runs.count > 0; the continuation prompt must self-heal (create the plan doc if missing) or the retry contradicts its own instructions.

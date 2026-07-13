@@ -45,6 +45,8 @@ public actor TaskRunner {
         let aliases = allowedAliases.joined(separator: ",")
         let provider = "model_providers.codexswap-task={ name=\"CodexSwap Task\", base_url=\"\(tomlEscape(baseURL))\", wire_api=\"responses\", env_key=\"CODEXSWAP_TASK_TOKEN\", http_headers={ \"\(ProxyRequestMode.taskHeader)\"=\"\(tomlEscape(aliases))\" } }"
         let prompt = task.runs.isEmpty ? TaskPrompt.firstRun(task: task) : TaskPrompt.continuation(task: task)
+        let gitDir = URL(fileURLWithPath: task.repoPath, isDirectory: true)
+            .appendingPathComponent(".git", isDirectory: true).path
         var arguments = [
             "exec",
             "-s", "workspace-write",
@@ -53,6 +55,9 @@ public actor TaskRunner {
             "-c", "model_reasoning_effort=\"\(tomlEscape(task.reasoningEffort))\"",
             "-c", provider,
             "-c", "model_provider=\"codexswap-task\"",
+            // workspace-write protects .git unconditionally; the task contract requires branch
+            // + commits, so whitelist exactly this repo's .git — nothing outside the repo.
+            "-c", "sandbox_workspace_write.writable_roots=[\"\(tomlEscape(gitDir))\"]",
         ]
         if task.allowNetwork {
             arguments += ["-c", "sandbox_workspace_write.network_access=true"]
@@ -74,7 +79,9 @@ public actor TaskRunner {
         guard FileManager.default.fileExists(atPath: task.repoPath, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw TaskRunnerError.invalidRepository
         }
-        guard let binary = CodexLauncher.resolveCodexBinary() else { throw TaskRunnerError.binaryNotFound }
+        // Warm-up's resolution order: prefer the real binary over any PATH shim — a write-jailing
+        // shim would deny the isolated CODEX_HOME and fight the runner's own workspace-write sandbox.
+        guard let binary = CodexLauncher.resolveWarmupBinary() else { throw TaskRunnerError.binaryNotFound }
 
         let taskDir = task.taskDirURL(supportDir: supportDir)
         let codexHome = taskDir.appendingPathComponent("codex-home", isDirectory: true)
@@ -108,9 +115,11 @@ public actor TaskRunner {
             process.currentDirectoryURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             process.standardOutput = logHandle
             process.standardError = logHandle
+            // HOME stays the real home: sandboxed git needs ~/.gitconfig for author identity,
+            // and Seatbelt already confines writes to the workspace + writable_roots.
             process.environment = [
                 "CODEX_HOME": codexHome.path,
-                "HOME": codexHome.path,
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
                 "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin",
                 "CODEXSWAP_TASK_TOKEN": "local-loopback-only",
                 "NO_COLOR": "1",

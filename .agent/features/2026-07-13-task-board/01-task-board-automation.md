@@ -59,7 +59,7 @@ New fields (all with tolerant-decoder defaults, same pattern as existing):
 | `automationAccounts` | [String] | [] | Aliases the automation may use (board checklist) |
 | `automationMaxConcurrent` | Int | 1 | Max simultaneous running tasks (clamp 1...4 on decode) |
 | `automationConsumeBankedWindow` | Bool | false | When false, only run on accounts whose 5h window is already started (usedPercent > 0); when true, a task may start (consume) a fresh/banked window |
-| `automationDefaultModel` | String | "gpt-5.6-codex" | Default model for new tasks |
+| `automationDefaultModel` | String | "gpt-5.6-sol" | Default model for new tasks |
 | `notifyOnTaskEvents` | Bool | true | Notifications for task start/finish/pause/fail |
 
 ### 3. Task model + store (new files: AutomationTask.swift, TaskStore.swift)
@@ -86,7 +86,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var prompt: String            // the user's task description / prompt
     public var repoPath: String          // absolute path to the working repo
     public var branch: String            // git branch the task must work on (created if missing)
-    public var model: String             // e.g. "gpt-5.6-codex", "gpt-5.6-sol"
+    public var model: String             // e.g. "gpt-5.6-sol", "gpt-5.6-codex-sol"
     public var reasoningEffort: String   // "low"|"medium"|"high" (default "high")
     public var allowNetwork: Bool        // sandbox_workspace_write.network_access (default false)
     public var column: TaskColumn
@@ -248,7 +248,7 @@ Actor. Mirrors `ProcessWarmupRunner` mechanics (termination-handler + continuati
   running task out does NOT stop it — Stop is explicit).
 - Task editor sheet (add/edit): title, prompt TextEditor, repo folder picker (NSOpenPanel via
   fileImporter), branch text field (default suggestion `codexswap/<slug>`), model Picker
-  (gpt-5.6-sol / gpt-5.6-codex / gpt-5.5-codex / custom text), reasoning effort Picker,
+  (gpt-5.6-sol / gpt-5.6-codex-sol / gpt-5.6-terra / gpt-5.5-codex / custom text), reasoning effort Picker,
   allow-network Toggle with warning text. Validate: nonempty title/prompt/repo/branch.
 - AppDelegate: handle new AppEvents → notifications (respect `notifyOnTaskEvents`); status-bar
   icon shows a small badge/tint when tasks are running (running task ⇒ `contentTintColor =

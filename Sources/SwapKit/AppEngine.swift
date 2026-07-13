@@ -141,7 +141,14 @@ public actor AppEngine {
             sink: sink,
             verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
         )
-        try await proxy.start()
+        do {
+            try await proxy.start()
+        } catch {
+            // A failed bind must still shut the HTTP client down: dropping the server
+            // otherwise traps in AsyncHTTPClient's deinit and crashes the app.
+            await proxy.stop()
+            throw error
+        }
         self.proxy = proxy
         if let url = await proxy.proxyURL() { RuntimeHandoff.writeProxyURL(url) }
 
@@ -634,10 +641,24 @@ public actor AppEngine {
             task.column = .done
             task.orderIndex = await taskStore.tasks(in: .done).count
             terminalEvent = .taskCompleted(title: task.title)
-        } else if exit.exitCode == 0 {
+        } else if progress?.status == "BLOCKED" {
+            outcome = "failed"
+            task.phase = .failed
+            task.column = .inProgress
+            task.lastError = "Plan reports BLOCKED — see \(task.planRelativePath)"
+            terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "blocked")
+        } else if exit.exitCode == 0, progress != nil {
             outcome = "continue"
             task.phase = .pausedQuota
             task.column = .inProgress
+        } else if exit.exitCode == 0 {
+            // A clean exit that produced no plan document is not resumable work; rescheduling
+            // it would hot-loop the same failing run until the account's quota is gone.
+            outcome = "failed"
+            task.phase = .failed
+            task.column = .inProgress
+            task.lastError = exit.stderrTail.isEmpty ? "run ended without a plan document" : exit.stderrTail
+            terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "no plan produced")
         } else {
             outcome = "failed"
             task.phase = .failed

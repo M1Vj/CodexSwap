@@ -96,7 +96,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         prompt: String,
         repoPath: String,
         branch: String,
-        model: String = "gpt-5.6-codex",
+        model: String = "gpt-5.6-sol",
         reasoningEffort: String = "high",
         allowNetwork: Bool = false,
         accountAliases: [String] = [],
@@ -136,7 +136,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         prompt = try c.decodeIfPresent(String.self, forKey: .prompt) ?? ""
         repoPath = try c.decodeIfPresent(String.self, forKey: .repoPath) ?? ""
         branch = try c.decodeIfPresent(String.self, forKey: .branch) ?? ""
-        model = try c.decodeIfPresent(String.self, forKey: .model) ?? "gpt-5.6-codex"
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? "gpt-5.6-sol"
         reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort) ?? "high"
         allowNetwork = try c.decodeIfPresent(Bool.self, forKey: .allowNetwork) ?? false
         accountAliases = try c.decodeIfPresent([String].self, forKey: .accountAliases) ?? []

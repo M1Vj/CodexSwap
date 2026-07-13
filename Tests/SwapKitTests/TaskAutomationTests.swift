@@ -9,7 +9,7 @@ final class TaskAutomationTests: XCTestCase {
         prompt: String = "Do the work.",
         repoPath: String = "/tmp/repository",
         branch: String = "codexswap/task",
-        model: String = "gpt-5.6-codex",
+        model: String = "gpt-5.6-sol",
         reasoningEffort: String = "high",
         allowNetwork: Bool = false,
         column: TaskColumn = .todo,
@@ -52,7 +52,7 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(settings.automationAccounts, [])
         XCTAssertEqual(settings.automationMaxConcurrent, 1)
         XCTAssertFalse(settings.automationConsumeBankedWindow)
-        XCTAssertEqual(settings.automationDefaultModel, "gpt-5.6-codex")
+        XCTAssertEqual(settings.automationDefaultModel, "gpt-5.6-sol")
         XCTAssertTrue(settings.notifyOnTaskEvents)
     }
 
@@ -347,7 +347,7 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(task.prompt, "p")
         XCTAssertEqual(task.repoPath, "/tmp")
         XCTAssertEqual(task.branch, "b")
-        XCTAssertEqual(task.model, "gpt-5.6-codex")
+        XCTAssertEqual(task.model, "gpt-5.6-sol")
         XCTAssertEqual(task.reasoningEffort, "high")
         XCTAssertFalse(task.allowNetwork)
         XCTAssertEqual(task.column, .todo)
