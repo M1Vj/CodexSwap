@@ -12,10 +12,15 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Per-task settings: repository folder, branch, model, reasoning effort, sandbox network access, and account override.
 - Automation controls in Settings and on the board: master switch, account checklist, max concurrent runs, banked-window consumption, and task notifications.
 - Menu-bar running indicator and task started/completed/waiting/failed notifications.
+- Evergreen tasks that loop forever: sessions extend their own checklist and a COMPLETE plan re-queues for the next quota window.
+- Structured automation trace log (`automation.log`, rotated) covering scheduling decisions, per-alias ineligibility reasons, launches, exits, and lifecycle events, with Logs and per-task Show Run Log actions on the board.
+- Crash and shutdown recovery: runs interrupted by quit or crash are closed as `interrupted` and resume automatically on the next quota window.
 
 ### Fixed
 
 - A failed proxy port bind no longer crashes the app on AsyncHTTPClient shutdown.
+- Stale usage-limit cooldowns are cleared when fresh usage reports headroom, so automation starts as soon as quota is actually back.
+- The model picker offers only live-validated model names.
 
 ## [0.2.0] - Unreleased
 

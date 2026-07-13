@@ -74,11 +74,15 @@ Routing safely manages only CodexSwap's provider values in `~/.codex/config.toml
 
 ### Task board automation
 
+![CodexSwap Task Board with an evergreen task running](Assets/screenshots/task-board.png)
+
 **Task Board…** (`⌘T` from the menu) opens a kanban board with **To Do**, **In Queue**, **In Progress**, and **Done** columns. Each task holds its own settings: a prompt, the repository folder the Codex CLI opens in, a working branch, the model and reasoning effort, optional sandbox network access, and an optional per-task account list that overrides the board's global account checklist.
 
 When automation is enabled, queued tasks start as background `codex exec` runs as soon as an enabled account has quota — including after a five-hour or weekly window reset. Runs execute with the workspace-write sandbox and never with approval bypass: writes stay confined to the task's repository (plus its `.git`) and the run's private `CODEX_HOME`. Every task plans first, maintaining `.codexswap/tasks/<slug>/PLAN.md` on its branch with a checklist, work log, and a final `STATUS:` line; a run interrupted by a usage limit waits in **In Progress** and resumes on the next window. **Export Prompt** copies a self-contained handoff (prompt, repository, branch, and current plan) for use in any other AI tool.
 
 Task runs consume quota on the accounts you enable for automation. The **May consume banked window** switch controls whether automation may spend a reset that has not started yet.
+
+Marking a task **Evergreen (loop forever)** keeps it in rotation permanently: every session ends by extending its own checklist, and even a plan that reports `STATUS: COMPLETE` re-queues for the next quota window instead of retiring to Done. Every scheduling decision, launch, and exit is traced to `~/Library/Application Support/CodexSwap/automation.log` — the board's **Logs** button opens it, and each card's **Show Run Log** opens the raw output of its latest run.
 
 ### Quota warm-up
 
