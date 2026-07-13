@@ -50,30 +50,39 @@ public actor AccountStore {
 
     private func index(_ alias: String) -> Int? { data.accounts.firstIndex { $0.alias == alias } }
 
+    /// Shared ordering for picking the next account: priority strategy ranks by priority
+    /// first, round-robin spreads by least-recently-used; both tiebreak LRU then alias.
+    static func selectionOrder(_ a: Account, _ b: Account, strategy: RotationStrategy) -> Bool {
+        if strategy == .priority, a.priority != b.priority { return a.priority > b.priority }
+        let la = a.lastUsedAt ?? .distantPast
+        let lb = b.lastUsedAt ?? .distantPast
+        if la != lb { return la < lb }
+        return a.alias < b.alias
+    }
+
     private func eligibleSorted(now: Date) -> [Account] {
         data.accounts
             .filter { $0.isEligible(now: now) }
-            .sorted { a, b in
-                if a.priority != b.priority { return a.priority > b.priority }
-                let la = a.lastUsedAt ?? .distantPast
-                let lb = b.lastUsedAt ?? .distantPast
-                if la != lb { return la < lb }
-                return a.alias < b.alias
-            }
+            .sorted { Self.selectionOrder($0, $1, strategy: .priority) }
     }
 
-    public func bestEligible(among aliases: [String], now: Date = Date()) -> Account? {
+    /// Best allowed account under the configured rotation strategy, preferring accounts
+    /// still under the pre-emptive usage thresholds; when every allowed account is over
+    /// threshold, falls back to the best one anyway — same as normal traffic, which keeps
+    /// serving on an over-threshold account when nothing else is eligible.
+    public func bestEligible(
+        among aliases: [String],
+        primaryThreshold: Int = Int.max,
+        secondaryThreshold: Int = Int.max,
+        now: Date = Date()
+    ) -> Account? {
         let allowed = Set(aliases)
-        return data.accounts
+        let ordered = data.accounts
             .filter { allowed.contains($0.alias) && $0.isEligible(now: now) }
-            .sorted { a, b in
-                if a.priority != b.priority { return a.priority > b.priority }
-                let la = a.lastUsedAt ?? .distantPast
-                let lb = b.lastUsedAt ?? .distantPast
-                if la != lb { return la < lb }
-                return a.alias < b.alias
-            }
-            .first
+            .sorted { Self.selectionOrder($0, $1, strategy: strategy) }
+        return ordered.first {
+            $0.isWithinRotationThresholds(primaryPercent: primaryThreshold, secondaryPercent: secondaryThreshold)
+        } ?? ordered.first
     }
 
     private func lruEligible(now: Date, excluding: String? = nil) -> Account? {

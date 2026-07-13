@@ -86,6 +86,15 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public func isEligible(now: Date) -> Bool {
         !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
     }
+
+    /// Mirrors the proxy's pre-emptive rotation gate: a reported window at or past its
+    /// configured threshold means the account should be avoided while an alternative
+    /// still has headroom.
+    public func isWithinRotationThresholds(primaryPercent: Int, secondaryPercent: Int) -> Bool {
+        !usage.contains { window in
+            window.usedPercent >= (window.windowSeconds >= 604_800 ? secondaryPercent : primaryPercent)
+        }
+    }
 }
 
 public enum RotationStrategy: String, Codable, Sendable, CaseIterable {
