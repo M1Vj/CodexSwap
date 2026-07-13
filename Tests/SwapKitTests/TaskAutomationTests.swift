@@ -452,6 +452,20 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(unchangedByEmptyUsage?.disabledUntil, ["premium": cooldown])
     }
 
+    func testHasStartedWindowJudgesFromReportedWindows() {
+        func account(_ windows: [UsageWindow]) -> Account {
+            Account(alias: "a", accessToken: "t", usage: windows)
+        }
+        let weekly = { (used: Int) in UsageWindow(label: "Weekly", usedPercent: used, windowSeconds: 604_800, resetAt: nil) }
+        let short = { (used: Int) in UsageWindow(label: "5h", usedPercent: used, windowSeconds: 18_000, resetAt: nil) }
+
+        XCTAssertTrue(AppEngine.hasStartedWindow(account([weekly(29)])))
+        XCTAssertFalse(AppEngine.hasStartedWindow(account([weekly(0)])))
+        XCTAssertTrue(AppEngine.hasStartedWindow(account([short(3), weekly(0)])))
+        XCTAssertFalse(AppEngine.hasStartedWindow(account([short(0), weekly(20)])))
+        XCTAssertFalse(AppEngine.hasStartedWindow(account([])))
+    }
+
     func testUpdateUsageEmptyFetchKeepsExistingReading() async throws {
         let root = try temporaryDirectory(named: "usage-empty-fetch")
         defer { try? FileManager.default.removeItem(at: root) }
