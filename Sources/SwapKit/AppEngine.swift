@@ -688,14 +688,22 @@ public actor AppEngine {
         return accounts
     }
 
+    /// "Started" must be judged from whatever windows are actually reported: while the 5h limit
+    /// is suspended only the weekly window exists, and demanding a started short window would
+    /// park the account forever even though no banked short reset exists to preserve.
+    static func hasStartedWindow(_ account: Account) -> Bool {
+        if let short = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }) {
+            return short.usedPercent > 0
+        }
+        return account.usage.contains { $0.usedPercent > 0 }
+    }
+
     private static func automationAccount(from accounts: [Account], settings: Settings, now: Date) -> Account? {
         return accounts
             .filter { account in
                 guard account.isEligible(now: now) else { return false }
                 if settings.automationConsumeBankedWindow { return true }
-                return account.usage.contains {
-                    $0.windowSeconds > 0 && $0.windowSeconds < 604_800 && $0.usedPercent > 0
-                }
+                return hasStartedWindow(account)
             }
             .sorted { lhs, rhs in
                 if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
@@ -721,10 +729,7 @@ public actor AppEngine {
             if let cooldown = account.cooldownUntil(now: now) {
                 return "\(safeAlias)=cooldown until \(shortDate(cooldown))"
             }
-            if !settings.automationConsumeBankedWindow,
-               !account.usage.contains(where: {
-                   $0.windowSeconds > 0 && $0.windowSeconds < 604_800 && $0.usedPercent > 0
-               }) {
+            if !settings.automationConsumeBankedWindow, !hasStartedWindow(account) {
                 return "\(safeAlias)=banked-unstarted"
             }
             return "\(safeAlias)=eligible"
