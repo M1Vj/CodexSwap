@@ -19,6 +19,10 @@ struct SettingsActions {
     let setNotifyOnRotate: (Bool) -> Void
     let setNotifyOnExhausted: (Bool) -> Void
     let setNotifyOnWindowReset: (Bool) -> Void
+    let setAutomationEnabled: (Bool) -> Void
+    let setNotifyOnTaskEvents: (Bool) -> Void
+    let setAutomationConsumeBankedWindow: (Bool) -> Void
+    let setAutomationMaxConcurrent: (Int) -> Void
     let installShim: () -> Void
     let uninstallShim: () -> Void
 }
