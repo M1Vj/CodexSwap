@@ -466,6 +466,26 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertFalse(AppEngine.hasStartedWindow(account([])))
     }
 
+    func testIsStagnantContinueRequiresThreeIdenticalContinueRuns() {
+        let progress = PlanProgress(done: 40, total: 44, status: "CONTINUE")
+        func run(_ outcome: String, done: Int? = 40, total: Int? = 44, closed: Bool = true) -> TaskRunRecord {
+            TaskRunRecord(
+                startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+                finishedAt: closed ? Date(timeIntervalSince1970: 1_800_000_100) : nil,
+                outcome: outcome,
+                planDone: done,
+                planTotal: total
+            )
+        }
+
+        XCTAssertTrue(AppEngine.isStagnantContinue(previousRuns: [run("continue"), run("continue")], progress: progress))
+        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue")], progress: progress))
+        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue", done: 38), run("continue")], progress: progress))
+        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("interrupted"), run("continue")], progress: progress))
+        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue"), run("continue", closed: false)], progress: progress))
+        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue", done: nil, total: nil), run("continue")], progress: progress))
+    }
+
     func testUpsertWithoutUsagePreservesStoredReading() async throws {
         let root = try temporaryDirectory(named: "upsert-preserves-usage")
         defer { try? FileManager.default.removeItem(at: root) }
