@@ -691,17 +691,6 @@ public actor AppEngine {
     /// "Started" must be judged from whatever windows are actually reported: while the 5h limit
     /// is suspended only the weekly window exists, and demanding a started short window would
     /// park the account forever even though no banked short reset exists to preserve.
-    /// Stagnant = this run and the two previous closed runs all ended "continue" with the
-    /// exact same checklist state. Interruptions and failures break the pattern on purpose.
-    static func isStagnantContinue<Runs: Sequence>(previousRuns: Runs, progress: PlanProgress) -> Bool
-    where Runs.Element == TaskRunRecord {
-        let closed = previousRuns.filter { $0.finishedAt != nil }.suffix(2)
-        guard closed.count == 2 else { return false }
-        return closed.allSatisfy {
-            $0.outcome == "continue" && $0.planDone == progress.done && $0.planTotal == progress.total
-        }
-    }
-
     static func hasStartedWindow(_ account: Account) -> Bool {
         if let short = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }) {
             return short.usedPercent > 0
@@ -861,65 +850,23 @@ public actor AppEngine {
         let progress = planText.flatMap(PlanDocParser.parse)
         task.planProgress = progress
 
-        let outcome: String
-        var terminalEvent: AppEvent?
-        if task.phase == .stopped {
-            outcome = "stopped"
-            task.phase = .stopped
-            task.column = .inProgress
-        } else if exit.quotaExhausted {
-            outcome = "paused-quota"
-            task.phase = .pausedQuota
-            task.column = .inProgress
-            terminalEvent = .taskPausedQuota(title: task.title)
-        } else if progress?.status == "COMPLETE", task.isEvergreen {
-            // Evergreen tasks never retire: even a COMPLETE plan re-enters the rotation so the
-            // next quota window starts a fresh improvement cycle.
-            outcome = "cycle-complete"
-            task.phase = .pausedQuota
-            task.column = .inProgress
-            terminalEvent = .taskCompleted(title: task.title)
-        } else if progress?.status == "COMPLETE" {
-            outcome = "completed"
-            task.phase = .completed
-            task.column = .done
+        let context = TaskExitContext(
+            exitCode: exit.exitCode,
+            quotaExhausted: exit.quotaExhausted,
+            stopped: task.phase == .stopped,
+            stderrTail: exit.stderrTail,
+            progress: progress,
+            isEvergreen: task.isEvergreen,
+            previousRuns: Array(task.runs.dropLast()),
+            planRelativePath: task.planRelativePath,
+            now: now
+        )
+        let transition = TaskOutcomeReducer.reduce(context)
+        task.phase = transition.phase
+        task.column = transition.column
+        task.lastError = transition.lastError
+        if task.column == .done {
             task.orderIndex = await taskStore.tasks(in: .done).count
-            terminalEvent = .taskCompleted(title: task.title)
-        } else if progress?.status == "BLOCKED" {
-            outcome = "failed"
-            task.phase = .failed
-            task.column = .inProgress
-            task.lastError = "Plan reports BLOCKED — see \(task.planRelativePath)"
-            terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "blocked")
-        } else if exit.exitCode == 0, let progress {
-            if Self.isStagnantContinue(previousRuns: task.runs.dropLast(), progress: progress) {
-                // Three consecutive sessions with identical checklist state means the run is
-                // spinning (e.g. waiting for an approval nobody can give) — surface it instead
-                // of burning the account's quota on the same loop.
-                outcome = "failed"
-                task.phase = .failed
-                task.column = .inProgress
-                task.lastError = "no checklist progress across 3 consecutive runs — see \(task.planRelativePath) and the run logs"
-                terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "stagnant")
-            } else {
-                outcome = "continue"
-                task.phase = .pausedQuota
-                task.column = .inProgress
-            }
-        } else if exit.exitCode == 0 {
-            // A clean exit that produced no plan document is not resumable work; rescheduling
-            // it would hot-loop the same failing run until the account's quota is gone.
-            outcome = "failed"
-            task.phase = .failed
-            task.column = .inProgress
-            task.lastError = exit.stderrTail.isEmpty ? "run ended without a plan document" : exit.stderrTail
-            terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "no plan produced")
-        } else {
-            outcome = "failed"
-            task.phase = .failed
-            task.column = .inProgress
-            task.lastError = exit.stderrTail
-            terminalEvent = .taskFailed(title: task.title, reason: exit.stderrTail)
         }
 
         if task.column == .inProgress,
@@ -929,7 +876,7 @@ public actor AppEngine {
         if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
             task.runs[runIndex].finishedAt = now
             task.runs[runIndex].exitCode = exit.exitCode
-            task.runs[runIndex].outcome = outcome
+            task.runs[runIndex].outcome = transition.outcome
             task.runs[runIndex].planDone = progress?.done
             task.runs[runIndex].planTotal = progress?.total
         }
@@ -951,11 +898,20 @@ public actor AppEngine {
         }
         await autoLog.write(
             "run",
-            "exit \(Self.taskLabel(task)) code \(exit.exitCode) outcome \(outcome) plan \(progressText) next \(nextState)"
+            "exit \(Self.taskLabel(task)) code \(exit.exitCode) outcome \(transition.outcome) plan \(progressText) next \(nextState)"
         )
-        if let terminalEvent { emit(terminalEvent) }
+        switch transition.terminalEvent {
+        case .completed:
+            emit(.taskCompleted(title: task.title))
+        case .pausedQuota:
+            emit(.taskPausedQuota(title: task.title))
+        case .failed:
+            emit(.taskFailed(title: task.title, reason: transition.lastError ?? exit.stderrTail))
+        case nil:
+            break
+        }
         emit(.snapshotChanged)
-        await automationTick()
+        if transition.scheduleAnotherTick { await automationTick() }
     }
 
     // MARK: - Poller

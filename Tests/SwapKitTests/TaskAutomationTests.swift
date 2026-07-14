@@ -608,12 +608,12 @@ final class TaskAutomationTests: XCTestCase {
             )
         }
 
-        XCTAssertTrue(AppEngine.isStagnantContinue(previousRuns: [run("continue"), run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue", done: 38), run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("interrupted"), run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue"), run("continue", closed: false)], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue", done: nil, total: nil), run("continue")], progress: progress))
+        XCTAssertTrue(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue"), run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue", done: 38), run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("interrupted"), run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue"), run("continue", closed: false)], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue", done: nil, total: nil), run("continue")], progress: progress))
     }
 
     func testUpsertWithoutUsagePreservesStoredReading() async throws {
