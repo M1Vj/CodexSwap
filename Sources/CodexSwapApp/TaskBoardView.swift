@@ -6,7 +6,6 @@ struct TaskBoardView: View {
     @ObservedObject var model: TaskBoardViewModel
     @State private var editor: TaskEditorPresentation?
     @State private var taskToDelete: AutomationTask?
-    @State private var showsArchivedTasks = false
     @State private var searchText = ""
     @State private var needsAttention = false
     @State private var actionFeedback: [UUID: String] = [:]
@@ -75,9 +74,10 @@ struct TaskBoardView: View {
                 }
             }
         }
-        .sheet(isPresented: $showsArchivedTasks) {
+        .sheet(isPresented: archivedIsPresented) {
             ArchivedTasksView(
                 tasks: archivedTasks,
+                selectedTaskID: $model.archivedTaskID,
                 restoreTask: model.actions.restoreTask,
                 deleteTask: { taskToDelete = $0 }
             )
@@ -135,7 +135,9 @@ struct TaskBoardView: View {
                 .toggleStyle(.button)
                 .controlSize(.small)
 
-            Button("Archived", systemImage: "archivebox") { showsArchivedTasks = true }
+            Button("Archived", systemImage: "archivebox") {
+                model.showArchivedTasks()
+            }
                 .controlSize(.small)
                 .accessibilityLabel("Show \(archivedTasks.count) archived tasks")
 
@@ -174,17 +176,21 @@ struct TaskBoardView: View {
         if runningCount > 0 {
             return (.green, "Running \(runningCount) task\(runningCount == 1 ? "" : "s")")
         }
-        if !model.settings.automationEnabled {
-            return (.gray, "Automation off")
+        if !queuedTaskIDs.isEmpty {
+            return (
+                .orange,
+                TaskBoardWaitingHeader.text(
+                    waitingTaskIDs: queuedTaskIDs,
+                    schedulingReasons: model.schedulingReasons
+                )
+            )
         }
-        if queuedCount > 0 {
-            return (.orange, "Waiting for quota — \(queuedCount) queued")
-        }
+        if !model.settings.automationEnabled { return (.gray, "Automation off") }
         return (.gray, "Idle")
     }
 
-    private var queuedCount: Int {
-        model.tasks.filter { $0.archivedAt == nil && $0.column == .queued }.count
+    private var queuedTaskIDs: [UUID] {
+        model.tasks.filter { $0.archivedAt == nil && $0.column == .queued }.map(\.id)
     }
 
     private var automationEnabledBinding: Binding<Bool> {
@@ -219,6 +225,15 @@ struct TaskBoardView: View {
         Binding(
             get: { taskToDelete != nil },
             set: { if !$0 { taskToDelete = nil } }
+        )
+    }
+
+    private var archivedIsPresented: Binding<Bool> {
+        Binding(
+            get: { model.isArchivedSheetPresented },
+            set: { isPresented in
+                if !isPresented { model.dismissArchivedTasks() }
+            }
         )
     }
 
@@ -786,6 +801,7 @@ private struct TaskInsertionDropZone: View {
 private struct ArchivedTasksView: View {
     @Environment(\.dismiss) private var dismiss
     let tasks: [AutomationTask]
+    @Binding var selectedTaskID: UUID?
     let restoreTask: (UUID) -> Void
     let deleteTask: (AutomationTask) -> Void
 
@@ -803,7 +819,7 @@ private struct ArchivedTasksView: View {
                 ContentUnavailableView("No Archived Tasks", systemImage: "archivebox")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(tasks) { task in
+                List(tasks, selection: $selectedTaskID) { task in
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(task.title)
@@ -824,6 +840,7 @@ private struct ArchivedTasksView: View {
                             .accessibilityLabel("Delete \(task.title) permanently")
                     }
                     .padding(.vertical, 4)
+                    .tag(task.id)
                 }
             }
         }

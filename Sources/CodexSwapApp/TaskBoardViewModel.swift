@@ -2,6 +2,12 @@ import Combine
 import Foundation
 import SwapKit
 
+enum TaskBoardFocusResult: Equatable {
+    case active
+    case archived
+    case missing
+}
+
 @MainActor
 struct TaskBoardActions {
     let addTask: (AutomationTask) -> Void
@@ -36,6 +42,8 @@ final class TaskBoardViewModel: ObservableObject {
     @Published private(set) var settings: Settings
     @Published private(set) var schedulingReasons: [String: String]
     @Published var selectedTaskID: UUID?
+    @Published var archivedTaskID: UUID?
+    @Published var isArchivedSheetPresented: Bool
     @Published var message: String?
 
     let actions: TaskBoardActions
@@ -47,6 +55,8 @@ final class TaskBoardViewModel: ObservableObject {
         self.settings = settings
         schedulingReasons = snapshot.schedulingReasons
         selectedTaskID = nil
+        archivedTaskID = nil
+        isArchivedSheetPresented = false
         self.actions = actions
     }
 
@@ -60,13 +70,50 @@ final class TaskBoardViewModel: ObservableObject {
            !snapshot.tasks.contains(where: { $0.id == selectedTaskID && $0.archivedAt == nil }) {
             self.selectedTaskID = nil
         }
+        if let archivedTaskID,
+           !snapshot.tasks.contains(where: { $0.id == archivedTaskID && $0.archivedAt != nil }) {
+            self.archivedTaskID = nil
+        }
     }
 
     func showMessage(_ value: String) {
         message = value
     }
 
-    func focusTask(_ id: UUID) {
+    func showArchivedTasks() {
+        selectedTaskID = nil
+        archivedTaskID = nil
+        isArchivedSheetPresented = true
+    }
+
+    func dismissArchivedTasks() {
+        archivedTaskID = nil
+        isArchivedSheetPresented = false
+    }
+
+    func showTaskNoLongerExists() {
+        selectedTaskID = nil
+        archivedTaskID = nil
+        isArchivedSheetPresented = false
+        message = "This task no longer exists."
+    }
+
+    func focusTask(_ id: UUID) -> TaskBoardFocusResult {
+        guard let task = tasks.first(where: { $0.id == id }) else {
+            selectedTaskID = nil
+            archivedTaskID = nil
+            isArchivedSheetPresented = false
+            return .missing
+        }
+        if task.archivedAt != nil {
+            selectedTaskID = nil
+            archivedTaskID = id
+            isArchivedSheetPresented = true
+            return .archived
+        }
+        archivedTaskID = nil
+        isArchivedSheetPresented = false
         selectedTaskID = id
+        return .active
     }
 }

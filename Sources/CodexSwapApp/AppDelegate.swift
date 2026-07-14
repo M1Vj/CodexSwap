@@ -82,8 +82,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Snapshot / events
 
     private func refreshSnapshot() async {
-        latest = await engine.snapshot()
         settings = await SettingsStoreBridge.current()
+        latest = await engine.snapshot()
         settingsViewModel?.update(snapshot: latest, settings: settings)
         taskBoardViewModel?.update(snapshot: latest, settings: settings)
         rebuildMenu()
@@ -434,22 +434,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         taskBoardWindowController?.show()
     }
 
-    private func focusTaskBoard(taskID: UUID) {
-        taskBoardViewModel.focusTask(taskID)
+    @discardableResult
+    private func focusTaskBoard(taskID: UUID) -> TaskBoardFocusResult {
+        let result = taskBoardViewModel.focusTask(taskID)
         showTaskBoard()
+        return result
     }
 
-    private func handleTaskNotification(action: String, taskID: UUID) {
-        focusTaskBoard(taskID: taskID)
+    private func handleTaskNotification(action: String, taskID: UUID) async {
+        await refreshSnapshot()
+        guard focusTaskBoard(taskID: taskID) != .missing else {
+            taskBoardViewModel.showTaskNoLongerExists()
+            return
+        }
         switch action {
         case TaskNotification.openLogAction:
+            guard await engine.tasks().contains(where: { $0.id == taskID }) else {
+                taskBoardViewModel.showTaskNoLongerExists()
+                return
+            }
             openLatestRunLog(taskID: taskID)
         case TaskNotification.retryAction:
-            Task { @MainActor in
-                let result = await engine.runTaskNow(id: taskID)
-                taskBoardViewModel.showMessage(result.feedback)
+            let result = await engine.runTaskNow(id: taskID)
+            if case let .blocked(reason) = result, reason == "Task not found" {
+                taskBoardViewModel.showTaskNoLongerExists()
                 await refreshSnapshot()
+                return
             }
+            taskBoardViewModel.showMessage(result.feedback)
+            await refreshSnapshot()
         default:
             break
         }
