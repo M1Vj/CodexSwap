@@ -31,6 +31,11 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
     public var baseSHA: String?
     public var headSHA: String?
     public var actualBranch: String?
+    public var sessionID: String?
+    public var inputTokens: Int?
+    public var cachedTokens: Int?
+    public var outputTokens: Int?
+    public var summary: String?
 
     public init(
         id: UUID = UUID(),
@@ -44,7 +49,12 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         servedAliases: [String] = [],
         baseSHA: String? = nil,
         headSHA: String? = nil,
-        actualBranch: String? = nil
+        actualBranch: String? = nil,
+        sessionID: String? = nil,
+        inputTokens: Int? = nil,
+        cachedTokens: Int? = nil,
+        outputTokens: Int? = nil,
+        summary: String? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -58,6 +68,11 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         self.baseSHA = baseSHA
         self.headSHA = headSHA
         self.actualBranch = actualBranch
+        self.sessionID = sessionID
+        self.inputTokens = inputTokens
+        self.cachedTokens = cachedTokens
+        self.outputTokens = outputTokens
+        self.summary = summary
     }
 
     public init(from decoder: Decoder) throws {
@@ -74,6 +89,11 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         baseSHA = (try? c.decodeIfPresent(String.self, forKey: .baseSHA)) ?? nil
         headSHA = (try? c.decodeIfPresent(String.self, forKey: .headSHA)) ?? nil
         actualBranch = (try? c.decodeIfPresent(String.self, forKey: .actualBranch)) ?? nil
+        sessionID = try c.decodeIfPresent(String.self, forKey: .sessionID)
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens)
+        cachedTokens = try c.decodeIfPresent(Int.self, forKey: .cachedTokens)
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens)
+        summary = try c.decodeIfPresent(String.self, forKey: .summary)
     }
 }
 
@@ -121,6 +141,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var nextRetryAt: Date?
     public var stagnationRecoveries: Int
     public var archivedAt: Date?
+    public var fallbackModels: [String]
+    public var modelFallbacksUsed: Int
+    public var totalRuns: Int
 
     public init(
         id: UUID = UUID(),
@@ -144,7 +167,10 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         retryAttempts: Int = 0,
         nextRetryAt: Date? = nil,
         stagnationRecoveries: Int = 0,
-        archivedAt: Date? = nil
+        archivedAt: Date? = nil,
+        fallbackModels: [String] = [],
+        modelFallbacksUsed: Int = 0,
+        totalRuns: Int = 0
     ) {
         self.id = id
         self.title = title
@@ -168,6 +194,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.nextRetryAt = nextRetryAt
         self.stagnationRecoveries = stagnationRecoveries
         self.archivedAt = archivedAt
+        self.fallbackModels = fallbackModels
+        self.modelFallbacksUsed = modelFallbacksUsed
+        self.totalRuns = max(totalRuns, runs.count)
     }
 
     public init(from decoder: Decoder) throws {
@@ -195,6 +224,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         nextRetryAt = try c.decodeIfPresent(Date.self, forKey: .nextRetryAt)
         stagnationRecoveries = try c.decodeIfPresent(Int.self, forKey: .stagnationRecoveries) ?? 0
         archivedAt = (try? c.decodeIfPresent(Date.self, forKey: .archivedAt)) ?? nil
+        fallbackModels = try c.decodeIfPresent([String].self, forKey: .fallbackModels) ?? []
+        modelFallbacksUsed = try c.decodeIfPresent(Int.self, forKey: .modelFallbacksUsed) ?? 0
+        totalRuns = max(try c.decodeIfPresent(Int.self, forKey: .totalRuns) ?? 0, runs.count)
     }
 
     public var planRelativePath: String {
@@ -221,7 +253,8 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
             column: .todo,
             phase: .idle,
             createdAt: date,
-            updatedAt: date
+            updatedAt: date,
+            fallbackModels: fallbackModels
         )
     }
 

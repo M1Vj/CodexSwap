@@ -23,6 +23,9 @@ public struct Settings: Codable, Sendable, Equatable {
     public var automationAccounts: [String]
     public var automationMaxConcurrent: Int
     public var automationConsumeBankedWindow: Bool
+    /// Minimum unused percent every reported window must retain for a run START to be admitted;
+    /// mid-run proxy failover is not gated by this.
+    public var automationMinHeadroomPercent: Int
     public var automationDefaultModel: String
     public var notifyOnTaskEvents: Bool
     public var proxyPort: Int
@@ -46,6 +49,7 @@ public struct Settings: Codable, Sendable, Equatable {
         automationAccounts: [],
         automationMaxConcurrent: 1,
         automationConsumeBankedWindow: false,
+        automationMinHeadroomPercent: 5,
         automationDefaultModel: "gpt-5.6-sol",
         notifyOnTaskEvents: true,
         proxyPort: defaultProxyPort
@@ -68,6 +72,7 @@ public struct Settings: Codable, Sendable, Equatable {
         automationAccounts: [String],
         automationMaxConcurrent: Int,
         automationConsumeBankedWindow: Bool,
+        automationMinHeadroomPercent: Int = 5,
         automationDefaultModel: String,
         notifyOnTaskEvents: Bool,
         proxyPort: Int
@@ -88,6 +93,7 @@ public struct Settings: Codable, Sendable, Equatable {
         self.automationAccounts = automationAccounts
         self.automationMaxConcurrent = automationMaxConcurrent
         self.automationConsumeBankedWindow = automationConsumeBankedWindow
+        self.automationMinHeadroomPercent = min(max(automationMinHeadroomPercent, 0), 50)
         self.automationDefaultModel = automationDefaultModel
         self.notifyOnTaskEvents = notifyOnTaskEvents
         self.proxyPort = proxyPort
@@ -114,6 +120,8 @@ public struct Settings: Codable, Sendable, Equatable {
         let decodedMaxConcurrent = try c.decodeIfPresent(Int.self, forKey: .automationMaxConcurrent) ?? d.automationMaxConcurrent
         automationMaxConcurrent = (1...4).contains(decodedMaxConcurrent) ? decodedMaxConcurrent : d.automationMaxConcurrent
         automationConsumeBankedWindow = try c.decodeIfPresent(Bool.self, forKey: .automationConsumeBankedWindow) ?? d.automationConsumeBankedWindow
+        let decodedHeadroom = try c.decodeIfPresent(Int.self, forKey: .automationMinHeadroomPercent) ?? d.automationMinHeadroomPercent
+        automationMinHeadroomPercent = (0...50).contains(decodedHeadroom) ? decodedHeadroom : d.automationMinHeadroomPercent
         automationDefaultModel = try c.decodeIfPresent(String.self, forKey: .automationDefaultModel) ?? d.automationDefaultModel
         notifyOnTaskEvents = try c.decodeIfPresent(Bool.self, forKey: .notifyOnTaskEvents) ?? d.notifyOnTaskEvents
         let decodedPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
