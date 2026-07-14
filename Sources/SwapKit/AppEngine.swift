@@ -92,7 +92,7 @@ public actor AppEngine {
     private let configManager: CodexConfigManager
     private let warmupService: QuotaWarmupService
     private let taskStore: TaskStore
-    private let taskRunner: TaskRunner
+    private let taskRunner: any TaskRunning
     private let autoLog: AutomationLog
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
@@ -125,6 +125,28 @@ public actor AppEngine {
         self.taskRunner = taskRunner ?? TaskRunner { [autoLog] category, message in
             await autoLog.write(category, message)
         }
+    }
+
+    init(
+        store: AccountStore = AccountStore(),
+        settingsStore: SettingsStore = SettingsStore(),
+        usage: any UsageFetching = UsageClient(),
+        refresher: TokenRefresher = TokenRefresher(),
+        configManager: CodexConfigManager = CodexConfigManager(),
+        warmupService: QuotaWarmupService = QuotaWarmupService(),
+        taskStore: TaskStore = TaskStore(),
+        taskRunning: any TaskRunning,
+        autoLog: AutomationLog = AutomationLog()
+    ) {
+        self.store = store
+        self.settingsStore = settingsStore
+        self.usage = usage
+        self.refresher = refresher
+        self.configManager = configManager
+        self.warmupService = warmupService
+        self.taskStore = taskStore
+        self.taskRunner = taskRunning
+        self.autoLog = autoLog
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -560,7 +582,7 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
-    fileprivate func forwardProxyEvent(_ event: ProxyEvent) async {
+    func forwardProxyEvent(_ event: ProxyEvent) async {
         let runningIDs = await taskRunner.runningIDs()
         if !runningIDs.isEmpty || !schedulingTaskIDs.isEmpty {
             switch event.kind {
@@ -577,7 +599,7 @@ public actor AppEngine {
                     "proxy",
                     "rotated \(Self.oneLine(event.from ?? "unknown")) to \(Self.oneLine(event.to ?? "unknown")) limit \(Self.oneLine(event.limit ?? "codex"))"
                 )
-            case .refreshed, .tokensUpdated:
+            case .refreshed, .tokensUpdated, .served:
                 break
             }
         }
@@ -585,7 +607,22 @@ public actor AppEngine {
         case .rotated:
             emit(.rotated(from: event.from ?? "?", to: event.to ?? "?", limit: event.limit ?? "codex", resetAt: event.resetAt))
         case .exhausted:
-            for taskID in await taskRunner.runningIDs() {
+            let mappedTaskID: UUID?
+            if let runID = event.runID {
+                mappedTaskID = await taskRunner.taskID(forRunID: runID)
+            } else {
+                mappedTaskID = nil
+                await autoLog.write("proxy", "legacy exhausted event without runID; broadcasting to all running tasks")
+            }
+            let targets = Self.quotaTargetTaskIDs(
+                for: event,
+                mappedTaskID: mappedTaskID,
+                runningIDs: runningIDs
+            )
+            if event.runID != nil, targets.isEmpty {
+                await autoLog.write("proxy", "run-scoped exhausted event did not map to a running task")
+            }
+            for taskID in targets {
                 await taskRunner.noteQuotaExhausted(taskID: taskID)
             }
             emit(.exhausted(limit: event.limit ?? "codex"))
@@ -595,8 +632,34 @@ public actor AppEngine {
             emit(.refreshed(alias: event.from ?? "?"))
         case .tokensUpdated:
             break
+        case .served:
+            await recordServedAlias(event.from, runID: event.runID)
         }
         emit(.snapshotChanged)
+    }
+
+    static func quotaTargetTaskIDs(
+        for event: ProxyEvent,
+        mappedTaskID: UUID?,
+        runningIDs: Set<UUID>
+    ) -> Set<UUID> {
+        guard event.runID != nil else { return runningIDs }
+        guard let mappedTaskID, runningIDs.contains(mappedTaskID) else { return [] }
+        return [mappedTaskID]
+    }
+
+    private func recordServedAlias(_ alias: String?, runID: String?) async {
+        guard let alias, !alias.isEmpty,
+              let runID, let id = UUID(uuidString: runID) else { return }
+        for var task in await taskStore.all() {
+            guard let runIndex = task.runs.firstIndex(where: { $0.id == id }) else { continue }
+            guard !task.runs[runIndex].servedAliases.contains(alias) else { return }
+            task.runs[runIndex].servedAliases.append(alias)
+            task.runs[runIndex].servedAliases.sort()
+            task.updatedAt = Date()
+            await taskStore.update(task)
+            return
+        }
     }
 
     public func automationTick() async {
@@ -899,10 +962,31 @@ public actor AppEngine {
         repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
 
         let startGate = TaskStartGate()
+        let runID = UUID()
+        let now = Date()
+        let runNumber = task.runs.count + 1
+        var started = task
+        if task.column != .inProgress {
+            started.orderIndex = await taskStore.tasks(in: .inProgress).count
+        }
+        started.column = .inProgress
+        started.phase = task.runs.isEmpty ? .planning : .running
+        started.updatedAt = now
+        started.lastError = nil
+        started.nextRetryAt = nil
+        started.runs.append(TaskRunRecord(
+            id: runID,
+            startedAt: now,
+            outcome: "",
+            logFileName: "run-\(runNumber).log"
+        ))
+        await taskStore.update(started)
+
         do {
             try await taskRunner.start(
                 task: task,
                 allowedAliases: Self.allowedAliases(for: task, settings: settings),
+                runID: runID,
                 proxyURL: proxyURL,
                 supportDir: AppPaths.supportDir()
             ) { [weak self] taskID, exit in
@@ -916,23 +1000,6 @@ public actor AppEngine {
             return .failed
         }
 
-        let now = Date()
-        let runNumber = task.runs.count + 1
-        var started = task
-        if task.column != .inProgress {
-            started.orderIndex = await taskStore.tasks(in: .inProgress).count
-        }
-        started.column = .inProgress
-        started.phase = task.runs.isEmpty ? .planning : .running
-        started.updatedAt = now
-        started.lastError = nil
-        started.nextRetryAt = nil
-        started.runs.append(TaskRunRecord(
-            startedAt: now,
-            outcome: "",
-            logFileName: "run-\(runNumber).log"
-        ))
-        await taskStore.update(started)
         guard await taskStore.task(id: task.id) != nil else {
             await taskRunner.stop(taskID: task.id)
             await startGate.release()
@@ -973,6 +1040,11 @@ public actor AppEngine {
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
         task.stagnationRecoveries = transition.stagnationRecoveries
+        if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
+            task.runs[runIndex].finishedAt = now
+            task.runs[runIndex].exitCode = 1
+            task.runs[runIndex].outcome = transition.outcome
+        }
         task.updatedAt = now
         await taskStore.update(task)
         switch transition.terminalEvent {
