@@ -63,6 +63,33 @@ public enum TaskPrompt {
         """
     }
 
+    public static func replan(task: AutomationTask) -> String {
+        """
+        # Repair and continue task plan: \(task.title)
+
+        Work only inside the repository that is already the current working directory: `\(task.repoPath)`.
+
+        - Ensure branch `\(task.branch)` exists. If it is missing, create it from the current HEAD, then check it out.
+        - Work only on `\(task.branch)` and never touch other branches.
+        - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
+        - You run unattended: decide autonomously, record rationale in the Work Log, and reserve `STATUS: BLOCKED` for genuinely external obstacles.
+
+        Read `\(task.planRelativePath)`, then audit the checklist against the actual repository state; delete obsolete items, remove work that is already complete, and merge micro-items into 3–15 executable work packages. Give every package concrete acceptance criteria and order the packages by dependency and impact.
+
+        Rewrite the checklist and append a dated Work Log entry explaining the repair. Then immediately execute the first package and continue through as many packages as time and quota allow. This run must not end without either concrete checklist progress or a materially rewritten plan that removes the cause of stagnation.
+
+        Verify changed work with targeted checks and run the repository's full verification suite once before the final commit. Commit all implementation and plan changes before the session ends. Keep the plan's final line in exactly one of these forms and add nothing after it:
+
+        - `STATUS: COMPLETE` only when every checklist item is ticked and verification succeeded.
+        - `STATUS: CONTINUE` when executable work remains.
+        - `STATUS: BLOCKED: <reason>` only when an external dependency prevents progress.
+
+        ## Original prompt
+
+        \(fencedBlock(task.prompt))\(evergreenClause(task))
+        """
+    }
+
     public static func export(task: AutomationTask, planDoc: String?) -> String {
         let planSection = planDoc.flatMap { $0.isEmpty ? nil : fencedBlock($0) } ?? "no plan yet"
         return """

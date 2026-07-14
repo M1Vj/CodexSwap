@@ -349,6 +349,34 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertTrue(allowed.contains("sandbox_workspace_write.network_access=true"))
     }
 
+    func testTaskRunnerUsesReplanPromptAfterReplanOutcome() {
+        var task = makeTask()
+        task.runs = [TaskRunRecord(
+            startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            finishedAt: Date(timeIntervalSince1970: 1_800_000_100),
+            outcome: "replan"
+        )]
+
+        let arguments = TaskRunner.launchArgs(
+            task: task,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: ["a"]
+        )
+
+        XCTAssertEqual(arguments.last, TaskPrompt.replan(task: task))
+    }
+
+    func testReplanPromptRequiresPlanRepairAndImmediateExecution() {
+        let prompt = TaskPrompt.replan(task: makeTask())
+
+        XCTAssertTrue(prompt.contains("audit the checklist against the actual repository state"))
+        XCTAssertTrue(prompt.contains("delete obsolete items"))
+        XCTAssertTrue(prompt.contains("3–15 executable work packages"))
+        XCTAssertTrue(prompt.contains("acceptance criteria"))
+        XCTAssertTrue(prompt.contains("immediately execute the first package"))
+        XCTAssertTrue(prompt.contains("must not end"))
+    }
+
     func testAutomationTaskMinimalJSONDecodesWithDefaults() throws {
         let id = UUID()
         let json = """
@@ -374,6 +402,7 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertNil(task.planProgress)
         XCTAssertEqual(task.retryAttempts, 0)
         XCTAssertNil(task.nextRetryAt)
+        XCTAssertEqual(task.stagnationRecoveries, 0)
     }
 
     func testAutomationTaskDecodeWithoutAccountAliasesDefaultsToEmpty() throws {
@@ -776,5 +805,37 @@ final class TaskAutomationTests: XCTestCase {
         )
 
         XCTAssertEqual(Set(candidates.map(\.id)), [due.id, paused.id, queued.id])
+    }
+
+    func testSchedulerExcludesTaskWhenCanonicalRepositoryIsLeased() {
+        var running = makeTask(
+            title: "Running",
+            repoPath: "/tmp/codexswap-repository",
+            column: .inProgress
+        )
+        running.phase = .running
+        var candidate = makeTask(
+            title: "Candidate",
+            repoPath: "/tmp/nested/../codexswap-repository",
+            column: .queued
+        )
+        candidate.phase = .idle
+
+        let candidates = AppEngine.schedulableTasks(
+            [running, candidate],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [running.id: running.repoPath],
+            now: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+
+        XCTAssertTrue(candidates.isEmpty)
+        XCTAssertTrue(AppEngine.repositoryIsBusy(
+            for: candidate,
+            tasks: [running, candidate],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [running.id: running.repoPath]
+        ))
     }
 }

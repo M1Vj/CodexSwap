@@ -145,16 +145,36 @@ enum TaskOutcomeReducer {
             )
         }
         if context.exitCode == 0, let progress = context.progress {
+            let recoveries = checklistShapeChanged(previousRuns: context.previousRuns, progress: progress)
+                ? 0
+                : context.stagnationRecoveries
             if isStagnantContinue(previousRuns: context.previousRuns, progress: progress) {
-                return transition(
-                    context,
+                if recoveries == 0 {
+                    return TaskTransition(
+                        outcome: "replan",
+                        phase: .pausedQuota,
+                        column: .inProgress,
+                        lastError: "no checklist progress across 3 consecutive runs — scheduling an automatic replan",
+                        retryAttempts: 0,
+                        stagnationRecoveries: 1
+                    )
+                }
+                return TaskTransition(
                     outcome: "failed",
                     phase: .failed,
-                    lastError: "no checklist progress across 3 consecutive runs — see \(context.planRelativePath) and the run logs",
-                    terminalEvent: .failed
+                    column: .inProgress,
+                    lastError: "no checklist progress across 3 consecutive runs after automatic replan — see \(context.planRelativePath) and the run logs",
+                    terminalEvent: .failed,
+                    retryAttempts: 0,
+                    stagnationRecoveries: recoveries
                 )
             }
-            return successfulTransition(context, outcome: "continue", phase: .pausedQuota)
+            return successfulTransition(
+                context,
+                outcome: "continue",
+                phase: .pausedQuota,
+                stagnationRecoveries: recoveries
+            )
         }
         if context.exitCode == 0 {
             let reason = context.stderrTail.isEmpty ? "run ended without a plan document" : context.stderrTail
@@ -181,7 +201,7 @@ enum TaskOutcomeReducer {
                     lastError: "\(reason) (retry limit reached)",
                     terminalEvent: .failed,
                     retryAttempts: context.retryAttempts,
-                    stagnationRecoveries: context.stagnationRecoveries
+                    stagnationRecoveries: reconciledStagnationRecoveries(context)
                 )
             }
             return TaskTransition(
@@ -191,7 +211,7 @@ enum TaskOutcomeReducer {
                 lastError: reason,
                 retryAttempts: context.retryAttempts + 1,
                 nextRetryAt: context.now.addingTimeInterval(retryDelay(attempts: context.retryAttempts)),
-                stagnationRecoveries: context.stagnationRecoveries
+                stagnationRecoveries: reconciledStagnationRecoveries(context)
             )
         }
         return TaskTransition(
@@ -201,7 +221,7 @@ enum TaskOutcomeReducer {
             lastError: reason,
             terminalEvent: .failed,
             retryAttempts: context.retryAttempts,
-            stagnationRecoveries: context.stagnationRecoveries
+            stagnationRecoveries: reconciledStagnationRecoveries(context)
         )
     }
 
@@ -217,6 +237,13 @@ enum TaskOutcomeReducer {
         return closed.allSatisfy {
             $0.outcome == "continue" && $0.planDone == progress.done && $0.planTotal == progress.total
         }
+    }
+
+    private static func checklistShapeChanged(previousRuns: [TaskRunRecord], progress: PlanProgress) -> Bool {
+        guard let previous = previousRuns.last(where: { $0.finishedAt != nil }),
+              let previousDone = previous.planDone,
+              let previousTotal = previous.planTotal else { return false }
+        return previousDone != progress.done || previousTotal != progress.total
     }
 
     private static func transition(
@@ -235,7 +262,7 @@ enum TaskOutcomeReducer {
             terminalEvent: terminalEvent,
             retryAttempts: context.retryAttempts,
             nextRetryAt: context.nextRetryAt,
-            stagnationRecoveries: context.stagnationRecoveries
+            stagnationRecoveries: reconciledStagnationRecoveries(context)
         )
     }
 
@@ -244,7 +271,8 @@ enum TaskOutcomeReducer {
         outcome: String,
         phase: TaskPhase,
         column: TaskColumn = .inProgress,
-        terminalEvent: TaskTerminalEventKind? = nil
+        terminalEvent: TaskTerminalEventKind? = nil,
+        stagnationRecoveries: Int? = nil
     ) -> TaskTransition {
         TaskTransition(
             outcome: outcome,
@@ -252,8 +280,16 @@ enum TaskOutcomeReducer {
             column: column,
             terminalEvent: terminalEvent,
             retryAttempts: 0,
-            stagnationRecoveries: context.stagnationRecoveries
+            stagnationRecoveries: stagnationRecoveries ?? reconciledStagnationRecoveries(context)
         )
+    }
+
+    private static func reconciledStagnationRecoveries(_ context: TaskExitContext) -> Int {
+        guard let progress = context.progress,
+              checklistShapeChanged(previousRuns: context.previousRuns, progress: progress) else {
+            return context.stagnationRecoveries
+        }
+        return 0
     }
 
     private static func failureReason(kind: TaskFailureKind, stderrTail: String) -> String {

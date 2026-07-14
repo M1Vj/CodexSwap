@@ -101,6 +101,7 @@ public actor AppEngine {
     private var warmupInProgress = false
     private var schedulingTaskIDs: Set<UUID> = []
     private var interruptingTaskIDs: Set<UUID> = []
+    private var repositoryLeases: [UUID: String] = [:]
 
     public init(
         store: AccountStore = AccountStore(),
@@ -171,6 +172,9 @@ public actor AppEngine {
         }
         let runningIDs = await taskRunner.runningIDs()
         let storedTasks = await taskStore.all()
+        repositoryLeases = Dictionary(uniqueKeysWithValues: storedTasks.compactMap {
+            runningIDs.contains($0.id) ? ($0.id, Self.canonicalRepositoryPath($0.repoPath)) : nil
+        })
         let reconciled = Self.interruptedTasks(in: storedTasks, running: runningIDs)
         var recoveredCount = 0
         for (before, after) in zip(storedTasks, reconciled) where before != after {
@@ -201,6 +205,7 @@ public actor AppEngine {
             await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
         }
         interruptingTaskIDs.subtract(runningIDs)
+        for taskID in runningIDs { repositoryLeases.removeValue(forKey: taskID) }
         await autoLog.write("lifecycle", "engine stop: paused \(pausedCount) running task(s) for shutdown")
         RuntimeHandoff.clearProxyURL()
         await proxy?.stop()
@@ -349,6 +354,16 @@ public actor AppEngine {
         await autoLog.write("api", "runTaskNow \(Self.taskLabel(task))")
         let runningIDs = await taskRunner.runningIDs()
         guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else { return }
+        guard !Self.repositoryIsBusy(
+            for: task,
+            tasks: await taskStore.all(),
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases
+        ) else {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
+            return
+        }
         schedulingTaskIDs.insert(id)
         var reservationHeld = true
         defer {
@@ -590,6 +605,7 @@ public actor AppEngine {
             await taskStore.all(),
             runningIDs: runningIDs,
             schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases,
             now: Date()
         )
         await autoLog.write(
@@ -679,6 +695,7 @@ public actor AppEngine {
         _ tasks: [AutomationTask],
         runningIDs: Set<UUID>,
         schedulingIDs: Set<UUID>,
+        leasedRepositories: [UUID: String] = [:],
         now: Date
     ) -> [AutomationTask] {
         func ordered(_ tasks: [AutomationTask]) -> [AutomationTask] {
@@ -696,7 +713,44 @@ public actor AppEngine {
         let queued = ordered(tasks.filter { $0.column == .queued && $0.phase == .idle })
         return (inProgress + queued).filter {
             !runningIDs.contains($0.id) && !schedulingIDs.contains($0.id)
+                && !repositoryIsBusy(
+                    for: $0,
+                    tasks: tasks,
+                    runningIDs: runningIDs,
+                    schedulingIDs: schedulingIDs,
+                    leasedRepositories: leasedRepositories
+                )
         }
+    }
+
+    static func repositoryIsBusy(
+        for task: AutomationTask,
+        tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        leasedRepositories: [UUID: String] = [:]
+    ) -> Bool {
+        let repository = canonicalRepositoryPath(task.repoPath)
+        if leasedRepositories.contains(where: {
+            $0.key != task.id && canonicalRepositoryPath($0.value) == repository
+        }) {
+            return true
+        }
+        let occupiedIDs = runningIDs
+            .union(schedulingIDs)
+            .union(leasedRepositories.keys)
+            .subtracting([task.id])
+        guard !occupiedIDs.isEmpty else { return false }
+        return tasks.contains {
+            occupiedIDs.contains($0.id) && canonicalRepositoryPath($0.repoPath) == repository
+        }
+    }
+
+    private static func canonicalRepositoryPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
     }
 
     private func hydratedAutomationAccounts(aliases: [String]) async -> [Account] {
@@ -779,8 +833,19 @@ public actor AppEngine {
             if ownsReservation { schedulingTaskIDs.remove(task.id) }
         }
         let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
-        let runningCount = await taskRunner.runningIDs().count
-        guard runningCount + schedulingTaskIDs.count <= maximumConcurrent else { return .unavailable }
+        let runningIDs = await taskRunner.runningIDs()
+        guard runningIDs.count + schedulingTaskIDs.count <= maximumConcurrent else { return .unavailable }
+        guard !Self.repositoryIsBusy(
+            for: task,
+            tasks: await taskStore.all(),
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases
+        ) else {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
+            return .unavailable
+        }
+        repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
 
         let startGate = TaskStartGate()
         do {
@@ -796,6 +861,7 @@ public actor AppEngine {
             }
         } catch {
             await handleTaskLaunchError(taskID: task.id, error: error)
+            repositoryLeases.removeValue(forKey: task.id)
             return .failed
         }
 
@@ -841,6 +907,7 @@ public actor AppEngine {
             previousRuns: task.runs.filter { $0.finishedAt != nil },
             retryAttempts: task.retryAttempts,
             nextRetryAt: task.nextRetryAt,
+            stagnationRecoveries: task.stagnationRecoveries,
             planRelativePath: task.planRelativePath,
             now: now,
             launchError: error as? TaskRunnerError
@@ -854,6 +921,7 @@ public actor AppEngine {
         task.lastError = transition.lastError
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
+        task.stagnationRecoveries = transition.stagnationRecoveries
         task.updatedAt = now
         await taskStore.update(task)
         switch transition.terminalEvent {
@@ -871,6 +939,7 @@ public actor AppEngine {
     }
 
     private func handleTaskExit(taskID: UUID, exit: TaskRunner.RunExit) async {
+        defer { repositoryLeases.removeValue(forKey: taskID) }
         guard !interruptingTaskIDs.contains(taskID) else {
             await autoLog.write(
                 "lifecycle",
@@ -903,6 +972,7 @@ public actor AppEngine {
             previousRuns: Array(task.runs.dropLast()),
             retryAttempts: task.retryAttempts,
             nextRetryAt: task.nextRetryAt,
+            stagnationRecoveries: task.stagnationRecoveries,
             planRelativePath: task.planRelativePath,
             now: now
         )
@@ -912,6 +982,7 @@ public actor AppEngine {
         task.lastError = transition.lastError
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
+        task.stagnationRecoveries = transition.stagnationRecoveries
         if task.column == .done {
             task.orderIndex = await taskStore.tasks(in: .done).count
         }
@@ -960,6 +1031,7 @@ public actor AppEngine {
             break
         }
         emit(.snapshotChanged)
+        repositoryLeases.removeValue(forKey: taskID)
         if transition.scheduleAnotherTick { await automationTick() }
     }
 

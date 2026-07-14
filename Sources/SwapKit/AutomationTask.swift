@@ -103,6 +103,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var planProgress: PlanProgress?
     public var retryAttempts: Int
     public var nextRetryAt: Date?
+    public var stagnationRecoveries: Int
 
     public init(
         id: UUID = UUID(),
@@ -124,7 +125,8 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         lastError: String? = nil,
         planProgress: PlanProgress? = nil,
         retryAttempts: Int = 0,
-        nextRetryAt: Date? = nil
+        nextRetryAt: Date? = nil,
+        stagnationRecoveries: Int = 0
     ) {
         self.id = id
         self.title = title
@@ -146,6 +148,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.planProgress = planProgress
         self.retryAttempts = retryAttempts
         self.nextRetryAt = nextRetryAt
+        self.stagnationRecoveries = stagnationRecoveries
     }
 
     public init(from decoder: Decoder) throws {
@@ -171,6 +174,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         planProgress = try c.decodeIfPresent(PlanProgress.self, forKey: .planProgress)
         retryAttempts = try c.decodeIfPresent(Int.self, forKey: .retryAttempts) ?? 0
         nextRetryAt = try c.decodeIfPresent(Date.self, forKey: .nextRetryAt)
+        stagnationRecoveries = try c.decodeIfPresent(Int.self, forKey: .stagnationRecoveries) ?? 0
     }
 
     public var planRelativePath: String {

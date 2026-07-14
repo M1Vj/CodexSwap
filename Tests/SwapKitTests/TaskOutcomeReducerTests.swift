@@ -93,16 +93,52 @@ final class TaskOutcomeReducerTests: XCTestCase {
         }
     }
 
-    func testStagnationRequiresThreeIdenticalContinueRuns() {
+    func testFirstStagnationSchedulesReplan() {
         let progress = PlanProgress(done: 40, total: 44, status: "CONTINUE")
         let previousRuns = [closedRun(outcome: "continue"), closedRun(outcome: "continue")]
         let context = TaskExitContext(exitCode: 0, progress: progress, previousRuns: previousRuns)
 
         let transition = TaskOutcomeReducer.reduce(context)
 
+        XCTAssertEqual(transition.outcome, "replan")
+        XCTAssertEqual(transition.phase, .pausedQuota)
+        XCTAssertEqual(transition.stagnationRecoveries, 1)
+        XCTAssertNil(transition.terminalEvent)
+    }
+
+    func testSecondStagnationAfterReplanFails() {
+        let progress = PlanProgress(done: 40, total: 44, status: "CONTINUE")
+        let previousRuns = [closedRun(outcome: "continue"), closedRun(outcome: "continue")]
+        let context = TaskExitContext(
+            exitCode: 0,
+            progress: progress,
+            previousRuns: previousRuns,
+            stagnationRecoveries: 1
+        )
+
+        let transition = TaskOutcomeReducer.reduce(context)
+
         XCTAssertEqual(transition.outcome, "failed")
         XCTAssertEqual(transition.phase, .failed)
         XCTAssertEqual(transition.terminalEvent, .failed)
+    }
+
+    func testChecklistShapeChangeResetsStagnationRecovery() {
+        let previousRuns = [
+            closedRun(outcome: "replan", done: 40, total: 44),
+            closedRun(outcome: "continue", done: 40, total: 44),
+        ]
+        let context = TaskExitContext(
+            exitCode: 0,
+            progress: PlanProgress(done: 3, total: 8, status: "CONTINUE"),
+            previousRuns: previousRuns,
+            stagnationRecoveries: 1
+        )
+
+        let transition = TaskOutcomeReducer.reduce(context)
+
+        XCTAssertEqual(transition.outcome, "continue")
+        XCTAssertEqual(transition.stagnationRecoveries, 0)
     }
 
     func testCompletionGateRejectsInvalidCompleteStates() {
