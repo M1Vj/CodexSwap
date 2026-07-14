@@ -25,11 +25,13 @@ agent reliability literature).
 | Wave | Branch | Scope | Guide |
 | --- | --- | --- | --- |
 | 1 | `feat/engine-correctness` | Outcome reducer extraction, completion gate, typed failures + retry backoff, auto-replan, repo lease | `01-engine-correctness.md` |
-| 2 | `feat/run-scoped-routing` | Run-scoped proxy headers/events, targeted quota pause, per-run turn stickiness | `02-run-scoped-routing.md` (to write) |
-| 3 | `feat/run-telemetry` | `--json` + `--output-last-message`, token/session telemetry, run summaries, headroom admission, model fallback, bounded run metadata | `03-telemetry.md` (to write) |
-| 4 | `feat/context-lifetime` | Bounded handoff section vs append-only history, evergreen cycles, commit-aware verification receipts | `04-context-lifetime.md` (to write) |
-| 5 | `feat/board-cockpit` | Task inspector (live log tail, run timeline, plan tab), pause reasons + countdown, retry/requeue buttons, filters | `05-board-cockpit.md` (to write) |
-| 6 | `feat/board-power` | Changes/commits tab, quota attribution UI, menu-bar cockpit, actionable notifications, archive, reorder, duplicate/templates | `06-board-power.md` (to write) |
+| 1b | `feat/native-subagents-prompt` | Task prompts direct agents to codex native collab subagents (bounded scopes, never block session end) | small PR, no guide |
+| 2 | `feat/run-scoped-routing` | Run-scoped proxy headers/events, targeted quota pause, per-run turn stickiness | `02-run-scoped-routing.md` |
+| 3 | `feat/run-telemetry` | `--json` + `--output-last-message`, token/session telemetry, run summaries, headroom admission, model fallback, bounded run metadata | `03-telemetry.md` |
+| 4 | `feat/context-lifetime` | Bounded handoff section vs append-only history, evergreen cycles, commit-aware verification receipts | `04-context-lifetime.md` |
+| 5 | `feat/board-cockpit` | Task inspector (live log tail, run timeline, plan tab), pause reasons + countdown, retry/requeue buttons, filters | `05-board-cockpit.md` |
+| 6 | `feat/board-power` | Changes/commits tab, quota attribution UI, menu-bar cockpit, actionable notifications, archive, reorder, duplicate | `06-board-power.md` |
+| 7 | `feat/board-v2-verification` | Independent adversarial audit of waves 1-6, compatibility probe, live E2E on deployed build, docs/screenshot sync | `07-final-verification.md` |
 
 Full audit texts: engine + UX audits stored in session scratchpad; key findings
 reproduced in each wave guide. External references: vibe-kanban README, Codex
