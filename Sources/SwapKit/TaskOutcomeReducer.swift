@@ -11,6 +11,7 @@ struct TaskExitContext: Sendable {
     var exitCode: Int32
     var quotaExhausted: Bool
     var stopped: Bool
+    var stalled: Bool
     var stderrTail: String
     var progress: PlanProgress?
     var isEvergreen: Bool
@@ -28,6 +29,7 @@ struct TaskExitContext: Sendable {
         exitCode: Int32,
         quotaExhausted: Bool = false,
         stopped: Bool = false,
+        stalled: Bool = false,
         stderrTail: String = "",
         progress: PlanProgress? = nil,
         isEvergreen: Bool = false,
@@ -44,6 +46,7 @@ struct TaskExitContext: Sendable {
         self.exitCode = exitCode
         self.quotaExhausted = quotaExhausted
         self.stopped = stopped
+        self.stalled = stalled
         self.stderrTail = stderrTail
         self.progress = progress
         self.isEvergreen = isEvergreen
@@ -199,9 +202,12 @@ enum TaskOutcomeReducer {
         let failureKind = FailureClassifier.classify(
             exitCode: context.exitCode,
             stderrTail: context.stderrTail,
-            launchError: context.launchError
+            launchError: context.launchError,
+            stalled: context.stalled
         )
-        let reason = failureReason(kind: failureKind, stderrTail: context.stderrTail)
+        let reason = context.stalled
+            ? "no output for \(Int(TaskRunner.stallTimeoutSeconds / 60)) minutes — killed as a stalled stream"
+            : failureReason(kind: failureKind, stderrTail: context.stderrTail)
         if failureKind == .modelRejected, let fallback = context.nextFallbackModel {
             return TaskTransition(
                 outcome: "model-fallback",

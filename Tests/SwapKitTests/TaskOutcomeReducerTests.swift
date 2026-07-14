@@ -300,6 +300,43 @@ final class TaskOutcomeReducerTests: XCTestCase {
         XCTAssertNil(transition.nextRetryAt)
     }
 
+    func testStalledExitClassifiesTransient() {
+        XCTAssertEqual(
+            FailureClassifier.classify(exitCode: 15, stderrTail: "", launchError: nil, stalled: true),
+            .transient
+        )
+        XCTAssertEqual(
+            FailureClassifier.classify(exitCode: 15, stderrTail: "", launchError: nil),
+            .unknown
+        )
+    }
+
+    func testStalledExitRetriesWithBackoff() {
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 15,
+            stalled: true,
+            retryAttempts: 0
+        ))
+
+        XCTAssertEqual(transition.outcome, "retry")
+        XCTAssertEqual(transition.phase, .retryWaiting)
+        XCTAssertEqual(transition.retryAttempts, 1)
+        XCTAssertNotNil(transition.nextRetryAt)
+        XCTAssertTrue(transition.lastError?.contains("stalled stream") == true)
+    }
+
+    func testStalledExitRespectsRetryLimit() {
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 15,
+            stalled: true,
+            retryAttempts: 3
+        ))
+
+        XCTAssertEqual(transition.outcome, "failed")
+        XCTAssertEqual(transition.phase, .failed)
+        XCTAssertTrue(transition.lastError?.contains("retry limit reached") == true)
+    }
+
     private func closedRun(outcome: String, done: Int = 40, total: Int = 44) -> TaskRunRecord {
         TaskRunRecord(
             startedAt: Date(timeIntervalSince1970: 1_800_000_000),

@@ -14,7 +14,8 @@ enum FailureClassifier {
     static func classify(
         exitCode: Int32,
         stderrTail: String,
-        launchError: TaskRunnerError?
+        launchError: TaskRunnerError?,
+        stalled: Bool = false
     ) -> TaskFailureKind {
         if let launchError {
             switch launchError {
@@ -28,6 +29,7 @@ enum FailureClassifier {
                 return .unknown
             }
         }
+        if stalled { return .transient }
 
         let tail = stderrTail.lowercased()
         if tail.contains("not supported when using codex") || tail.contains("model_not_found") {

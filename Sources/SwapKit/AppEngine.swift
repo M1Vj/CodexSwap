@@ -1285,6 +1285,7 @@ public actor AppEngine {
             exitCode: exit.exitCode,
             quotaExhausted: exit.quotaExhausted,
             stopped: task.phase == .stopped,
+            stalled: exit.stalled,
             stderrTail: exit.stderrTail,
             progress: progress,
             isEvergreen: task.isEvergreen,
