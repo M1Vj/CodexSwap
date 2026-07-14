@@ -933,10 +933,11 @@ private struct TaskEditorView: View {
                         draft.branch = "codexswap/\(slug(for: title))"
                     }
 
-                LabeledContent("Prompt") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Prompt")
                     TextEditor(text: $draft.prompt)
                         .font(.body)
-                        .frame(minHeight: 140)
+                        .frame(maxWidth: .infinity, minHeight: 240)
                         .padding(4)
                         .overlay {
                             RoundedRectangle(cornerRadius: 5)
