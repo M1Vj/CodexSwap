@@ -15,17 +15,21 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Evergreen tasks that loop forever: sessions extend their own checklist and a COMPLETE plan re-queues for the next quota window.
 - Structured automation trace log (`automation.log`, rotated) covering scheduling decisions, per-alias ineligibility reasons, launches, exits, and lifecycle events, with Logs and per-task Show Run Log actions on the board.
 - Crash and shutdown recovery: runs interrupted by quit or crash are closed as `interrupted` and resume automatically on the next quota window.
+- Typed task-failure handling with bounded exponential retry for transient network errors and timeouts.
+- Automatic plan repair after repeated checklist stagnation, with one recovery attempt before terminal failure.
 
 ### Changed
 
 - Task runs follow the same rotation settings as normal proxy traffic: the configured strategy (priority or round-robin), per-account priorities, and the pre-emptive usage thresholds. Tasks prefer accounts still under threshold and move off an account before it hard-limits, falling back to the best over-threshold account only when none has headroom.
 - Task sessions may batch their commits: the run contract no longer demands a commit per checklist item, only that all work and the plan document are committed before the session ends.
+- Task completion now requires a successful process exit and a non-empty fully checked plan whose final non-blank line reports `STATUS: COMPLETE`.
 
 ### Fixed
 
 - A failed proxy port bind no longer crashes the app on AsyncHTTPClient shutdown.
 - Stale usage-limit cooldowns are cleared when fresh usage reports headroom, so automation starts as soon as quota is actually back.
 - The model picker offers only live-validated model names.
+- Task scheduling serializes access to each canonical repository path so concurrent runs cannot race in one working tree.
 
 ## [0.2.0] - Unreleased
 

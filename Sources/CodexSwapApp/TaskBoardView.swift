@@ -388,6 +388,8 @@ private struct TaskCardView: View {
             RunningBadge(text: "Running")
         case .pausedQuota:
             TaskBadge(text: "Waiting for quota", color: .orange, symbol: "clock.fill")
+        case .retryWaiting:
+            TaskBadge(text: retryBadgeText, color: .orange, symbol: "clock.fill")
         case .failed:
             TaskBadge(text: "Failed", color: .red, symbol: "exclamationmark.circle.fill")
         case .stopped:
@@ -399,6 +401,13 @@ private struct TaskCardView: View {
 
     private var repoName: String {
         URL(fileURLWithPath: task.repoPath).lastPathComponent
+    }
+
+    private var retryBadgeText: String {
+        guard let nextRetryAt = task.nextRetryAt else { return "Retrying soon" }
+        let seconds = max(0, Int(nextRetryAt.timeIntervalSinceNow.rounded(.up)))
+        guard seconds >= 60 else { return "Retrying soon" }
+        return "Retrying in \((seconds + 59) / 60)m"
     }
 }
 

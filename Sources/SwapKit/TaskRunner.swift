@@ -47,7 +47,14 @@ public actor TaskRunner {
         let baseURL = proxyURL.absoluteString.trimmingTrailingSlash() + "/backend-api/codex"
         let aliases = allowedAliases.joined(separator: ",")
         let provider = "model_providers.codexswap-task={ name=\"CodexSwap Task\", base_url=\"\(tomlEscape(baseURL))\", wire_api=\"responses\", env_key=\"CODEXSWAP_TASK_TOKEN\", http_headers={ \"\(ProxyRequestMode.taskHeader)\"=\"\(tomlEscape(aliases))\" } }"
-        let prompt = task.runs.isEmpty ? TaskPrompt.firstRun(task: task) : TaskPrompt.continuation(task: task)
+        let prompt: String
+        if task.runs.isEmpty {
+            prompt = TaskPrompt.firstRun(task: task)
+        } else if task.runs.last(where: { $0.finishedAt != nil })?.outcome == "replan" {
+            prompt = TaskPrompt.replan(task: task)
+        } else {
+            prompt = TaskPrompt.continuation(task: task)
+        }
         let gitDir = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             .appendingPathComponent(".git", isDirectory: true).path
         var arguments = [

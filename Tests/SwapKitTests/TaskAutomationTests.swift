@@ -176,6 +176,21 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(progress, PlanProgress(done: 0, total: 0, status: "BLOCKED"))
     }
 
+    func testPlanDocParserIgnoresStatusBeforeLastNonBlankLine() throws {
+        let text = """
+        ## Checklist
+        - [x] Finished
+        STATUS: COMPLETE
+
+        A trailing work-log entry makes the earlier status stale.
+
+        """
+
+        let progress = try XCTUnwrap(PlanDocParser.parse(text))
+
+        XCTAssertEqual(progress, PlanProgress(done: 1, total: 1, status: nil))
+    }
+
     func testPlanDocParserReturnsNilForIrrelevantText() {
         XCTAssertNil(PlanDocParser.parse("A document without checklist markers or a status line."))
         XCTAssertNil(PlanDocParser.parse(""))
@@ -334,6 +349,34 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertTrue(allowed.contains("sandbox_workspace_write.network_access=true"))
     }
 
+    func testTaskRunnerUsesReplanPromptAfterReplanOutcome() {
+        var task = makeTask()
+        task.runs = [TaskRunRecord(
+            startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            finishedAt: Date(timeIntervalSince1970: 1_800_000_100),
+            outcome: "replan"
+        )]
+
+        let arguments = TaskRunner.launchArgs(
+            task: task,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: ["a"]
+        )
+
+        XCTAssertEqual(arguments.last, TaskPrompt.replan(task: task))
+    }
+
+    func testReplanPromptRequiresPlanRepairAndImmediateExecution() {
+        let prompt = TaskPrompt.replan(task: makeTask())
+
+        XCTAssertTrue(prompt.contains("audit the checklist against the actual repository state"))
+        XCTAssertTrue(prompt.contains("delete obsolete items"))
+        XCTAssertTrue(prompt.contains("3–15 executable work packages"))
+        XCTAssertTrue(prompt.contains("acceptance criteria"))
+        XCTAssertTrue(prompt.contains("immediately execute the first package"))
+        XCTAssertTrue(prompt.contains("must not end"))
+    }
+
     func testAutomationTaskMinimalJSONDecodesWithDefaults() throws {
         let id = UUID()
         let json = """
@@ -357,6 +400,9 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(task.runs, [])
         XCTAssertNil(task.lastError)
         XCTAssertNil(task.planProgress)
+        XCTAssertEqual(task.retryAttempts, 0)
+        XCTAssertNil(task.nextRetryAt)
+        XCTAssertEqual(task.stagnationRecoveries, 0)
     }
 
     func testAutomationTaskDecodeWithoutAccountAliasesDefaultsToEmpty() throws {
@@ -608,12 +654,12 @@ final class TaskAutomationTests: XCTestCase {
             )
         }
 
-        XCTAssertTrue(AppEngine.isStagnantContinue(previousRuns: [run("continue"), run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue", done: 38), run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("interrupted"), run("continue")], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue"), run("continue", closed: false)], progress: progress))
-        XCTAssertFalse(AppEngine.isStagnantContinue(previousRuns: [run("continue", done: nil, total: nil), run("continue")], progress: progress))
+        XCTAssertTrue(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue"), run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue", done: 38), run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("interrupted"), run("continue")], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue"), run("continue", closed: false)], progress: progress))
+        XCTAssertFalse(TaskOutcomeReducer.isStagnantContinue(previousRuns: [run("continue", done: nil, total: nil), run("continue")], progress: progress))
     }
 
     func testUpsertWithoutUsagePreservesStoredReading() async throws {
@@ -734,5 +780,89 @@ final class TaskAutomationTests: XCTestCase {
         let recovered = AppEngine.interruptedTasks(in: [task], running: [task.id], now: now)
 
         XCTAssertEqual(recovered, [task])
+    }
+
+    func testSchedulerIncludesOnlyDueRetryWaitingTasks() {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        var due = makeTask(title: "Due", column: .inProgress)
+        due.phase = .retryWaiting
+        due.nextRetryAt = now
+        var future = makeTask(title: "Future", column: .inProgress)
+        future.phase = .retryWaiting
+        future.nextRetryAt = now.addingTimeInterval(60)
+        var missingDate = makeTask(title: "Missing date", column: .inProgress)
+        missingDate.phase = .retryWaiting
+        var paused = makeTask(title: "Paused", column: .inProgress)
+        paused.phase = .pausedQuota
+        var queued = makeTask(title: "Queued", column: .queued)
+        queued.phase = .idle
+
+        let candidates = AppEngine.schedulableTasks(
+            [due, future, missingDate, paused, queued],
+            runningIDs: [],
+            schedulingIDs: [],
+            now: now
+        )
+
+        XCTAssertEqual(Set(candidates.map(\.id)), [due.id, paused.id, queued.id])
+    }
+
+    func testSchedulerExcludesTaskWhenCanonicalRepositoryIsLeased() {
+        var running = makeTask(
+            title: "Running",
+            repoPath: "/tmp/codexswap-repository",
+            column: .inProgress
+        )
+        running.phase = .running
+        var candidate = makeTask(
+            title: "Candidate",
+            repoPath: "/tmp/nested/../codexswap-repository",
+            column: .queued
+        )
+        candidate.phase = .idle
+
+        let candidates = AppEngine.schedulableTasks(
+            [running, candidate],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [running.id: running.repoPath],
+            now: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+
+        XCTAssertTrue(candidates.isEmpty)
+        XCTAssertEqual(AppEngine.repositoryBlockedTasks(
+            [running, candidate],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [running.id: running.repoPath],
+            now: Date(timeIntervalSince1970: 1_900_000_000)
+        ).map(\.id), [candidate.id])
+        XCTAssertTrue(AppEngine.repositoryIsBusy(
+            for: candidate,
+            tasks: [running, candidate],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [running.id: running.repoPath]
+        ))
+    }
+
+    func testRepositoryLeaseBlocksRelaunchOfSameTaskUntilExitHandlingCompletes() {
+        var task = makeTask(repoPath: "/tmp/codexswap-repository", column: .queued)
+        task.phase = .idle
+
+        XCTAssertTrue(AppEngine.repositoryIsBusy(
+            for: task,
+            tasks: [task],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [task.id: task.repoPath]
+        ))
+        XCTAssertTrue(AppEngine.schedulableTasks(
+            [task],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [task.id: task.repoPath],
+            now: Date(timeIntervalSince1970: 1_900_000_000)
+        ).isEmpty)
     }
 }

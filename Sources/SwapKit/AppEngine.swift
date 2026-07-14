@@ -101,6 +101,7 @@ public actor AppEngine {
     private var warmupInProgress = false
     private var schedulingTaskIDs: Set<UUID> = []
     private var interruptingTaskIDs: Set<UUID> = []
+    private var repositoryLeases: [UUID: String] = [:]
 
     public init(
         store: AccountStore = AccountStore(),
@@ -171,6 +172,9 @@ public actor AppEngine {
         }
         let runningIDs = await taskRunner.runningIDs()
         let storedTasks = await taskStore.all()
+        for task in storedTasks where runningIDs.contains(task.id) {
+            repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
+        }
         let reconciled = Self.interruptedTasks(in: storedTasks, running: runningIDs)
         var recoveredCount = 0
         for (before, after) in zip(storedTasks, reconciled) where before != after {
@@ -193,12 +197,14 @@ public actor AppEngine {
         var pausedCount = 0
         for taskID in runningIDs {
             await taskRunner.stop(taskID: taskID)
-            guard let task = await taskStore.task(id: taskID),
-                  let interrupted = Self.interruptedTasks(in: [task], running: [], now: now).first,
-                  interrupted != task else { continue }
-            await taskStore.update(interrupted)
-            pausedCount += 1
-            await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
+            if let task = await taskStore.task(id: taskID),
+               let interrupted = Self.interruptedTasks(in: [task], running: [], now: now).first,
+               interrupted != task {
+                await taskStore.update(interrupted)
+                pausedCount += 1
+                await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
+            }
+            repositoryLeases.removeValue(forKey: taskID)
         }
         interruptingTaskIDs.subtract(runningIDs)
         await autoLog.write("lifecycle", "engine stop: paused \(pausedCount) running task(s) for shutdown")
@@ -349,6 +355,16 @@ public actor AppEngine {
         await autoLog.write("api", "runTaskNow \(Self.taskLabel(task))")
         let runningIDs = await taskRunner.runningIDs()
         guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else { return }
+        guard !Self.repositoryIsBusy(
+            for: task,
+            tasks: await taskStore.all(),
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases
+        ) else {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
+            return
+        }
         schedulingTaskIDs.insert(id)
         var reservationHeld = true
         defer {
@@ -586,15 +602,22 @@ public actor AppEngine {
     public func automationTick() async {
         let settings = await settingsStore.get()
         let runningIDs = await taskRunner.runningIDs()
-        let paused = await taskStore.tasks(in: .inProgress)
-            .filter { $0.phase == .pausedQuota }
-        // Only idle queued tasks are schedulable: a failed launch (missing repo/binary) must
-        // not be retried in a tight loop — moving the card re-arms it via phase = .idle.
-        let queued = await taskStore.tasks(in: .queued)
-            .filter { $0.phase == .idle }
-        let waiting = (paused + queued).filter {
-            !runningIDs.contains($0.id) && !schedulingTaskIDs.contains($0.id)
-        }
+        let storedTasks = await taskStore.all()
+        let now = Date()
+        let repositoryBlocked = Self.repositoryBlockedTasks(
+            storedTasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases,
+            now: now
+        )
+        let waiting = Self.schedulableTasks(
+            storedTasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases,
+            now: now
+        )
         await autoLog.write(
             "tick",
             "entering running \(runningIDs.count) scheduling \(schedulingTaskIDs.count) waiting \(waiting.count)"
@@ -611,6 +634,9 @@ public actor AppEngine {
         guard runningIDs.count + schedulingTaskIDs.count < maximumConcurrent else {
             await autoLog.write("tick", "early-out: concurrency full")
             return
+        }
+        for task in repositoryBlocked {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
         }
         guard !waiting.isEmpty else {
             await autoLog.write("tick", "early-out: no waiting tasks")
@@ -678,6 +704,106 @@ public actor AppEngine {
         task.accountAliases.isEmpty ? settings.automationAccounts : task.accountAliases
     }
 
+    static func schedulableTasks(
+        _ tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        leasedRepositories: [UUID: String] = [:],
+        now: Date
+    ) -> [AutomationTask] {
+        schedulingCandidates(
+            tasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingIDs,
+            now: now
+        ).filter {
+            !repositoryIsBusy(
+                for: $0,
+                tasks: tasks,
+                runningIDs: runningIDs,
+                schedulingIDs: schedulingIDs,
+                leasedRepositories: leasedRepositories
+            )
+        }
+    }
+
+    static func repositoryBlockedTasks(
+        _ tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        leasedRepositories: [UUID: String] = [:],
+        now: Date
+    ) -> [AutomationTask] {
+        schedulingCandidates(
+            tasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingIDs,
+            now: now
+        ).filter {
+            repositoryIsBusy(
+                for: $0,
+                tasks: tasks,
+                runningIDs: runningIDs,
+                schedulingIDs: schedulingIDs,
+                leasedRepositories: leasedRepositories
+            )
+        }
+    }
+
+    private static func schedulingCandidates(
+        _ tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        now: Date
+    ) -> [AutomationTask] {
+        func ordered(_ tasks: [AutomationTask]) -> [AutomationTask] {
+            tasks.sorted {
+                if $0.orderIndex != $1.orderIndex { return $0.orderIndex < $1.orderIndex }
+                if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        }
+        let inProgress = ordered(tasks.filter {
+            guard $0.column == .inProgress else { return false }
+            if $0.phase == .pausedQuota { return true }
+            return $0.phase == .retryWaiting && $0.nextRetryAt.map { $0 <= now } == true
+        })
+        let queued = ordered(tasks.filter { $0.column == .queued && $0.phase == .idle })
+        return (inProgress + queued).filter {
+            !runningIDs.contains($0.id) && !schedulingIDs.contains($0.id)
+        }
+    }
+
+    static func repositoryIsBusy(
+        for task: AutomationTask,
+        tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        leasedRepositories: [UUID: String] = [:]
+    ) -> Bool {
+        let repository = canonicalRepositoryPath(task.repoPath)
+        if leasedRepositories.contains(where: {
+            canonicalRepositoryPath($0.value) == repository
+        }) {
+            return true
+        }
+        let occupiedIDs = runningIDs
+            .union(schedulingIDs)
+            .union(leasedRepositories.keys)
+            .subtracting([task.id])
+        guard !occupiedIDs.isEmpty else { return false }
+        return tasks.contains {
+            occupiedIDs.contains($0.id) && canonicalRepositoryPath($0.repoPath) == repository
+        }
+    }
+
+    private static func canonicalRepositoryPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+    }
+
     private func hydratedAutomationAccounts(aliases: [String]) async -> [Account] {
         var accounts: [Account] = []
         for alias in aliases {
@@ -691,17 +817,6 @@ public actor AppEngine {
     /// "Started" must be judged from whatever windows are actually reported: while the 5h limit
     /// is suspended only the weekly window exists, and demanding a started short window would
     /// park the account forever even though no banked short reset exists to preserve.
-    /// Stagnant = this run and the two previous closed runs all ended "continue" with the
-    /// exact same checklist state. Interruptions and failures break the pattern on purpose.
-    static func isStagnantContinue<Runs: Sequence>(previousRuns: Runs, progress: PlanProgress) -> Bool
-    where Runs.Element == TaskRunRecord {
-        let closed = previousRuns.filter { $0.finishedAt != nil }.suffix(2)
-        guard closed.count == 2 else { return false }
-        return closed.allSatisfy {
-            $0.outcome == "continue" && $0.planDone == progress.done && $0.planTotal == progress.total
-        }
-    }
-
     static func hasStartedWindow(_ account: Account) -> Bool {
         if let short = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }) {
             return short.usedPercent > 0
@@ -769,8 +884,19 @@ public actor AppEngine {
             if ownsReservation { schedulingTaskIDs.remove(task.id) }
         }
         let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
-        let runningCount = await taskRunner.runningIDs().count
-        guard runningCount + schedulingTaskIDs.count <= maximumConcurrent else { return .unavailable }
+        let runningIDs = await taskRunner.runningIDs()
+        guard runningIDs.count + schedulingTaskIDs.count <= maximumConcurrent else { return .unavailable }
+        guard !Self.repositoryIsBusy(
+            for: task,
+            tasks: await taskStore.all(),
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases
+        ) else {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
+            return .unavailable
+        }
+        repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
 
         let startGate = TaskStartGate()
         do {
@@ -785,7 +911,8 @@ public actor AppEngine {
                 await self.handleTaskExit(taskID: taskID, exit: exit)
             }
         } catch {
-            await failTaskLaunch(taskID: task.id, reason: error.localizedDescription)
+            await handleTaskLaunchError(taskID: task.id, error: error)
+            repositoryLeases.removeValue(forKey: task.id)
             return .failed
         }
 
@@ -799,6 +926,7 @@ public actor AppEngine {
         started.phase = task.runs.isEmpty ? .planning : .running
         started.updatedAt = now
         started.lastError = nil
+        started.nextRetryAt = nil
         started.runs.append(TaskRunRecord(
             startedAt: now,
             outcome: "",
@@ -820,22 +948,45 @@ public actor AppEngine {
         return .started
     }
 
-    private func failTaskLaunch(taskID: UUID, reason: String) async {
+    private func handleTaskLaunchError(taskID: UUID, error: any Error) async {
         guard var task = await taskStore.task(id: taskID) else { return }
+        let now = Date()
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 1,
+            stderrTail: error.localizedDescription,
+            isEvergreen: task.isEvergreen,
+            previousRuns: task.runs.filter { $0.finishedAt != nil },
+            retryAttempts: task.retryAttempts,
+            nextRetryAt: task.nextRetryAt,
+            stagnationRecoveries: task.stagnationRecoveries,
+            planRelativePath: task.planRelativePath,
+            now: now,
+            launchError: error as? TaskRunnerError
+        ))
         await autoLog.write(
             "run",
-            "failTaskLaunch \(Self.taskLabel(task)) reason \(Self.oneLine(reason))"
+            "launch exit \(Self.taskLabel(task)) outcome \(transition.outcome) reason \(Self.oneLine(transition.lastError ?? error.localizedDescription))"
         )
-        if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
-            task.runs[runIndex].finishedAt = Date()
-            task.runs[runIndex].outcome = "failed"
-        }
-        task.phase = .failed
-        task.lastError = reason
-        task.updatedAt = Date()
+        task.phase = transition.phase
+        task.column = transition.column
+        task.lastError = transition.lastError
+        task.retryAttempts = transition.retryAttempts
+        task.nextRetryAt = transition.nextRetryAt
+        task.stagnationRecoveries = transition.stagnationRecoveries
+        task.updatedAt = now
         await taskStore.update(task)
-        emit(.taskFailed(title: task.title, reason: reason))
+        switch transition.terminalEvent {
+        case .completed:
+            emit(.taskCompleted(title: task.title))
+        case .pausedQuota:
+            emit(.taskPausedQuota(title: task.title))
+        case .failed:
+            emit(.taskFailed(title: task.title, reason: transition.lastError ?? error.localizedDescription))
+        case nil:
+            break
+        }
         emit(.snapshotChanged)
+        if transition.scheduleAnotherTick { await automationTick() }
     }
 
     private func handleTaskExit(taskID: UUID, exit: TaskRunner.RunExit) async {
@@ -846,6 +997,7 @@ public actor AppEngine {
             )
             return
         }
+        defer { repositoryLeases.removeValue(forKey: taskID) }
         guard var task = await taskStore.task(id: taskID) else { return }
         guard let lastRun = task.runs.last, lastRun.finishedAt == nil else {
             await autoLog.write(
@@ -861,65 +1013,29 @@ public actor AppEngine {
         let progress = planText.flatMap(PlanDocParser.parse)
         task.planProgress = progress
 
-        let outcome: String
-        var terminalEvent: AppEvent?
-        if task.phase == .stopped {
-            outcome = "stopped"
-            task.phase = .stopped
-            task.column = .inProgress
-        } else if exit.quotaExhausted {
-            outcome = "paused-quota"
-            task.phase = .pausedQuota
-            task.column = .inProgress
-            terminalEvent = .taskPausedQuota(title: task.title)
-        } else if progress?.status == "COMPLETE", task.isEvergreen {
-            // Evergreen tasks never retire: even a COMPLETE plan re-enters the rotation so the
-            // next quota window starts a fresh improvement cycle.
-            outcome = "cycle-complete"
-            task.phase = .pausedQuota
-            task.column = .inProgress
-            terminalEvent = .taskCompleted(title: task.title)
-        } else if progress?.status == "COMPLETE" {
-            outcome = "completed"
-            task.phase = .completed
-            task.column = .done
+        let context = TaskExitContext(
+            exitCode: exit.exitCode,
+            quotaExhausted: exit.quotaExhausted,
+            stopped: task.phase == .stopped,
+            stderrTail: exit.stderrTail,
+            progress: progress,
+            isEvergreen: task.isEvergreen,
+            previousRuns: Array(task.runs.dropLast()),
+            retryAttempts: task.retryAttempts,
+            nextRetryAt: task.nextRetryAt,
+            stagnationRecoveries: task.stagnationRecoveries,
+            planRelativePath: task.planRelativePath,
+            now: now
+        )
+        let transition = TaskOutcomeReducer.reduce(context)
+        task.phase = transition.phase
+        task.column = transition.column
+        task.lastError = transition.lastError
+        task.retryAttempts = transition.retryAttempts
+        task.nextRetryAt = transition.nextRetryAt
+        task.stagnationRecoveries = transition.stagnationRecoveries
+        if task.column == .done {
             task.orderIndex = await taskStore.tasks(in: .done).count
-            terminalEvent = .taskCompleted(title: task.title)
-        } else if progress?.status == "BLOCKED" {
-            outcome = "failed"
-            task.phase = .failed
-            task.column = .inProgress
-            task.lastError = "Plan reports BLOCKED — see \(task.planRelativePath)"
-            terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "blocked")
-        } else if exit.exitCode == 0, let progress {
-            if Self.isStagnantContinue(previousRuns: task.runs.dropLast(), progress: progress) {
-                // Three consecutive sessions with identical checklist state means the run is
-                // spinning (e.g. waiting for an approval nobody can give) — surface it instead
-                // of burning the account's quota on the same loop.
-                outcome = "failed"
-                task.phase = .failed
-                task.column = .inProgress
-                task.lastError = "no checklist progress across 3 consecutive runs — see \(task.planRelativePath) and the run logs"
-                terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "stagnant")
-            } else {
-                outcome = "continue"
-                task.phase = .pausedQuota
-                task.column = .inProgress
-            }
-        } else if exit.exitCode == 0 {
-            // A clean exit that produced no plan document is not resumable work; rescheduling
-            // it would hot-loop the same failing run until the account's quota is gone.
-            outcome = "failed"
-            task.phase = .failed
-            task.column = .inProgress
-            task.lastError = exit.stderrTail.isEmpty ? "run ended without a plan document" : exit.stderrTail
-            terminalEvent = .taskFailed(title: task.title, reason: task.lastError ?? "no plan produced")
-        } else {
-            outcome = "failed"
-            task.phase = .failed
-            task.column = .inProgress
-            task.lastError = exit.stderrTail
-            terminalEvent = .taskFailed(title: task.title, reason: exit.stderrTail)
         }
 
         if task.column == .inProgress,
@@ -929,7 +1045,7 @@ public actor AppEngine {
         if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
             task.runs[runIndex].finishedAt = now
             task.runs[runIndex].exitCode = exit.exitCode
-            task.runs[runIndex].outcome = outcome
+            task.runs[runIndex].outcome = transition.outcome
             task.runs[runIndex].planDone = progress?.done
             task.runs[runIndex].planTotal = progress?.total
         }
@@ -942,6 +1058,8 @@ public actor AppEngine {
             nextState = "done"
         case .pausedQuota:
             nextState = "pausedQuota"
+        case .retryWaiting:
+            nextState = "retryWaiting"
         case .failed:
             nextState = "failed error \(Self.errorExcerpt(task.lastError ?? exit.stderrTail))"
         case .stopped:
@@ -951,11 +1069,21 @@ public actor AppEngine {
         }
         await autoLog.write(
             "run",
-            "exit \(Self.taskLabel(task)) code \(exit.exitCode) outcome \(outcome) plan \(progressText) next \(nextState)"
+            "exit \(Self.taskLabel(task)) code \(exit.exitCode) outcome \(transition.outcome) plan \(progressText) next \(nextState)"
         )
-        if let terminalEvent { emit(terminalEvent) }
+        switch transition.terminalEvent {
+        case .completed:
+            emit(.taskCompleted(title: task.title))
+        case .pausedQuota:
+            emit(.taskPausedQuota(title: task.title))
+        case .failed:
+            emit(.taskFailed(title: task.title, reason: transition.lastError ?? exit.stderrTail))
+        case nil:
+            break
+        }
         emit(.snapshotChanged)
-        await automationTick()
+        repositoryLeases.removeValue(forKey: taskID)
+        if transition.scheduleAnotherTick { await automationTick() }
     }
 
     // MARK: - Poller

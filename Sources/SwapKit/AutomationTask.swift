@@ -12,6 +12,7 @@ public enum TaskPhase: String, Codable, Sendable {
     case planning
     case running
     case pausedQuota
+    case retryWaiting
     case failed
     case stopped
     case completed
@@ -100,6 +101,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var runs: [TaskRunRecord]
     public var lastError: String?
     public var planProgress: PlanProgress?
+    public var retryAttempts: Int
+    public var nextRetryAt: Date?
+    public var stagnationRecoveries: Int
 
     public init(
         id: UUID = UUID(),
@@ -119,7 +123,10 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         updatedAt: Date = Date(),
         runs: [TaskRunRecord] = [],
         lastError: String? = nil,
-        planProgress: PlanProgress? = nil
+        planProgress: PlanProgress? = nil,
+        retryAttempts: Int = 0,
+        nextRetryAt: Date? = nil,
+        stagnationRecoveries: Int = 0
     ) {
         self.id = id
         self.title = title
@@ -139,6 +146,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.runs = runs
         self.lastError = lastError
         self.planProgress = planProgress
+        self.retryAttempts = retryAttempts
+        self.nextRetryAt = nextRetryAt
+        self.stagnationRecoveries = stagnationRecoveries
     }
 
     public init(from decoder: Decoder) throws {
@@ -162,6 +172,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         runs = try c.decodeIfPresent([TaskRunRecord].self, forKey: .runs) ?? []
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
         planProgress = try c.decodeIfPresent(PlanProgress.self, forKey: .planProgress)
+        retryAttempts = try c.decodeIfPresent(Int.self, forKey: .retryAttempts) ?? 0
+        nextRetryAt = try c.decodeIfPresent(Date.self, forKey: .nextRetryAt)
+        stagnationRecoveries = try c.decodeIfPresent(Int.self, forKey: .stagnationRecoveries) ?? 0
     }
 
     public var planRelativePath: String {
@@ -191,17 +204,18 @@ public enum PlanDocParser {
     public static func parse(_ text: String) -> PlanProgress? {
         var done = 0
         var total = 0
-        var status: String?
+        let lines = text.components(separatedBy: .newlines)
 
-        for line in text.components(separatedBy: .newlines) {
+        for line in lines {
             if let marker = capture(in: line, pattern: #"^\s*-\s+\[([ x])\]"#) {
                 total += 1
                 if marker.caseInsensitiveCompare("x") == .orderedSame { done += 1 }
             }
-            if let word = capture(in: line, pattern: #"^\s*(?:\*\*)?STATUS:(?:\*\*)?\s*([A-Z]+)"#) {
-                status = word.uppercased()
-            }
         }
+        let lastLine = lines.last { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let status = lastLine
+            .flatMap { capture(in: $0, pattern: #"^\s*(?:\*\*)?STATUS:(?:\*\*)?\s*([A-Z]+)"#) }
+            .map { $0.uppercased() }
 
         guard total > 0 || status != nil else { return nil }
         return PlanProgress(done: done, total: total, status: status)
