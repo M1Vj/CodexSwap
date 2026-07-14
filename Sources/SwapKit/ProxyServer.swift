@@ -7,10 +7,11 @@ import AsyncHTTPClient
 enum ProxyRequestMode: Equatable, Sendable {
     static let warmupHeader = "X-CodexSwap-Warmup-Account"
     static let taskHeader = "X-CodexSwap-Task-Accounts"
+    static let taskRunHeader = "X-CodexSwap-Task-Run"
 
     case normal
     case warmup(alias: String)
-    case task(allowed: [String])
+    case task(allowed: [String], runID: String? = nil)
 
     init(headers: HTTPHeaders) {
         if let alias = headers.first(name: Self.warmupHeader), !alias.isEmpty {
@@ -20,7 +21,10 @@ enum ProxyRequestMode: Equatable, Sendable {
                 .split(separator: ",", omittingEmptySubsequences: false)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
-            self = allowed.isEmpty ? .normal : .task(allowed: allowed)
+            let runID = headers.first(name: Self.taskRunHeader)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            self = allowed.isEmpty ? .normal : .task(allowed: allowed, runID: runID)
         } else {
             self = .normal
         }
@@ -35,6 +39,16 @@ enum ProxyRequestMode: Equatable, Sendable {
         if case .task = self { return true }
         return false
     }
+
+    var taskRunID: String? {
+        guard case .task(_, let runID) = self else { return nil }
+        return runID
+    }
+}
+
+func taskTurnKey(for mode: ProxyRequestMode) -> String? {
+    guard case .task(let allowed, let runID) = mode else { return nil }
+    return runID ?? allowed.joined(separator: ",")
 }
 
 func proxyRequestMode(headers: HTTPHeaders, method: HTTPMethod, path: String, loopbackOnly: Bool) -> ProxyRequestMode {
@@ -59,7 +73,7 @@ func selectProxyAccount(
         // that CodexBar's fresh credentials can serve.
         guard let account = await store.hydrateFromManagedHome(alias), account.isEligible(now: now) else { return nil }
         return account
-    case .task(let allowed):
+    case .task(let allowed, _):
         for alias in allowed {
             _ = await store.hydrateFromManagedHome(alias)
         }
@@ -90,6 +104,7 @@ func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHead
     headers.remove(name: "Proxy-Connection")
     headers.remove(name: ProxyRequestMode.warmupHeader)
     headers.remove(name: ProxyRequestMode.taskHeader)
+    headers.remove(name: ProxyRequestMode.taskRunHeader)
     headers.replaceOrAdd(name: "Authorization", value: "Bearer \(account.accessToken)")
     if !account.accountID.isEmpty {
         headers.replaceOrAdd(name: "ChatGPT-Account-Id", value: account.accountID)
@@ -100,12 +115,47 @@ func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHead
 }
 
 public struct ProxyEvent: Sendable {
-    public enum Kind: Sendable { case rotated, exhausted, needsLogin, refreshed, tokensUpdated }
+    public enum Kind: Sendable { case rotated, exhausted, needsLogin, refreshed, tokensUpdated, served }
     public let kind: Kind
     public let from: String?
     public let to: String?
     public let limit: String?
     public let resetAt: Date?
+    public let runID: String?
+
+    public init(
+        kind: Kind,
+        from: String?,
+        to: String?,
+        limit: String?,
+        resetAt: Date?,
+        runID: String? = nil
+    ) {
+        self.kind = kind
+        self.from = from
+        self.to = to
+        self.limit = limit
+        self.resetAt = resetAt
+        self.runID = runID
+    }
+
+    static func taskScoped(
+        kind: Kind,
+        from: String?,
+        to: String?,
+        limit: String?,
+        resetAt: Date?,
+        mode: ProxyRequestMode
+    ) -> ProxyEvent {
+        ProxyEvent(
+            kind: kind,
+            from: from,
+            to: to,
+            limit: limit,
+            resetAt: resetAt,
+            runID: mode.taskRunID
+        )
+    }
 }
 
 public protocol ProxyEventSink: Sendable {
@@ -115,6 +165,12 @@ public protocol ProxyEventSink: Sendable {
 public struct NullEventSink: ProxyEventSink {
     public init() {}
     public func handle(_ event: ProxyEvent) async {}
+}
+
+typealias TaskTurn = (alias: String, at: Date)
+
+func pruneTaskTurns(_ turns: inout [String: TaskTurn], olderThan cutoff: Date) {
+    turns = turns.filter { $0.value.at >= cutoff }
 }
 
 /// Serializes forced refreshes per alias and suppresses a re-refresh whose prior new token still failed.
@@ -157,7 +213,7 @@ public actor ProxyServer {
     private var lastActivityAt: Date?
     private var lastActivityAlias: String?
     private var lastTurnAt: Date?
-    private var taskTurns: [String: (alias: String, at: Date)] = [:]
+    private var taskTurns: [String: TaskTurn] = [:]
     private var inflightRefresh: [String: Task<CodexTokens, Error>] = [:]
 
     public struct Activity: Sendable {
@@ -298,8 +354,14 @@ public actor ProxyServer {
         }
 
         var preferredTaskAlias: String?
-        if case .task(let allowed) = mode, settings.rotationStrategy == .roundRobin {
-            let key = allowed.joined(separator: ",")
+        if mode.isTask {
+            pruneTaskTurns(
+                &taskTurns,
+                olderThan: Date().addingTimeInterval(-TimeInterval(settings.roundRobinTurnGapSeconds))
+            )
+        }
+        if mode.isTask, settings.rotationStrategy == .roundRobin,
+           let key = taskTurnKey(for: mode) {
             if let turn = taskTurns[key],
                Date().timeIntervalSince(turn.at) <= TimeInterval(settings.roundRobinTurnGapSeconds) {
                 preferredTaskAlias = turn.alias
@@ -317,9 +379,7 @@ public actor ProxyServer {
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
         }
-        if case .task(let allowed) = mode {
-            taskTurns[allowed.joined(separator: ",")] = (account.alias, Date())
-        }
+        await recordTaskSelection(account.alias, mode: mode)
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
         var tokenRefreshed = false
@@ -436,7 +496,14 @@ public actor ProxyServer {
                             tokenRefreshed = false
                             continue
                         }
-                        await sink.handle(ProxyEvent(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt))
+                        await sink.handle(ProxyEvent.taskScoped(
+                            kind: .exhausted,
+                            from: account.alias,
+                            to: nil,
+                            limit: limit,
+                            resetAt: resetAt,
+                            mode: mode
+                        ))
                         try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
                         return
                     }
@@ -475,13 +542,35 @@ public actor ProxyServer {
             primaryThreshold: settings.primaryThresholdPercent,
             secondaryThreshold: settings.secondaryThresholdPercent
         ), next.alias != alias else { return nil }
+        await recordTaskSelection(next.alias, mode: mode)
         return next
+    }
+
+    private func recordTaskSelection(_ alias: String, mode: ProxyRequestMode) async {
+        guard let key = taskTurnKey(for: mode) else { return }
+        taskTurns[key] = (alias, Date())
+        guard let runID = mode.taskRunID else { return }
+        await sink.handle(ProxyEvent(
+            kind: .served,
+            from: alias,
+            to: nil,
+            limit: nil,
+            resetAt: nil,
+            runID: runID
+        ))
     }
 
     private func taskFailover(from account: Account, mode: ProxyRequestMode, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, status: HTTPResponseStatus, headers: HTTPHeaders, errBody: ByteBuffer) async throws -> Account? {
         await store.markNeedsLoginOnly(account.alias)
         let next = await selectNextTaskAccount(mode: mode, excluding: account.alias)
-        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: next?.alias, limit: nil, resetAt: nil))
+        await sink.handle(ProxyEvent.taskScoped(
+            kind: .needsLogin,
+            from: account.alias,
+            to: next?.alias,
+            limit: nil,
+            resetAt: nil,
+            mode: mode
+        ))
         guard let next else {
             try await deliverBuffered(outbound, status: status, headers: headers, body: errBody)
             return nil

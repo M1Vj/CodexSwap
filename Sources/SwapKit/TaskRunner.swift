@@ -32,21 +32,28 @@ public actor TaskRunner {
     private struct RunningTask {
         let process: Process
         let logURL: URL
+        let runID: UUID
         var quotaExhausted: Bool
     }
 
     private static let timeoutNanoseconds: UInt64 = 6 * 60 * 60 * 1_000_000_000
     private var running: [UUID: RunningTask] = [:]
+    private var taskIDsByRunID: [UUID: UUID] = [:]
     private let logSink: (@Sendable (String, String) async -> Void)?
 
     public init(logSink: (@Sendable (String, String) async -> Void)? = nil) {
         self.logSink = logSink
     }
 
-    public static func launchArgs(task: AutomationTask, proxyURL: URL, allowedAliases: [String]) -> [String] {
+    public static func launchArgs(
+        task: AutomationTask,
+        proxyURL: URL,
+        allowedAliases: [String],
+        runID: UUID = UUID()
+    ) -> [String] {
         let baseURL = proxyURL.absoluteString.trimmingTrailingSlash() + "/backend-api/codex"
         let aliases = allowedAliases.joined(separator: ",")
-        let provider = "model_providers.codexswap-task={ name=\"CodexSwap Task\", base_url=\"\(tomlEscape(baseURL))\", wire_api=\"responses\", env_key=\"CODEXSWAP_TASK_TOKEN\", http_headers={ \"\(ProxyRequestMode.taskHeader)\"=\"\(tomlEscape(aliases))\" } }"
+        let provider = "model_providers.codexswap-task={ name=\"CodexSwap Task\", base_url=\"\(tomlEscape(baseURL))\", wire_api=\"responses\", env_key=\"CODEXSWAP_TASK_TOKEN\", http_headers={ \"\(ProxyRequestMode.taskHeader)\"=\"\(tomlEscape(aliases))\", \"\(ProxyRequestMode.taskRunHeader)\"=\"\(runID.uuidString)\" } }"
         let prompt: String
         if task.runs.isEmpty {
             prompt = TaskPrompt.firstRun(task: task)
@@ -79,6 +86,7 @@ public actor TaskRunner {
     public func start(
         task: AutomationTask,
         allowedAliases: [String],
+        runID: UUID,
         proxyURL: URL,
         supportDir: URL,
         onExit: @escaping @Sendable (UUID, RunExit) async -> Void
@@ -123,7 +131,12 @@ public actor TaskRunner {
             try logHandle.truncate(atOffset: 0)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binary)
-            process.arguments = Self.launchArgs(task: task, proxyURL: proxyURL, allowedAliases: allowedAliases)
+            process.arguments = Self.launchArgs(
+                task: task,
+                proxyURL: proxyURL,
+                allowedAliases: allowedAliases,
+                runID: runID
+            )
             process.currentDirectoryURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             process.standardOutput = logHandle
             process.standardError = logHandle
@@ -147,7 +160,13 @@ public actor TaskRunner {
                 "launch task \(Self.shortID(task.id)) run \(runNumber) binary \(binary) cwd \(task.repoPath) model \(task.model) allowNetwork \(task.allowNetwork) allowedAliases \(allowedAliases.count)"
             )
             try process.run()
-            running[task.id] = RunningTask(process: process, logURL: logURL, quotaExhausted: false)
+            running[task.id] = RunningTask(
+                process: process,
+                logURL: logURL,
+                runID: runID,
+                quotaExhausted: false
+            )
+            taskIDsByRunID[runID] = task.id
 
             Task { [weak self] in
                 let exitCode: Int32
@@ -178,6 +197,11 @@ public actor TaskRunner {
         Set(running.keys)
     }
 
+    public func taskID(forRunID runID: String) -> UUID? {
+        guard let id = UUID(uuidString: runID) else { return nil }
+        return taskIDsByRunID[id]
+    }
+
     public func noteQuotaExhausted(taskID: UUID) async {
         guard running[taskID] != nil else { return }
         running[taskID]?.quotaExhausted = true
@@ -190,6 +214,7 @@ public actor TaskRunner {
         onExit: @escaping @Sendable (UUID, RunExit) async -> Void
     ) async {
         guard let run = running.removeValue(forKey: taskID) else { return }
+        taskIDsByRunID[run.runID] = nil
         let tail = Self.logTail(at: run.logURL, maximumBytes: 4_096)
         let lowercasedTail = String(decoding: tail, as: UTF8.self).lowercased()
         let quotaExhausted = run.quotaExhausted
@@ -278,3 +303,20 @@ public actor TaskRunner {
             .replacingOccurrences(of: "\t", with: "\\t")
     }
 }
+
+protocol TaskRunning: Sendable {
+    func start(
+        task: AutomationTask,
+        allowedAliases: [String],
+        runID: UUID,
+        proxyURL: URL,
+        supportDir: URL,
+        onExit: @escaping @Sendable (UUID, TaskRunner.RunExit) async -> Void
+    ) async throws
+    func stop(taskID: UUID) async
+    func runningIDs() async -> Set<UUID>
+    func taskID(forRunID runID: String) async -> UUID?
+    func noteQuotaExhausted(taskID: UUID) async
+}
+
+extension TaskRunner: TaskRunning {}
