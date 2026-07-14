@@ -20,6 +20,8 @@ struct TaskExitContext: Sendable {
     var planRelativePath: String
     var now: Date
     var launchError: TaskRunnerError?
+    var currentModel: String
+    var nextFallbackModel: String?
 
     init(
         exitCode: Int32,
@@ -34,7 +36,9 @@ struct TaskExitContext: Sendable {
         stagnationRecoveries: Int = 0,
         planRelativePath: String = "PLAN.md",
         now: Date = Date(),
-        launchError: TaskRunnerError? = nil
+        launchError: TaskRunnerError? = nil,
+        currentModel: String = "",
+        nextFallbackModel: String? = nil
     ) {
         self.exitCode = exitCode
         self.quotaExhausted = quotaExhausted
@@ -49,6 +53,8 @@ struct TaskExitContext: Sendable {
         self.planRelativePath = planRelativePath
         self.now = now
         self.launchError = launchError
+        self.currentModel = currentModel
+        self.nextFallbackModel = nextFallbackModel
     }
 }
 
@@ -61,6 +67,7 @@ struct TaskTransition: Sendable, Equatable {
     var retryAttempts: Int
     var nextRetryAt: Date?
     var stagnationRecoveries: Int
+    var fallbackModel: String?
     var scheduleAnotherTick: Bool
 
     init(
@@ -72,6 +79,7 @@ struct TaskTransition: Sendable, Equatable {
         retryAttempts: Int = 0,
         nextRetryAt: Date? = nil,
         stagnationRecoveries: Int = 0,
+        fallbackModel: String? = nil,
         scheduleAnotherTick: Bool = true
     ) {
         self.outcome = outcome
@@ -82,6 +90,7 @@ struct TaskTransition: Sendable, Equatable {
         self.retryAttempts = retryAttempts
         self.nextRetryAt = nextRetryAt
         self.stagnationRecoveries = stagnationRecoveries
+        self.fallbackModel = fallbackModel
         self.scheduleAnotherTick = scheduleAnotherTick
     }
 }
@@ -192,6 +201,17 @@ enum TaskOutcomeReducer {
             launchError: context.launchError
         )
         let reason = failureReason(kind: failureKind, stderrTail: context.stderrTail)
+        if failureKind == .modelRejected, let fallback = context.nextFallbackModel {
+            return TaskTransition(
+                outcome: "model-fallback",
+                phase: .pausedQuota,
+                column: .inProgress,
+                lastError: "model \(context.currentModel) rejected — falling back to \(fallback)",
+                retryAttempts: 0,
+                stagnationRecoveries: reconciledStagnationRecoveries(context),
+                fallbackModel: fallback
+            )
+        }
         if failureKind == .transient || failureKind == .timeout {
             guard context.retryAttempts < 3 else {
                 return TaskTransition(

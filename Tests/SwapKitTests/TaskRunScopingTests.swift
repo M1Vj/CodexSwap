@@ -17,6 +17,7 @@ private actor FakeTaskRunner: TaskRunning {
         task: AutomationTask,
         allowedAliases: [String],
         runID: UUID,
+        runNumber: Int?,
         proxyURL: URL,
         supportDir: URL,
         onExit: @escaping @Sendable (UUID, TaskRunner.RunExit) async -> Void

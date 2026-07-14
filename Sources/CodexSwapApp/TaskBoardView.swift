@@ -878,6 +878,7 @@ private struct TaskEditorView: View {
     @State private var draft: AutomationTask
     @State private var modelSelection: String
     @State private var customModel: String
+    @State private var fallbackModelsText: String
     @State private var branchWasEdited: Bool
 
     let accounts: [Account]
@@ -891,9 +892,11 @@ private struct TaskEditorView: View {
         if Self.builtInModels.contains(task.model) {
             _modelSelection = State(initialValue: task.model)
             _customModel = State(initialValue: "")
+            _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
         } else {
             _modelSelection = State(initialValue: "custom")
             _customModel = State(initialValue: task.model)
+            _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
         }
         _branchWasEdited = State(initialValue: !isNew && !task.branch.isEmpty)
         self.accounts = accounts
@@ -942,6 +945,7 @@ private struct TaskEditorView: View {
                 if modelSelection == "custom" {
                     TextField("Custom model", text: $customModel)
                 }
+                TextField("Fallback models (comma-separated)", text: $fallbackModelsText)
 
                 Picker("Reasoning Effort", selection: $draft.reasoningEffort) {
                     Text("Low").tag("low")
@@ -1083,6 +1087,11 @@ private struct TaskEditorView: View {
         draft.repoPath = draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines)
         draft.branch = draft.branch.trimmingCharacters(in: .whitespacesAndNewlines)
         draft.model = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        draft.fallbackModels = fallbackModelsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        draft.modelFallbacksUsed = 0
         draft.updatedAt = Date()
         onSave(draft)
         dismiss()

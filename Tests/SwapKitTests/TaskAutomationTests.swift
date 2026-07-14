@@ -562,7 +562,10 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(AppEngine.automationAccount(from: [hot, cool], settings: settings, now: now)?.alias, "cool")
 
         let alsoHot = Account(alias: "also-hot", accessToken: "t", priority: 5, usage: [weekly(99)])
-        XCTAssertEqual(AppEngine.automationAccount(from: [hot, alsoHot], settings: settings, now: now)?.alias, "hot")
+        XCTAssertNil(
+            AppEngine.automationAccount(from: [hot, alsoHot], settings: settings, now: now),
+            "run starts never fall back to over-threshold accounts; mid-run proxy failover keeps the fallback"
+        )
 
         settings.rotationStrategy = .roundRobin
         let recent = Account(alias: "recent", accessToken: "t", priority: 10, lastUsedAt: now, usage: [weekly(10)])

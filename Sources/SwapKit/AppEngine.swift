@@ -297,10 +297,11 @@ public actor AppEngine {
     }
 
     public func runLogURL(taskID: UUID, runNumber: Int) async -> URL? {
-        guard let task = await taskStore.task(id: taskID), task.runs.indices.contains(runNumber - 1) else {
+        guard let task = await taskStore.task(id: taskID),
+              let run = task.runs.first(where: { $0.logFileName == "run-\(runNumber).log" }) else {
             return nil
         }
-        let fileName = task.runs[runNumber - 1].logFileName
+        let fileName = run.logFileName
         guard !fileName.isEmpty, URL(fileURLWithPath: fileName).lastPathComponent == fileName else { return nil }
         let url = task.taskDirURL(supportDir: supportDir).appendingPathComponent(fileName)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
@@ -1019,12 +1020,31 @@ public actor AppEngine {
                 return hasStartedWindow(account)
             }
             .sorted { AccountStore.selectionOrder($0, $1, strategy: settings.rotationStrategy) }
+        // Starting a fresh unattended session on an over-threshold or headroom-starved
+        // account is wasted quota; unlike serving live traffic, a start has no fallback.
         return ordered.first {
             $0.isWithinRotationThresholds(
                 primaryPercent: settings.primaryThresholdPercent,
                 secondaryPercent: settings.secondaryThresholdPercent
-            )
-        } ?? ordered.first
+            ) && hasHeadroom($0, minimumPercent: settings.automationMinHeadroomPercent)
+        }
+    }
+
+
+    static func nextFallbackModel(for task: AutomationTask) -> String? {
+        guard task.fallbackModels.indices.contains(task.modelFallbacksUsed) else { return nil }
+        let candidate = task.fallbackModels[task.modelFallbacksUsed]
+        let trimmed = candidate.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, trimmed != task.model else {
+            var probe = task
+            probe.modelFallbacksUsed += 1
+            return nextFallbackModel(for: probe)
+        }
+        return trimmed
+    }
+
+    static func hasHeadroom(_ account: Account, minimumPercent: Int) -> Bool {
+        account.usage.allSatisfy { 100 - $0.usedPercent >= minimumPercent }
     }
 
     private static func accountEligibilityReasons(
@@ -1037,6 +1057,7 @@ public actor AppEngine {
             aliases: aliases,
             accounts: accounts,
             consumeBankedWindow: settings.automationConsumeBankedWindow,
+            minHeadroomPercent: settings.automationMinHeadroomPercent,
             now: now
         )
     }
@@ -1080,7 +1101,7 @@ public actor AppEngine {
         let runID = UUID()
         let now = Date()
         let gitState = await GitProbe.repositoryState(at: task.repoPath)
-        let runNumber = task.runs.count + 1
+        let runNumber = max(task.totalRuns, task.runs.count) + 1
         var started = task
         if task.column != .inProgress {
             started.orderIndex = await taskStore.tasks(in: .inProgress).count
@@ -1090,6 +1111,7 @@ public actor AppEngine {
         started.updatedAt = now
         started.lastError = nil
         started.nextRetryAt = nil
+        started.totalRuns = runNumber
         started.runs.append(TaskRunRecord(
             id: runID,
             startedAt: now,
@@ -1107,6 +1129,7 @@ public actor AppEngine {
                 task: task,
                 allowedAliases: Self.allowedAliases(for: task, settings: settings),
                 runID: runID,
+                runNumber: runNumber,
                 proxyURL: proxyURL,
                 supportDir: supportDir
             ) { [weak self] taskID, exit in
@@ -1149,7 +1172,9 @@ public actor AppEngine {
             stagnationRecoveries: task.stagnationRecoveries,
             planRelativePath: task.planRelativePath,
             now: now,
-            launchError: error as? TaskRunnerError
+            launchError: error as? TaskRunnerError,
+            currentModel: task.model,
+            nextFallbackModel: Self.nextFallbackModel(for: task)
         ))
         await autoLog.write(
             "run",
@@ -1161,6 +1186,10 @@ public actor AppEngine {
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
         task.stagnationRecoveries = transition.stagnationRecoveries
+        if let fallback = transition.fallbackModel {
+            task.model = fallback
+            task.modelFallbacksUsed += 1
+        }
         if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
             task.runs[runIndex].finishedAt = now
             task.runs[runIndex].exitCode = 1
@@ -1221,7 +1250,9 @@ public actor AppEngine {
             nextRetryAt: task.nextRetryAt,
             stagnationRecoveries: task.stagnationRecoveries,
             planRelativePath: task.planRelativePath,
-            now: now
+            now: now,
+            currentModel: task.model,
+            nextFallbackModel: Self.nextFallbackModel(for: task)
         )
         let transition = TaskOutcomeReducer.reduce(context)
         task.phase = transition.phase
@@ -1230,6 +1261,10 @@ public actor AppEngine {
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
         task.stagnationRecoveries = transition.stagnationRecoveries
+        if let fallback = transition.fallbackModel {
+            task.model = fallback
+            task.modelFallbacksUsed += 1
+        }
         if task.column == .done {
             task.orderIndex = await taskStore.tasks(in: .done).count
         }
@@ -1238,6 +1273,7 @@ public actor AppEngine {
            !(await taskStore.tasks(in: .inProgress).contains(where: { $0.id == task.id })) {
             task.orderIndex = await taskStore.tasks(in: .inProgress).count
         }
+        let taskDir = task.taskDirURL(supportDir: supportDir)
         if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
             task.runs[runIndex].finishedAt = now
             task.runs[runIndex].exitCode = exit.exitCode
@@ -1246,7 +1282,9 @@ public actor AppEngine {
             task.runs[runIndex].planTotal = progress?.total
             task.runs[runIndex].headSHA = gitState?.headSHA
             task.runs[runIndex].actualBranch = gitState?.branch
+            ingestRunTelemetry(into: &task.runs[runIndex], taskDir: taskDir)
         }
+        archiveExcessRuns(&task, taskDir: taskDir)
         task.updatedAt = now
         await taskStore.update(task)
         let progressText = "done \(progress?.done ?? 0) total \(progress?.total ?? 0) status \(progress?.status ?? "none")"
@@ -1282,6 +1320,51 @@ public actor AppEngine {
         emit(.snapshotChanged)
         repositoryLeases.removeValue(forKey: taskID)
         if transition.scheduleAnotherTick { await automationTick() }
+    }
+
+
+    private func ingestRunTelemetry(into run: inout TaskRunRecord, taskDir: URL) {
+        guard !run.logFileName.isEmpty else { return }
+        let telemetry = CodexEventDecoder.decode(logURL: taskDir.appendingPathComponent(run.logFileName))
+        run.sessionID = telemetry.sessionID
+        run.inputTokens = telemetry.inputTokens
+        run.cachedTokens = telemetry.cachedTokens
+        run.outputTokens = telemetry.outputTokens
+        let finalURL = taskDir.appendingPathComponent(run.logFileName.replacingOccurrences(of: ".log", with: ".final.md"))
+        let finalText = try? String(contentsOf: finalURL, encoding: .utf8)
+        try? FileManager.default.removeItem(at: finalURL)
+        let summary = (finalText?.isEmpty == false ? finalText : telemetry.finalMessage)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        run.summary = summary.map { String($0.prefix(2_000)) }
+    }
+
+    static func capRuns(_ runs: [TaskRunRecord], limit: Int) -> (kept: [TaskRunRecord], evicted: [TaskRunRecord]) {
+        guard runs.count > limit else { return (runs, []) }
+        return (Array(runs.suffix(limit)), Array(runs.prefix(runs.count - limit)))
+    }
+
+    private func archiveExcessRuns(_ task: inout AutomationTask, taskDir: URL) {
+        let (kept, evicted) = Self.capRuns(task.runs, limit: 25)
+        guard !evicted.isEmpty else { return }
+        let archiveURL = taskDir.appendingPathComponent("runs-archive.jsonl")
+        let encoder = JSONEncoder.codex
+        var lines = Data()
+        for record in evicted {
+            guard let data = try? encoder.encode(record) else { continue }
+            lines.append(data)
+            lines.append(Data("\n".utf8))
+        }
+        if !lines.isEmpty {
+            if !FileManager.default.fileExists(atPath: archiveURL.path) {
+                FileManager.default.createFile(atPath: archiveURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+            }
+            if let handle = try? FileHandle(forWritingTo: archiveURL) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: lines)
+                try? handle.close()
+            }
+        }
+        task.runs = kept
     }
 
     // MARK: - Poller

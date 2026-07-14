@@ -179,14 +179,12 @@ final class TaskBoardCockpitTests: XCTestCase {
         XCTAssertEqual(TaskRunTimelineRow.rows(for: task, now: now).map(\.outcomeKind), [.waiting, .waiting])
     }
 
-    func testRunSummaryExtractorReadsParallelTelemetrySummaryField() {
-        struct TelemetryFixture { let summary: String? }
-
+    func testRunSummaryExtractorReadsTelemetrySummaryField() {
         XCTAssertEqual(
-            TaskRunSummaryExtractor.summary(from: TelemetryFixture(summary: "Implemented and verified.")),
+            TaskRunSummaryExtractor.summary(from: TaskRunRecord(summary: "Implemented and verified.")),
             "Implemented and verified."
         )
-        XCTAssertNil(TaskRunSummaryExtractor.summary(from: TelemetryFixture(summary: nil)))
+        XCTAssertNil(TaskRunSummaryExtractor.summary(from: TaskRunRecord(summary: nil)))
     }
 
     func testLogTailReturnsOnlyRequestedFinalLines() async throws {

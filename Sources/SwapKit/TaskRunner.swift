@@ -49,7 +49,8 @@ public actor TaskRunner {
         task: AutomationTask,
         proxyURL: URL,
         allowedAliases: [String],
-        runID: UUID = UUID()
+        runID: UUID = UUID(),
+        finalMessagePath: String? = nil
     ) -> [String] {
         let baseURL = proxyURL.absoluteString.trimmingTrailingSlash() + "/backend-api/codex"
         let aliases = allowedAliases.joined(separator: ",")
@@ -66,6 +67,7 @@ public actor TaskRunner {
             .appendingPathComponent(".git", isDirectory: true).path
         var arguments = [
             "exec",
+            "--json",
             "-s", "workspace-write",
             "-c", "approval_policy=\"never\"",
             "-m", task.model,
@@ -79,6 +81,9 @@ public actor TaskRunner {
         if task.allowNetwork {
             arguments += ["-c", "sandbox_workspace_write.network_access=true"]
         }
+        if let finalMessagePath {
+            arguments += ["--output-last-message", finalMessagePath]
+        }
         arguments.append(prompt)
         return arguments
     }
@@ -87,6 +92,7 @@ public actor TaskRunner {
         task: AutomationTask,
         allowedAliases: [String],
         runID: UUID,
+        runNumber explicitRunNumber: Int? = nil,
         proxyURL: URL,
         supportDir: URL,
         onExit: @escaping @Sendable (UUID, RunExit) async -> Void
@@ -103,8 +109,9 @@ public actor TaskRunner {
 
         let taskDir = task.taskDirURL(supportDir: supportDir)
         let codexHome = taskDir.appendingPathComponent("codex-home", isDirectory: true)
-        let runNumber = task.runs.count + 1
+        let runNumber = explicitRunNumber ?? max(task.totalRuns, task.runs.count) + 1
         let logURL = taskDir.appendingPathComponent("run-\(runNumber).log")
+        let finalMessageURL = taskDir.appendingPathComponent("run-\(runNumber).final.md")
         try FileManager.default.createDirectory(
             at: taskDir,
             withIntermediateDirectories: true,
@@ -135,7 +142,8 @@ public actor TaskRunner {
                 task: task,
                 proxyURL: proxyURL,
                 allowedAliases: allowedAliases,
-                runID: runID
+                runID: runID,
+                finalMessagePath: finalMessageURL.path
             )
             process.currentDirectoryURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             process.standardOutput = logHandle
@@ -274,6 +282,9 @@ public actor TaskRunner {
             for (_, name) in runLogs.dropFirst(keepLogs) {
                 try? fm.removeItem(at: taskDir.appendingPathComponent(name))
             }
+            for name in names where name.hasPrefix("run-") && name.hasSuffix(".final.md") {
+                try? fm.removeItem(at: taskDir.appendingPathComponent(name))
+            }
         }
         let sessions = codexHome.appendingPathComponent("sessions", isDirectory: true)
         let cutoff = now.addingTimeInterval(-7 * 86_400)
@@ -309,6 +320,7 @@ protocol TaskRunning: Sendable {
         task: AutomationTask,
         allowedAliases: [String],
         runID: UUID,
+        runNumber: Int?,
         proxyURL: URL,
         supportDir: URL,
         onExit: @escaping @Sendable (UUID, TaskRunner.RunExit) async -> Void

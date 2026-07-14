@@ -57,6 +57,7 @@ public enum TaskSchedulingReasonFormatter {
         aliases: [String],
         accounts: [Account],
         consumeBankedWindow: Bool,
+        minHeadroomPercent: Int = 0,
         now: Date
     ) -> String {
         guard !aliases.isEmpty else { return "No accounts configured" }
@@ -70,6 +71,9 @@ public enum TaskSchedulingReasonFormatter {
             }
             if !consumeBankedWindow, !hasStartedWindow(account) {
                 return "\(safeAlias): banked window not started"
+            }
+            if let starved = account.usage.first(where: { 100 - $0.usedPercent < minHeadroomPercent }) {
+                return "\(safeAlias): headroom<\(minHeadroomPercent)% (\(starved.label) \(starved.usedPercent)% used)"
             }
             return "\(safeAlias): eligible"
         }.joined(separator: "; ")
@@ -175,19 +179,23 @@ public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
 }
 
 public enum TaskRunSummaryExtractor {
-    public static func summary(from value: Any) -> String? {
-        // Wave 3 owns TaskRunRecord.summary; reflection keeps this parallel branch merge-independent.
-        let summary = Mirror(reflecting: value).children.first { $0.label == "summary" }?.value
-        if let summary = summary as? String { return summary.isEmpty ? nil : summary }
-        if let optional = summary {
-            let mirror = Mirror(reflecting: optional)
-            if mirror.displayStyle == .optional,
-               let text = mirror.children.first?.value as? String,
-               !text.isEmpty {
-                return text
-            }
-        }
-        return nil
+    public static func summary(from run: TaskRunRecord) -> String? {
+        var parts: [String] = []
+        if let tokens = tokenLine(for: run) { parts.append(tokens) }
+        if let summary = run.summary, !summary.isEmpty { parts.append(summary) }
+        return parts.isEmpty ? nil : parts.joined(separator: " — ")
+    }
+
+    public static func tokenLine(for run: TaskRunRecord) -> String? {
+        var pieces: [String] = []
+        if let input = run.inputTokens { pieces.append("in \(compact(input))") }
+        if let cached = run.cachedTokens { pieces.append("cached \(compact(cached))") }
+        if let output = run.outputTokens { pieces.append("out \(compact(output))") }
+        return pieces.isEmpty ? nil : pieces.joined(separator: " · ")
+    }
+
+    private static func compact(_ value: Int) -> String {
+        value >= 10_000 ? "\(value / 1_000)k" : String(value)
     }
 }
 
