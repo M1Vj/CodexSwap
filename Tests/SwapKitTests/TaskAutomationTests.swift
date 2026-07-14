@@ -601,6 +601,23 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertFalse(TaskPrompt.continuation(task: task).contains("every ticked `- [x]` item still holds"))
     }
 
+    func testPromptsDirectAgentsToNativeSubagents() {
+        let task = makeTask()
+        let prompts = [
+            TaskPrompt.firstRun(task: task),
+            TaskPrompt.continuation(task: task),
+            TaskPrompt.replan(task: task),
+            TaskPrompt.export(task: task, planDoc: nil),
+        ]
+        for prompt in prompts {
+            XCTAssertTrue(prompt.contains("subagent"), "subagent delegation clause missing")
+            XCTAssertTrue(prompt.contains("timeboxed"), "timebox constraint missing")
+        }
+        for prompt in prompts.dropLast() {
+            XCTAssertTrue(prompt.contains("never block the session's end or final commit on one"))
+        }
+    }
+
     func testPromptsAllowBulkCommits() {
         let task = makeTask()
         for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
