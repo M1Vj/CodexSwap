@@ -171,11 +171,15 @@ public actor AppEngine {
         let sink = EngineSink(engine: self)
         var proxyConfig = ProxyServer.Config()
         proxyConfig.port = settings.proxyPort
+        let stableURL = stableProxyURL(port: settings.proxyPort)
         let proxy = ProxyServer(
             store: store,
             refresher: refresher,
             config: proxyConfig,
             settingsProvider: { [settingsStore] in await settingsStore.get() },
+            routingEnabledProvider: { [configManager] in
+                (try? configManager.state(proxyURL: stableURL)) == .enabled
+            },
             sink: sink,
             verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
         )
@@ -646,14 +650,25 @@ public actor AppEngine {
         return candidates
     }
 
+    /// Automatic warm-up may only spend quota on accounts the user has opted into:
+    /// rotation participants (priority > 0) or automation-enabled accounts. Manual
+    /// warm-up remains an explicit action over every account.
+    static func autoWarmupEligible(_ account: Account, settings: Settings) -> Bool {
+        account.priority > 0 || settings.automationAccounts.contains(account.alias)
+    }
+
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
+        await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force)
+    }
+
+    private func performWarmup(candidates: [Account], proxyURL: URL, force: Bool) async -> WarmupSummary {
         guard !warmupInProgress else {
             let now = Date()
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         }
         warmupInProgress = true
         emit(.snapshotChanged)
-        let summary = await warmupService.run(accounts: await warmupCandidates(), proxyURL: proxyURL, force: force)
+        let summary = await warmupService.run(accounts: candidates, proxyURL: proxyURL, force: force)
         if !summary.warmed.isEmpty {
             let aliases = Set(summary.warmed)
             await pollUsage(activeOnly: false, aliases: aliases)
@@ -748,7 +763,11 @@ public actor AppEngine {
         case .tokensUpdated:
             break
         case .served:
-            await recordServedAlias(event.from, runID: event.runID)
+            if event.runID == nil {
+                await autoLog.write("proxy", "serving interactive traffic on \(Self.oneLine(event.from ?? "unknown"))")
+            } else {
+                await recordServedAlias(event.from, runID: event.runID)
+            }
         }
         emit(.snapshotChanged)
     }
@@ -1416,12 +1435,18 @@ public actor AppEngine {
                 await self.expireCooldownsAndNotify()
                 await self.pollUsage(activeOnly: true)
                 await self.pollRunningTaskUsage(settings: settings)
-                await self.proactiveSwitchIfNeeded(settings: settings)
+                if await self.verifiedRoutingState(settings: settings) == .enabled {
+                    await self.proactiveSwitchIfNeeded(settings: settings)
+                }
                 await self.automationTick()
                 if settings.automaticallyWarmAccounts,
-                   let url = await self.proxy?.proxyURL(),
-                   await self.warmupService.hasDueAccount(in: await self.warmupCandidates()) {
-                    _ = await self.performWarmup(proxyURL: url, force: false)
+                   let url = await self.proxy?.proxyURL() {
+                    let autoCandidates = (await self.warmupCandidates()).filter {
+                        Self.autoWarmupEligible($0, settings: settings)
+                    }
+                    if await self.warmupService.hasDueAccount(in: autoCandidates) {
+                        _ = await self.performWarmup(candidates: autoCandidates, proxyURL: url, force: false)
+                    }
                 }
                 await self.emitSnapshot()
                 try? await Task.sleep(nanoseconds: UInt64(max(15, settings.usagePollSeconds)) * 1_000_000_000)
@@ -1473,6 +1498,10 @@ public actor AppEngine {
             if window.usedPercent >= threshold {
                 let result = await store.rotateFrom(alias, limit: window.label, resetAt: window.resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
                 if result.rotated, let next = result.next {
+                    await autoLog.write(
+                        "proxy",
+                        "proactive switch from \(Self.oneLine(alias)) to \(Self.oneLine(next.alias)) (\(Self.oneLine(window.label)) \(window.usedPercent)% used)"
+                    )
                     emit(.rotated(from: alias, to: next.alias, limit: window.label, resetAt: window.resetAt))
                 }
                 return

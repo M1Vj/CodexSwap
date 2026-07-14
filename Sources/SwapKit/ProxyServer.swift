@@ -51,6 +51,10 @@ func taskTurnKey(for mode: ProxyRequestMode) -> String? {
     return runID ?? allowed.joined(separator: ",")
 }
 
+func refusesInteractiveTraffic(mode: ProxyRequestMode, routingEnabled: Bool) -> Bool {
+    mode == .normal && !routingEnabled
+}
+
 func proxyRequestMode(headers: HTTPHeaders, method: HTTPMethod, path: String, loopbackOnly: Bool) -> ProxyRequestMode {
     guard loopbackOnly, method == .POST, path.hasSuffix("/responses") else { return .normal }
     return ProxyRequestMode(headers: headers)
@@ -200,6 +204,7 @@ public actor ProxyServer {
     private let store: AccountStore
     private let refresher: TokenRefresher
     private let settingsProvider: @Sendable () async -> Settings
+    private let routingEnabledProvider: @Sendable () async -> Bool
     private let sink: ProxyEventSink
     private let config: Config
     private let group: MultiThreadedEventLoopGroup
@@ -241,9 +246,11 @@ public actor ProxyServer {
         refresher: TokenRefresher = TokenRefresher(),
         config: Config = Config(),
         settingsProvider: @escaping @Sendable () async -> Settings,
+        routingEnabledProvider: @escaping @Sendable () async -> Bool = { true },
         sink: ProxyEventSink = NullEventSink(),
         verbose: Bool = false
     ) {
+        self.routingEnabledProvider = routingEnabledProvider
         self.store = store
         self.refresher = refresher
         self.config = config
@@ -355,6 +362,15 @@ public actor ProxyServer {
         let (rawPath, query) = splitPathQuery(head.uri)
         let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
         let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
+
+        // Interactive traffic is only served while Codex routing is enabled: with routing
+        // off, nothing legitimate points at this port, and silently serving a stale client
+        // would spend accounts the user never intended to touch. App-initiated task and
+        // warm-up requests carry their headers and are unaffected.
+        if refusesInteractiveTraffic(mode: mode, routingEnabled: await routingEnabledProvider()) {
+            try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap routing is disabled; enable \"Route Codex through CodexSwap\" in Settings")
+            return
+        }
 
         // Round-robin load balancing: at each new turn (a model call after an idle gap), advance to the
         // next account so usage spreads across all of them. Codex is stateless (store=false, no
@@ -545,6 +561,9 @@ public actor ProxyServer {
             // A 401 reaching here was suppressed by the burn guard; clearing would defeat it.
             if resp.status != .unauthorized {
                 await burn.clear(alias: account.alias)
+            }
+            if mode == .normal, lastActivityAlias != account.alias {
+                await sink.handle(ProxyEvent(kind: .served, from: account.alias, to: nil, limit: nil, resetAt: nil, runID: nil))
             }
             recordActivity(account.alias)
             log("\(head.method.rawValue) \(rawPath) account=\(account.alias) -> \(resp.status.code)")
