@@ -266,6 +266,22 @@ final class RunTelemetryTests: XCTestCase {
         XCTAssertEqual(quarantined.count, 1)
     }
 
+    func testInteractiveTrafficRefusedOnlyWhenRoutingDisabled() {
+        XCTAssertTrue(refusesInteractiveTraffic(mode: .normal, routingEnabled: false))
+        XCTAssertFalse(refusesInteractiveTraffic(mode: .normal, routingEnabled: true))
+        XCTAssertFalse(refusesInteractiveTraffic(mode: .task(allowed: ["a"]), routingEnabled: false))
+        XCTAssertFalse(refusesInteractiveTraffic(mode: .warmup(alias: "a"), routingEnabled: false))
+    }
+
+    func testAutoWarmupOnlySpendsOptedInAccounts() {
+        var settings = Settings.default
+        settings.automationAccounts = ["worker"]
+
+        XCTAssertTrue(AppEngine.autoWarmupEligible(Account(alias: "rotator", accessToken: "t", priority: 5), settings: settings))
+        XCTAssertTrue(AppEngine.autoWarmupEligible(Account(alias: "worker", accessToken: "t", priority: 0), settings: settings))
+        XCTAssertFalse(AppEngine.autoWarmupEligible(Account(alias: "bystander", accessToken: "t", priority: 0), settings: settings), "accounts the user never enabled must not be warmed automatically")
+    }
+
     func testReasonFormatterReportsOverThresholdDistinctFromHeadroom() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let weekly = UsageWindow(label: "Weekly", usedPercent: 95, windowSeconds: 18_000, resetAt: nil)
