@@ -140,6 +140,10 @@ public actor TaskStore {
         if let tasks = try? JSONDecoder.codex.decode([AutomationTask].self, from: raw) {
             return TaskStoreData(tasks: tasks)
         }
+        // The file exists but cannot be decoded: quarantine the original bytes so a
+        // later persist of the empty fallback store can never destroy user data.
+        let quarantine = url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
+        try? FileManager.default.moveItem(at: url, to: quarantine)
         return nil
     }
 

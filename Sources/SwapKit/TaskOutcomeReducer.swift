@@ -2,6 +2,7 @@ import Foundation
 
 enum TaskTerminalEventKind: Sendable, Equatable {
     case completed
+    case cycleCompleted
     case pausedQuota
     case failed
 }
@@ -114,7 +115,7 @@ enum TaskOutcomeReducer {
                     context,
                     outcome: "cycle-complete",
                     phase: .pausedQuota,
-                    terminalEvent: .completed
+                    terminalEvent: .cycleCompleted
                 )
             }
             if !context.isEvergreen,

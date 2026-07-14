@@ -381,7 +381,10 @@ public actor ProxyServer {
                 preferredTaskAlias = turn.alias
             }
         }
-        if preferredTaskAlias == nil, let runID = mode.taskRunID, let pin = taskStartPins[runID] {
+        // One-shot: the pin steers only the run's first selection so round-robin
+        // spreading (rule 27) governs every later turn.
+        if preferredTaskAlias == nil, let runID = mode.taskRunID,
+           let pin = taskStartPins.removeValue(forKey: runID) {
             preferredTaskAlias = pin.alias
         }
 

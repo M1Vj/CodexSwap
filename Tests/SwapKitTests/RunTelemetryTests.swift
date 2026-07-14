@@ -201,6 +201,71 @@ final class RunTelemetryTests: XCTestCase {
         XCTAssertNil(AppEngine.nextFallback(for: task), "rejected models are never revisited")
     }
 
+    func testPlanParserScopesCheckboxesToChecklistSectionAndSkipsFences() throws {
+        let doc = """
+        # Task
+        ## Handoff
+        - [ ] not a real item
+        ## Checklist
+        - [x] real done
+        - [ ] real open
+        ## Original prompt
+        ```
+        - [ ] fenced checkbox from the prompt
+        ```
+        - [ ] after another heading
+        STATUS: CONTINUE
+        """
+        let progress = try XCTUnwrap(PlanDocParser.parse(doc))
+
+        XCTAssertEqual(progress.done, 1)
+        XCTAssertEqual(progress.total, 2)
+        XCTAssertEqual(progress.status, "CONTINUE")
+    }
+
+    func testPlanParserWithoutChecklistHeadingKeepsLegacyCounting() throws {
+        let progress = try XCTUnwrap(PlanDocParser.parse("- [x] a\n- [ ] b\nSTATUS: CONTINUE"))
+
+        XCTAssertEqual(progress.done, 1)
+        XCTAssertEqual(progress.total, 2)
+    }
+
+    func testMalformedNewMetadataDecodesToDefaultsInsteadOfThrowing() throws {
+        let record = try JSONDecoder().decode(
+            TaskRunRecord.self,
+            from: Data(#"{"servedAliases":"oops","inputTokens":"NaN","summary":42}"#.utf8)
+        )
+        XCTAssertEqual(record.servedAliases, [])
+        XCTAssertNil(record.inputTokens)
+        XCTAssertNil(record.summary)
+
+        let task = try JSONDecoder().decode(
+            AutomationTask.self,
+            from: Data(#"{"title":"t","prompt":"p","repoPath":"/tmp","branch":"b","fallbackModels":123,"totalRuns":"x","runs":"bad"}"#.utf8)
+        )
+        XCTAssertEqual(task.fallbackModels, [])
+        XCTAssertEqual(task.totalRuns, 0)
+        XCTAssertTrue(task.runs.isEmpty)
+    }
+
+    func testTaskStoreQuarantinesCorruptFileInsteadOfClobbering() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("store-quarantine-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("tasks.json")
+        try Data("not json at all".utf8).write(to: url)
+
+        let store = TaskStore(url: url)
+        let loaded = await store.all()
+
+        XCTAssertTrue(loaded.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "corrupt file must be moved aside")
+        let quarantined = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("tasks.json.corrupt-") }
+        XCTAssertEqual(quarantined.count, 1)
+    }
+
     func testReasonFormatterReportsOverThresholdDistinctFromHeadroom() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let weekly = UsageWindow(label: "Weekly", usedPercent: 95, windowSeconds: 18_000, resetAt: nil)

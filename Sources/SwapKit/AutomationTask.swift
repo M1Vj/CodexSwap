@@ -85,15 +85,15 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         logFileName = try c.decodeIfPresent(String.self, forKey: .logFileName) ?? ""
         planDone = try c.decodeIfPresent(Int.self, forKey: .planDone)
         planTotal = try c.decodeIfPresent(Int.self, forKey: .planTotal)
-        servedAliases = try c.decodeIfPresent([String].self, forKey: .servedAliases) ?? []
+        servedAliases = (try? c.decodeIfPresent([String].self, forKey: .servedAliases)) ?? []
         baseSHA = (try? c.decodeIfPresent(String.self, forKey: .baseSHA)) ?? nil
         headSHA = (try? c.decodeIfPresent(String.self, forKey: .headSHA)) ?? nil
         actualBranch = (try? c.decodeIfPresent(String.self, forKey: .actualBranch)) ?? nil
-        sessionID = try c.decodeIfPresent(String.self, forKey: .sessionID)
-        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens)
-        cachedTokens = try c.decodeIfPresent(Int.self, forKey: .cachedTokens)
-        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens)
-        summary = try c.decodeIfPresent(String.self, forKey: .summary)
+        sessionID = (try? c.decodeIfPresent(String.self, forKey: .sessionID)) ?? nil
+        inputTokens = (try? c.decodeIfPresent(Int.self, forKey: .inputTokens)) ?? nil
+        cachedTokens = (try? c.decodeIfPresent(Int.self, forKey: .cachedTokens)) ?? nil
+        outputTokens = (try? c.decodeIfPresent(Int.self, forKey: .outputTokens)) ?? nil
+        summary = (try? c.decodeIfPresent(String.self, forKey: .summary)) ?? nil
     }
 }
 
@@ -217,16 +217,16 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         orderIndex = try c.decodeIfPresent(Int.self, forKey: .orderIndex) ?? 0
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? now
         updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
-        runs = try c.decodeIfPresent([TaskRunRecord].self, forKey: .runs) ?? []
+        runs = (try? c.decodeIfPresent([TaskRunRecord].self, forKey: .runs)) ?? []
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
         planProgress = try c.decodeIfPresent(PlanProgress.self, forKey: .planProgress)
-        retryAttempts = try c.decodeIfPresent(Int.self, forKey: .retryAttempts) ?? 0
-        nextRetryAt = try c.decodeIfPresent(Date.self, forKey: .nextRetryAt)
-        stagnationRecoveries = try c.decodeIfPresent(Int.self, forKey: .stagnationRecoveries) ?? 0
+        retryAttempts = (try? c.decodeIfPresent(Int.self, forKey: .retryAttempts)) ?? 0
+        nextRetryAt = (try? c.decodeIfPresent(Date.self, forKey: .nextRetryAt)) ?? nil
+        stagnationRecoveries = (try? c.decodeIfPresent(Int.self, forKey: .stagnationRecoveries)) ?? 0
         archivedAt = (try? c.decodeIfPresent(Date.self, forKey: .archivedAt)) ?? nil
-        fallbackModels = try c.decodeIfPresent([String].self, forKey: .fallbackModels) ?? []
-        modelFallbacksUsed = try c.decodeIfPresent(Int.self, forKey: .modelFallbacksUsed) ?? 0
-        totalRuns = max(try c.decodeIfPresent(Int.self, forKey: .totalRuns) ?? 0, runs.count)
+        fallbackModels = (try? c.decodeIfPresent([String].self, forKey: .fallbackModels)) ?? []
+        modelFallbacksUsed = (try? c.decodeIfPresent(Int.self, forKey: .modelFallbacksUsed)) ?? 0
+        totalRuns = max((try? c.decodeIfPresent(Int.self, forKey: .totalRuns)) ?? 0, runs.count)
     }
 
     public var planRelativePath: String {
@@ -277,7 +277,29 @@ public enum PlanDocParser {
         var total = 0
         let lines = text.components(separatedBy: .newlines)
 
+        // Checkboxes count only inside the `## Checklist` section (when one exists) and
+        // never inside fenced blocks — the plan embeds the original prompt verbatim, and
+        // its stray `- [ ]` lines must not gate completion. Docs without the heading keep
+        // whole-document counting for backward compatibility.
+        let hasChecklistHeading = lines.contains { checklistHeading($0) }
+        var inFence = false
+        var inChecklist = !hasChecklistHeading
         for line in lines {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                inFence.toggle()
+                continue
+            }
+            if inFence { continue }
+            if hasChecklistHeading {
+                if checklistHeading(line) {
+                    inChecklist = true
+                    continue
+                }
+                if inChecklist, line.range(of: #"^#{1,6}\s"#, options: .regularExpression) != nil {
+                    inChecklist = false
+                }
+            }
+            guard inChecklist else { continue }
             if let marker = capture(in: line, pattern: #"^\s*-\s+\[([ x])\]"#) {
                 total += 1
                 if marker.caseInsensitiveCompare("x") == .orderedSame { done += 1 }
@@ -290,6 +312,10 @@ public enum PlanDocParser {
 
         guard total > 0 || status != nil else { return nil }
         return PlanProgress(done: done, total: total, status: status)
+    }
+
+    private static func checklistHeading(_ line: String) -> Bool {
+        line.range(of: #"^#{1,6}\s+Checklist\b"#, options: [.regularExpression, .caseInsensitive]) != nil
     }
 
     public static func handoffExcerpt(_ text: String) -> String? {

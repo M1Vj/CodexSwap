@@ -16,6 +16,7 @@ public enum AppEvent: Sendable {
     case refreshed(alias: String)
     case taskStarted(id: UUID, title: String, account: String?)
     case taskCompleted(id: UUID, title: String)
+    case taskCycleCompleted(id: UUID, title: String)
     case taskPausedQuota(id: UUID, title: String)
     case taskFailed(id: UUID, title: String, reason: String)
     case snapshotChanged
@@ -449,11 +450,18 @@ public actor AppEngine {
     }
 
     public func runTaskNow(id: UUID, inProgressIndex: Int?) async -> TaskRunNowResult {
-        guard let task = await taskStore.task(id: id) else { return .blocked(reason: "Task not found") }
+        guard var task = await taskStore.task(id: id) else { return .blocked(reason: "Task not found") }
         guard task.archivedAt == nil else {
             return .blocked(reason: "Archived tasks must be restored before running")
         }
         await autoLog.write("api", "runTaskNow \(Self.taskLabel(task))")
+        if task.phase == .failed || task.phase == .stopped || task.phase == .retryWaiting {
+            // A deliberate manual retry earns a fresh bounded retry budget.
+            task.retryAttempts = 0
+            task.nextRetryAt = nil
+            task.updatedAt = Date()
+            await taskStore.update(task)
+        }
         let runningIDs = await taskRunner.runningIDs()
         guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else {
             return .blocked(reason: "Task is already running")
@@ -537,6 +545,7 @@ public actor AppEngine {
         task.column = .queued
         task.phase = .idle
         task.orderIndex = queueIndex
+        task.retryAttempts = 0
         task.nextRetryAt = nil
         task.updatedAt = Date()
         await taskStore.update(task)
@@ -727,7 +736,11 @@ public actor AppEngine {
             for taskID in targets {
                 await taskRunner.noteQuotaExhausted(taskID: taskID)
             }
-            emit(.exhausted(limit: event.limit ?? "codex"))
+            // A run-scoped 429 concerns one task; other accounts may be healthy, so the
+            // global "all accounts limited" event fires only for legacy unscoped events.
+            if event.runID == nil {
+                emit(.exhausted(limit: event.limit ?? "codex"))
+            }
         case .needsLogin:
             emit(.needsLogin(alias: event.from ?? "?"))
         case .refreshed:
@@ -1119,7 +1132,7 @@ public actor AppEngine {
             startedAt: now,
             outcome: "",
             logFileName: "run-\(runNumber).log",
-            baseSHA: gitState?.headSHA
+            baseSHA: await GitProbe.branchTip(at: task.repoPath, branch: task.branch) ?? gitState?.headSHA
         ))
         await taskStore.update(started)
         if let preferredInProgressIndex, task.column != .inProgress {
@@ -1143,6 +1156,7 @@ public actor AppEngine {
         } catch {
             await handleTaskLaunchError(taskID: task.id, error: error)
             repositoryLeases.removeValue(forKey: task.id)
+            await proxy?.unpinTaskStart(runID: runID.uuidString)
             return .failed
         }
 
@@ -1207,6 +1221,8 @@ public actor AppEngine {
         switch transition.terminalEvent {
         case .completed:
             emit(.taskCompleted(id: task.id, title: task.title))
+        case .cycleCompleted:
+            emit(.taskCycleCompleted(id: task.id, title: task.title))
         case .pausedQuota:
             emit(.taskPausedQuota(id: task.id, title: task.title))
         case .failed:
@@ -1319,6 +1335,8 @@ public actor AppEngine {
         switch transition.terminalEvent {
         case .completed:
             emit(.taskCompleted(id: task.id, title: task.title))
+        case .cycleCompleted:
+            emit(.taskCycleCompleted(id: task.id, title: task.title))
         case .pausedQuota:
             emit(.taskPausedQuota(id: task.id, title: task.title))
         case .failed:

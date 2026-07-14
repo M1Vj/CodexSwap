@@ -27,7 +27,7 @@ final class TaskOutcomeReducerTests: XCTestCase {
                     outcome: "cycle-complete",
                     phase: .pausedQuota,
                     column: .inProgress,
-                    terminalEvent: .completed
+                    terminalEvent: .cycleCompleted
                 )
             ),
             (
