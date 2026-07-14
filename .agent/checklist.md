@@ -47,3 +47,14 @@
 ## Packaging
 - [x] .app bundle + ad-hoc code sign (Scripts/build-app.sh); notarize pending (needs Developer ID)
 - [ ] Distribution (brew cask / release)
+
+## Task Board v2 (2026-07-14)
+
+- [x] Wave 1 — engine correctness: outcome reducer, completion gate, typed retries, auto-replan, repo lease (PR #12)
+- [x] Wave 1b — native collab subagent contract in task prompts (PR #13)
+- [x] Wave 2 — run-scoped proxy routing and quota events (PR #14)
+- [x] Wave 3 — structured telemetry, headroom admission, model fallback, bounded history (PR #18)
+- [x] Wave 4 — context lifetime: Handoff, WORKLOG, evergreen cycles, verification receipts (PR #16)
+- [x] Wave 5 — board cockpit: inspector, live log, reasons, recovery actions, filters (PR #15)
+- [x] Wave 6 — changes review, attribution, lane policy, archive, duplicate, notifications (PR #17)
+- [x] Wave 7 — final adversarial audit, hardening (PRs #19, #20), live E2E on deployed build, docs/screenshot sync
