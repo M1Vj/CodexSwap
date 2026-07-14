@@ -12,6 +12,7 @@ public enum TaskPrompt {
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
         - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine.
         - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in the Work Log, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
+        - Use your native subagents for bounded parallelizable work — deep research sweeps, independent review of a finished unit, broad exploration — while you continue on the critical path. Keep each subagent brief small and timeboxed; narrow or absorb any that overruns its scope. Never sit idle waiting on a subagent and never block the session's end or final commit on one.
 
         ## Plan-first protocol
 
@@ -46,6 +47,7 @@ public enum TaskPrompt {
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
         - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine.
         - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in the Work Log, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
+        - Use your native subagents for bounded parallelizable work — deep research sweeps, independent review of a finished unit, broad exploration — while you continue on the critical path. Keep each subagent brief small and timeboxed; narrow or absorb any that overruns its scope. Never sit idle waiting on a subagent and never block the session's end or final commit on one.
 
         Read `\(task.planRelativePath)` before changing code. If it does not exist yet (an earlier session ended before planning), first create it with the task title, the original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it. Spot-check only the most recently ticked items with fast, targeted checks — do not re-run full suites to revalidate old work; the previous session's evidence stands unless your changes touch it. Continue from the first unchecked `- [ ]` item and complete as many items as the session allows — never end after a single item when time and quota remain. After each item, tick it and append a dated `## Work Log` entry. Commits may be batched — one bulk commit covering many items, or the whole session, is fine — as long as all work and the plan update are committed before the session ends. Run the repository's full verification suite once, before your final commit — not after every item.
 
@@ -73,6 +75,7 @@ public enum TaskPrompt {
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
         - You run unattended: decide autonomously, record rationale in the Work Log, and reserve `STATUS: BLOCKED` for genuinely external obstacles.
+        - Use your native subagents for bounded parallelizable work — deep research sweeps, independent review of a finished unit, broad exploration — while you continue on the critical path. Keep each subagent brief small and timeboxed; narrow or absorb any that overruns its scope. Never sit idle waiting on a subagent and never block the session's end or final commit on one.
 
         Read `\(task.planRelativePath)`, then audit the checklist against the actual repository state; delete obsolete items, remove work that is already complete, and merge micro-items into 3–15 executable work packages. Give every package concrete acceptance criteria and order the packages by dependency and impact.
 
@@ -116,7 +119,8 @@ public enum TaskPrompt {
         4. Maintain `\(task.planRelativePath)`. If no plan exists, first create it with the task title, original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it.
         5. Work through checklist items in order, completing as many as the session allows. Spot-check recently ticked items with targeted checks only, continue at the first `- [ ]` item, tick each completed item to `- [x]`, and append a dated Work Log entry; commits may be batched into one bulk commit for the session, as long as everything including the plan update is committed before the session ends. Run the full verification suite once before the final commit.
         6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.
-        7. If you run unattended, never end a session asking for input or approval: pick the most reasonable default yourself, record the decision and rationale in the Work Log, and continue. `STATUS: BLOCKED` is only for genuinely external obstacles, never a design choice.\(evergreenClause(task))
+        7. If you run unattended, never end a session asking for input or approval: pick the most reasonable default yourself, record the decision and rationale in the Work Log, and continue. `STATUS: BLOCKED` is only for genuinely external obstacles, never a design choice.
+        8. If your harness supports subagents, delegate bounded parallelizable work (research sweeps, independent review, broad exploration) to them with small timeboxed briefs, and never block the session's end on one.\(evergreenClause(task))
         """
     }
 
