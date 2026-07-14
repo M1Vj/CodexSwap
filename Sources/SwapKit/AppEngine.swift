@@ -172,9 +172,9 @@ public actor AppEngine {
         }
         let runningIDs = await taskRunner.runningIDs()
         let storedTasks = await taskStore.all()
-        repositoryLeases = Dictionary(uniqueKeysWithValues: storedTasks.compactMap {
-            runningIDs.contains($0.id) ? ($0.id, Self.canonicalRepositoryPath($0.repoPath)) : nil
-        })
+        for task in storedTasks where runningIDs.contains(task.id) {
+            repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
+        }
         let reconciled = Self.interruptedTasks(in: storedTasks, running: runningIDs)
         var recoveredCount = 0
         for (before, after) in zip(storedTasks, reconciled) where before != after {
@@ -197,15 +197,16 @@ public actor AppEngine {
         var pausedCount = 0
         for taskID in runningIDs {
             await taskRunner.stop(taskID: taskID)
-            guard let task = await taskStore.task(id: taskID),
-                  let interrupted = Self.interruptedTasks(in: [task], running: [], now: now).first,
-                  interrupted != task else { continue }
-            await taskStore.update(interrupted)
-            pausedCount += 1
-            await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
+            if let task = await taskStore.task(id: taskID),
+               let interrupted = Self.interruptedTasks(in: [task], running: [], now: now).first,
+               interrupted != task {
+                await taskStore.update(interrupted)
+                pausedCount += 1
+                await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
+            }
+            repositoryLeases.removeValue(forKey: taskID)
         }
         interruptingTaskIDs.subtract(runningIDs)
-        for taskID in runningIDs { repositoryLeases.removeValue(forKey: taskID) }
         await autoLog.write("lifecycle", "engine stop: paused \(pausedCount) running task(s) for shutdown")
         RuntimeHandoff.clearProxyURL()
         await proxy?.stop()
@@ -601,12 +602,21 @@ public actor AppEngine {
     public func automationTick() async {
         let settings = await settingsStore.get()
         let runningIDs = await taskRunner.runningIDs()
-        let waiting = Self.schedulableTasks(
-            await taskStore.all(),
+        let storedTasks = await taskStore.all()
+        let now = Date()
+        let repositoryBlocked = Self.repositoryBlockedTasks(
+            storedTasks,
             runningIDs: runningIDs,
             schedulingIDs: schedulingTaskIDs,
             leasedRepositories: repositoryLeases,
-            now: Date()
+            now: now
+        )
+        let waiting = Self.schedulableTasks(
+            storedTasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            leasedRepositories: repositoryLeases,
+            now: now
         )
         await autoLog.write(
             "tick",
@@ -624,6 +634,9 @@ public actor AppEngine {
         guard runningIDs.count + schedulingTaskIDs.count < maximumConcurrent else {
             await autoLog.write("tick", "early-out: concurrency full")
             return
+        }
+        for task in repositoryBlocked {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
         }
         guard !waiting.isEmpty else {
             await autoLog.write("tick", "early-out: no waiting tasks")
@@ -698,6 +711,51 @@ public actor AppEngine {
         leasedRepositories: [UUID: String] = [:],
         now: Date
     ) -> [AutomationTask] {
+        schedulingCandidates(
+            tasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingIDs,
+            now: now
+        ).filter {
+            !repositoryIsBusy(
+                for: $0,
+                tasks: tasks,
+                runningIDs: runningIDs,
+                schedulingIDs: schedulingIDs,
+                leasedRepositories: leasedRepositories
+            )
+        }
+    }
+
+    static func repositoryBlockedTasks(
+        _ tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        leasedRepositories: [UUID: String] = [:],
+        now: Date
+    ) -> [AutomationTask] {
+        schedulingCandidates(
+            tasks,
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingIDs,
+            now: now
+        ).filter {
+            repositoryIsBusy(
+                for: $0,
+                tasks: tasks,
+                runningIDs: runningIDs,
+                schedulingIDs: schedulingIDs,
+                leasedRepositories: leasedRepositories
+            )
+        }
+    }
+
+    private static func schedulingCandidates(
+        _ tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        now: Date
+    ) -> [AutomationTask] {
         func ordered(_ tasks: [AutomationTask]) -> [AutomationTask] {
             tasks.sorted {
                 if $0.orderIndex != $1.orderIndex { return $0.orderIndex < $1.orderIndex }
@@ -713,13 +771,6 @@ public actor AppEngine {
         let queued = ordered(tasks.filter { $0.column == .queued && $0.phase == .idle })
         return (inProgress + queued).filter {
             !runningIDs.contains($0.id) && !schedulingIDs.contains($0.id)
-                && !repositoryIsBusy(
-                    for: $0,
-                    tasks: tasks,
-                    runningIDs: runningIDs,
-                    schedulingIDs: schedulingIDs,
-                    leasedRepositories: leasedRepositories
-                )
         }
     }
 
@@ -732,7 +783,7 @@ public actor AppEngine {
     ) -> Bool {
         let repository = canonicalRepositoryPath(task.repoPath)
         if leasedRepositories.contains(where: {
-            $0.key != task.id && canonicalRepositoryPath($0.value) == repository
+            canonicalRepositoryPath($0.value) == repository
         }) {
             return true
         }
@@ -939,7 +990,6 @@ public actor AppEngine {
     }
 
     private func handleTaskExit(taskID: UUID, exit: TaskRunner.RunExit) async {
-        defer { repositoryLeases.removeValue(forKey: taskID) }
         guard !interruptingTaskIDs.contains(taskID) else {
             await autoLog.write(
                 "lifecycle",
@@ -947,6 +997,7 @@ public actor AppEngine {
             )
             return
         }
+        defer { repositoryLeases.removeValue(forKey: taskID) }
         guard var task = await taskStore.task(id: taskID) else { return }
         guard let lastRun = task.runs.last, lastRun.finishedAt == nil else {
             await autoLog.write(

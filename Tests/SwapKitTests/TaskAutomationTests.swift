@@ -830,6 +830,13 @@ final class TaskAutomationTests: XCTestCase {
         )
 
         XCTAssertTrue(candidates.isEmpty)
+        XCTAssertEqual(AppEngine.repositoryBlockedTasks(
+            [running, candidate],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [running.id: running.repoPath],
+            now: Date(timeIntervalSince1970: 1_900_000_000)
+        ).map(\.id), [candidate.id])
         XCTAssertTrue(AppEngine.repositoryIsBusy(
             for: candidate,
             tasks: [running, candidate],
@@ -837,5 +844,25 @@ final class TaskAutomationTests: XCTestCase {
             schedulingIDs: [],
             leasedRepositories: [running.id: running.repoPath]
         ))
+    }
+
+    func testRepositoryLeaseBlocksRelaunchOfSameTaskUntilExitHandlingCompletes() {
+        var task = makeTask(repoPath: "/tmp/codexswap-repository", column: .queued)
+        task.phase = .idle
+
+        XCTAssertTrue(AppEngine.repositoryIsBusy(
+            for: task,
+            tasks: [task],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [task.id: task.repoPath]
+        ))
+        XCTAssertTrue(AppEngine.schedulableTasks(
+            [task],
+            runningIDs: [],
+            schedulingIDs: [],
+            leasedRepositories: [task.id: task.repoPath],
+            now: Date(timeIntervalSince1970: 1_900_000_000)
+        ).isEmpty)
     }
 }
