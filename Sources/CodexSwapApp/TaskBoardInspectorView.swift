@@ -8,14 +8,17 @@ struct TaskBoardInspectorView: View {
     let planDocument: (UUID) async -> String?
 
     @State private var tab: InspectorTab = .log
-    @State private var selectedRunNumber: Int?
-    @State private var runURLs: [Int: URL] = [:]
-    @State private var expiredRuns: Set<Int> = []
+    @State private var selectedRunID: UUID?
+    @State private var runURLs: [UUID: URL] = [:]
+    @State private var expiredRuns: Set<UUID> = []
     @State private var logLines: [String] = []
     @State private var planText: String?
     @State private var followsLog = true
     @State private var loadedTaskID: UUID?
-    @State private var loadedRunCount = 0
+    @State private var latestRunID: UUID?
+    @State private var activeLoadKey: InspectorLoadKey?
+    @State private var activeLogLoadKey: SelectedLogLoadKey?
+    @State private var activeChangesLoadKey: ChangesLoadKey?
     @State private var changeSummaries: [UUID: GitChangeSummary] = [:]
     @State private var loadingChangeRunIDs: Set<UUID> = []
     @State private var failedChangeRunIDs: Set<UUID> = []
@@ -32,11 +35,11 @@ struct TaskBoardInspectorView: View {
             tabContent
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .task(id: InspectorLoadKey(taskID: task.id, runIDs: task.runs.map(\.id), updatedAt: task.updatedAt)) {
-            await loadTask()
+        .task(id: inspectorLoadKey) {
+            await loadTask(expected: inspectorLoadKey)
         }
-        .task(id: selectedLogURL) { await pollSelectedLog() }
-        .task(id: changesLoadKey) { await loadSelectedChanges() }
+        .task(id: selectedLogLoadKey) { await pollSelectedLog(expected: selectedLogLoadKey) }
+        .task(id: changesLoadKey) { await loadSelectedChanges(expected: changesLoadKey) }
     }
 
     private var inspectorHeader: some View {
@@ -152,7 +155,7 @@ struct TaskBoardInspectorView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(timelineRows) { row in
                         Button {
-                            selectRun(row.runNumber)
+                            selectRun(row.id)
                         } label: {
                             HStack(alignment: .top, spacing: 10) {
                                 outcomeIcon(row.outcomeKind)
@@ -169,7 +172,7 @@ struct TaskBoardInspectorView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                     aliasChips(row.servedAliases)
-                                    if expiredRuns.contains(row.runNumber) {
+                                    if expiredRuns.contains(row.id) {
                                         Label("Log expired", systemImage: "doc.badge.clock")
                                             .font(.caption)
                                             .foregroundStyle(.orange)
@@ -181,7 +184,7 @@ struct TaskBoardInspectorView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .background(selectedRunNumber == row.runNumber ? Color.accentColor.opacity(0.12) : .clear)
+                        .background(selectedRunID == row.id ? Color.accentColor.opacity(0.12) : .clear)
                         Divider()
                     }
                 }
@@ -354,91 +357,192 @@ struct TaskBoardInspectorView: View {
     }
 
     private var selectedTimelineRow: TaskRunTimelineRow? {
-        timelineRows.first { $0.runNumber == selectedRunNumber }
+        timelineRows.first { $0.id == selectedRunID }
     }
 
     private var selectedLogURL: URL? {
-        selectedRunNumber.flatMap { runURLs[$0] }
+        selectedRunID.flatMap { runURLs[$0] }
     }
 
     private var selectedRunRecord: TaskRunRecord? {
-        guard let selectedRunNumber, task.runs.indices.contains(selectedRunNumber - 1) else { return nil }
-        return task.runs[selectedRunNumber - 1]
+        TaskRunIdentityResolver.record(id: selectedRunID, in: task.runs)
+    }
+
+    private var inspectorLoadKey: InspectorLoadKey {
+        InspectorLoadKey(taskID: task.id, runIDs: task.runs.map(\.id), updatedAt: task.updatedAt)
+    }
+
+    private var selectedLogLoadKey: SelectedLogLoadKey {
+        SelectedLogLoadKey(taskID: task.id, runID: selectedRunID, url: selectedLogURL)
     }
 
     private var changesLoadKey: ChangesLoadKey {
-        ChangesLoadKey(tab: tab, runID: selectedRunRecord?.id, updatedAt: task.updatedAt)
+        ChangesLoadKey(taskID: task.id, tab: tab, runID: selectedRunID, updatedAt: task.updatedAt)
     }
 
-    private func loadTask() async {
-        let taskChanged = loadedTaskID != task.id
+    private func loadTask(expected: InspectorLoadKey) async {
+        guard !Task.isCancelled else { return }
+        activeLoadKey = expected
+        let taskChanged = loadedTaskID != expected.taskID
+        if taskChanged {
+            guard isActiveLoad(expected) else { return }
+            loadedTaskID = expected.taskID
+            guard isCurrentLoad(expected) else { return }
+            selectedRunID = nil
+            guard isCurrentLoad(expected) else { return }
+            latestRunID = nil
+            guard isCurrentLoad(expected) else { return }
+            runURLs = [:]
+            guard isCurrentLoad(expected) else { return }
+            expiredRuns = []
+            guard isCurrentLoad(expected) else { return }
+            logLines = []
+            guard isCurrentLoad(expected) else { return }
+            planText = nil
+            guard isCurrentLoad(expected) else { return }
+            followsLog = true
+            guard isCurrentLoad(expected) else { return }
+            tab = .runs
+            guard isCurrentLoad(expected) else { return }
+            changeSummaries = [:]
+            guard isCurrentLoad(expected) else { return }
+            loadingChangeRunIDs = []
+            guard isCurrentLoad(expected) else { return }
+            failedChangeRunIDs = []
+            guard isCurrentLoad(expected) else { return }
+            activeLogLoadKey = nil
+            guard isCurrentLoad(expected) else { return }
+            activeChangesLoadKey = nil
+        }
+
+        let selectionAtStart = selectedRunID
+        let previousLatest = latestRunID
         let rows = timelineRows
-        var urls: [Int: URL] = [:]
-        var expired: Set<Int> = []
+        var urls: [UUID: URL] = [:]
+        var expired: Set<UUID> = []
         for row in rows {
-            if let url = await runLogURL(task.id, row.runNumber) {
-                urls[row.runNumber] = url
+            if let url = await runLogURL(expected.taskID, row.runNumber) {
+                guard isCurrentLoad(expected) else { return }
+                urls[row.id] = url
             } else {
-                expired.insert(row.runNumber)
+                guard isCurrentLoad(expected) else { return }
+                expired.insert(row.id)
             }
         }
+        let plan = await planDocument(expected.taskID)
+        guard isCurrentLoad(expected) else { return }
+        let resolvedRunID = TaskRunIdentityResolver.selectedRunID(
+            current: selectionAtStart,
+            previousLatest: previousLatest,
+            runs: task.runs
+        )
+
+        guard isCurrentLoad(expected) else { return }
         runURLs = urls
+        guard isCurrentLoad(expected) else { return }
         expiredRuns = expired
-        if taskChanged || task.runs.count > loadedRunCount {
-            selectedRunNumber = rows.first?.runNumber
-        } else if !rows.contains(where: { $0.runNumber == selectedRunNumber }) {
-            selectedRunNumber = rows.first?.runNumber
+        guard isCurrentLoad(expected) else { return }
+        let shouldUpdateSelection = selectedRunID == selectionAtStart
+        if shouldUpdateSelection {
+            selectedRunID = resolvedRunID
         }
-        loadedTaskID = task.id
-        loadedRunCount = task.runs.count
-        planText = await planDocument(task.id)
-        logLines = []
-        followsLog = true
-        if taskChanged {
-            tab = selectedLogURL == nil ? .runs : .log
-        } else if tab == .log, selectedLogURL == nil {
-            tab = .runs
+        guard isCurrentLoad(expected) else { return }
+        latestRunID = task.runs.last?.id
+        guard isCurrentLoad(expected) else { return }
+        planText = plan
+        if shouldUpdateSelection {
+            guard isCurrentLoad(expected), selectedRunID == resolvedRunID else { return }
+            logLines = []
+            guard isCurrentLoad(expected), selectedRunID == resolvedRunID else { return }
+            followsLog = true
+            if taskChanged {
+                guard isCurrentLoad(expected), selectedRunID == resolvedRunID else { return }
+                tab = resolvedRunID.flatMap { urls[$0] } == nil ? .runs : .log
+            } else if tab == .log, selectedLogURL == nil {
+                guard isCurrentLoad(expected), selectedRunID == resolvedRunID else { return }
+                tab = .runs
+            }
         }
     }
 
-    private func pollSelectedLog() async {
-        guard let url = selectedLogURL else {
+    private func pollSelectedLog(expected: SelectedLogLoadKey) async {
+        guard !Task.isCancelled else { return }
+        activeLogLoadKey = expected
+        guard isCurrentLogLoad(expected) else { return }
+        guard let url = expected.url else {
+            guard isCurrentLogLoad(expected) else { return }
             logLines = []
             return
         }
         while !Task.isCancelled {
             let next = await TaskLogTailReader.lines(at: url, maxLines: 500)
-            if next != logLines { logLines = next }
+            guard isCurrentLogLoad(expected) else { return }
+            if next != logLines {
+                guard isCurrentLogLoad(expected) else { return }
+                logLines = next
+            }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }
 
-    private func selectRun(_ runNumber: Int) {
-        selectedRunNumber = runNumber
+    private func selectRun(_ runID: UUID) {
+        selectedRunID = runID
         logLines = []
         followsLog = true
-        if runURLs[runNumber] != nil { tab = .log }
+        if runURLs[runID] != nil { tab = .log }
     }
 
-    private func loadSelectedChanges() async {
-        guard tab == .changes,
+    private func loadSelectedChanges(expected: ChangesLoadKey) async {
+        guard !Task.isCancelled else { return }
+        activeChangesLoadKey = expected
+        guard isCurrentChangesLoad(expected),
+              expected.tab == .changes,
               let run = selectedRunRecord,
+              run.id == expected.runID,
               changeSummaries[run.id] == nil,
               !failedChangeRunIDs.contains(run.id),
               let baseSHA = run.baseSHA,
               let headSHA = run.headSHA else { return }
+        guard isCurrentChangesLoad(expected) else { return }
         loadingChangeRunIDs.insert(run.id)
-        defer { loadingChangeRunIDs.remove(run.id) }
-        if let summary = await GitProbe.changes(
+        let summary = await GitProbe.changes(
             at: task.repoPath,
             baseSHA: baseSHA,
             headSHA: headSHA,
             commitLimit: 50
-        ) {
+        )
+        guard isCurrentChangesLoad(expected) else { return }
+        loadingChangeRunIDs.remove(run.id)
+        guard isCurrentChangesLoad(expected) else { return }
+        if let summary {
             changeSummaries[run.id] = summary
         } else {
+            guard isCurrentChangesLoad(expected) else { return }
             failedChangeRunIDs.insert(run.id)
         }
+    }
+
+    private func isCurrentLoad(_ expected: InspectorLoadKey) -> Bool {
+        isActiveLoad(expected) && loadedTaskID == expected.taskID
+    }
+
+    private func isActiveLoad(_ expected: InspectorLoadKey) -> Bool {
+        !Task.isCancelled && activeLoadKey == expected
+    }
+
+    private func isCurrentLogLoad(_ expected: SelectedLogLoadKey) -> Bool {
+        !Task.isCancelled
+            && activeLogLoadKey == expected
+            && loadedTaskID == expected.taskID
+            && selectedRunID == expected.runID
+    }
+
+    private func isCurrentChangesLoad(_ expected: ChangesLoadKey) -> Bool {
+        !Task.isCancelled
+            && activeChangesLoadKey == expected
+            && loadedTaskID == expected.taskID
+            && tab == expected.tab
+            && selectedRunID == expected.runID
     }
 
     private func runDetail(_ row: TaskRunTimelineRow) -> String {
@@ -492,6 +596,7 @@ private enum InspectorTab: String {
 }
 
 private struct ChangesLoadKey: Hashable {
+    let taskID: UUID
     let tab: InspectorTab
     let runID: UUID?
     let updatedAt: Date
@@ -501,6 +606,12 @@ private struct InspectorLoadKey: Hashable {
     let taskID: UUID
     let runIDs: [UUID]
     let updatedAt: Date
+}
+
+private struct SelectedLogLoadKey: Hashable {
+    let taskID: UUID
+    let runID: UUID?
+    let url: URL?
 }
 
 private struct LogTailView: View {

@@ -128,6 +128,24 @@ public enum TaskRunOutcomeKind: Sendable, Equatable {
     case unknown
 }
 
+public enum TaskRunIdentityResolver {
+    public static func record(id: UUID?, in runs: [TaskRunRecord]) -> TaskRunRecord? {
+        guard let id else { return nil }
+        return runs.first { $0.id == id }
+    }
+
+    public static func selectedRunID(
+        current: UUID?,
+        previousLatest: UUID?,
+        runs: [TaskRunRecord]
+    ) -> UUID? {
+        guard let latest = runs.last?.id else { return nil }
+        guard let current else { return latest }
+        guard runs.contains(where: { $0.id == current }) else { return latest }
+        return current == previousLatest ? latest : current
+    }
+}
+
 public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
     public let id: UUID
     public let runNumber: Int
@@ -309,5 +327,74 @@ public enum TaskBoardMenuStatus {
                 now: now
             )
         }.min()
+    }
+}
+
+public enum TaskBoardWaitingHeader {
+    public static func text(
+        waitingTaskIDs: [UUID],
+        schedulingReasons: [String: String]
+    ) -> String {
+        let count = waitingTaskIDs.count
+        guard count > 0 else { return "Idle" }
+        let categories = waitingTaskIDs.map { taskID in
+            category(for: schedulingReasons[taskID.uuidString])
+        }
+        let counts = categories.reduce(into: [ReasonCategory: Int]()) { result, category in
+            result[category, default: 0] += 1
+        }
+        guard let maximum = counts.values.max() else { return "\(count) waiting" }
+        let mostCommon = counts.filter { $0.value == maximum }.map(\.key)
+        guard mostCommon.count == 1, let category = mostCommon.first, category != .other else {
+            return "\(count) waiting"
+        }
+
+        switch category {
+        case .automation:
+            return "Automation off — \(count) queued"
+        case .proxy:
+            return "Waiting for proxy — \(count) queued"
+        case .concurrency:
+            return "Waiting for a run slot — \(count) queued"
+        case .repository:
+            return "Waiting for repository — \(count) queued"
+        case .account:
+            return "Waiting for an account — \(count) queued"
+        case .quota:
+            return "Waiting for quota — \(count) queued"
+        case .retry:
+            return "Waiting to retry — \(count) queued"
+        case .other:
+            return "\(count) waiting"
+        }
+    }
+
+    private enum ReasonCategory: Hashable {
+        case automation
+        case proxy
+        case concurrency
+        case repository
+        case account
+        case quota
+        case retry
+        case other
+    }
+
+    private static func category(for reason: String?) -> ReasonCategory {
+        guard let reason else { return .other }
+        let value = reason.lowercased()
+        if value.contains("automation is disabled") { return .automation }
+        if value.contains("proxy is unavailable") { return .proxy }
+        if value.contains("available run slot") { return .concurrency }
+        if value.contains("repository is busy") { return .repository }
+        if value.contains("no accounts") || value.contains("needs login") || value.contains("unknown account") {
+            return .account
+        }
+        if value.contains("retry") || value.contains("backoff") { return .retry }
+        if value.contains("cooldown") || value.contains("quota") || value.contains("banked window")
+            || value.contains("over threshold") || value.contains("headroom<") {
+            return .quota
+        }
+        return .other
     }
 }
