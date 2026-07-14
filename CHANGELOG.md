@@ -19,6 +19,7 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 ### Changed
 
 - Task runs follow the same rotation settings as normal proxy traffic: the configured strategy (priority or round-robin), per-account priorities, and the pre-emptive usage thresholds. Tasks prefer accounts still under threshold and move off an account before it hard-limits, falling back to the best over-threshold account only when none has headroom.
+- Task sessions may batch their commits: the run contract no longer demands a commit per checklist item, only that all work and the plan document are committed before the session ends.
 
 ### Fixed
 
