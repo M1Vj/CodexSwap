@@ -96,14 +96,14 @@ final class RunTelemetryTests: XCTestCase {
     func testNextFallbackModelWalksListAndSkipsCurrentModel() {
         var task = AutomationTask(title: "t", prompt: "p", repoPath: "/tmp", branch: "b", model: "m0")
         task.fallbackModels = ["m0", "m1", "m2"]
-        XCTAssertEqual(AppEngine.nextFallbackModel(for: task), "m1")
+        XCTAssertEqual(AppEngine.nextFallback(for: task)?.model, "m1")
 
         task.model = "m1"
         task.modelFallbacksUsed = 1
-        XCTAssertEqual(AppEngine.nextFallbackModel(for: task), "m2", "already-adopted fallback is skipped")
+        XCTAssertEqual(AppEngine.nextFallback(for: task)?.model, "m2", "already-adopted fallback is skipped")
 
         task.modelFallbacksUsed = 3
-        XCTAssertNil(AppEngine.nextFallbackModel(for: task))
+        XCTAssertNil(AppEngine.nextFallback(for: task))
     }
 
     func testReducerModelFallbackTransitionThenTerminalFailure() {
@@ -162,6 +162,61 @@ final class RunTelemetryTests: XCTestCase {
         let run = TaskRunRecord(inputTokens: 25_837, cachedTokens: 18_901, outputTokens: 1_600, summary: "Shipped.")
         XCTAssertEqual(TaskRunSummaryExtractor.summary(from: run), "in 25k · cached 18k · out 1600 — Shipped.")
         XCTAssertNil(TaskRunSummaryExtractor.summary(from: TaskRunRecord()))
+    }
+
+    func testDecoderChunkedFileReadMatchesTextDecode() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("telemetry-chunk-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("run-1.log")
+        try Self.fixture.data(using: .utf8)!.write(to: url)
+
+        let chunked = CodexEventDecoder.decode(logURL: url, chunkBytes: 8)
+
+        XCTAssertEqual(chunked, CodexEventDecoder.decode(logText: Self.fixture))
+    }
+
+    func testTimelineRunNumbersSurviveHistoryEviction() {
+        let task = AutomationTask(
+            title: "t", prompt: "p", repoPath: "/tmp", branch: "b",
+            runs: (6...8).map { n in
+                TaskRunRecord(startedAt: Date(timeIntervalSince1970: Double(n)), finishedAt: Date(timeIntervalSince1970: Double(n) + 1), outcome: "continue", logFileName: "run-\(n).log")
+            }
+        )
+
+        XCTAssertEqual(TaskRunTimelineRow.rows(for: task).map(\.runNumber), [8, 7, 6])
+    }
+
+    func testNextFallbackSkipsDuplicatesAndNeverRevisits() {
+        var task = AutomationTask(title: "t", prompt: "p", repoPath: "/tmp", branch: "b", model: "m0")
+        task.fallbackModels = ["m0", "m0", "m1"]
+
+        let first = AppEngine.nextFallback(for: task)
+        XCTAssertEqual(first?.model, "m1")
+        XCTAssertEqual(first?.index, 2)
+
+        task.model = "m1"
+        task.modelFallbacksUsed = (first?.index ?? 0) + 1
+        XCTAssertNil(AppEngine.nextFallback(for: task), "rejected models are never revisited")
+    }
+
+    func testReasonFormatterReportsOverThresholdDistinctFromHeadroom() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weekly = UsageWindow(label: "Weekly", usedPercent: 95, windowSeconds: 18_000, resetAt: nil)
+        let account = Account(alias: "edge", accessToken: "t", usage: [weekly])
+
+        let reasons = TaskSchedulingReasonFormatter.format(
+            aliases: ["edge"],
+            accounts: [account],
+            consumeBankedWindow: true,
+            minHeadroomPercent: 5,
+            primaryThresholdPercent: 95,
+            secondaryThresholdPercent: 98,
+            now: now
+        )
+
+        XCTAssertTrue(reasons.contains("over threshold"), reasons)
     }
 
     func testReasonFormatterReportsHeadroomStarvation() {

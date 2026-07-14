@@ -214,6 +214,7 @@ public actor ProxyServer {
     private var lastActivityAlias: String?
     private var lastTurnAt: Date?
     private var taskTurns: [String: TaskTurn] = [:]
+    private var taskStartPins: [String: (alias: String, at: Date)] = [:]
     private var inflightRefresh: [String: Task<CodexTokens, Error>] = [:]
 
     public struct Activity: Sendable {
@@ -257,6 +258,19 @@ public actor ProxyServer {
     }
 
     public func port() -> Int? { boundPort }
+
+    /// Pins the scheduler-admitted account as the preferred alias for a run's requests.
+    /// The pin is a preference, not a mandate: selection still validates eligibility and
+    /// thresholds per request, so a pinned account that goes hot degrades to rotation.
+    public func pinTaskStart(runID: String, alias: String) {
+        let cutoff = Date().addingTimeInterval(-86_400)
+        taskStartPins = taskStartPins.filter { $0.value.at >= cutoff }
+        taskStartPins[runID] = (alias, Date())
+    }
+
+    public func unpinTaskStart(runID: String) {
+        taskStartPins.removeValue(forKey: runID)
+    }
 
     public func proxyURL() -> URL? {
         guard let p = boundPort else { return nil }
@@ -366,6 +380,9 @@ public actor ProxyServer {
                Date().timeIntervalSince(turn.at) <= TimeInterval(settings.roundRobinTurnGapSeconds) {
                 preferredTaskAlias = turn.alias
             }
+        }
+        if preferredTaskAlias == nil, let runID = mode.taskRunID, let pin = taskStartPins[runID] {
+            preferredTaskAlias = pin.alias
         }
 
         guard var account = await selectProxyAccount(

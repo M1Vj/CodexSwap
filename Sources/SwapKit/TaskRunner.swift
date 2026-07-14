@@ -260,8 +260,14 @@ public actor TaskRunner {
                 group.cancelAll()
                 return status
             } catch {
+                // Give the process a bounded grace period to flush and exit so the
+                // log tail and final-message file are complete before ingestion.
                 if process.isRunning { process.terminate() }
                 group.cancelAll()
+                for _ in 0..<50 where process.isRunning {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                if process.isRunning { process.terminate() }
                 throw error
             }
         }

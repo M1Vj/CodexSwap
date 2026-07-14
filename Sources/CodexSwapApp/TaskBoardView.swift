@@ -1086,12 +1086,16 @@ private struct TaskEditorView: View {
         draft.prompt = draft.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         draft.repoPath = draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines)
         draft.branch = draft.branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previousModel = draft.model
+        let previousFallbacks = draft.fallbackModels
         draft.model = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
         draft.fallbackModels = fallbackModelsText
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        draft.modelFallbacksUsed = 0
+        if draft.model != previousModel || draft.fallbackModels != previousFallbacks {
+            draft.modelFallbacksUsed = 0
+        }
         draft.updatedAt = Date()
         onSave(draft)
         dismiss()

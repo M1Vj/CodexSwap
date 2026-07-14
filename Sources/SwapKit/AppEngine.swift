@@ -1031,16 +1031,16 @@ public actor AppEngine {
     }
 
 
-    static func nextFallbackModel(for task: AutomationTask) -> String? {
-        guard task.fallbackModels.indices.contains(task.modelFallbacksUsed) else { return nil }
-        let candidate = task.fallbackModels[task.modelFallbacksUsed]
-        let trimmed = candidate.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, trimmed != task.model else {
-            var probe = task
-            probe.modelFallbacksUsed += 1
-            return nextFallbackModel(for: probe)
+    static func nextFallback(for task: AutomationTask) -> (model: String, index: Int)? {
+        var index = task.modelFallbacksUsed
+        while task.fallbackModels.indices.contains(index) {
+            let candidate = task.fallbackModels[index].trimmingCharacters(in: .whitespaces)
+            if !candidate.isEmpty, candidate != task.model {
+                return (candidate, index)
+            }
+            index += 1
         }
-        return trimmed
+        return nil
     }
 
     static func hasHeadroom(_ account: Account, minimumPercent: Int) -> Bool {
@@ -1058,6 +1058,8 @@ public actor AppEngine {
             accounts: accounts,
             consumeBankedWindow: settings.automationConsumeBankedWindow,
             minHeadroomPercent: settings.automationMinHeadroomPercent,
+            primaryThresholdPercent: settings.primaryThresholdPercent,
+            secondaryThresholdPercent: settings.secondaryThresholdPercent,
             now: now
         )
     }
@@ -1124,6 +1126,7 @@ public actor AppEngine {
             await taskStore.move(id: task.id, to: .inProgress, index: preferredInProgressIndex)
         }
 
+        await proxy?.pinTaskStart(runID: runID.uuidString, alias: account.alias)
         do {
             try await taskRunner.start(
                 task: task,
@@ -1174,7 +1177,7 @@ public actor AppEngine {
             now: now,
             launchError: error as? TaskRunnerError,
             currentModel: task.model,
-            nextFallbackModel: Self.nextFallbackModel(for: task)
+            nextFallbackModel: Self.nextFallback(for: task)?.model
         ))
         await autoLog.write(
             "run",
@@ -1186,9 +1189,10 @@ public actor AppEngine {
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
         task.stagnationRecoveries = transition.stagnationRecoveries
-        if let fallback = transition.fallbackModel {
+        if let fallback = transition.fallbackModel,
+           let selected = Self.nextFallback(for: task), selected.model == fallback {
             task.model = fallback
-            task.modelFallbacksUsed += 1
+            task.modelFallbacksUsed = selected.index + 1
         }
         if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
             task.runs[runIndex].finishedAt = now
@@ -1197,6 +1201,7 @@ public actor AppEngine {
             task.runs[runIndex].headSHA = gitState?.headSHA
             task.runs[runIndex].actualBranch = gitState?.branch
         }
+        archiveExcessRuns(&task, taskDir: task.taskDirURL(supportDir: supportDir))
         task.updatedAt = now
         await taskStore.update(task)
         switch transition.terminalEvent {
@@ -1222,6 +1227,9 @@ public actor AppEngine {
             return
         }
         defer { repositoryLeases.removeValue(forKey: taskID) }
+        if let openRun = (await taskStore.task(id: taskID))?.runs.last(where: { $0.finishedAt == nil }) {
+            await proxy?.unpinTaskStart(runID: openRun.id.uuidString)
+        }
         guard var task = await taskStore.task(id: taskID) else { return }
         guard let lastRun = task.runs.last, lastRun.finishedAt == nil else {
             await autoLog.write(
@@ -1252,7 +1260,7 @@ public actor AppEngine {
             planRelativePath: task.planRelativePath,
             now: now,
             currentModel: task.model,
-            nextFallbackModel: Self.nextFallbackModel(for: task)
+            nextFallbackModel: Self.nextFallback(for: task)?.model
         )
         let transition = TaskOutcomeReducer.reduce(context)
         task.phase = transition.phase
@@ -1261,9 +1269,10 @@ public actor AppEngine {
         task.retryAttempts = transition.retryAttempts
         task.nextRetryAt = transition.nextRetryAt
         task.stagnationRecoveries = transition.stagnationRecoveries
-        if let fallback = transition.fallbackModel {
+        if let fallback = transition.fallbackModel,
+           let selected = Self.nextFallback(for: task), selected.model == fallback {
             task.model = fallback
-            task.modelFallbacksUsed += 1
+            task.modelFallbacksUsed = selected.index + 1
         }
         if task.column == .done {
             task.orderIndex = await taskStore.tasks(in: .done).count
@@ -1346,23 +1355,33 @@ public actor AppEngine {
     private func archiveExcessRuns(_ task: inout AutomationTask, taskDir: URL) {
         let (kept, evicted) = Self.capRuns(task.runs, limit: 25)
         guard !evicted.isEmpty else { return }
-        let archiveURL = taskDir.appendingPathComponent("runs-archive.jsonl")
-        let encoder = JSONEncoder.codex
+        // History is only dropped from memory after every evicted record is durably
+        // appended as single-line JSONL; any failure keeps the full in-memory history.
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var lines = Data()
         for record in evicted {
-            guard let data = try? encoder.encode(record) else { continue }
+            guard let data = try? encoder.encode(record) else { return }
             lines.append(data)
             lines.append(Data("\n".utf8))
         }
-        if !lines.isEmpty {
-            if !FileManager.default.fileExists(atPath: archiveURL.path) {
-                FileManager.default.createFile(atPath: archiveURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
-            }
-            if let handle = try? FileHandle(forWritingTo: archiveURL) {
-                _ = try? handle.seekToEnd()
-                try? handle.write(contentsOf: lines)
-                try? handle.close()
-            }
+        let archiveURL = taskDir.appendingPathComponent("runs-archive.jsonl")
+        if !FileManager.default.fileExists(atPath: archiveURL.path) {
+            guard FileManager.default.createFile(
+                atPath: archiveURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else { return }
+        }
+        guard let handle = try? FileHandle(forWritingTo: archiveURL) else { return }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: lines)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            return
         }
         task.runs = kept
     }

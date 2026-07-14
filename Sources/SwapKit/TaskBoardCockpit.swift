@@ -58,6 +58,8 @@ public enum TaskSchedulingReasonFormatter {
         accounts: [Account],
         consumeBankedWindow: Bool,
         minHeadroomPercent: Int = 0,
+        primaryThresholdPercent: Int = 100,
+        secondaryThresholdPercent: Int = 100,
         now: Date
     ) -> String {
         guard !aliases.isEmpty else { return "No accounts configured" }
@@ -74,6 +76,11 @@ public enum TaskSchedulingReasonFormatter {
             }
             if let starved = account.usage.first(where: { 100 - $0.usedPercent < minHeadroomPercent }) {
                 return "\(safeAlias): headroom<\(minHeadroomPercent)% (\(starved.label) \(starved.usedPercent)% used)"
+            }
+            if let over = account.usage.first(where: {
+                $0.usedPercent >= ($0.windowSeconds >= 604_800 ? secondaryThresholdPercent : primaryThresholdPercent)
+            }) {
+                return "\(safeAlias): over threshold (\(over.label) \(over.usedPercent)% used)"
             }
             return "\(safeAlias): eligible"
         }.joined(separator: "; ")
@@ -151,7 +158,7 @@ public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
         task.runs.enumerated().reversed().map { index, run in
             TaskRunTimelineRow(
                 id: run.id,
-                runNumber: index + 1,
+                runNumber: runNumber(for: run) ?? index + 1,
                 startedAt: run.startedAt,
                 duration: max(0, (run.finishedAt ?? now).timeIntervalSince(run.startedAt)),
                 outcome: run.outcome,
@@ -164,6 +171,11 @@ public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
                 servedAliases: run.servedAliases
             )
         }
+    }
+
+    static func runNumber(for run: TaskRunRecord) -> Int? {
+        guard run.logFileName.hasPrefix("run-"), run.logFileName.hasSuffix(".log") else { return nil }
+        return Int(run.logFileName.dropFirst(4).dropLast(4))
     }
 
     private static func outcomeKind(for run: TaskRunRecord) -> TaskRunOutcomeKind {
