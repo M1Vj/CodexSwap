@@ -709,21 +709,23 @@ public actor AppEngine {
         return account.usage.contains { $0.usedPercent > 0 }
     }
 
-    private static func automationAccount(from accounts: [Account], settings: Settings, now: Date) -> Account? {
-        return accounts
+    /// Same selection contract as the proxy: honor the configured rotation strategy and
+    /// prefer accounts under the pre-emptive thresholds, falling back to the best
+    /// over-threshold account when none has headroom.
+    static func automationAccount(from accounts: [Account], settings: Settings, now: Date) -> Account? {
+        let ordered = accounts
             .filter { account in
                 guard account.isEligible(now: now) else { return false }
                 if settings.automationConsumeBankedWindow { return true }
                 return hasStartedWindow(account)
             }
-            .sorted { lhs, rhs in
-                if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
-                let lhsLastUsed = lhs.lastUsedAt ?? .distantPast
-                let rhsLastUsed = rhs.lastUsedAt ?? .distantPast
-                if lhsLastUsed != rhsLastUsed { return lhsLastUsed < rhsLastUsed }
-                return lhs.alias < rhs.alias
-            }
-            .first
+            .sorted { AccountStore.selectionOrder($0, $1, strategy: settings.rotationStrategy) }
+        return ordered.first {
+            $0.isWithinRotationThresholds(
+                primaryPercent: settings.primaryThresholdPercent,
+                secondaryPercent: settings.secondaryThresholdPercent
+            )
+        } ?? ordered.first
     }
 
     private static func accountEligibilityReasons(

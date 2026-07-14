@@ -42,7 +42,14 @@ func proxyRequestMode(headers: HTTPHeaders, method: HTTPMethod, path: String, lo
     return ProxyRequestMode(headers: headers)
 }
 
-func selectProxyAccount(store: AccountStore, mode: ProxyRequestMode, now: Date = Date()) async -> Account? {
+func selectProxyAccount(
+    store: AccountStore,
+    mode: ProxyRequestMode,
+    primaryThreshold: Int = Int.max,
+    secondaryThreshold: Int = Int.max,
+    preferredTaskAlias: String? = nil,
+    now: Date = Date()
+) async -> Account? {
     switch mode {
     case .normal:
         return await store.current(now: now)
@@ -56,7 +63,21 @@ func selectProxyAccount(store: AccountStore, mode: ProxyRequestMode, now: Date =
         for alias in allowed {
             _ = await store.hydrateFromManagedHome(alias)
         }
-        guard let account = await store.bestEligible(among: allowed, now: now) else { return nil }
+        // Round-robin turn stickiness: requests inside the same turn stay on one account
+        // (per-account prompt caches upstream), but an account that crossed its threshold
+        // loses the turn, matching how proactive rotation ignores turn boundaries.
+        if let preferred = preferredTaskAlias, allowed.contains(preferred),
+           let sticky = await store.account(preferred), sticky.isEligible(now: now),
+           sticky.isWithinRotationThresholds(primaryPercent: primaryThreshold, secondaryPercent: secondaryThreshold) {
+            await store.touchLastUsed(preferred, now: now)
+            return sticky
+        }
+        guard let account = await store.bestEligible(
+            among: allowed,
+            primaryThreshold: primaryThreshold,
+            secondaryThreshold: secondaryThreshold,
+            now: now
+        ) else { return nil }
         await store.touchLastUsed(account.alias, now: now)
         return account
     }
@@ -136,6 +157,7 @@ public actor ProxyServer {
     private var lastActivityAt: Date?
     private var lastActivityAlias: String?
     private var lastTurnAt: Date?
+    private var taskTurns: [String: (alias: String, at: Date)] = [:]
     private var inflightRefresh: [String: Task<CodexTokens, Error>] = [:]
 
     public struct Activity: Sendable {
@@ -275,10 +297,28 @@ public actor ProxyServer {
             lastTurnAt = now
         }
 
-        guard var account = await selectProxyAccount(store: store, mode: mode) else {
+        var preferredTaskAlias: String?
+        if case .task(let allowed) = mode, settings.rotationStrategy == .roundRobin {
+            let key = allowed.joined(separator: ",")
+            if let turn = taskTurns[key],
+               Date().timeIntervalSince(turn.at) <= TimeInterval(settings.roundRobinTurnGapSeconds) {
+                preferredTaskAlias = turn.alias
+            }
+        }
+
+        guard var account = await selectProxyAccount(
+            store: store,
+            mode: mode,
+            primaryThreshold: settings.primaryThresholdPercent,
+            secondaryThreshold: settings.secondaryThresholdPercent,
+            preferredTaskAlias: preferredTaskAlias
+        ) else {
             log("\(head.method.rawValue) \(rawPath) -> no eligible account")
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
+        }
+        if case .task(let allowed) = mode {
+            taskTurns[allowed.joined(separator: ",")] = (account.alias, Date())
         }
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
@@ -428,7 +468,13 @@ public actor ProxyServer {
     }
 
     private func selectNextTaskAccount(mode: ProxyRequestMode, excluding alias: String) async -> Account? {
-        guard let next = await selectProxyAccount(store: store, mode: mode), next.alias != alias else { return nil }
+        let settings = await settingsProvider()
+        guard let next = await selectProxyAccount(
+            store: store,
+            mode: mode,
+            primaryThreshold: settings.primaryThresholdPercent,
+            secondaryThreshold: settings.secondaryThresholdPercent
+        ), next.alias != alias else { return nil }
         return next
     }
 

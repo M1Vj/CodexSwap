@@ -466,6 +466,85 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertFalse(AppEngine.hasStartedWindow(account([])))
     }
 
+    func testBestEligiblePrefersAccountUnderRotationThresholds() async throws {
+        let root = try temporaryDirectory(named: "task-threshold-selection")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weekly = { (used: Int) in UsageWindow(label: "Weekly", usedPercent: used, windowSeconds: 604_800, resetAt: nil) }
+        let short = { (used: Int) in UsageWindow(label: "5h", usedPercent: used, windowSeconds: 18_000, resetAt: nil) }
+        await store.upsert(Account(alias: "primary", accessToken: "t", priority: 10, usage: [weekly(98)]))
+        await store.upsert(Account(alias: "secondary", accessToken: "t", priority: 5, usage: [weekly(27)]))
+
+        let preferred = await store.bestEligible(among: ["primary", "secondary"], primaryThreshold: 95, secondaryThreshold: 98, now: now)
+        XCTAssertEqual(preferred?.alias, "secondary")
+
+        await store.updateUsage("secondary", windows: [short(96), weekly(27)])
+        let shortWindowGated = await store.bestEligible(among: ["primary", "secondary"], primaryThreshold: 95, secondaryThreshold: 98, now: now)
+        XCTAssertEqual(shortWindowGated?.alias, "primary", "a 5h window at the primary threshold must gate the account")
+
+        await store.updateUsage("secondary", windows: [weekly(99)])
+        let fallback = await store.bestEligible(among: ["primary", "secondary"], primaryThreshold: 95, secondaryThreshold: 98, now: now)
+        XCTAssertEqual(fallback?.alias, "primary", "all over threshold must fall back to the best account, not stall")
+
+        let unlimited = await store.bestEligible(among: ["primary", "secondary"], now: now)
+        XCTAssertEqual(unlimited?.alias, "primary")
+    }
+
+    func testBestEligibleRoundRobinOrdersByLeastRecentlyUsed() async throws {
+        let root = try temporaryDirectory(named: "task-roundrobin-selection")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        await store.upsert(Account(alias: "recent", accessToken: "t", priority: 10, lastUsedAt: now.addingTimeInterval(-60)))
+        await store.upsert(Account(alias: "stale", accessToken: "t", priority: 0, lastUsedAt: now.addingTimeInterval(-3_600)))
+
+        let priorityPick = await store.bestEligible(among: ["recent", "stale"], now: now)
+        XCTAssertEqual(priorityPick?.alias, "recent")
+
+        await store.setStrategy(.roundRobin)
+        let roundRobinPick = await store.bestEligible(among: ["recent", "stale"], now: now)
+        XCTAssertEqual(roundRobinPick?.alias, "stale", "round-robin must spread by least-recently-used, ignoring priority")
+    }
+
+    func testAutomationAccountFollowsRotationSettings() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weekly = { (used: Int) in UsageWindow(label: "Weekly", usedPercent: used, windowSeconds: 604_800, resetAt: nil) }
+        var settings = Settings.default
+        let hot = Account(alias: "hot", accessToken: "t", priority: 10, usage: [weekly(98)])
+        let cool = Account(alias: "cool", accessToken: "t", priority: 5, usage: [weekly(27)])
+        XCTAssertEqual(AppEngine.automationAccount(from: [hot, cool], settings: settings, now: now)?.alias, "cool")
+
+        let alsoHot = Account(alias: "also-hot", accessToken: "t", priority: 5, usage: [weekly(99)])
+        XCTAssertEqual(AppEngine.automationAccount(from: [hot, alsoHot], settings: settings, now: now)?.alias, "hot")
+
+        settings.rotationStrategy = .roundRobin
+        let recent = Account(alias: "recent", accessToken: "t", priority: 10, lastUsedAt: now, usage: [weekly(10)])
+        let stale = Account(alias: "stale", accessToken: "t", priority: 0, lastUsedAt: now.addingTimeInterval(-3_600), usage: [weekly(10)])
+        XCTAssertEqual(AppEngine.automationAccount(from: [recent, stale], settings: settings, now: now)?.alias, "stale")
+    }
+
+    func testSelectProxyAccountTaskModeStickyPreferredLosesTurnOverThreshold() async throws {
+        let root = try temporaryDirectory(named: "task-sticky-selection")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weekly = { (used: Int) in UsageWindow(label: "Weekly", usedPercent: used, windowSeconds: 604_800, resetAt: nil) }
+        await store.upsert(Account(alias: "first", accessToken: "t", priority: 10, usage: [weekly(20)]))
+        await store.upsert(Account(alias: "second", accessToken: "t", priority: 5, usage: [weekly(10)]))
+        let mode = ProxyRequestMode.task(allowed: ["first", "second"])
+
+        let sticky = await selectProxyAccount(store: store, mode: mode, primaryThreshold: 95, secondaryThreshold: 98, preferredTaskAlias: "second", now: now)
+        XCTAssertEqual(sticky?.alias, "second", "an eligible under-threshold preferred account keeps the turn")
+
+        let outsider = await selectProxyAccount(store: store, mode: mode, primaryThreshold: 95, secondaryThreshold: 98, preferredTaskAlias: "not-allowed", now: now)
+        XCTAssertEqual(outsider?.alias, "first", "a preferred alias outside the allowed subset is ignored")
+
+        await store.updateUsage("second", windows: [weekly(99)])
+        let reselected = await selectProxyAccount(store: store, mode: mode, primaryThreshold: 95, secondaryThreshold: 98, preferredTaskAlias: "second", now: now)
+        XCTAssertEqual(reselected?.alias, "first", "crossing the threshold mid-turn must drop stickiness")
+    }
+
     func testPromptsMandateBatchingAndSingleFinalVerification() {
         let task = makeTask()
         for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
