@@ -6,6 +6,10 @@ struct TaskBoardView: View {
     @ObservedObject var model: TaskBoardViewModel
     @State private var editor: TaskEditorPresentation?
     @State private var taskToDelete: AutomationTask?
+    @State private var selectedTaskID: UUID?
+    @State private var searchText = ""
+    @State private var needsAttention = false
+    @State private var actionFeedback: [UUID: String] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -15,25 +19,46 @@ struct TaskBoardView: View {
 
             Divider()
 
-            HStack(alignment: .top, spacing: 12) {
-                ForEach(TaskColumn.allCases, id: \.rawValue) { column in
-                    TaskColumnView(
-                        column: column,
-                        tasks: tasks(in: column),
-                        runningTaskIDs: model.runningTaskIDs,
-                        moveTask: model.actions.moveTask,
-                        runNow: model.actions.runNow,
-                        stopTask: model.actions.stopTask,
-                        exportPrompt: model.actions.exportPrompt,
-                        openRunLog: model.actions.openRunLog,
-                        editTask: { showEditor(for: $0) },
-                        deleteTask: { taskToDelete = $0 }
+            HSplitView {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(TaskColumn.allCases, id: \.rawValue) { column in
+                        TaskColumnView(
+                            column: column,
+                            tasks: tasks(in: column),
+                            totalCount: totalCount(in: column),
+                            runningTaskIDs: model.runningTaskIDs,
+                            selectedTaskID: selectedTaskID,
+                            schedulingReasons: model.schedulingReasons,
+                            actionFeedback: actionFeedback,
+                            accounts: model.accounts,
+                            settings: model.settings,
+                            moveTask: model.actions.moveTask,
+                            runNow: model.actions.runNow,
+                            requeueTask: model.actions.requeueTask,
+                            stopTask: model.actions.stopTask,
+                            exportPrompt: model.actions.exportPrompt,
+                            openRunLog: model.actions.openRunLog,
+                            showActionFeedback: showActionFeedback,
+                            selectTask: { selectedTaskID = $0 },
+                            editTask: { showEditor(for: $0) },
+                            deleteTask: { taskToDelete = $0 }
+                        )
+                    }
+                }
+                .padding(14)
+                .frame(minWidth: 900, maxWidth: .infinity, maxHeight: .infinity)
+
+                if let selectedTask {
+                    TaskBoardInspectorView(
+                        task: selectedTask,
+                        runLogURL: model.actions.runLogURL,
+                        planDocument: model.actions.planDocument
                     )
+                    .frame(minWidth: 320, idealWidth: 370, maxWidth: 480, maxHeight: .infinity)
                 }
             }
-            .padding(14)
         }
-        .frame(minWidth: 1_000, minHeight: 620)
+        .frame(minWidth: 1_320, minHeight: 620)
         .sheet(item: $editor) { presentation in
             TaskEditorView(task: presentation.task, accounts: model.accounts, isNew: presentation.isNew) { task in
                 if presentation.isNew {
@@ -86,6 +111,15 @@ struct TaskBoardView: View {
                 .help("Allows automation to spend a banked 5-hour reset when starting a task.")
 
             Spacer(minLength: 8)
+
+            TextField("Search tasks", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 180)
+                .accessibilityLabel("Search tasks")
+
+            Toggle("Needs Attention", isOn: $needsAttention)
+                .toggleStyle(.button)
+                .controlSize(.small)
 
             Button("Logs", systemImage: "doc.text.magnifyingglass", action: model.actions.openAutomationLog)
                 .controlSize(.small)
@@ -173,10 +207,27 @@ struct TaskBoardView: View {
     private func tasks(in column: TaskColumn) -> [AutomationTask] {
         model.tasks
             .filter { $0.column == column }
+            .filter { TaskBoardFilter.includes($0, query: searchText, needsAttention: needsAttention) }
             .sorted { lhs, rhs in
                 if lhs.orderIndex != rhs.orderIndex { return lhs.orderIndex < rhs.orderIndex }
                 return lhs.createdAt < rhs.createdAt
             }
+    }
+
+    private func totalCount(in column: TaskColumn) -> Int {
+        model.tasks.filter { $0.column == column }.count
+    }
+
+    private var selectedTask: AutomationTask? {
+        selectedTaskID.flatMap { id in model.tasks.first { $0.id == id } }
+    }
+
+    private func showActionFeedback(_ taskID: UUID, _ value: String) {
+        actionFeedback[taskID] = value
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if actionFeedback[taskID] == value { actionFeedback.removeValue(forKey: taskID) }
+        }
     }
 
     private func showAddEditor() {
@@ -228,12 +279,21 @@ private struct TaskEditorPresentation: Identifiable {
 private struct TaskColumnView: View {
     let column: TaskColumn
     let tasks: [AutomationTask]
+    let totalCount: Int
     let runningTaskIDs: Set<UUID>
+    let selectedTaskID: UUID?
+    let schedulingReasons: [String: String]
+    let actionFeedback: [UUID: String]
+    let accounts: [Account]
+    let settings: SwapKit.Settings
     let moveTask: (UUID, TaskColumn, Int) -> Void
-    let runNow: (UUID) -> Void
+    let runNow: (UUID) async -> TaskRunNowResult
+    let requeueTask: (UUID) async -> Void
     let stopTask: (UUID) -> Void
     let exportPrompt: (UUID) -> Void
     let openRunLog: (UUID) -> Void
+    let showActionFeedback: (UUID, String) -> Void
+    let selectTask: (UUID) -> Void
     let editTask: (AutomationTask) -> Void
     let deleteTask: (AutomationTask) -> Void
 
@@ -243,29 +303,19 @@ private struct TaskColumnView: View {
                 Text(column.boardTitle)
                     .font(.headline)
                 Spacer()
-                Text("\(tasks.count)")
+                Text("\(tasks.count)/\(totalCount)")
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(.quaternary, in: Capsule())
-                    .accessibilityLabel("\(tasks.count) tasks")
+                    .accessibilityLabel("\(tasks.count) of \(totalCount) tasks shown")
             }
             .padding(.horizontal, 4)
 
             ScrollView {
                 LazyVStack(spacing: 10) {
                     ForEach(tasks) { task in
-                        TaskCardView(
-                            task: task,
-                            isRunning: runningTaskIDs.contains(task.id),
-                            runNow: { runNow(task.id) },
-                            stopTask: { stopTask(task.id) },
-                            exportPrompt: { exportPrompt(task.id) },
-                            openRunLog: { openRunLog(task.id) },
-                            editTask: { editTask(task) },
-                            deleteTask: { deleteTask(task) }
-                        )
-                        .draggable(task.id.uuidString)
+                        taskCard(task)
                     }
                 }
                 .padding(1)
@@ -276,19 +326,49 @@ private struct TaskColumnView: View {
         .background(Color(nsColor: .underPageBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
         .dropDestination(for: String.self) { values, _ in
             guard let value = values.first, let id = UUID(uuidString: value) else { return false }
-            moveTask(id, column, tasks.count)
+            moveTask(id, column, totalCount)
             return true
         }
+    }
+
+    private func taskCard(_ task: AutomationTask) -> some View {
+        TaskCardView(
+            task: task,
+            isRunning: runningTaskIDs.contains(task.id),
+            isSelected: selectedTaskID == task.id,
+            schedulingReason: schedulingReasons[task.id.uuidString],
+            actionFeedback: actionFeedback[task.id],
+            accounts: accounts,
+            settings: settings,
+            runNow: { await runNow(task.id) },
+            requeueTask: { await requeueTask(task.id) },
+            stopTask: { stopTask(task.id) },
+            exportPrompt: { exportPrompt(task.id) },
+            openRunLog: { openRunLog(task.id) },
+            showActionFeedback: { showActionFeedback(task.id, $0) },
+            selectTask: { selectTask(task.id) },
+            editTask: { editTask(task) },
+            deleteTask: { deleteTask(task) }
+        )
+        .draggable(task.id.uuidString)
     }
 }
 
 private struct TaskCardView: View {
     let task: AutomationTask
     let isRunning: Bool
-    let runNow: () -> Void
+    let isSelected: Bool
+    let schedulingReason: String?
+    let actionFeedback: String?
+    let accounts: [Account]
+    let settings: SwapKit.Settings
+    let runNow: () async -> TaskRunNowResult
+    let requeueTask: () async -> Void
     let stopTask: () -> Void
     let exportPrompt: () -> Void
     let openRunLog: () -> Void
+    let showActionFeedback: (String) -> Void
+    let selectTask: () -> Void
     let editTask: () -> Void
     let deleteTask: () -> Void
     @State private var isHovering = false
@@ -332,19 +412,35 @@ private struct TaskCardView: View {
                     .foregroundStyle(.red)
                     .lineLimit(2)
             }
+
+            if task.phase == .pausedQuota || task.phase == .retryWaiting {
+                waitingReason
+            }
+
+            if task.phase == .failed || task.phase == .stopped {
+                recoveryActions
+            }
+
+            if let actionFeedback {
+                Text(actionFeedback)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                .stroke(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
         }
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .onHover { isHovering = $0 }
+        .simultaneousGesture(TapGesture().onEnded(selectTask))
         .onTapGesture(count: 2, perform: editTask)
         .contextMenu {
-            Button(action: runNow) { Label("Run Now", systemImage: "play.fill") }
+            Button(action: startRun) { Label("Run Now", systemImage: "play.fill") }
                 .disabled(isRunning)
             Button(action: stopTask) { Label("Stop", systemImage: "stop.fill") }
                 .disabled(!isRunning)
@@ -360,7 +456,7 @@ private struct TaskCardView: View {
 
     private var hoverActions: some View {
         HStack(spacing: 2) {
-            Button(action: runNow) { Image(systemName: "play.fill") }
+            Button(action: startRun) { Image(systemName: "play.fill") }
                 .disabled(isRunning)
                 .accessibilityLabel("Run \(task.title) now")
             Button(action: stopTask) { Image(systemName: "stop.fill") }
@@ -389,7 +485,7 @@ private struct TaskCardView: View {
         case .pausedQuota:
             TaskBadge(text: "Waiting for quota", color: .orange, symbol: "clock.fill")
         case .retryWaiting:
-            TaskBadge(text: retryBadgeText, color: .orange, symbol: "clock.fill")
+            TaskBadge(text: "Retry scheduled", color: .orange, symbol: "clock.fill")
         case .failed:
             TaskBadge(text: "Failed", color: .red, symbol: "exclamationmark.circle.fill")
         case .stopped:
@@ -403,11 +499,60 @@ private struct TaskCardView: View {
         URL(fileURLWithPath: task.repoPath).lastPathComponent
     }
 
-    private var retryBadgeText: String {
-        guard let nextRetryAt = task.nextRetryAt else { return "Retrying soon" }
-        let seconds = max(0, Int(nextRetryAt.timeIntervalSinceNow.rounded(.up)))
-        guard seconds >= 60 else { return "Retrying soon" }
-        return "Retrying in \((seconds + 59) / 60)m"
+    private var waitingReason: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Text(waitingReasonText(at: context.date))
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+        }
+    }
+
+    private var recoveryActions: some View {
+        HStack(spacing: 6) {
+            Button("Retry Now", systemImage: "arrow.clockwise", action: startRun)
+            Button("Requeue", systemImage: "text.badge.plus", action: requeue)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+
+    private func waitingReasonText(at date: Date) -> String {
+        let aliases = task.accountAliases.isEmpty ? settings.automationAccounts : task.accountAliases
+        let deadline = TaskSchedulingReasonFormatter.nextDeadline(
+            task: task,
+            aliases: aliases,
+            accounts: accounts,
+            now: date
+        )
+        if task.phase == .retryWaiting, let deadline {
+            return "Retrying in \(Self.countdown(to: deadline, from: date))"
+        }
+        if let schedulingReason, let deadline {
+            return "\(schedulingReason) · resets in \(Self.countdown(to: deadline, from: date))"
+        }
+        return schedulingReason ?? "Waiting for scheduler"
+    }
+
+    private func startRun() {
+        Task { @MainActor in
+            let feedback = await runNow().feedback
+            showActionFeedback(feedback)
+        }
+    }
+
+    private func requeue() {
+        Task { @MainActor in
+            await requeueTask()
+            showActionFeedback("Requeued")
+        }
+    }
+
+    private static func countdown(to deadline: Date, from now: Date) -> String {
+        let seconds = max(0, Int(deadline.timeIntervalSince(now).rounded(.up)))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds / 3_600)h \((seconds % 3_600) / 60)m"
     }
 }
 

@@ -8,8 +8,8 @@ final class TaskBoardWindowController: NSWindowController, NSWindowDelegate {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "CodexSwap Task Board"
         window.styleMask = [.titled, .closable, .resizable]
-        window.setContentSize(NSSize(width: 1_080, height: 680))
-        window.minSize = NSSize(width: 1_000, height: 620)
+        window.setContentSize(NSSize(width: 1_420, height: 760))
+        window.minSize = NSSize(width: 1_320, height: 620)
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)

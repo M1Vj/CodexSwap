@@ -158,6 +158,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             taskStatus.isEnabled = false
             menu.addItem(taskStatus)
+
+            for task in latest.tasks
+                .filter({ latest.runningTaskIDs.contains($0.id) })
+                .sorted(by: { $0.title.localizedStandardCompare($1.title) == .orderedAscending }) {
+                let runningTask = NSMenuItem(title: runningTaskMenuTitle(task), action: nil, keyEquivalent: "")
+                runningTask.isEnabled = false
+                menu.addItem(runningTask)
+            }
+
+            if let resetAt = TaskBoardMenuStatus.nextQuotaReset(
+                tasks: latest.tasks,
+                schedulingReasons: latest.schedulingReasons,
+                accounts: latest.accounts,
+                globalAliases: settings.automationAccounts,
+                now: Date()
+            ) {
+                let reset = NSMenuItem(
+                    title: "Next reset in \(Self.countdown(to: resetAt))",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                reset.isEnabled = false
+                menu.addItem(reset)
+            }
         }
 
         menu.addItem(.separator())
@@ -213,6 +237,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item)
     }
 
+    private func runningTaskMenuTitle(_ task: AutomationTask) -> String {
+        let title = String(task.title.prefix(54))
+        if let progress = task.planProgress {
+            return "↳ \(title) · \(progress.done)/\(progress.total)"
+        }
+        if let run = task.runs.last, let done = run.planDone, let total = run.planTotal {
+            return "↳ \(title) · \(done)/\(total)"
+        }
+        return "↳ \(title) · working"
+    }
+
     private func makeSettingsActions() -> SettingsActions {
         SettingsActions(
             setRouting: { [weak self] enabled in self?.setAutomaticRouting(enabled) },
@@ -262,8 +297,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { await self.engine.moveTask(id: id, to: column, index: index); await self.refreshSnapshot() }
             },
             runNow: { [weak self] id in
+                guard let self else { return .blocked(reason: "Task board closed") }
+                let result = await self.engine.runTaskNow(id: id)
+                await self.refreshSnapshot()
+                return result
+            },
+            requeueTask: { [weak self] id in
                 guard let self else { return }
-                Task { await self.engine.runTaskNow(id: id); await self.refreshSnapshot() }
+                await self.engine.requeueTask(id: id)
+                await self.refreshSnapshot()
             },
             stopTask: { [weak self] id in
                 guard let self else { return }
@@ -285,6 +327,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             openRunLog: { [weak self] id in
                 self?.openLatestRunLog(taskID: id)
+            },
+            runLogURL: { [weak self] id, runNumber in
+                guard let self else { return nil }
+                return await self.engine.runLogURL(taskID: id, runNumber: runNumber)
+            },
+            planDocument: { [weak self] id in
+                guard let self else { return nil }
+                return await self.engine.planDocument(taskID: id)
             },
             setAutomationEnabled: { [weak self] enabled in
                 self?.updateSettings { $0.automationEnabled = enabled }
@@ -608,6 +658,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if s < 60 { return "\(s)s ago" }
         if s < 3600 { return "\(s / 60)m ago" }
         return "\(s / 3600)h ago"
+    }
+
+    static func countdown(to date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, Int(date.timeIntervalSince(now).rounded(.up)))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\((seconds + 59) / 60)m" }
+        return "\(seconds / 3_600)h \((seconds % 3_600) / 60)m"
     }
 
     private func updateStatusIcon() {
