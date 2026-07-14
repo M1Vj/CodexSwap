@@ -10,7 +10,7 @@ public enum TaskPrompt {
         - Ensure branch `\(task.branch)` exists. If it is missing, create it from the current HEAD, then check it out.
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        - Make small conventional commits as work progresses.
+        - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine.
         - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in the Work Log, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
 
         ## Plan-first protocol
@@ -19,7 +19,7 @@ public enum TaskPrompt {
 
         `STATUS: CONTINUE`
 
-        Commit the initial plan. Then execute checklist items in order, and complete as many items as the session allows — never end the session after a single item when time and quota remain. After each completed item, change its marker to `- [x]` and append a dated entry to `## Work Log`; commit per logical unit of work, not per keystroke. While working, verify each item with fast checks scoped to what it touched; run the repository's full verification suite once, before your final commit — not after every item.
+        Then execute checklist items in order, and complete as many items as the session allows — never end the session after a single item when time and quota remain. After each completed item, change its marker to `- [x]` and append a dated entry to `## Work Log`. Commits may be batched — one bulk commit covering many items, or the whole session, is fine — as long as all work and the plan document are committed before the session ends. While working, verify each item with fast checks scoped to what it touched; run the repository's full verification suite once, before your final commit — not after every item.
 
         Keep `\(task.planRelativePath)` current throughout the session. Its final line must always use exactly one of these forms:
 
@@ -44,10 +44,10 @@ public enum TaskPrompt {
         - Ensure branch `\(task.branch)` exists. If it is missing, create it from the current HEAD, then check it out.
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        - Make small conventional commits as work progresses.
+        - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine.
         - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in the Work Log, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
 
-        Read `\(task.planRelativePath)` before changing code. If it does not exist yet (an earlier session ended before planning), first create it with the task title, the original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it. Spot-check only the most recently ticked items with fast, targeted checks — do not re-run full suites to revalidate old work; the previous session's evidence stands unless your changes touch it. Continue from the first unchecked `- [ ]` item and complete as many items as the session allows — never end after a single item when time and quota remain. After each item, tick it and append a dated `## Work Log` entry; commit per logical unit of work. Run the repository's full verification suite once, before your final commit — not after every item.
+        Read `\(task.planRelativePath)` before changing code. If it does not exist yet (an earlier session ended before planning), first create it with the task title, the original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it. Spot-check only the most recently ticked items with fast, targeted checks — do not re-run full suites to revalidate old work; the previous session's evidence stands unless your changes touch it. Continue from the first unchecked `- [ ]` item and complete as many items as the session allows — never end after a single item when time and quota remain. After each item, tick it and append a dated `## Work Log` entry. Commits may be batched — one bulk commit covering many items, or the whole session, is fine — as long as all work and the plan update are committed before the session ends. Run the repository's full verification suite once, before your final commit — not after every item.
 
         Maintain the checklist and keep the document's final line in exactly one of these forms:
 
@@ -85,9 +85,9 @@ public enum TaskPrompt {
 
         1. Work only inside the repository. Ensure branch `\(task.branch)` exists; if missing, create it from the current HEAD, then check it out. Work only on that branch and never touch other branches.
         2. Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        3. Make small conventional commits as work progresses.
+        3. Commit with clear conventional messages; batching the session's work into one bulk commit is fine.
         4. Maintain `\(task.planRelativePath)`. If no plan exists, first create it with the task title, original prompt, a `## Checklist` of small verifiable `- [ ]` steps, a `## Work Log`, and a final `STATUS: CONTINUE` line, then commit it.
-        5. Work through checklist items in order, completing as many as the session allows. Spot-check recently ticked items with targeted checks only, continue at the first `- [ ]` item, tick each completed item to `- [x]`, append a dated Work Log entry, and commit per logical unit. Run the full verification suite once before the final commit.
+        5. Work through checklist items in order, completing as many as the session allows. Spot-check recently ticked items with targeted checks only, continue at the first `- [ ]` item, tick each completed item to `- [x]`, and append a dated Work Log entry; commits may be batched into one bulk commit for the session, as long as everything including the plan update is committed before the session ends. Run the full verification suite once before the final commit.
         6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.
         7. If you run unattended, never end a session asking for input or approval: pick the most reasonable default yourself, record the decision and rationale in the Work Log, and continue. `STATUS: BLOCKED` is only for genuinely external obstacles, never a design choice.\(evergreenClause(task))
         """

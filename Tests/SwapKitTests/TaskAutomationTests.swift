@@ -555,6 +555,18 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertFalse(TaskPrompt.continuation(task: task).contains("every ticked `- [x]` item still holds"))
     }
 
+    func testPromptsAllowBulkCommits() {
+        let task = makeTask()
+        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
+            XCTAssertTrue(prompt.contains("bulk commit"), "bulk-commit allowance missing")
+            XCTAssertFalse(prompt.contains("commit per logical unit"), "per-item commit mandate must be gone")
+            XCTAssertFalse(prompt.contains("small conventional commits"), "per-step commit mandate must be gone")
+        }
+        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task)] {
+            XCTAssertTrue(prompt.contains("committed before the session ends"), "end-of-session commit requirement missing")
+        }
+    }
+
     func testPruneArtifactsKeepsNewestLogsAndFreshSessions() throws {
         let root = try temporaryDirectory(named: "prune-artifacts")
         defer { try? FileManager.default.removeItem(at: root) }
