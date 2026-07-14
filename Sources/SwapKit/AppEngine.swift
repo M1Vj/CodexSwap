@@ -34,6 +34,7 @@ public struct EngineSnapshot: Sendable {
     public let warmupInProgress: Bool
     public let tasks: [AutomationTask]
     public let runningTaskIDs: Set<UUID>
+    public let schedulingReasons: [String: String]
 
     public var isRunning: Bool { proxyURL != nil }
 
@@ -41,7 +42,7 @@ public struct EngineSnapshot: Sendable {
                 servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil,
                 routingState: CodexRoutingState = .disabled, warmupSummary: WarmupSummary? = nil,
                 warmupInProgress: Bool = false, tasks: [AutomationTask] = [],
-                runningTaskIDs: Set<UUID> = []) {
+                runningTaskIDs: Set<UUID> = [], schedulingReasons: [String: String] = [:]) {
         self.accounts = accounts
         self.activeAlias = activeAlias
         self.proxyURL = proxyURL
@@ -54,6 +55,7 @@ public struct EngineSnapshot: Sendable {
         self.warmupInProgress = warmupInProgress
         self.tasks = tasks
         self.runningTaskIDs = runningTaskIDs
+        self.schedulingReasons = schedulingReasons
     }
 }
 
@@ -76,7 +78,7 @@ private actor TaskStartGate {
     }
 }
 
-private enum TaskStartResult: Sendable {
+private enum TaskStartResult: Sendable, Equatable {
     case started
     case unavailable
     case failed
@@ -94,6 +96,7 @@ public actor AppEngine {
     private let taskStore: TaskStore
     private let taskRunner: any TaskRunning
     private let autoLog: AutomationLog
+    private let supportDir: URL
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
@@ -102,6 +105,7 @@ public actor AppEngine {
     private var schedulingTaskIDs: Set<UUID> = []
     private var interruptingTaskIDs: Set<UUID> = []
     private var repositoryLeases: [UUID: String] = [:]
+    private var schedulingReasons: [String: String] = [:]
 
     public init(
         store: AccountStore = AccountStore(),
@@ -112,7 +116,8 @@ public actor AppEngine {
         warmupService: QuotaWarmupService = QuotaWarmupService(),
         taskStore: TaskStore = TaskStore(),
         taskRunner: TaskRunner? = nil,
-        autoLog: AutomationLog = AutomationLog()
+        autoLog: AutomationLog = AutomationLog(),
+        supportDir: URL = AppPaths.supportDir()
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -122,6 +127,7 @@ public actor AppEngine {
         self.warmupService = warmupService
         self.taskStore = taskStore
         self.autoLog = autoLog
+        self.supportDir = supportDir
         self.taskRunner = taskRunner ?? TaskRunner { [autoLog] category, message in
             await autoLog.write(category, message)
         }
@@ -136,7 +142,8 @@ public actor AppEngine {
         warmupService: QuotaWarmupService = QuotaWarmupService(),
         taskStore: TaskStore = TaskStore(),
         taskRunning: any TaskRunning,
-        autoLog: AutomationLog = AutomationLog()
+        autoLog: AutomationLog = AutomationLog(),
+        supportDir: URL = AppPaths.supportDir()
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -147,6 +154,7 @@ public actor AppEngine {
         self.taskStore = taskStore
         self.taskRunner = taskRunning
         self.autoLog = autoLog
+        self.supportDir = supportDir
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -259,12 +267,32 @@ public actor AppEngine {
             warmupSummary: warmupSummary,
             warmupInProgress: warmupInProgress,
             tasks: await taskStore.all(),
-            runningTaskIDs: await taskRunner.runningIDs()
+            runningTaskIDs: await taskRunner.runningIDs(),
+            schedulingReasons: schedulingReasons
         )
     }
 
     public func tasks() async -> [AutomationTask] {
         await taskStore.all()
+    }
+
+    public func runLogURL(taskID: UUID, runNumber: Int) async -> URL? {
+        guard let task = await taskStore.task(id: taskID), task.runs.indices.contains(runNumber - 1) else {
+            return nil
+        }
+        let fileName = task.runs[runNumber - 1].logFileName
+        guard !fileName.isEmpty, URL(fileURLWithPath: fileName).lastPathComponent == fileName else { return nil }
+        let url = task.taskDirURL(supportDir: supportDir).appendingPathComponent(fileName)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    public func planDocument(taskID: UUID) async -> String? {
+        guard let task = await taskStore.task(id: taskID) else { return nil }
+        let url = URL(fileURLWithPath: task.repoPath, isDirectory: true)
+            .appendingPathComponent(task.planRelativePath)
+        return await Task.detached(priority: .utility) {
+            try? String(contentsOf: url, encoding: .utf8)
+        }.value
     }
 
     static func interruptedTasks(
@@ -341,7 +369,7 @@ public actor AppEngine {
         await taskStore.remove(id: id)
         if wasRunning { await taskRunner.stop(taskID: id) }
         if let task {
-            try? FileManager.default.removeItem(at: task.taskDirURL(supportDir: AppPaths.supportDir()))
+            try? FileManager.default.removeItem(at: task.taskDirURL(supportDir: supportDir))
         }
         emit(.snapshotChanged)
     }
@@ -372,11 +400,13 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
-    public func runTaskNow(id: UUID) async {
-        guard let task = await taskStore.task(id: id) else { return }
+    public func runTaskNow(id: UUID) async -> TaskRunNowResult {
+        guard let task = await taskStore.task(id: id) else { return .blocked(reason: "Task not found") }
         await autoLog.write("api", "runTaskNow \(Self.taskLabel(task))")
         let runningIDs = await taskRunner.runningIDs()
-        guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else { return }
+        guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else {
+            return .blocked(reason: "Task is already running")
+        }
         guard !Self.repositoryIsBusy(
             for: task,
             tasks: await taskStore.all(),
@@ -385,7 +415,8 @@ public actor AppEngine {
             leasedRepositories: repositoryLeases
         ) else {
             await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
-            return
+            schedulingReasons[id.uuidString] = "Repository is busy"
+            return .blocked(reason: "Repository is busy")
         }
         schedulingTaskIDs.insert(id)
         var reservationHeld = true
@@ -414,10 +445,13 @@ public actor AppEngine {
             case .started:
                 schedulingTaskIDs.remove(id)
                 reservationHeld = false
+                schedulingReasons.removeValue(forKey: id.uuidString)
                 await automationTick()
-                return
+                return .started
             case .failed:
-                return
+                let reason = await taskStore.task(id: id)?.lastError ?? "Task could not start"
+                schedulingReasons[id.uuidString] = reason
+                return .blocked(reason: reason)
             case .unavailable:
                 break
             }
@@ -442,6 +476,22 @@ public actor AppEngine {
             await taskStore.update(queued)
         }
         emit(.snapshotChanged)
+        return .queued
+    }
+
+    public func requeueTask(id: UUID) async {
+        guard var task = await taskStore.task(id: id) else { return }
+        let queueIndex = await taskStore.tasks(in: .queued).count
+        task.column = .queued
+        task.phase = .idle
+        task.orderIndex = queueIndex
+        task.nextRetryAt = nil
+        task.updatedAt = Date()
+        await taskStore.update(task)
+        schedulingReasons.removeValue(forKey: id.uuidString)
+        await autoLog.write("api", "requeueTask \(Self.taskLabel(task))")
+        emit(.snapshotChanged)
+        await automationTick()
     }
 
     public func exportPrompt(id: UUID) async -> String? {
@@ -667,6 +717,14 @@ public actor AppEngine {
         let runningIDs = await taskRunner.runningIDs()
         let storedTasks = await taskStore.all()
         let now = Date()
+        let reasonTasks = storedTasks.filter {
+            ($0.column == .queued && $0.phase == .idle)
+                || ($0.column == .inProgress && ($0.phase == .pausedQuota || $0.phase == .retryWaiting))
+        }
+        schedulingReasons = Dictionary(uniqueKeysWithValues: reasonTasks.compactMap { task in
+            guard task.phase == .retryWaiting, let retryAt = task.nextRetryAt, retryAt > now else { return nil }
+            return (task.id.uuidString, "Retrying when backoff ends")
+        })
         let repositoryBlocked = Self.repositoryBlockedTasks(
             storedTasks,
             runningIDs: runningIDs,
@@ -686,19 +744,25 @@ public actor AppEngine {
             "entering running \(runningIDs.count) scheduling \(schedulingTaskIDs.count) waiting \(waiting.count)"
         )
         guard settings.automationEnabled else {
+            for task in reasonTasks { schedulingReasons[task.id.uuidString] = "Automation is disabled" }
             await autoLog.write("tick", "early-out: disabled")
             return
         }
         guard let proxyURL = await proxy?.proxyURL() else {
+            for task in reasonTasks { schedulingReasons[task.id.uuidString] = "Proxy is unavailable" }
             await autoLog.write("tick", "early-out: no proxy")
             return
         }
         let maximumConcurrent = max(1, min(4, settings.automationMaxConcurrent))
         guard runningIDs.count + schedulingTaskIDs.count < maximumConcurrent else {
+            for task in reasonTasks where schedulingReasons[task.id.uuidString] == nil {
+                schedulingReasons[task.id.uuidString] = "Waiting for an available run slot"
+            }
             await autoLog.write("tick", "early-out: concurrency full")
             return
         }
         for task in repositoryBlocked {
+            schedulingReasons[task.id.uuidString] = "Repository is busy"
             await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
         }
         guard !waiting.isEmpty else {
@@ -706,6 +770,7 @@ public actor AppEngine {
             return
         }
         guard !settings.automationAccounts.isEmpty || waiting.contains(where: { !$0.accountAliases.isEmpty }) else {
+            for task in waiting { schedulingReasons[task.id.uuidString] = "No accounts configured" }
             await autoLog.write("tick", "early-out: no accounts configured")
             return
         }
@@ -743,11 +808,14 @@ public actor AppEngine {
                         "tick",
                         "\(Self.taskLabel(task)) no eligible account among [\(Self.aliasList(aliases))] (reasons per alias: \(reasons))"
                     )
+                    schedulingReasons[task.id.uuidString] = reasons
                     ineligibleTasks.append(task)
                     candidateAliases.formUnion(aliases)
                     continue
                 }
-                _ = await startTask(task, account: account, settings: settings, proxyURL: proxyURL)
+                if await startTask(task, account: account, settings: settings, proxyURL: proxyURL) == .started {
+                    schedulingReasons.removeValue(forKey: task.id.uuidString)
+                }
             }
 
             let currentRunningIDs = await taskRunner.runningIDs()
@@ -912,19 +980,12 @@ public actor AppEngine {
         settings: Settings,
         now: Date
     ) -> String {
-        let byAlias = Dictionary(uniqueKeysWithValues: accounts.map { ($0.alias, $0) })
-        return aliases.map { alias in
-            let safeAlias = oneLine(alias)
-            guard let account = byAlias[alias] else { return "\(safeAlias)=unknown-alias" }
-            if account.needsLogin || account.accessToken.isEmpty { return "\(safeAlias)=needs-login" }
-            if let cooldown = account.cooldownUntil(now: now) {
-                return "\(safeAlias)=cooldown until \(shortDate(cooldown))"
-            }
-            if !settings.automationConsumeBankedWindow, !hasStartedWindow(account) {
-                return "\(safeAlias)=banked-unstarted"
-            }
-            return "\(safeAlias)=eligible"
-        }.joined(separator: "; ")
+        TaskSchedulingReasonFormatter.format(
+            aliases: aliases,
+            accounts: accounts,
+            consumeBankedWindow: settings.automationConsumeBankedWindow,
+            now: now
+        )
     }
 
     private func startTask(
@@ -988,7 +1049,7 @@ public actor AppEngine {
                 allowedAliases: Self.allowedAliases(for: task, settings: settings),
                 runID: runID,
                 proxyURL: proxyURL,
-                supportDir: AppPaths.supportDir()
+                supportDir: supportDir
             ) { [weak self] taskID, exit in
                 await startGate.wait()
                 guard let self else { return }

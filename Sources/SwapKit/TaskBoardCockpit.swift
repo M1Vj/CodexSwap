@@ -1,0 +1,258 @@
+import Foundation
+
+public enum TaskBoardFilter {
+    public static func includes(_ task: AutomationTask, query: String, needsAttention: Bool) -> Bool {
+        if needsAttention, ![.failed, .pausedQuota, .retryWaiting].contains(task.phase) {
+            return false
+        }
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return true }
+        return [task.title, task.prompt, task.repoPath].contains {
+            $0.localizedCaseInsensitiveContains(needle)
+        }
+    }
+}
+
+public enum TaskSchedulingReasonFormatter {
+    public static func format(
+        aliases: [String],
+        accounts: [Account],
+        consumeBankedWindow: Bool,
+        now: Date
+    ) -> String {
+        guard !aliases.isEmpty else { return "No accounts configured" }
+        let byAlias = Dictionary(uniqueKeysWithValues: accounts.map { ($0.alias, $0) })
+        return aliases.map { alias in
+            let safeAlias = oneLine(alias)
+            guard let account = byAlias[alias] else { return "\(safeAlias): unknown account" }
+            if account.needsLogin || account.accessToken.isEmpty { return "\(safeAlias): needs login" }
+            if let cooldown = account.cooldownUntil(now: now) {
+                return "\(safeAlias): cooldown until \(shortDate(cooldown))"
+            }
+            if !consumeBankedWindow, !hasStartedWindow(account) {
+                return "\(safeAlias): banked window not started"
+            }
+            return "\(safeAlias): eligible"
+        }.joined(separator: "; ")
+    }
+
+    public static func nextDeadline(
+        task: AutomationTask,
+        aliases: [String],
+        accounts: [Account],
+        now: Date
+    ) -> Date? {
+        if task.phase == .retryWaiting, let retryAt = task.nextRetryAt, retryAt > now {
+            return retryAt
+        }
+        let allowed = Set(aliases)
+        return accounts
+            .filter { allowed.contains($0.alias) }
+            .compactMap { account in
+                if let cooldown = account.cooldownUntil(now: now) { return cooldown }
+                return account.usage.compactMap(\.resetAt).filter { $0 > now }.min()
+            }
+            .min()
+    }
+
+    private static func hasStartedWindow(_ account: Account) -> Bool {
+        if let short = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }) {
+            return short.usedPercent > 0
+        }
+        return account.usage.contains { $0.usedPercent > 0 }
+    }
+
+    private static func oneLine(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func shortDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d HH:mm"
+        return formatter.string(from: date)
+    }
+}
+
+public enum TaskRunOutcomeKind: Sendable, Equatable {
+    case running
+    case succeeded
+    case failed
+    case waiting
+    case stopped
+    case unknown
+}
+
+public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public let runNumber: Int
+    public let startedAt: Date
+    public let duration: TimeInterval
+    public let outcome: String
+    public let outcomeKind: TaskRunOutcomeKind
+    public let exitCode: Int32?
+    public let planDone: Int?
+    public let planTotal: Int?
+    public let logFileName: String
+    public let telemetrySummary: String?
+
+    public var planSummary: String? {
+        guard let planDone, let planTotal else { return nil }
+        return "\(planDone)/\(planTotal)"
+    }
+
+    public static func rows(for task: AutomationTask, now: Date = Date()) -> [TaskRunTimelineRow] {
+        task.runs.enumerated().reversed().map { index, run in
+            TaskRunTimelineRow(
+                id: run.id,
+                runNumber: index + 1,
+                startedAt: run.startedAt,
+                duration: max(0, (run.finishedAt ?? now).timeIntervalSince(run.startedAt)),
+                outcome: run.outcome,
+                outcomeKind: outcomeKind(for: run),
+                exitCode: run.exitCode,
+                planDone: run.planDone,
+                planTotal: run.planTotal,
+                logFileName: run.logFileName,
+                telemetrySummary: TaskRunSummaryExtractor.summary(from: run)
+            )
+        }
+    }
+
+    private static func outcomeKind(for run: TaskRunRecord) -> TaskRunOutcomeKind {
+        if run.finishedAt == nil { return .running }
+        let value = run.outcome.lowercased()
+        if value == "invalid-complete" || value == "replan" { return .waiting }
+        if value.contains("complete") || value.contains("success") { return .succeeded }
+        if value.contains("stop") || value.contains("interrupt") { return .stopped }
+        if value.contains("quota") || value.contains("retry") || value.contains("continue") { return .waiting }
+        if value.contains("fail") || (run.exitCode.map { $0 != 0 } == true) { return .failed }
+        return .unknown
+    }
+}
+
+public enum TaskRunSummaryExtractor {
+    public static func summary(from value: Any) -> String? {
+        // Wave 3 owns TaskRunRecord.summary; reflection keeps this parallel branch merge-independent.
+        let summary = Mirror(reflecting: value).children.first { $0.label == "summary" }?.value
+        if let summary = summary as? String { return summary.isEmpty ? nil : summary }
+        if let optional = summary {
+            let mirror = Mirror(reflecting: optional)
+            if mirror.displayStyle == .optional,
+               let text = mirror.children.first?.value as? String,
+               !text.isEmpty {
+                return text
+            }
+        }
+        return nil
+    }
+}
+
+public struct TaskPlanChecklist: Sendable, Equatable {
+    public let done: [String]
+    public let remaining: [String]
+    public let handoffExcerpt: String?
+    public let progress: PlanProgress?
+
+    public static func scan(_ document: String) -> TaskPlanChecklist {
+        var done: [String] = []
+        var remaining: [String] = []
+        var handoffLines: [String] = []
+        var inHandoff = false
+        for line in document.components(separatedBy: .newlines) {
+            let value = line.trimmingCharacters(in: .whitespaces)
+            if value.lowercased() == "## handoff" {
+                inHandoff = true
+                continue
+            }
+            if inHandoff, value.hasPrefix("#") {
+                inHandoff = false
+            } else if inHandoff, !value.isEmpty {
+                handoffLines.append(value)
+            }
+            guard value.count >= 5, value.hasPrefix("- ["), value[value.index(value.startIndex, offsetBy: 4)] == "]" else {
+                continue
+            }
+            let marker = value[value.index(value.startIndex, offsetBy: 3)]
+            let text = value.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { continue }
+            if marker == "x" || marker == "X" {
+                done.append(text)
+            } else if marker == " " {
+                remaining.append(text)
+            }
+        }
+        let handoff = handoffLines.isEmpty ? nil : String(handoffLines.joined(separator: "\n").prefix(2_000))
+        return TaskPlanChecklist(
+            done: done,
+            remaining: remaining,
+            handoffExcerpt: handoff,
+            progress: PlanDocParser.parse(document)
+        )
+    }
+}
+
+public enum TaskLogTailReader {
+    public static func lines(at url: URL, maxLines: Int = 500) async -> [String] {
+        guard maxLines > 0 else { return [] }
+        return await Task.detached(priority: .utility) {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+            defer { try? handle.close() }
+            guard let length = try? handle.seekToEnd() else { return [] }
+            let byteCount = min(length, 1_048_576)
+            try? handle.seek(toOffset: length - byteCount)
+            guard let data = try? handle.read(upToCount: Int(byteCount)) else { return [] }
+            var lines = String(decoding: data, as: UTF8.self)
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+            if lines.last == "" { lines.removeLast() }
+            if byteCount < length, !lines.isEmpty { lines.removeFirst() }
+            return Array(lines.suffix(maxLines))
+        }.value
+    }
+}
+
+public enum TaskRunNowResult: Sendable, Equatable {
+    case started
+    case queued
+    case blocked(reason: String)
+
+    public var feedback: String {
+        switch self {
+        case .started: "Started"
+        case .queued: "Queued"
+        case let .blocked(reason): reason
+        }
+    }
+}
+
+public enum TaskBoardMenuStatus {
+    public static func nextQuotaReset(
+        tasks: [AutomationTask],
+        schedulingReasons: [String: String],
+        accounts: [Account],
+        globalAliases: [String],
+        now: Date
+    ) -> Date? {
+        guard !tasks.contains(where: { $0.phase == .planning || $0.phase == .running }) else { return nil }
+        let waiting = tasks.filter {
+            ($0.column == .queued && $0.phase == .idle)
+                || ($0.column == .inProgress && $0.phase == .pausedQuota)
+        }
+        guard !waiting.isEmpty else { return nil }
+        guard waiting.allSatisfy({ task in
+            guard let reason = schedulingReasons[task.id.uuidString]?.lowercased() else { return false }
+            return reason.contains("cooldown") || reason.contains("quota") || reason.contains("banked window")
+        }) else { return nil }
+        return waiting.compactMap { task in
+            TaskSchedulingReasonFormatter.nextDeadline(
+                task: task,
+                aliases: task.accountAliases.isEmpty ? globalAliases : task.accountAliases,
+                accounts: accounts,
+                now: now
+            )
+        }.min()
+    }
+}
