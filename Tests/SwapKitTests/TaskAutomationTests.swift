@@ -176,6 +176,21 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(progress, PlanProgress(done: 0, total: 0, status: "BLOCKED"))
     }
 
+    func testPlanDocParserIgnoresStatusBeforeLastNonBlankLine() throws {
+        let text = """
+        ## Checklist
+        - [x] Finished
+        STATUS: COMPLETE
+
+        A trailing work-log entry makes the earlier status stale.
+
+        """
+
+        let progress = try XCTUnwrap(PlanDocParser.parse(text))
+
+        XCTAssertEqual(progress, PlanProgress(done: 1, total: 1, status: nil))
+    }
+
     func testPlanDocParserReturnsNilForIrrelevantText() {
         XCTAssertNil(PlanDocParser.parse("A document without checklist markers or a status line."))
         XCTAssertNil(PlanDocParser.parse(""))

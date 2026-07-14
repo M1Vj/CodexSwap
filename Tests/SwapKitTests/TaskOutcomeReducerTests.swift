@@ -105,6 +105,50 @@ final class TaskOutcomeReducerTests: XCTestCase {
         XCTAssertEqual(transition.terminalEvent, .failed)
     }
 
+    func testCompletionGateRejectsInvalidCompleteStates() {
+        let cases: [(String, TaskExitContext)] = [
+            (
+                "unchecked items",
+                TaskExitContext(
+                    exitCode: 0,
+                    progress: PlanProgress(done: 2, total: 3, status: "COMPLETE")
+                )
+            ),
+            (
+                "empty checklist",
+                TaskExitContext(
+                    exitCode: 0,
+                    progress: PlanProgress(done: 0, total: 0, status: "COMPLETE")
+                )
+            ),
+            (
+                "nonzero exit",
+                TaskExitContext(
+                    exitCode: 1,
+                    progress: PlanProgress(done: 3, total: 3, status: "COMPLETE")
+                )
+            ),
+            (
+                "evergreen nonzero exit",
+                TaskExitContext(
+                    exitCode: 1,
+                    progress: PlanProgress(done: 2, total: 3, status: "COMPLETE"),
+                    isEvergreen: true
+                )
+            ),
+        ]
+
+        for (name, context) in cases {
+            let transition = TaskOutcomeReducer.reduce(context)
+            XCTAssertEqual(transition.outcome, "invalid-complete", name)
+            XCTAssertEqual(transition.phase, .pausedQuota, name)
+            XCTAssertEqual(transition.column, .inProgress, name)
+            XCTAssertNotNil(transition.lastError, name)
+            XCTAssertNil(transition.terminalEvent, name)
+            XCTAssertTrue(transition.scheduleAnotherTick, name)
+        }
+    }
+
     private func closedRun(outcome: String, done: Int = 40, total: Int = 44) -> TaskRunRecord {
         TaskRunRecord(
             startedAt: Date(timeIntervalSince1970: 1_800_000_000),

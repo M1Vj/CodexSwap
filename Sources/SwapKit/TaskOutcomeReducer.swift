@@ -99,21 +99,35 @@ enum TaskOutcomeReducer {
                 terminalEvent: .pausedQuota
             )
         }
-        if context.progress?.status == "COMPLETE", context.isEvergreen {
+        if let progress = context.progress, progress.status == "COMPLETE" {
+            if context.isEvergreen, context.exitCode == 0 {
+                return transition(
+                    context,
+                    outcome: "cycle-complete",
+                    phase: .pausedQuota,
+                    terminalEvent: .completed
+                )
+            }
+            if !context.isEvergreen,
+               context.exitCode == 0,
+               progress.total > 0,
+               progress.done == progress.total {
+                return transition(
+                    context,
+                    outcome: "completed",
+                    phase: .completed,
+                    column: .done,
+                    terminalEvent: .completed
+                )
+            }
+            let requirement = context.isEvergreen
+                ? "exit code 0"
+                : "exit code 0 and a non-empty fully checked checklist"
             return transition(
                 context,
-                outcome: "cycle-complete",
+                outcome: "invalid-complete",
                 phase: .pausedQuota,
-                terminalEvent: .completed
-            )
-        }
-        if context.progress?.status == "COMPLETE" {
-            return transition(
-                context,
-                outcome: "completed",
-                phase: .completed,
-                column: .done,
-                terminalEvent: .completed
+                lastError: "STATUS: COMPLETE requires \(requirement); run exited \(context.exitCode) with \(progress.done)/\(progress.total) items checked"
             )
         }
         if context.progress?.status == "BLOCKED" {

@@ -191,17 +191,18 @@ public enum PlanDocParser {
     public static func parse(_ text: String) -> PlanProgress? {
         var done = 0
         var total = 0
-        var status: String?
+        let lines = text.components(separatedBy: .newlines)
 
-        for line in text.components(separatedBy: .newlines) {
+        for line in lines {
             if let marker = capture(in: line, pattern: #"^\s*-\s+\[([ x])\]"#) {
                 total += 1
                 if marker.caseInsensitiveCompare("x") == .orderedSame { done += 1 }
             }
-            if let word = capture(in: line, pattern: #"^\s*(?:\*\*)?STATUS:(?:\*\*)?\s*([A-Z]+)"#) {
-                status = word.uppercased()
-            }
         }
+        let lastLine = lines.last { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let status = lastLine
+            .flatMap { capture(in: $0, pattern: #"^\s*(?:\*\*)?STATUS:(?:\*\*)?\s*([A-Z]+)"#) }
+            .map { $0.uppercased() }
 
         guard total > 0 || status != nil else { return nil }
         return PlanProgress(done: done, total: total, status: status)
