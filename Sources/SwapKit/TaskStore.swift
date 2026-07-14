@@ -36,11 +36,20 @@ public actor TaskStore {
         data.tasks.first { $0.id == id }
     }
 
+    public func archived() -> [AutomationTask] {
+        data.tasks
+            .filter { $0.archivedAt != nil }
+            .sorted {
+                if $0.archivedAt != $1.archivedAt { return ($0.archivedAt ?? .distantPast) > ($1.archivedAt ?? .distantPast) }
+                return isOrderedBefore($0, $1)
+            }
+    }
+
     public func add(_ task: AutomationTask) {
         guard !data.tasks.contains(where: { $0.id == task.id }) else { return }
         compact(task.column)
         var task = task
-        task.orderIndex = data.tasks.filter { $0.column == task.column }.count
+        task.orderIndex = orderedTaskIDs(in: task.column).count
         data.tasks.append(task)
         persist()
     }
@@ -62,6 +71,49 @@ public actor TaskStore {
         persist()
     }
 
+    public func archive(id: UUID, at date: Date = Date()) {
+        guard let index = data.tasks.firstIndex(where: { $0.id == id && $0.archivedAt == nil }) else { return }
+        let column = data.tasks[index].column
+        data.tasks[index].archivedAt = date
+        data.tasks[index].updatedAt = date
+        compact(column)
+        persist()
+    }
+
+    public func restore(id: UUID, at date: Date = Date()) {
+        guard let index = data.tasks.firstIndex(where: { $0.id == id && $0.archivedAt != nil }) else { return }
+        let column = data.tasks[index].column
+        data.tasks[index].archivedAt = nil
+        data.tasks[index].updatedAt = date
+        data.tasks[index].orderIndex = orderedTaskIDs(in: column, excluding: id).count
+        compact(column)
+        persist()
+    }
+
+    @discardableResult
+    public func archiveAllDone(at date: Date = Date()) -> Int {
+        let ids = data.tasks.filter { $0.column == .done && $0.archivedAt == nil }.map(\.id)
+        guard !ids.isEmpty else { return 0 }
+        let idSet = Set(ids)
+        for index in data.tasks.indices where idSet.contains(data.tasks[index].id) {
+            data.tasks[index].archivedAt = date
+            data.tasks[index].updatedAt = date
+        }
+        compact(.done)
+        persist()
+        return ids.count
+    }
+
+    @discardableResult
+    public func duplicate(id: UUID, at date: Date = Date()) -> AutomationTask? {
+        guard let source = data.tasks.first(where: { $0.id == id }) else { return nil }
+        var duplicate = source.duplicate(at: date)
+        duplicate.orderIndex = orderedTaskIDs(in: .todo).count
+        data.tasks.append(duplicate)
+        persist()
+        return duplicate
+    }
+
     public func move(id: UUID, to column: TaskColumn, index: Int) {
         guard let taskIndex = data.tasks.firstIndex(where: { $0.id == id }) else { return }
         let sourceColumn = data.tasks[taskIndex].column
@@ -78,7 +130,7 @@ public actor TaskStore {
 
     public func tasks(in column: TaskColumn) -> [AutomationTask] {
         data.tasks
-            .filter { $0.column == column }
+            .filter { $0.column == column && $0.archivedAt == nil }
             .sorted(by: isOrderedBefore)
     }
 
@@ -97,7 +149,7 @@ public actor TaskStore {
 
     private func orderedTaskIDs(in column: TaskColumn, excluding excludedID: UUID? = nil) -> [UUID] {
         data.tasks
-            .filter { $0.column == column && $0.id != excludedID }
+            .filter { $0.column == column && $0.archivedAt == nil && $0.id != excludedID }
             .sorted(by: isOrderedBefore)
             .map(\.id)
     }

@@ -28,6 +28,9 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
     public var planDone: Int?
     public var planTotal: Int?
     public var servedAliases: [String]
+    public var baseSHA: String?
+    public var headSHA: String?
+    public var actualBranch: String?
 
     public init(
         id: UUID = UUID(),
@@ -38,7 +41,10 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         logFileName: String = "",
         planDone: Int? = nil,
         planTotal: Int? = nil,
-        servedAliases: [String] = []
+        servedAliases: [String] = [],
+        baseSHA: String? = nil,
+        headSHA: String? = nil,
+        actualBranch: String? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -49,6 +55,9 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         self.planDone = planDone
         self.planTotal = planTotal
         self.servedAliases = servedAliases
+        self.baseSHA = baseSHA
+        self.headSHA = headSHA
+        self.actualBranch = actualBranch
     }
 
     public init(from decoder: Decoder) throws {
@@ -62,6 +71,9 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         planDone = try c.decodeIfPresent(Int.self, forKey: .planDone)
         planTotal = try c.decodeIfPresent(Int.self, forKey: .planTotal)
         servedAliases = try c.decodeIfPresent([String].self, forKey: .servedAliases) ?? []
+        baseSHA = (try? c.decodeIfPresent(String.self, forKey: .baseSHA)) ?? nil
+        headSHA = (try? c.decodeIfPresent(String.self, forKey: .headSHA)) ?? nil
+        actualBranch = (try? c.decodeIfPresent(String.self, forKey: .actualBranch)) ?? nil
     }
 }
 
@@ -108,6 +120,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var retryAttempts: Int
     public var nextRetryAt: Date?
     public var stagnationRecoveries: Int
+    public var archivedAt: Date?
 
     public init(
         id: UUID = UUID(),
@@ -130,7 +143,8 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         planProgress: PlanProgress? = nil,
         retryAttempts: Int = 0,
         nextRetryAt: Date? = nil,
-        stagnationRecoveries: Int = 0
+        stagnationRecoveries: Int = 0,
+        archivedAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -153,6 +167,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.retryAttempts = retryAttempts
         self.nextRetryAt = nextRetryAt
         self.stagnationRecoveries = stagnationRecoveries
+        self.archivedAt = archivedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -179,6 +194,7 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         retryAttempts = try c.decodeIfPresent(Int.self, forKey: .retryAttempts) ?? 0
         nextRetryAt = try c.decodeIfPresent(Date.self, forKey: .nextRetryAt)
         stagnationRecoveries = try c.decodeIfPresent(Int.self, forKey: .stagnationRecoveries) ?? 0
+        archivedAt = (try? c.decodeIfPresent(Date.self, forKey: .archivedAt)) ?? nil
     }
 
     public var planRelativePath: String {
@@ -189,6 +205,24 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         supportDir
             .appendingPathComponent("tasks", isDirectory: true)
             .appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    public func duplicate(at date: Date = Date()) -> AutomationTask {
+        AutomationTask(
+            title: "\(title) Copy",
+            prompt: prompt,
+            repoPath: repoPath,
+            branch: branch,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            allowNetwork: allowNetwork,
+            isEvergreen: isEvergreen,
+            accountAliases: accountAliases,
+            column: .todo,
+            phase: .idle,
+            createdAt: date,
+            updatedAt: date
+        )
     }
 
     private var slug: String {

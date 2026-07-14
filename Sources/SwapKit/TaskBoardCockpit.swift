@@ -2,6 +2,7 @@ import Foundation
 
 public enum TaskBoardFilter {
     public static func includes(_ task: AutomationTask, query: String, needsAttention: Bool) -> Bool {
+        guard task.archivedAt == nil else { return false }
         if needsAttention, ![.failed, .pausedQuota, .retryWaiting].contains(task.phase) {
             return false
         }
@@ -10,6 +11,44 @@ public enum TaskBoardFilter {
         return [task.title, task.prompt, task.repoPath].contains {
             $0.localizedCaseInsensitiveContains(needle)
         }
+    }
+}
+
+public enum TaskDropPlacement: Sendable, Equatable {
+    case before
+    case after
+}
+
+public enum TaskReorder {
+    public static func destinationIndex(
+        sourceIndex: Int,
+        targetIndex: Int,
+        placement: TaskDropPlacement,
+        itemCount: Int
+    ) -> Int {
+        guard itemCount > 1 else { return 0 }
+        let source = max(0, min(sourceIndex, itemCount - 1))
+        let target = max(0, min(targetIndex, itemCount - 1))
+        var boundary = target + (placement == .after ? 1 : 0)
+        if source < boundary { boundary -= 1 }
+        return max(0, min(boundary, itemCount - 1))
+    }
+}
+
+public enum TaskLaneDropDecision: Sendable, Equatable {
+    case move
+    case runNow
+    case reject(reason: String)
+}
+
+public enum TaskLaneDropPolicy {
+    public static func decision(for task: AutomationTask, into column: TaskColumn) -> TaskLaneDropDecision {
+        if task.column == column { return .move }
+        if column == .inProgress { return .runNow }
+        if column == .done, task.phase != .completed {
+            return .reject(reason: "Only completed tasks can move to Done")
+        }
+        return .move
     }
 }
 
@@ -97,6 +136,7 @@ public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
     public let planTotal: Int?
     public let logFileName: String
     public let telemetrySummary: String?
+    public let servedAliases: [String]
 
     public var planSummary: String? {
         guard let planDone, let planTotal else { return nil }
@@ -116,7 +156,8 @@ public struct TaskRunTimelineRow: Sendable, Equatable, Identifiable {
                 planDone: run.planDone,
                 planTotal: run.planTotal,
                 logFileName: run.logFileName,
-                telemetrySummary: TaskRunSummaryExtractor.summary(from: run)
+                telemetrySummary: TaskRunSummaryExtractor.summary(from: run),
+                servedAliases: run.servedAliases
             )
         }
     }

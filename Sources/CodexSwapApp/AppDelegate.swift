@@ -5,6 +5,16 @@ import SwapKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private enum TaskNotification {
+        static let taskIDKey = "taskID"
+        static let failureCategory = "TASK_FAILURE"
+        static let quotaCategory = "TASK_QUOTA_PAUSE"
+        static let completionCategory = "TASK_COMPLETION"
+        static let openLogAction = "OPEN_TASK_LOG"
+        static let retryAction = "RETRY_TASK"
+        static let openBoardAction = "OPEN_TASK_BOARD"
+    }
+
     private let engine = AppEngine(settingsStore: SettingsStoreBridge.shared)
     private var hasBundle: Bool { Bundle.main.bundleIdentifier != nil }
     private var statusItem: NSStatusItem!
@@ -37,7 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
 
         if hasBundle {
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            let notificationCenter = UNUserNotificationCenter.current()
+            notificationCenter.delegate = self
+            registerTaskNotificationCategories(on: notificationCenter)
+            notificationCenter.requestAuthorization(options: [.alert, .sound]) { granted, _ in
                 if !granted {
                     FileHandle.standardError.write("[notify] notifications denied; menu-bar alerts will not be shown\n".data(using: .utf8)!)
                 }
@@ -93,22 +106,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if settings.notifyOnWindowReset {
                 notify(title: "Quota reset", body: "\(alias) is back in rotation.")
             }
-        case let .taskStarted(title, account):
+        case let .taskStarted(id, title, account):
             if settings.notifyOnTaskEvents {
                 let body = account.map { "\(title) · \($0)" } ?? title
-                notify(title: "Task started", body: body)
+                notify(title: "Task started", body: body, taskID: id)
             }
-        case let .taskCompleted(title):
+        case let .taskCompleted(id, title):
             if settings.notifyOnTaskEvents {
-                notify(title: "Task completed", body: title)
+                notify(
+                    title: "Task completed",
+                    body: title,
+                    category: TaskNotification.completionCategory,
+                    taskID: id
+                )
             }
-        case let .taskPausedQuota(title):
+        case let .taskPausedQuota(id, title):
             if settings.notifyOnTaskEvents {
-                notify(title: "Task waiting for quota", body: title)
+                notify(
+                    title: "Task waiting for quota",
+                    body: title,
+                    category: TaskNotification.quotaCategory,
+                    taskID: id
+                )
             }
-        case let .taskFailed(title, _):
+        case let .taskFailed(id, title, _):
             if settings.notifyOnTaskEvents {
-                notify(title: "Task failed", body: title)
+                notify(
+                    title: "Task failed",
+                    body: title,
+                    category: TaskNotification.failureCategory,
+                    taskID: id
+                )
             }
         case .refreshed, .snapshotChanged:
             break
@@ -149,39 +177,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         active.isEnabled = false
         menu.addItem(active)
 
-        if !latest.tasks.isEmpty {
-            let queuedCount = latest.tasks.filter { $0.column == .queued }.count
+        let activeTasks = latest.tasks.filter { $0.archivedAt == nil }
+        if !activeTasks.isEmpty {
+            let runningTasks = activeTasks.filter { latest.runningTaskIDs.contains($0.id) }
+            let waitingTasks = activeTasks.filter {
+                ($0.column == .queued && $0.phase == .idle)
+                    || ($0.column == .inProgress && ($0.phase == .pausedQuota || $0.phase == .retryWaiting))
+            }
+            let failedCount = activeTasks.filter { $0.phase == .failed }.count
             let taskStatus = NSMenuItem(
-                title: "Tasks: \(latest.runningTaskIDs.count) running · \(queuedCount) queued",
+                title: "Tasks: \(runningTasks.count) running",
                 action: nil,
                 keyEquivalent: ""
             )
             taskStatus.isEnabled = false
             menu.addItem(taskStatus)
 
-            for task in latest.tasks
-                .filter({ latest.runningTaskIDs.contains($0.id) })
+            for task in runningTasks
                 .sorted(by: { $0.title.localizedStandardCompare($1.title) == .orderedAscending }) {
                 let runningTask = NSMenuItem(title: runningTaskMenuTitle(task), action: nil, keyEquivalent: "")
                 runningTask.isEnabled = false
                 menu.addItem(runningTask)
             }
 
-            if let resetAt = TaskBoardMenuStatus.nextQuotaReset(
-                tasks: latest.tasks,
+            let resetAt = TaskBoardMenuStatus.nextQuotaReset(
+                tasks: activeTasks,
                 schedulingReasons: latest.schedulingReasons,
                 accounts: latest.accounts,
                 globalAliases: settings.automationAccounts,
                 now: Date()
-            ) {
-                let reset = NSMenuItem(
-                    title: "Next reset in \(Self.countdown(to: resetAt))",
+            )
+            if !waitingTasks.isEmpty {
+                let waitingTitle = resetAt.map {
+                    "Waiting: \(waitingTasks.count) · next reset in \(Self.countdown(to: $0))"
+                } ?? "Waiting: \(waitingTasks.count)"
+                let waiting = NSMenuItem(
+                    title: waitingTitle,
                     action: nil,
                     keyEquivalent: ""
                 )
-                reset.isEnabled = false
-                menu.addItem(reset)
+                waiting.isEnabled = false
+                menu.addItem(waiting)
             }
+            let failed = NSMenuItem(title: "Failed: \(failedCount)", action: nil, keyEquivalent: "")
+            failed.isEnabled = false
+            menu.addItem(failed)
         }
 
         menu.addItem(.separator())
@@ -292,6 +332,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 Task { await self.engine.removeTask(id: id); await self.refreshSnapshot() }
             },
+            archiveTask: { [weak self] id in
+                guard let self else { return }
+                Task { await self.engine.archiveTask(id: id); await self.refreshSnapshot() }
+            },
+            archiveAllDone: { [weak self] in
+                guard let self else { return }
+                Task { await self.engine.archiveAllDone(); await self.refreshSnapshot() }
+            },
+            restoreTask: { [weak self] id in
+                guard let self else { return }
+                Task { await self.engine.restoreTask(id: id); await self.refreshSnapshot() }
+            },
+            duplicateTask: { [weak self] id in
+                guard let self else { return }
+                Task { await self.engine.duplicateTask(id: id); await self.refreshSnapshot() }
+            },
             moveTask: { [weak self] id, column, index in
                 guard let self else { return }
                 Task { await self.engine.moveTask(id: id, to: column, index: index); await self.refreshSnapshot() }
@@ -299,6 +355,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runNow: { [weak self] id in
                 guard let self else { return .blocked(reason: "Task board closed") }
                 let result = await self.engine.runTaskNow(id: id)
+                await self.refreshSnapshot()
+                return result
+            },
+            runNowAt: { [weak self] id, index in
+                guard let self else { return .blocked(reason: "Task board closed") }
+                let result = await self.engine.runTaskNow(id: id, inProgressIndex: index)
                 await self.refreshSnapshot()
                 return result
             },
@@ -361,6 +423,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             taskBoardWindowController = TaskBoardWindowController(viewModel: taskBoardViewModel)
         }
         taskBoardWindowController?.show()
+    }
+
+    private func focusTaskBoard(taskID: UUID) {
+        taskBoardViewModel.focusTask(taskID)
+        showTaskBoard()
+    }
+
+    private func handleTaskNotification(action: String, taskID: UUID) {
+        focusTaskBoard(taskID: taskID)
+        switch action {
+        case TaskNotification.openLogAction:
+            openLatestRunLog(taskID: taskID)
+        case TaskNotification.retryAction:
+            Task { @MainActor in
+                let result = await engine.runTaskNow(id: taskID)
+                taskBoardViewModel.showMessage(result.feedback)
+                await refreshSnapshot()
+            }
+        default:
+            break
+        }
     }
 
     @objc private func showSettings() {
@@ -629,7 +712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Helpers
 
-    private func notify(title: String, body: String) {
+    private func notify(title: String, body: String, category: String? = nil, taskID: UUID? = nil) {
         guard hasBundle else {
             FileHandle.standardError.write("[notify] \(title): \(body)\n".data(using: .utf8)!)
             return
@@ -637,8 +720,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        if let category { content.categoryIdentifier = category }
+        if let taskID { content.userInfo[TaskNotification.taskIDKey] = taskID.uuidString }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
+    }
+
+    private func registerTaskNotificationCategories(on center: UNUserNotificationCenter) {
+        let openLog = UNNotificationAction(
+            identifier: TaskNotification.openLogAction,
+            title: "Open Log",
+            options: [.foreground]
+        )
+        let retry = UNNotificationAction(
+            identifier: TaskNotification.retryAction,
+            title: "Retry",
+            options: [.foreground]
+        )
+        let openBoard = UNNotificationAction(
+            identifier: TaskNotification.openBoardAction,
+            title: "Open Board",
+            options: [.foreground]
+        )
+        center.setNotificationCategories([
+            UNNotificationCategory(
+                identifier: TaskNotification.failureCategory,
+                actions: [openLog, retry],
+                intentIdentifiers: []
+            ),
+            UNNotificationCategory(
+                identifier: TaskNotification.quotaCategory,
+                actions: [openBoard],
+                intentIdentifiers: []
+            ),
+            UNNotificationCategory(
+                identifier: TaskNotification.completionCategory,
+                actions: [openBoard],
+                intentIdentifiers: []
+            ),
+        ])
     }
 
     private func runAppleScript(_ source: String) -> Bool {
@@ -687,6 +807,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         Task { @MainActor in await refreshSnapshot() }
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        guard response.actionIdentifier != UNNotificationDismissActionIdentifier,
+              let rawTaskID = response.notification.request.content.userInfo[TaskNotification.taskIDKey] as? String,
+              let taskID = UUID(uuidString: rawTaskID) else { return }
+        await handleTaskNotification(action: response.actionIdentifier, taskID: taskID)
     }
 }
 
