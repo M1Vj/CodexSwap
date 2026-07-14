@@ -16,6 +16,9 @@ struct TaskBoardInspectorView: View {
     @State private var followsLog = true
     @State private var loadedTaskID: UUID?
     @State private var loadedRunCount = 0
+    @State private var changeSummaries: [UUID: GitChangeSummary] = [:]
+    @State private var loadingChangeRunIDs: Set<UUID> = []
+    @State private var failedChangeRunIDs: Set<UUID> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -33,6 +36,7 @@ struct TaskBoardInspectorView: View {
             await loadTask()
         }
         .task(id: selectedLogURL) { await pollSelectedLog() }
+        .task(id: changesLoadKey) { await loadSelectedChanges() }
     }
 
     private var inspectorHeader: some View {
@@ -59,6 +63,7 @@ struct TaskBoardInspectorView: View {
                 .disabled(selectedLogURL == nil)
             inspectorTabButton(.runs, title: "Runs", symbol: "clock.arrow.circlepath")
             inspectorTabButton(.plan, title: "Plan", symbol: "checklist")
+            inspectorTabButton(.changes, title: "Changes", symbol: "arrow.triangle.branch")
         }
         .controlSize(.small)
     }
@@ -83,6 +88,8 @@ struct TaskBoardInspectorView: View {
             runsTab
         case .plan:
             planTab
+        case .changes:
+            changesTab
         }
     }
 
@@ -131,6 +138,7 @@ struct TaskBoardInspectorView: View {
                     .textSelection(.enabled)
                     .lineLimit(5)
             }
+            aliasChips(row.servedAliases)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -160,6 +168,7 @@ struct TaskBoardInspectorView: View {
                                     Text(runDetail(row))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                    aliasChips(row.servedAliases)
                                     if expiredRuns.contains(row.runNumber) {
                                         Label("Log expired", systemImage: "doc.badge.clock")
                                             .font(.caption)
@@ -234,6 +243,112 @@ struct TaskBoardInspectorView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    @ViewBuilder
+    private var changesTab: some View {
+        if let run = selectedRunRecord {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let actualBranch = run.actualBranch,
+                       !actualBranch.isEmpty,
+                       actualBranch != task.branch {
+                        Label(
+                            "Run exited on \(actualBranch), expected \(task.branch)",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.orange)
+                    }
+
+                    if run.baseSHA == nil || run.headSHA == nil {
+                        ContentUnavailableView(
+                            "No Captured Changes",
+                            systemImage: "arrow.triangle.branch",
+                            description: Text("This run predates Git capture or the repository was unavailable.")
+                        )
+                    } else if loadingChangeRunIDs.contains(run.id) {
+                        HStack {
+                            ProgressView()
+                            Text("Loading commits and diff summary…")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    } else if let summary = changeSummaries[run.id] {
+                        changesSummary(summary, run: run)
+                    } else if failedChangeRunIDs.contains(run.id) {
+                        ContentUnavailableView(
+                            "Changes Unavailable",
+                            systemImage: "exclamationmark.triangle",
+                            description: Text("The captured revisions could not be read from this repository.")
+                        )
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else {
+            ContentUnavailableView("No Run Selected", systemImage: "arrow.triangle.branch")
+        }
+    }
+
+    private func changesSummary(_ summary: GitChangeSummary, run: TaskRunRecord) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text("\(summary.filesChanged) file\(summary.filesChanged == 1 ? "" : "s")")
+                Text("+\(summary.insertions)")
+                    .foregroundStyle(.green)
+                Text("−\(summary.deletions)")
+                    .foregroundStyle(.red)
+            }
+            .font(.callout.weight(.semibold))
+
+            if let baseSHA = run.baseSHA, let headSHA = run.headSHA {
+                Text("\(String(baseSHA.prefix(8))) → \(String(headSHA.prefix(8)))")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            Divider()
+
+            if summary.commits.isEmpty {
+                Text("No commits were created during this run.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(summary.commits) { commit in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(String(commit.sha.prefix(8)))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text(commit.subject)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .textSelection(.enabled)
+                }
+                if summary.isTruncated {
+                    Label("Commit list capped at 50", systemImage: "ellipsis")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func aliasChips(_ aliases: [String]) -> some View {
+        if !aliases.isEmpty {
+            HStack(spacing: 5) {
+                ForEach(aliases, id: \.self) { alias in
+                    Text(alias)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: Capsule())
+                        .accessibilityLabel("Served by \(alias)")
+                }
+            }
+        }
+    }
+
     private var timelineRows: [TaskRunTimelineRow] {
         TaskRunTimelineRow.rows(for: task)
     }
@@ -244,6 +359,15 @@ struct TaskBoardInspectorView: View {
 
     private var selectedLogURL: URL? {
         selectedRunNumber.flatMap { runURLs[$0] }
+    }
+
+    private var selectedRunRecord: TaskRunRecord? {
+        guard let selectedRunNumber, task.runs.indices.contains(selectedRunNumber - 1) else { return nil }
+        return task.runs[selectedRunNumber - 1]
+    }
+
+    private var changesLoadKey: ChangesLoadKey {
+        ChangesLoadKey(tab: tab, runID: selectedRunRecord?.id, updatedAt: task.updatedAt)
     }
 
     private func loadTask() async {
@@ -296,6 +420,27 @@ struct TaskBoardInspectorView: View {
         if runURLs[runNumber] != nil { tab = .log }
     }
 
+    private func loadSelectedChanges() async {
+        guard tab == .changes,
+              let run = selectedRunRecord,
+              changeSummaries[run.id] == nil,
+              !failedChangeRunIDs.contains(run.id),
+              let baseSHA = run.baseSHA,
+              let headSHA = run.headSHA else { return }
+        loadingChangeRunIDs.insert(run.id)
+        defer { loadingChangeRunIDs.remove(run.id) }
+        if let summary = await GitProbe.changes(
+            at: task.repoPath,
+            baseSHA: baseSHA,
+            headSHA: headSHA,
+            commitLimit: 50
+        ) {
+            changeSummaries[run.id] = summary
+        } else {
+            failedChangeRunIDs.insert(run.id)
+        }
+    }
+
     private func runDetail(_ row: TaskRunTimelineRow) -> String {
         var parts = [row.outcome.isEmpty ? "running" : row.outcome]
         if let exitCode = row.exitCode { parts.append("exit \(exitCode)") }
@@ -343,6 +488,13 @@ private enum InspectorTab: String {
     case log
     case runs
     case plan
+    case changes
+}
+
+private struct ChangesLoadKey: Hashable {
+    let tab: InspectorTab
+    let runID: UUID?
+    let updatedAt: Date
 }
 
 private struct InspectorLoadKey: Hashable {

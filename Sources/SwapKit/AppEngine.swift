@@ -14,10 +14,10 @@ public enum AppEvent: Sendable {
     case needsLogin(alias: String)
     case windowReset(alias: String)
     case refreshed(alias: String)
-    case taskStarted(title: String, account: String?)
-    case taskCompleted(title: String)
-    case taskPausedQuota(title: String)
-    case taskFailed(title: String, reason: String)
+    case taskStarted(id: UUID, title: String, account: String?)
+    case taskCompleted(id: UUID, title: String)
+    case taskPausedQuota(id: UUID, title: String)
+    case taskFailed(id: UUID, title: String, reason: String)
     case snapshotChanged
 }
 
@@ -208,9 +208,15 @@ public actor AppEngine {
         let reconciled = Self.interruptedTasks(in: storedTasks, running: runningIDs)
         var recoveredCount = 0
         for (before, after) in zip(storedTasks, reconciled) where before != after {
-            await taskStore.update(after)
+            var recovered = after
+            let gitState = await GitProbe.repositoryState(at: recovered.repoPath)
+            if let runIndex = recovered.runs.indices.last {
+                recovered.runs[runIndex].headSHA = gitState?.headSHA
+                recovered.runs[runIndex].actualBranch = gitState?.branch
+            }
+            await taskStore.update(recovered)
             recoveredCount += 1
-            await autoLog.write("lifecycle", "recovered interrupted task \(Self.taskLabel(after))")
+            await autoLog.write("lifecycle", "recovered interrupted task \(Self.taskLabel(recovered))")
         }
         await autoLog.write("lifecycle", "engine start reconciled \(recoveredCount) interrupted task(s)")
         startPoller()
@@ -223,13 +229,27 @@ public actor AppEngine {
         pollerTask = nil
         let runningIDs = await taskRunner.runningIDs()
         interruptingTaskIDs.formUnion(runningIDs)
-        let now = Date()
-        var pausedCount = 0
         for taskID in runningIDs {
             await taskRunner.stop(taskID: taskID)
+        }
+        for _ in 0..<30 {
+            let remaining = Set(await taskRunner.runningIDs()).intersection(runningIDs)
+            if remaining.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let stillRunning = Set(await taskRunner.runningIDs()).intersection(runningIDs)
+        var pausedCount = 0
+        for taskID in runningIDs {
             if let task = await taskStore.task(id: taskID),
-               let interrupted = Self.interruptedTasks(in: [task], running: [], now: now).first,
+               var interrupted = Self.interruptedTasks(in: [task], running: [], now: Date()).first,
                interrupted != task {
+                if !stillRunning.contains(taskID) {
+                    let gitState = await GitProbe.repositoryState(at: interrupted.repoPath)
+                    if let runIndex = interrupted.runs.indices.last {
+                        interrupted.runs[runIndex].headSHA = gitState?.headSHA
+                        interrupted.runs[runIndex].actualBranch = gitState?.branch
+                    }
+                }
                 await taskStore.update(interrupted)
                 pausedCount += 1
                 await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
@@ -374,6 +394,29 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
+    public func archiveTask(id: UUID) async {
+        guard let task = await taskStore.task(id: id),
+              task.column == .done || task.phase == .failed else { return }
+        await taskStore.archive(id: id)
+        schedulingReasons.removeValue(forKey: id.uuidString)
+        emit(.snapshotChanged)
+    }
+
+    public func archiveAllDone() async {
+        _ = await taskStore.archiveAllDone()
+        emit(.snapshotChanged)
+    }
+
+    public func restoreTask(id: UUID) async {
+        await taskStore.restore(id: id)
+        emit(.snapshotChanged)
+    }
+
+    public func duplicateTask(id: UUID) async {
+        _ = await taskStore.duplicate(id: id)
+        emit(.snapshotChanged)
+    }
+
     public func moveTask(id: UUID, to column: TaskColumn, index: Int) async {
         if let task = await taskStore.task(id: id) {
             await autoLog.write("api", "moveTask \(Self.taskLabel(task)) to \(column.rawValue)")
@@ -401,7 +444,14 @@ public actor AppEngine {
     }
 
     public func runTaskNow(id: UUID) async -> TaskRunNowResult {
+        await runTaskNow(id: id, inProgressIndex: nil)
+    }
+
+    public func runTaskNow(id: UUID, inProgressIndex: Int?) async -> TaskRunNowResult {
         guard let task = await taskStore.task(id: id) else { return .blocked(reason: "Task not found") }
+        guard task.archivedAt == nil else {
+            return .blocked(reason: "Archived tasks must be restored before running")
+        }
         await autoLog.write("api", "runTaskNow \(Self.taskLabel(task))")
         let runningIDs = await taskRunner.runningIDs()
         guard !runningIDs.contains(id), !schedulingTaskIDs.contains(id) else {
@@ -440,7 +490,8 @@ public actor AppEngine {
                 account: account,
                 settings: settings,
                 proxyURL: proxyURL,
-                reservationHeld: true
+                reservationHeld: true,
+                preferredInProgressIndex: inProgressIndex
             ) {
             case .started:
                 schedulingTaskIDs.remove(id)
@@ -718,8 +769,9 @@ public actor AppEngine {
         let storedTasks = await taskStore.all()
         let now = Date()
         let reasonTasks = storedTasks.filter {
-            ($0.column == .queued && $0.phase == .idle)
+            $0.archivedAt == nil && (($0.column == .queued && $0.phase == .idle)
                 || ($0.column == .inProgress && ($0.phase == .pausedQuota || $0.phase == .retryWaiting))
+            )
         }
         schedulingReasons = Dictionary(uniqueKeysWithValues: reasonTasks.compactMap { task in
             guard task.phase == .retryWaiting, let retryAt = task.nextRetryAt, retryAt > now else { return nil }
@@ -895,11 +947,12 @@ public actor AppEngine {
             }
         }
         let inProgress = ordered(tasks.filter {
+            guard $0.archivedAt == nil else { return false }
             guard $0.column == .inProgress else { return false }
             if $0.phase == .pausedQuota { return true }
             return $0.phase == .retryWaiting && $0.nextRetryAt.map { $0 <= now } == true
         })
-        let queued = ordered(tasks.filter { $0.column == .queued && $0.phase == .idle })
+        let queued = ordered(tasks.filter { $0.archivedAt == nil && $0.column == .queued && $0.phase == .idle })
         return (inProgress + queued).filter {
             !runningIDs.contains($0.id) && !schedulingIDs.contains($0.id)
         }
@@ -993,7 +1046,8 @@ public actor AppEngine {
         account: Account,
         settings: Settings,
         proxyURL: URL,
-        reservationHeld: Bool = false
+        reservationHeld: Bool = false,
+        preferredInProgressIndex: Int? = nil
     ) async -> TaskStartResult {
         let ownsReservation: Bool
         if reservationHeld {
@@ -1025,6 +1079,7 @@ public actor AppEngine {
         let startGate = TaskStartGate()
         let runID = UUID()
         let now = Date()
+        let gitState = await GitProbe.repositoryState(at: task.repoPath)
         let runNumber = task.runs.count + 1
         var started = task
         if task.column != .inProgress {
@@ -1039,9 +1094,13 @@ public actor AppEngine {
             id: runID,
             startedAt: now,
             outcome: "",
-            logFileName: "run-\(runNumber).log"
+            logFileName: "run-\(runNumber).log",
+            baseSHA: gitState?.headSHA
         ))
         await taskStore.update(started)
+        if let preferredInProgressIndex, task.column != .inProgress {
+            await taskStore.move(id: task.id, to: .inProgress, index: preferredInProgressIndex)
+        }
 
         do {
             try await taskRunner.start(
@@ -1070,7 +1129,7 @@ public actor AppEngine {
             "tick",
             "started task \(Self.taskLabel(started)) on alias \(Self.oneLine(account.alias)) (run \(runNumber))"
         )
-        emit(.taskStarted(title: task.title, account: account.alias))
+        emit(.taskStarted(id: task.id, title: task.title, account: account.alias))
         emit(.snapshotChanged)
         await startGate.release()
         return .started
@@ -1079,6 +1138,7 @@ public actor AppEngine {
     private func handleTaskLaunchError(taskID: UUID, error: any Error) async {
         guard var task = await taskStore.task(id: taskID) else { return }
         let now = Date()
+        let gitState = await GitProbe.repositoryState(at: task.repoPath)
         let transition = TaskOutcomeReducer.reduce(TaskExitContext(
             exitCode: 1,
             stderrTail: error.localizedDescription,
@@ -1105,16 +1165,18 @@ public actor AppEngine {
             task.runs[runIndex].finishedAt = now
             task.runs[runIndex].exitCode = 1
             task.runs[runIndex].outcome = transition.outcome
+            task.runs[runIndex].headSHA = gitState?.headSHA
+            task.runs[runIndex].actualBranch = gitState?.branch
         }
         task.updatedAt = now
         await taskStore.update(task)
         switch transition.terminalEvent {
         case .completed:
-            emit(.taskCompleted(title: task.title))
+            emit(.taskCompleted(id: task.id, title: task.title))
         case .pausedQuota:
-            emit(.taskPausedQuota(title: task.title))
+            emit(.taskPausedQuota(id: task.id, title: task.title))
         case .failed:
-            emit(.taskFailed(title: task.title, reason: transition.lastError ?? error.localizedDescription))
+            emit(.taskFailed(id: task.id, title: task.title, reason: transition.lastError ?? error.localizedDescription))
         case nil:
             break
         }
@@ -1140,6 +1202,7 @@ public actor AppEngine {
             return
         }
         let now = Date()
+        let gitState = await GitProbe.repositoryState(at: task.repoPath)
         let planURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             .appendingPathComponent(task.planRelativePath)
         let planText = try? String(contentsOf: planURL, encoding: .utf8)
@@ -1181,6 +1244,8 @@ public actor AppEngine {
             task.runs[runIndex].outcome = transition.outcome
             task.runs[runIndex].planDone = progress?.done
             task.runs[runIndex].planTotal = progress?.total
+            task.runs[runIndex].headSHA = gitState?.headSHA
+            task.runs[runIndex].actualBranch = gitState?.branch
         }
         task.updatedAt = now
         await taskStore.update(task)
@@ -1206,11 +1271,11 @@ public actor AppEngine {
         )
         switch transition.terminalEvent {
         case .completed:
-            emit(.taskCompleted(title: task.title))
+            emit(.taskCompleted(id: task.id, title: task.title))
         case .pausedQuota:
-            emit(.taskPausedQuota(title: task.title))
+            emit(.taskPausedQuota(id: task.id, title: task.title))
         case .failed:
-            emit(.taskFailed(title: task.title, reason: transition.lastError ?? exit.stderrTail))
+            emit(.taskFailed(id: task.id, title: task.title, reason: transition.lastError ?? exit.stderrTail))
         case nil:
             break
         }

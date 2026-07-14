@@ -6,10 +6,11 @@ struct TaskBoardView: View {
     @ObservedObject var model: TaskBoardViewModel
     @State private var editor: TaskEditorPresentation?
     @State private var taskToDelete: AutomationTask?
-    @State private var selectedTaskID: UUID?
+    @State private var showsArchivedTasks = false
     @State private var searchText = ""
     @State private var needsAttention = false
     @State private var actionFeedback: [UUID: String] = [:]
+    @State private var laneRejectionCounts: [TaskColumn: Int] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,22 +26,28 @@ struct TaskBoardView: View {
                         TaskColumnView(
                             column: column,
                             tasks: tasks(in: column),
+                            allTasks: orderedActiveTasks(in: column),
                             totalCount: totalCount(in: column),
                             runningTaskIDs: model.runningTaskIDs,
-                            selectedTaskID: selectedTaskID,
+                            selectedTaskID: model.selectedTaskID,
                             schedulingReasons: model.schedulingReasons,
                             actionFeedback: actionFeedback,
                             accounts: model.accounts,
                             settings: model.settings,
+                            shakeTrigger: laneRejectionCounts[column, default: 0],
+                            handleDrop: handleDrop,
                             moveTask: model.actions.moveTask,
                             runNow: model.actions.runNow,
+                            archiveAllDone: model.actions.archiveAllDone,
                             requeueTask: model.actions.requeueTask,
                             stopTask: model.actions.stopTask,
                             exportPrompt: model.actions.exportPrompt,
                             openRunLog: model.actions.openRunLog,
                             showActionFeedback: showActionFeedback,
-                            selectTask: { selectedTaskID = $0 },
+                            selectTask: { model.selectedTaskID = $0 },
                             editTask: { showEditor(for: $0) },
+                            archiveTask: model.actions.archiveTask,
+                            duplicateTask: model.actions.duplicateTask,
                             deleteTask: { taskToDelete = $0 }
                         )
                     }
@@ -67,6 +74,13 @@ struct TaskBoardView: View {
                     model.actions.updateTask(task)
                 }
             }
+        }
+        .sheet(isPresented: $showsArchivedTasks) {
+            ArchivedTasksView(
+                tasks: archivedTasks,
+                restoreTask: model.actions.restoreTask,
+                deleteTask: { taskToDelete = $0 }
+            )
         }
         .alert("CodexSwap", isPresented: messageIsPresented) {
             Button("OK") { model.message = nil }
@@ -121,6 +135,10 @@ struct TaskBoardView: View {
                 .toggleStyle(.button)
                 .controlSize(.small)
 
+            Button("Archived", systemImage: "archivebox") { showsArchivedTasks = true }
+                .controlSize(.small)
+                .accessibilityLabel("Show \(archivedTasks.count) archived tasks")
+
             Button("Logs", systemImage: "doc.text.magnifyingglass", action: model.actions.openAutomationLog)
                 .controlSize(.small)
                 .accessibilityLabel("Open automation log")
@@ -166,7 +184,7 @@ struct TaskBoardView: View {
     }
 
     private var queuedCount: Int {
-        model.tasks.filter { $0.column == .queued }.count
+        model.tasks.filter { $0.archivedAt == nil && $0.column == .queued }.count
     }
 
     private var automationEnabledBinding: Binding<Bool> {
@@ -205,21 +223,54 @@ struct TaskBoardView: View {
     }
 
     private func tasks(in column: TaskColumn) -> [AutomationTask] {
-        model.tasks
-            .filter { $0.column == column }
+        orderedActiveTasks(in: column)
             .filter { TaskBoardFilter.includes($0, query: searchText, needsAttention: needsAttention) }
-            .sorted { lhs, rhs in
-                if lhs.orderIndex != rhs.orderIndex { return lhs.orderIndex < rhs.orderIndex }
-                return lhs.createdAt < rhs.createdAt
-            }
     }
 
     private func totalCount(in column: TaskColumn) -> Int {
-        model.tasks.filter { $0.column == column }.count
+        orderedActiveTasks(in: column).count
     }
 
     private var selectedTask: AutomationTask? {
-        selectedTaskID.flatMap { id in model.tasks.first { $0.id == id } }
+        model.selectedTaskID.flatMap { id in model.tasks.first { $0.id == id && $0.archivedAt == nil } }
+    }
+
+    private var archivedTasks: [AutomationTask] {
+        model.tasks
+            .filter { $0.archivedAt != nil }
+            .sorted { ($0.archivedAt ?? .distantPast) > ($1.archivedAt ?? .distantPast) }
+    }
+
+    private func orderedActiveTasks(in column: TaskColumn) -> [AutomationTask] {
+        model.tasks
+            .filter { $0.archivedAt == nil && $0.column == column }
+            .sorted { lhs, rhs in
+                if lhs.orderIndex != rhs.orderIndex { return lhs.orderIndex < rhs.orderIndex }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+    }
+
+    private func handleDrop(_ id: UUID, _ column: TaskColumn, _ index: Int) -> Bool {
+        guard let task = model.tasks.first(where: { $0.id == id && $0.archivedAt == nil }) else { return false }
+        switch TaskLaneDropPolicy.decision(for: task, into: column) {
+        case .move:
+            model.actions.moveTask(id, column, index)
+            return true
+        case .runNow:
+            Task { @MainActor in
+                let result = await model.actions.runNowAt(id, index)
+                showActionFeedback(id, result.feedback)
+            }
+            return true
+        case let .reject(reason):
+            NSSound.beep()
+            showActionFeedback(id, reason)
+            withAnimation(.easeInOut(duration: 0.35)) {
+                laneRejectionCounts[column, default: 0] += 1
+            }
+            return false
+        }
     }
 
     private func showActionFeedback(_ taskID: UUID, _ value: String) {
@@ -279,6 +330,7 @@ private struct TaskEditorPresentation: Identifiable {
 private struct TaskColumnView: View {
     let column: TaskColumn
     let tasks: [AutomationTask]
+    let allTasks: [AutomationTask]
     let totalCount: Int
     let runningTaskIDs: Set<UUID>
     let selectedTaskID: UUID?
@@ -286,8 +338,11 @@ private struct TaskColumnView: View {
     let actionFeedback: [UUID: String]
     let accounts: [Account]
     let settings: SwapKit.Settings
+    let shakeTrigger: Int
+    let handleDrop: (UUID, TaskColumn, Int) -> Bool
     let moveTask: (UUID, TaskColumn, Int) -> Void
     let runNow: (UUID) async -> TaskRunNowResult
+    let archiveAllDone: () -> Void
     let requeueTask: (UUID) async -> Void
     let stopTask: (UUID) -> Void
     let exportPrompt: (UUID) -> Void
@@ -295,6 +350,8 @@ private struct TaskColumnView: View {
     let showActionFeedback: (UUID, String) -> Void
     let selectTask: (UUID) -> Void
     let editTask: (AutomationTask) -> Void
+    let archiveTask: (UUID) -> Void
+    let duplicateTask: (UUID) -> Void
     let deleteTask: (AutomationTask) -> Void
 
     var body: some View {
@@ -303,19 +360,51 @@ private struct TaskColumnView: View {
                 Text(column.boardTitle)
                     .font(.headline)
                 Spacer()
-                Text("\(tasks.count)/\(totalCount)")
+                Text(headerCount)
                     .font(.caption.weight(.semibold))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(.quaternary, in: Capsule())
-                    .accessibilityLabel("\(tasks.count) of \(totalCount) tasks shown")
+                    .accessibilityLabel(headerAccessibilityLabel)
+                if column == .done {
+                    Menu {
+                        Button("Archive All Done", systemImage: "archivebox") { archiveAllDone() }
+                            .disabled(allTasks.isEmpty)
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .accessibilityLabel("Done column actions")
+                }
             }
             .padding(.horizontal, 4)
 
             ScrollView {
                 LazyVStack(spacing: 10) {
-                    ForEach(tasks) { task in
-                        taskCard(task)
+                    ForEach(regularTasks) { task in
+                        taskDropContainer(task)
+                    }
+                    if column == .inProgress, !attentionTasks.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                            Text("Needs Attention")
+                            Spacer()
+                            Text("\(attentionTasks.count)")
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 4)
+                        .accessibilityElement(children: .combine)
+                    }
+                    ForEach(attentionTasks) { task in
+                        taskDropContainer(task)
+                    }
+                    if tasks.isEmpty {
+                        TaskInsertionDropZone {
+                            acceptDrop($0, at: 0)
+                        }
+                        .frame(minHeight: 80)
                     }
                 }
                 .padding(1)
@@ -324,16 +413,49 @@ private struct TaskColumnView: View {
         .padding(10)
         .frame(minWidth: 225, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(nsColor: .underPageBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .modifier(TaskLaneShakeEffect(trigger: shakeTrigger))
         .dropDestination(for: String.self) { values, _ in
             guard let value = values.first, let id = UUID(uuidString: value) else { return false }
-            moveTask(id, column, totalCount)
-            return true
+            return acceptDrop(id, at: allTasks.count)
+        }
+    }
+
+    private var regularTasks: [AutomationTask] {
+        guard column == .inProgress else { return tasks }
+        return tasks.filter { $0.phase != .failed && $0.phase != .retryWaiting }
+    }
+
+    private var attentionTasks: [AutomationTask] {
+        guard column == .inProgress else { return [] }
+        return tasks.filter { $0.phase == .failed || $0.phase == .retryWaiting }
+    }
+
+    private var headerCount: String {
+        if column == .inProgress {
+            let active = allTasks.filter { $0.phase == .planning || $0.phase == .running }.count
+            return "Active \(active)/\(settings.automationMaxConcurrent)"
+        }
+        return "\(tasks.count)/\(totalCount)"
+    }
+
+    private var headerAccessibilityLabel: String {
+        if column == .inProgress { return headerCount }
+        return "\(tasks.count) of \(totalCount) tasks shown"
+    }
+
+    private func taskDropContainer(_ task: AutomationTask) -> some View {
+        VStack(spacing: 0) {
+            TaskInsertionDropZone { acceptDrop($0, relativeTo: task, placement: .before) }
+            taskCard(task)
+            TaskInsertionDropZone { acceptDrop($0, relativeTo: task, placement: .after) }
         }
     }
 
     private func taskCard(_ task: AutomationTask) -> some View {
-        TaskCardView(
+        let position = allTasks.firstIndex(where: { $0.id == task.id })
+        return TaskCardView(
             task: task,
+            queuePosition: column == .queued ? position.map { $0 + 1 } : nil,
             isRunning: runningTaskIDs.contains(task.id),
             isSelected: selectedTaskID == task.id,
             schedulingReason: schedulingReasons[task.id.uuidString],
@@ -348,14 +470,58 @@ private struct TaskColumnView: View {
             showActionFeedback: { showActionFeedback(task.id, $0) },
             selectTask: { selectTask(task.id) },
             editTask: { editTask(task) },
+            moveToTop: { moveTask(task.id, column, 0) },
+            moveUp: { moveTask(task.id, column, max(0, (position ?? 0) - 1)) },
+            moveDown: { moveTask(task.id, column, min(max(0, allTasks.count - 1), (position ?? 0) + 1)) },
+            moveToBottom: { moveTask(task.id, column, max(0, allTasks.count - 1)) },
+            canMoveUp: (position ?? 0) > 0,
+            canMoveDown: (position ?? 0) < allTasks.count - 1,
+            archiveTask: { archiveTask(task.id) },
+            duplicateTask: { duplicateTask(task.id) },
             deleteTask: { deleteTask(task) }
         )
         .draggable(task.id.uuidString)
+    }
+
+    private func acceptDrop(_ id: UUID, relativeTo target: AutomationTask, placement: TaskDropPlacement) -> Bool {
+        guard let targetIndex = allTasks.firstIndex(where: { $0.id == target.id }) else { return false }
+        let index: Int
+        if let sourceIndex = allTasks.firstIndex(where: { $0.id == id }) {
+            index = TaskReorder.destinationIndex(
+                sourceIndex: sourceIndex,
+                targetIndex: targetIndex,
+                placement: placement,
+                itemCount: allTasks.count
+            )
+        } else {
+            index = targetIndex + (placement == .after ? 1 : 0)
+        }
+        return acceptDrop(id, at: index)
+    }
+
+    private func acceptDrop(_ id: UUID, at index: Int) -> Bool {
+        handleDrop(id, column, max(0, min(index, allTasks.count)))
+    }
+}
+
+private struct TaskLaneShakeEffect: GeometryEffect {
+    var trigger: Int
+    var animatableData: CGFloat
+
+    init(trigger: Int) {
+        self.trigger = trigger
+        animatableData = CGFloat(trigger)
+    }
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let offset = 6 * sin(animatableData * .pi * 4)
+        return ProjectionTransform(CGAffineTransform(translationX: offset, y: 0))
     }
 }
 
 private struct TaskCardView: View {
     let task: AutomationTask
+    let queuePosition: Int?
     let isRunning: Bool
     let isSelected: Bool
     let schedulingReason: String?
@@ -370,12 +536,29 @@ private struct TaskCardView: View {
     let showActionFeedback: (String) -> Void
     let selectTask: () -> Void
     let editTask: () -> Void
+    let moveToTop: () -> Void
+    let moveUp: () -> Void
+    let moveDown: () -> Void
+    let moveToBottom: () -> Void
+    let canMoveUp: Bool
+    let canMoveDown: Bool
+    let archiveTask: () -> Void
+    let duplicateTask: () -> Void
     let deleteTask: () -> Void
     @State private var isHovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 8) {
+                if let queuePosition {
+                    Text("#\(queuePosition)")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: Capsule())
+                        .accessibilityLabel("Queue position \(queuePosition)")
+                }
                 Text(task.title)
                     .fontWeight(.medium)
                     .lineLimit(2)
@@ -394,6 +577,10 @@ private struct TaskCardView: View {
                 if task.isEvergreen { TaskChip(text: "∞ evergreen") }
                 if !task.accountAliases.isEmpty {
                     TaskChip(text: task.accountAliases.count == 1 ? task.accountAliases[0] : "\(task.accountAliases.count) acct")
+                }
+                if let aliases = task.runs.last?.servedAliases, !aliases.isEmpty {
+                    TaskChip(text: aliases.count == 1 ? aliases[0] : "\(aliases[0]) +\(aliases.count - 1)")
+                        .accessibilityLabel("Last run served by \(aliases.joined(separator: ", "))")
                 }
             }
 
@@ -449,6 +636,21 @@ private struct TaskCardView: View {
             Button(action: openRunLog) { Label("Show Run Log", systemImage: "doc.text.magnifyingglass") }
                 .disabled(task.runs.isEmpty)
             Button(action: editTask) { Label("Edit…", systemImage: "pencil") }
+            Divider()
+            Menu("Move") {
+                Button("Move to Top", systemImage: "arrow.up.to.line", action: moveToTop)
+                    .disabled(!canMoveUp)
+                Button("Move Up", systemImage: "arrow.up", action: moveUp)
+                    .disabled(!canMoveUp)
+                Button("Move Down", systemImage: "arrow.down", action: moveDown)
+                    .disabled(!canMoveDown)
+                Button("Move to Bottom", systemImage: "arrow.down.to.line", action: moveToBottom)
+                    .disabled(!canMoveDown)
+            }
+            Button(action: duplicateTask) { Label("Duplicate", systemImage: "plus.square.on.square") }
+            if task.column == .done || task.phase == .failed {
+                Button(action: archiveTask) { Label("Archive", systemImage: "archivebox") }
+            }
             Divider()
             Button(role: .destructive, action: deleteTask) { Label("Delete", systemImage: "trash") }
         }
@@ -553,6 +755,80 @@ private struct TaskCardView: View {
         if seconds < 60 { return "\(seconds)s" }
         if seconds < 3_600 { return "\(seconds / 60)m \(seconds % 60)s" }
         return "\(seconds / 3_600)h \((seconds % 3_600) / 60)m"
+    }
+}
+
+private struct TaskInsertionDropZone: View {
+    let accept: (UUID) -> Bool
+    @State private var isTargeted = false
+
+    var body: some View {
+        Rectangle()
+            .fill(isTargeted ? Color.accentColor : .clear)
+            .frame(height: 6)
+            .overlay(alignment: .leading) {
+                if isTargeted {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                        .offset(x: -3)
+                }
+            }
+            .contentShape(Rectangle())
+            .dropDestination(for: String.self) { values, _ in
+                guard let value = values.first, let id = UUID(uuidString: value) else { return false }
+                return accept(id)
+            } isTargeted: { isTargeted = $0 }
+            .accessibilityLabel(isTargeted ? "Insert task here" : "Task insertion point")
+    }
+}
+
+private struct ArchivedTasksView: View {
+    @Environment(\.dismiss) private var dismiss
+    let tasks: [AutomationTask]
+    let restoreTask: (UUID) -> Void
+    let deleteTask: (AutomationTask) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Archived Tasks")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+
+            if tasks.isEmpty {
+                ContentUnavailableView("No Archived Tasks", systemImage: "archivebox")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(tasks) { task in
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(task.title)
+                                .fontWeight(.medium)
+                            HStack(spacing: 6) {
+                                Text(task.column.boardTitle)
+                                if let archivedAt = task.archivedAt {
+                                    Text(archivedAt, style: .date)
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Restore", systemImage: "arrow.uturn.backward") { restoreTask(task.id) }
+                            .accessibilityLabel("Restore \(task.title)")
+                        Button("Delete Permanently", systemImage: "trash", role: .destructive) { deleteTask(task) }
+                            .accessibilityLabel("Delete \(task.title) permanently")
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 620, minHeight: 420)
     }
 }
 
