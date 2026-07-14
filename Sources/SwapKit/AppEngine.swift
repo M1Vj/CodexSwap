@@ -586,15 +586,12 @@ public actor AppEngine {
     public func automationTick() async {
         let settings = await settingsStore.get()
         let runningIDs = await taskRunner.runningIDs()
-        let paused = await taskStore.tasks(in: .inProgress)
-            .filter { $0.phase == .pausedQuota }
-        // Only idle queued tasks are schedulable: a failed launch (missing repo/binary) must
-        // not be retried in a tight loop — moving the card re-arms it via phase = .idle.
-        let queued = await taskStore.tasks(in: .queued)
-            .filter { $0.phase == .idle }
-        let waiting = (paused + queued).filter {
-            !runningIDs.contains($0.id) && !schedulingTaskIDs.contains($0.id)
-        }
+        let waiting = Self.schedulableTasks(
+            await taskStore.all(),
+            runningIDs: runningIDs,
+            schedulingIDs: schedulingTaskIDs,
+            now: Date()
+        )
         await autoLog.write(
             "tick",
             "entering running \(runningIDs.count) scheduling \(schedulingTaskIDs.count) waiting \(waiting.count)"
@@ -676,6 +673,30 @@ public actor AppEngine {
 
     static func allowedAliases(for task: AutomationTask, settings: Settings) -> [String] {
         task.accountAliases.isEmpty ? settings.automationAccounts : task.accountAliases
+    }
+
+    static func schedulableTasks(
+        _ tasks: [AutomationTask],
+        runningIDs: Set<UUID>,
+        schedulingIDs: Set<UUID>,
+        now: Date
+    ) -> [AutomationTask] {
+        func ordered(_ tasks: [AutomationTask]) -> [AutomationTask] {
+            tasks.sorted {
+                if $0.orderIndex != $1.orderIndex { return $0.orderIndex < $1.orderIndex }
+                if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        }
+        let inProgress = ordered(tasks.filter {
+            guard $0.column == .inProgress else { return false }
+            if $0.phase == .pausedQuota { return true }
+            return $0.phase == .retryWaiting && $0.nextRetryAt.map { $0 <= now } == true
+        })
+        let queued = ordered(tasks.filter { $0.column == .queued && $0.phase == .idle })
+        return (inProgress + queued).filter {
+            !runningIDs.contains($0.id) && !schedulingIDs.contains($0.id)
+        }
     }
 
     private func hydratedAutomationAccounts(aliases: [String]) async -> [Account] {
@@ -774,7 +795,7 @@ public actor AppEngine {
                 await self.handleTaskExit(taskID: taskID, exit: exit)
             }
         } catch {
-            await failTaskLaunch(taskID: task.id, reason: error.localizedDescription)
+            await handleTaskLaunchError(taskID: task.id, error: error)
             return .failed
         }
 
@@ -788,6 +809,7 @@ public actor AppEngine {
         started.phase = task.runs.isEmpty ? .planning : .running
         started.updatedAt = now
         started.lastError = nil
+        started.nextRetryAt = nil
         started.runs.append(TaskRunRecord(
             startedAt: now,
             outcome: "",
@@ -809,22 +831,43 @@ public actor AppEngine {
         return .started
     }
 
-    private func failTaskLaunch(taskID: UUID, reason: String) async {
+    private func handleTaskLaunchError(taskID: UUID, error: any Error) async {
         guard var task = await taskStore.task(id: taskID) else { return }
+        let now = Date()
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 1,
+            stderrTail: error.localizedDescription,
+            isEvergreen: task.isEvergreen,
+            previousRuns: task.runs.filter { $0.finishedAt != nil },
+            retryAttempts: task.retryAttempts,
+            nextRetryAt: task.nextRetryAt,
+            planRelativePath: task.planRelativePath,
+            now: now,
+            launchError: error as? TaskRunnerError
+        ))
         await autoLog.write(
             "run",
-            "failTaskLaunch \(Self.taskLabel(task)) reason \(Self.oneLine(reason))"
+            "launch exit \(Self.taskLabel(task)) outcome \(transition.outcome) reason \(Self.oneLine(transition.lastError ?? error.localizedDescription))"
         )
-        if let runIndex = task.runs.lastIndex(where: { $0.finishedAt == nil }) {
-            task.runs[runIndex].finishedAt = Date()
-            task.runs[runIndex].outcome = "failed"
-        }
-        task.phase = .failed
-        task.lastError = reason
-        task.updatedAt = Date()
+        task.phase = transition.phase
+        task.column = transition.column
+        task.lastError = transition.lastError
+        task.retryAttempts = transition.retryAttempts
+        task.nextRetryAt = transition.nextRetryAt
+        task.updatedAt = now
         await taskStore.update(task)
-        emit(.taskFailed(title: task.title, reason: reason))
+        switch transition.terminalEvent {
+        case .completed:
+            emit(.taskCompleted(title: task.title))
+        case .pausedQuota:
+            emit(.taskPausedQuota(title: task.title))
+        case .failed:
+            emit(.taskFailed(title: task.title, reason: transition.lastError ?? error.localizedDescription))
+        case nil:
+            break
+        }
         emit(.snapshotChanged)
+        if transition.scheduleAnotherTick { await automationTick() }
     }
 
     private func handleTaskExit(taskID: UUID, exit: TaskRunner.RunExit) async {
@@ -858,6 +901,8 @@ public actor AppEngine {
             progress: progress,
             isEvergreen: task.isEvergreen,
             previousRuns: Array(task.runs.dropLast()),
+            retryAttempts: task.retryAttempts,
+            nextRetryAt: task.nextRetryAt,
             planRelativePath: task.planRelativePath,
             now: now
         )
@@ -865,6 +910,8 @@ public actor AppEngine {
         task.phase = transition.phase
         task.column = transition.column
         task.lastError = transition.lastError
+        task.retryAttempts = transition.retryAttempts
+        task.nextRetryAt = transition.nextRetryAt
         if task.column == .done {
             task.orderIndex = await taskStore.tasks(in: .done).count
         }
@@ -889,6 +936,8 @@ public actor AppEngine {
             nextState = "done"
         case .pausedQuota:
             nextState = "pausedQuota"
+        case .retryWaiting:
+            nextState = "retryWaiting"
         case .failed:
             nextState = "failed error \(Self.errorExcerpt(task.lastError ?? exit.stderrTail))"
         case .stopped:

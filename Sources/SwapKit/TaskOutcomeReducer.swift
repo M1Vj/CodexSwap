@@ -101,7 +101,7 @@ enum TaskOutcomeReducer {
         }
         if let progress = context.progress, progress.status == "COMPLETE" {
             if context.isEvergreen, context.exitCode == 0 {
-                return transition(
+                return successfulTransition(
                     context,
                     outcome: "cycle-complete",
                     phase: .pausedQuota,
@@ -112,7 +112,7 @@ enum TaskOutcomeReducer {
                context.exitCode == 0,
                progress.total > 0,
                progress.done == progress.total {
-                return transition(
+                return successfulTransition(
                     context,
                     outcome: "completed",
                     phase: .completed,
@@ -123,12 +123,17 @@ enum TaskOutcomeReducer {
             let requirement = context.isEvergreen
                 ? "exit code 0"
                 : "exit code 0 and a non-empty fully checked checklist"
-            return transition(
+            var invalid = transition(
                 context,
                 outcome: "invalid-complete",
                 phase: .pausedQuota,
                 lastError: "STATUS: COMPLETE requires \(requirement); run exited \(context.exitCode) with \(progress.done)/\(progress.total) items checked"
             )
+            if context.exitCode == 0 {
+                invalid.retryAttempts = 0
+                invalid.nextRetryAt = nil
+            }
+            return invalid
         }
         if context.progress?.status == "BLOCKED" {
             return transition(
@@ -149,7 +154,7 @@ enum TaskOutcomeReducer {
                     terminalEvent: .failed
                 )
             }
-            return transition(context, outcome: "continue", phase: .pausedQuota)
+            return successfulTransition(context, outcome: "continue", phase: .pausedQuota)
         }
         if context.exitCode == 0 {
             let reason = context.stderrTail.isEmpty ? "run ended without a plan document" : context.stderrTail
@@ -161,13 +166,48 @@ enum TaskOutcomeReducer {
                 terminalEvent: .failed
             )
         }
-        return transition(
-            context,
+        let failureKind = FailureClassifier.classify(
+            exitCode: context.exitCode,
+            stderrTail: context.stderrTail,
+            launchError: context.launchError
+        )
+        let reason = failureReason(kind: failureKind, stderrTail: context.stderrTail)
+        if failureKind == .transient || failureKind == .timeout {
+            guard context.retryAttempts < 3 else {
+                return TaskTransition(
+                    outcome: "failed",
+                    phase: .failed,
+                    column: .inProgress,
+                    lastError: "\(reason) (retry limit reached)",
+                    terminalEvent: .failed,
+                    retryAttempts: context.retryAttempts,
+                    stagnationRecoveries: context.stagnationRecoveries
+                )
+            }
+            return TaskTransition(
+                outcome: "retry",
+                phase: .retryWaiting,
+                column: .inProgress,
+                lastError: reason,
+                retryAttempts: context.retryAttempts + 1,
+                nextRetryAt: context.now.addingTimeInterval(retryDelay(attempts: context.retryAttempts)),
+                stagnationRecoveries: context.stagnationRecoveries
+            )
+        }
+        return TaskTransition(
             outcome: "failed",
             phase: .failed,
-            lastError: context.stderrTail,
-            terminalEvent: .failed
+            column: .inProgress,
+            lastError: reason,
+            terminalEvent: .failed,
+            retryAttempts: context.retryAttempts,
+            stagnationRecoveries: context.stagnationRecoveries
         )
+    }
+
+    static func retryDelay(attempts: Int) -> TimeInterval {
+        let exponent = max(0, min(attempts, 30))
+        return TimeInterval(min(60 * (1 << exponent), 900))
     }
 
     static func isStagnantContinue<Runs: Sequence>(previousRuns: Runs, progress: PlanProgress) -> Bool
@@ -197,5 +237,28 @@ enum TaskOutcomeReducer {
             nextRetryAt: context.nextRetryAt,
             stagnationRecoveries: context.stagnationRecoveries
         )
+    }
+
+    private static func successfulTransition(
+        _ context: TaskExitContext,
+        outcome: String,
+        phase: TaskPhase,
+        column: TaskColumn = .inProgress,
+        terminalEvent: TaskTerminalEventKind? = nil
+    ) -> TaskTransition {
+        TaskTransition(
+            outcome: outcome,
+            phase: phase,
+            column: column,
+            terminalEvent: terminalEvent,
+            retryAttempts: 0,
+            stagnationRecoveries: context.stagnationRecoveries
+        )
+    }
+
+    private static func failureReason(kind: TaskFailureKind, stderrTail: String) -> String {
+        let detail = stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.isEmpty { return kind.rawValue }
+        return "\(kind.rawValue): \(detail)"
     }
 }

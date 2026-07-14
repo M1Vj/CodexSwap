@@ -12,6 +12,7 @@ public enum TaskPhase: String, Codable, Sendable {
     case planning
     case running
     case pausedQuota
+    case retryWaiting
     case failed
     case stopped
     case completed
@@ -100,6 +101,8 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
     public var runs: [TaskRunRecord]
     public var lastError: String?
     public var planProgress: PlanProgress?
+    public var retryAttempts: Int
+    public var nextRetryAt: Date?
 
     public init(
         id: UUID = UUID(),
@@ -119,7 +122,9 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         updatedAt: Date = Date(),
         runs: [TaskRunRecord] = [],
         lastError: String? = nil,
-        planProgress: PlanProgress? = nil
+        planProgress: PlanProgress? = nil,
+        retryAttempts: Int = 0,
+        nextRetryAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -139,6 +144,8 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         self.runs = runs
         self.lastError = lastError
         self.planProgress = planProgress
+        self.retryAttempts = retryAttempts
+        self.nextRetryAt = nextRetryAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -162,6 +169,8 @@ public struct AutomationTask: Codable, Sendable, Identifiable, Equatable {
         runs = try c.decodeIfPresent([TaskRunRecord].self, forKey: .runs) ?? []
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
         planProgress = try c.decodeIfPresent(PlanProgress.self, forKey: .planProgress)
+        retryAttempts = try c.decodeIfPresent(Int.self, forKey: .retryAttempts) ?? 0
+        nextRetryAt = try c.decodeIfPresent(Date.self, forKey: .nextRetryAt)
     }
 
     public var planRelativePath: String {

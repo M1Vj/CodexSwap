@@ -82,7 +82,7 @@ final class TaskOutcomeReducerTests: XCTestCase {
                     outcome: "failed",
                     phase: .failed,
                     column: .inProgress,
-                    lastError: "command failed",
+                    lastError: "unknown: command failed",
                     terminalEvent: .failed
                 )
             ),
@@ -147,6 +147,121 @@ final class TaskOutcomeReducerTests: XCTestCase {
             XCTAssertNil(transition.terminalEvent, name)
             XCTAssertTrue(transition.scheduleAnotherTick, name)
         }
+    }
+
+    func testFailureClassifierRecognizesObservedFailures() {
+        let cases: [(String, TaskFailureKind)] = [
+            ("stream disconnected before completion", .transient),
+            ("Connection reset by peer", .transient),
+            ("connection refused", .transient),
+            ("request timed out", .transient),
+            ("HTTP 503 Service Unavailable", .transient),
+            ("not supported when using Codex", .modelRejected),
+            ("model_not_found", .modelRejected),
+            ("HTTP 401 unauthorized", .authentication),
+            ("unexpected compiler failure", .unknown),
+        ]
+
+        for (stderrTail, expected) in cases {
+            XCTAssertEqual(
+                FailureClassifier.classify(exitCode: 1, stderrTail: stderrTail, launchError: nil),
+                expected,
+                stderrTail
+            )
+        }
+    }
+
+    func testFailureClassifierMapsTaskRunnerErrors() {
+        let cases: [(TaskRunnerError, TaskFailureKind)] = [
+            (.invalidRepository, .invalidRepository),
+            (.binaryNotFound, .binaryMissing),
+            (.timedOut, .timeout),
+            (.alreadyRunning, .unknown),
+        ]
+
+        for (error, expected) in cases {
+            XCTAssertEqual(
+                FailureClassifier.classify(exitCode: 1, stderrTail: "", launchError: error),
+                expected
+            )
+        }
+    }
+
+    func testTransientFailureSchedulesBoundedRetry() {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 1,
+            stderrTail: "stream disconnected",
+            retryAttempts: 0,
+            now: now
+        ))
+
+        XCTAssertEqual(transition.outcome, "retry")
+        XCTAssertEqual(transition.phase, .retryWaiting)
+        XCTAssertEqual(transition.retryAttempts, 1)
+        XCTAssertEqual(transition.nextRetryAt, now.addingTimeInterval(60))
+        XCTAssertNil(transition.terminalEvent)
+        XCTAssertEqual(TaskOutcomeReducer.retryDelay(attempts: 10), 900)
+    }
+
+    func testThirdFailedRetryBecomesTerminal() {
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 1,
+            stderrTail: "connection reset",
+            retryAttempts: 3
+        ))
+
+        XCTAssertEqual(transition.outcome, "failed")
+        XCTAssertEqual(transition.phase, .failed)
+        XCTAssertEqual(transition.retryAttempts, 3)
+        XCTAssertNil(transition.nextRetryAt)
+        XCTAssertEqual(transition.terminalEvent, .failed)
+    }
+
+    func testPermanentFailuresFailImmediately() {
+        let cases: [(String, TaskExitContext, TaskFailureKind)] = [
+            (
+                "invalid repository",
+                TaskExitContext(exitCode: 1, launchError: .invalidRepository),
+                .invalidRepository
+            ),
+            (
+                "missing binary",
+                TaskExitContext(exitCode: 1, launchError: .binaryNotFound),
+                .binaryMissing
+            ),
+            (
+                "authentication",
+                TaskExitContext(exitCode: 1, stderrTail: "HTTP 401 unauthorized"),
+                .authentication
+            ),
+            (
+                "model rejection",
+                TaskExitContext(exitCode: 1, stderrTail: "model_not_found"),
+                .modelRejected
+            ),
+        ]
+
+        for (name, context, expectedKind) in cases {
+            let transition = TaskOutcomeReducer.reduce(context)
+            XCTAssertEqual(transition.outcome, "failed", name)
+            XCTAssertEqual(transition.phase, .failed, name)
+            XCTAssertEqual(transition.terminalEvent, .failed, name)
+            XCTAssertTrue(transition.lastError?.contains(expectedKind.rawValue) == true, name)
+        }
+    }
+
+    func testSuccessfulRunResetsRetryState() {
+        let transition = TaskOutcomeReducer.reduce(TaskExitContext(
+            exitCode: 0,
+            progress: PlanProgress(done: 1, total: 2, status: "CONTINUE"),
+            retryAttempts: 2,
+            nextRetryAt: Date(timeIntervalSince1970: 1_900_000_000)
+        ))
+
+        XCTAssertEqual(transition.outcome, "continue")
+        XCTAssertEqual(transition.retryAttempts, 0)
+        XCTAssertNil(transition.nextRetryAt)
     }
 
     private func closedRun(outcome: String, done: Int = 40, total: Int = 44) -> TaskRunRecord {

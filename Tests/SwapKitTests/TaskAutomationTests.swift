@@ -372,6 +372,8 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(task.runs, [])
         XCTAssertNil(task.lastError)
         XCTAssertNil(task.planProgress)
+        XCTAssertEqual(task.retryAttempts, 0)
+        XCTAssertNil(task.nextRetryAt)
     }
 
     func testAutomationTaskDecodeWithoutAccountAliasesDefaultsToEmpty() throws {
@@ -749,5 +751,30 @@ final class TaskAutomationTests: XCTestCase {
         let recovered = AppEngine.interruptedTasks(in: [task], running: [task.id], now: now)
 
         XCTAssertEqual(recovered, [task])
+    }
+
+    func testSchedulerIncludesOnlyDueRetryWaitingTasks() {
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        var due = makeTask(title: "Due", column: .inProgress)
+        due.phase = .retryWaiting
+        due.nextRetryAt = now
+        var future = makeTask(title: "Future", column: .inProgress)
+        future.phase = .retryWaiting
+        future.nextRetryAt = now.addingTimeInterval(60)
+        var missingDate = makeTask(title: "Missing date", column: .inProgress)
+        missingDate.phase = .retryWaiting
+        var paused = makeTask(title: "Paused", column: .inProgress)
+        paused.phase = .pausedQuota
+        var queued = makeTask(title: "Queued", column: .queued)
+        queued.phase = .idle
+
+        let candidates = AppEngine.schedulableTasks(
+            [due, future, missingDate, paused, queued],
+            runningIDs: [],
+            schedulingIDs: [],
+            now: now
+        )
+
+        XCTAssertEqual(Set(candidates.map(\.id)), [due.id, paused.id, queued.id])
     }
 }
