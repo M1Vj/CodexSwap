@@ -59,6 +59,13 @@ public enum GitProbe {
         )
     }
 
+    public static func branchTip(at repositoryPath: String, branch: String) async -> String? {
+        guard !branch.isEmpty, !branch.hasPrefix("-") else { return nil }
+        guard let output = await run(at: repositoryPath, arguments: ["rev-parse", "--verify", "refs/heads/\(branch)"]) else { return nil }
+        let sha = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isSHA(sha) ? sha : nil
+    }
+
     private static func run(at repositoryPath: String, arguments: [String]) async -> String? {
         let process = Process()
         let outputURL = FileManager.default.temporaryDirectory

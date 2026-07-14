@@ -20,6 +20,16 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ### Changed
 
+- Task inspector: click any card for a live log tail (follow/pause), a per-run outcome timeline with durations and plan counts, the parsed plan checklist, and a Changes tab showing each run's commits, diff totals, and branch-mismatch warnings.
+- Per-run records now capture the codex session ID, token usage (input/cached/output), a final-message summary, the accounts that actually served the run, and base/head commit SHAs.
+- Typed failure handling with bounded retry backoff, automatic plan repair after stagnation, model fallback chains, and a real completion gate (exit 0 plus a fully checked plan) in a pure, table-tested outcome state machine.
+- Run-scoped proxy routing: quota events pause only the run that hit the limit, and the scheduler-admitted account is pinned as each run's preferred start account.
+- Admission headroom: run starts require configurable quota headroom and never launch on an over-threshold account; waiting cards show precise per-account reasons with countdowns.
+- Session context lifetime: a bounded Handoff section replaces unbounded work logs (history moves to WORKLOG.md), evergreen tasks archive finished cycles to CYCLES.md and reseed fresh checklists, and full-suite verification runs on receipts instead of every session.
+- Board power: positional queue reordering, lane drop policies with a true WIP count, search and Needs Attention filters, archive/restore, task duplication, a menu-bar task cockpit, and actionable notifications that focus the board.
+- Run history is capped per task with older records archived as JSONL; run logs and codex session artifacts prune automatically.
+
+
 - Task runs follow the same rotation settings as normal proxy traffic: the configured strategy (priority or round-robin), per-account priorities, and the pre-emptive usage thresholds. Tasks prefer accounts still under threshold and move off an account before it hard-limits, falling back to the best over-threshold account only when none has headroom.
 - Task sessions may batch their commits: the run contract no longer demands a commit per checklist item, only that all work and the plan document are committed before the session ends.
 - Task completion now requires a successful process exit and a non-empty fully checked plan whose final non-blank line reports `STATUS: COMPLETE`.

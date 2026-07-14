@@ -120,6 +120,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     taskID: id
                 )
             }
+        case let .taskCycleCompleted(id, title):
+            if settings.notifyOnTaskEvents {
+                notify(
+                    title: "Improvement cycle completed",
+                    body: "\(title) — re-queued for the next window",
+                    category: TaskNotification.completionCategory,
+                    taskID: id
+                )
+            }
         case let .taskPausedQuota(id, title):
             if settings.notifyOnTaskEvents {
                 notify(

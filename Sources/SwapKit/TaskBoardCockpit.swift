@@ -71,7 +71,7 @@ public enum TaskSchedulingReasonFormatter {
             if let cooldown = account.cooldownUntil(now: now) {
                 return "\(safeAlias): cooldown until \(shortDate(cooldown))"
             }
-            if !consumeBankedWindow, !hasStartedWindow(account) {
+            if !consumeBankedWindow, !AppEngine.hasStartedWindow(account) {
                 return "\(safeAlias): banked window not started"
             }
             if let starved = account.usage.first(where: { 100 - $0.usedPercent < minHeadroomPercent }) {
@@ -103,13 +103,6 @@ public enum TaskSchedulingReasonFormatter {
                 return account.usage.compactMap(\.resetAt).filter { $0 > now }.min()
             }
             .min()
-    }
-
-    private static func hasStartedWindow(_ account: Account) -> Bool {
-        if let short = account.usage.first(where: { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }) {
-            return short.usedPercent > 0
-        }
-        return account.usage.contains { $0.usedPercent > 0 }
     }
 
     private static func oneLine(_ value: String) -> String {
@@ -300,10 +293,11 @@ public enum TaskBoardMenuStatus {
         guard !tasks.contains(where: { $0.phase == .planning || $0.phase == .running }) else { return nil }
         let waiting = tasks.filter {
             ($0.column == .queued && $0.phase == .idle)
-                || ($0.column == .inProgress && $0.phase == .pausedQuota)
+                || ($0.column == .inProgress && ($0.phase == .pausedQuota || $0.phase == .retryWaiting))
         }
         guard !waiting.isEmpty else { return nil }
         guard waiting.allSatisfy({ task in
+            if task.phase == .retryWaiting { return true }
             guard let reason = schedulingReasons[task.id.uuidString]?.lowercased() else { return false }
             return reason.contains("cooldown") || reason.contains("quota") || reason.contains("banked window")
         }) else { return nil }
