@@ -21,11 +21,13 @@ public actor TaskRunner {
         public let exitCode: Int32
         public let quotaExhausted: Bool
         public let stderrTail: String
+        public let stalled: Bool
 
-        public init(exitCode: Int32, quotaExhausted: Bool, stderrTail: String) {
+        public init(exitCode: Int32, quotaExhausted: Bool, stderrTail: String, stalled: Bool = false) {
             self.exitCode = exitCode
             self.quotaExhausted = quotaExhausted
             self.stderrTail = stderrTail
+            self.stalled = stalled
         }
     }
 
@@ -34,9 +36,12 @@ public actor TaskRunner {
         let logURL: URL
         let runID: UUID
         var quotaExhausted: Bool
+        var stalled: Bool
     }
 
     private static let timeoutNanoseconds: UInt64 = 6 * 60 * 60 * 1_000_000_000
+    static let stallTimeoutSeconds: TimeInterval = 15 * 60
+    private static let stallCheckNanoseconds: UInt64 = 30 * 1_000_000_000
     private var running: [UUID: RunningTask] = [:]
     private var taskIDsByRunID: [UUID: UUID] = [:]
     private let logSink: (@Sendable (String, String) async -> Void)?
@@ -172,9 +177,14 @@ public actor TaskRunner {
                 process: process,
                 logURL: logURL,
                 runID: runID,
-                quotaExhausted: false
+                quotaExhausted: false,
+                stalled: false
             )
             taskIDsByRunID[runID] = task.id
+
+            Task { [weak self] in
+                await Self.watchForStall(runner: self, taskID: task.id, runID: runID, logURL: logURL)
+            }
 
             Task { [weak self] in
                 let exitCode: Int32
@@ -232,9 +242,46 @@ public actor TaskRunner {
         let stderrTail = String(decoding: tail.suffix(2_048), as: UTF8.self)
         await log(
             "runner",
-            "exit task \(Self.shortID(taskID)) code \(exitCode) quotaExhausted \(quotaExhausted) log \(run.logURL.lastPathComponent)"
+            "exit task \(Self.shortID(taskID)) code \(exitCode) quotaExhausted \(quotaExhausted) stalled \(run.stalled) log \(run.logURL.lastPathComponent)"
         )
-        await onExit(taskID, RunExit(exitCode: exitCode, quotaExhausted: quotaExhausted, stderrTail: stderrTail))
+        await onExit(taskID, RunExit(exitCode: exitCode, quotaExhausted: quotaExhausted, stderrTail: stderrTail, stalled: run.stalled))
+    }
+
+    private func isCurrentRun(taskID: UUID, runID: UUID) -> Bool {
+        guard let run = running[taskID], run.runID == runID else { return false }
+        return run.process.isRunning
+    }
+
+    private func killStalled(taskID: UUID, runID: UUID) async {
+        guard let run = running[taskID], run.runID == runID, run.process.isRunning else { return }
+        running[taskID]?.stalled = true
+        await log(
+            "runner",
+            "stall: no log growth for \(Int(Self.stallTimeoutSeconds / 60))m on task \(Self.shortID(taskID)) — terminating run"
+        )
+        run.process.terminate()
+    }
+
+    // The codex JSONL log only grows on completed items, so quiet stretches are
+    // normal — but 15 minutes of total silence matches a half-open upstream
+    // stream, which otherwise pins the run (and its concurrency slot) forever.
+    private static func watchForStall(runner: TaskRunner?, taskID: UUID, runID: UUID, logURL: URL) async {
+        var lastSize: UInt64 = 0
+        var lastGrowth = Date()
+        while true {
+            try? await Task.sleep(nanoseconds: stallCheckNanoseconds)
+            guard let runner, await runner.isCurrentRun(taskID: taskID, runID: runID) else { return }
+            let size = ((try? FileManager.default.attributesOfItem(atPath: logURL.path))?[.size] as? UInt64) ?? lastSize
+            if size != lastSize {
+                lastSize = size
+                lastGrowth = Date()
+                continue
+            }
+            if Date().timeIntervalSince(lastGrowth) >= stallTimeoutSeconds {
+                await runner.killStalled(taskID: taskID, runID: runID)
+                return
+            }
+        }
     }
 
     private func log(_ category: String, _ message: String) async {

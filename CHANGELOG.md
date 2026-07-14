@@ -36,6 +36,8 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ### Fixed
 
+- Stall watchdog: a run whose log stops growing for 15 minutes (a half-open upstream stream) is killed by the runner and retried with the normal transient backoff instead of pinning its concurrency slot forever.
+- The task editor's prompt field spans the full sheet width with a taller editing area instead of being squeezed into the form's value column.
 - A failed proxy port bind no longer crashes the app on AsyncHTTPClient shutdown.
 - Stale usage-limit cooldowns are cleared when fresh usage reports headroom, so automation starts as soon as quota is actually back.
 - The model picker offers only live-validated model names.
