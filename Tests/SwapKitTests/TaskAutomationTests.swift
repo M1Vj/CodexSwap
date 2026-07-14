@@ -591,11 +591,12 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(reselected?.alias, "first", "crossing the threshold mid-turn must drop stickiness")
     }
 
-    func testPromptsMandateBatchingAndSingleFinalVerification() {
+    func testPromptsMandateBatchingAndCommitAwareVerification() {
         let task = makeTask()
         for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
             XCTAssertTrue(prompt.contains("as many"), "batching mandate missing")
-            XCTAssertTrue(prompt.contains("full verification suite once"), "single-gate mandate missing")
+            XCTAssertTrue(prompt.contains("targeted checks suffice"), "targeted-check allowance missing")
+            XCTAssertTrue(prompt.contains("Verified: <suite command> at <short SHA>"), "verification receipt missing")
         }
         XCTAssertTrue(TaskPrompt.continuation(task: task).contains("Spot-check only the most recently ticked items"))
         XCTAssertFalse(TaskPrompt.continuation(task: task).contains("every ticked `- [x]` item still holds"))
@@ -620,7 +621,7 @@ final class TaskAutomationTests: XCTestCase {
 
     func testPromptsAllowBulkCommits() {
         let task = makeTask()
-        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
+        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.replan(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
             XCTAssertTrue(prompt.contains("bulk commit"), "bulk-commit allowance missing")
             XCTAssertFalse(prompt.contains("commit per logical unit"), "per-item commit mandate must be gone")
             XCTAssertFalse(prompt.contains("small conventional commits"), "per-step commit mandate must be gone")

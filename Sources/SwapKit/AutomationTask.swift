@@ -225,6 +225,23 @@ public enum PlanDocParser {
         return PlanProgress(done: done, total: total, status: status)
     }
 
+    public static func handoffExcerpt(_ text: String) -> String? {
+        let lines = text.components(separatedBy: .newlines)
+        guard let headingIndex = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines) == "## Handoff"
+        }) else { return nil }
+
+        let body = lines[(headingIndex + 1)...]
+            .prefix { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return !trimmed.hasPrefix("## ")
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return body.isEmpty ? nil : body
+    }
+
     private static func capture(in line: String, pattern: String) -> String? {
         guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
         let range = NSRange(line.startIndex..<line.endIndex, in: line)
