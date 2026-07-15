@@ -647,6 +647,7 @@ final class TaskAutomationTests: XCTestCase {
         for prompt in prompts {
             XCTAssertTrue(prompt.contains("subagent"), "subagent delegation clause missing")
             XCTAssertTrue(prompt.contains("timeboxed"), "timebox constraint missing")
+            XCTAssertTrue(prompt.contains("After one wait without a result"), "bounded-wait fallback missing")
         }
         for prompt in prompts.dropLast() {
             XCTAssertTrue(prompt.contains("never block the session's end or final commit on one"))
