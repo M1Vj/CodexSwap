@@ -335,8 +335,8 @@ public struct TaskBoardWindowSizing: Sendable, Equatable {
     public let minimumHeight: Double
 
     public static func resolve(visibleWidth: Double, visibleHeight: Double) -> TaskBoardWindowSizing {
-        let availableWidth = max(640, visibleWidth - 40)
-        let availableHeight = max(480, visibleHeight - 40)
+        let availableWidth = max(1, visibleWidth - 40)
+        let availableHeight = max(1, visibleHeight - 40)
         return TaskBoardWindowSizing(
             initialWidth: min(1_420, availableWidth),
             initialHeight: min(760, availableHeight),

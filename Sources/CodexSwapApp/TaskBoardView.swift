@@ -4,6 +4,7 @@ import SwapKit
 
 struct TaskBoardView: View {
     @ObservedObject var model: TaskBoardViewModel
+    let windowCommands: TaskBoardWindowCommands
     @State private var editor: TaskEditorPresentation?
     @State private var taskToDelete: AutomationTask?
     @State private var searchText = ""
@@ -69,7 +70,6 @@ struct TaskBoardView: View {
                 }
             }
         }
-        .frame(minWidth: 760, minHeight: 520)
         .sheet(item: $editor) { presentation in
             TaskEditorView(task: presentation.task, accounts: model.accounts, isNew: presentation.isNew) { task in
                 if presentation.isNew {
@@ -173,6 +173,24 @@ struct TaskBoardView: View {
             Button("Logs", systemImage: "doc.text.magnifyingglass", action: model.actions.openAutomationLog)
                 .controlSize(.small)
                 .accessibilityLabel("Open automation log")
+
+            Menu {
+                Button("Toggle Full Screen", systemImage: "arrow.up.left.and.arrow.down.right") {
+                    windowCommands.toggleFullScreen()
+                }
+
+                Button("Move to Next Display", systemImage: "display.2") {
+                    windowCommands.moveToNextDisplay()
+                }
+
+                Button("Center on Current Display", systemImage: "scope") {
+                    windowCommands.centerOnCurrentDisplay()
+                }
+            } label: {
+                Label("Window", systemImage: "macwindow")
+            }
+            .controlSize(.small)
+            .help("Full screen or reposition the Task Board")
 
             Button("Add Task", systemImage: "plus", action: showAddEditor)
         }

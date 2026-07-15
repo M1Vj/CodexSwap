@@ -79,6 +79,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = sem.wait(timeout: .now() + 2)
     }
 
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if TaskBoardReopenPolicy.shouldShowBoard(hasVisibleWindows: flag) {
+            showTaskBoard()
+        }
+        return true
+    }
+
     // MARK: - Snapshot / events
 
     private func refreshSnapshot() async {

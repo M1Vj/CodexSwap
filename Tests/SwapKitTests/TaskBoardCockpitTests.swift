@@ -41,6 +41,17 @@ final class TaskBoardCockpitTests: XCTestCase {
         XCTAssertLessThanOrEqual(sizing.minimumHeight, sizing.initialHeight)
     }
 
+    func testTaskBoardWindowSizingRemainsValidOnVerySmallDisplays() {
+        let sizing = TaskBoardWindowSizing.resolve(visibleWidth: 500, visibleHeight: 360)
+
+        XCTAssertGreaterThan(sizing.minimumWidth, 0)
+        XCTAssertGreaterThan(sizing.minimumHeight, 0)
+        XCTAssertLessThanOrEqual(sizing.minimumWidth, 460)
+        XCTAssertLessThanOrEqual(sizing.minimumHeight, 320)
+        XCTAssertLessThanOrEqual(sizing.minimumWidth, sizing.initialWidth)
+        XCTAssertLessThanOrEqual(sizing.minimumHeight, sizing.initialHeight)
+    }
+
     func testTaskCardIdentityChangesWhenTaskMovesIntoAttentionGroup() {
         let id = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
 

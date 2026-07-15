@@ -13,6 +13,7 @@
 ### Task 1: Prove window placement geometry
 
 **Files:**
+- Create: `Sources/SwapKit/TaskBoardReopenPolicy.swift`
 - Create: `Sources/SwapKit/TaskBoardWindowPlacement.swift`
 - Create: `Tests/SwapKitTests/TaskBoardWindowPlacementTests.swift`
 
@@ -108,6 +109,7 @@ Expected: all placement tests pass.
 ### Task 2: Connect native AppKit window behavior
 
 **Files:**
+- Create: `Sources/CodexSwapApp/TaskBoardWindowCommands.swift`
 - Modify: `Sources/CodexSwapApp/TaskBoardWindowController.swift`
 
 - [ ] **Step 1: Add a weak command bridge and native window capabilities**
@@ -122,11 +124,11 @@ final class TaskBoardWindowCommands {
 }
 ```
 
-Create the commands before the hosting controller, assign its controller after `super.init`, include `.miniaturizable`, insert `.fullScreenPrimary`, and use the frame autosave name `CodexSwapTaskBoardWindow`.
+Create the commands before the hosting controller, let the SwiftUI view retain the bridge, assign its weak controller after `super.init`, include `.miniaturizable`, insert `.fullScreenPrimary`, and use the frame autosave name `CodexSwapTaskBoardWindow`.
 
 - [ ] **Step 2: Restore and recover a persisted frame**
 
-After applying the initial screen-aware content size, call `setFrameUsingName`, enable `setFrameAutosaveName`, then convert the restored `NSRect` and all `NSScreen.visibleFrame` values through `TaskBoardWindowPlacement.recover`. Center only when no frame was restored.
+After applying the initial screen-aware content size and minimum, center the window, enable `setFrameAutosaveName`, then convert the restored `NSRect` and all `NSScreen.visibleFrame` values through `TaskBoardWindowPlacement.recover`. Expand tiny stored frames to the target screen's usable minimum and immediately save the normalized result.
 
 - [ ] **Step 3: Implement safe full-screen and display actions**
 
@@ -156,6 +158,7 @@ Expected: build succeeds with no warnings from the new command bridge.
 
 **Files:**
 - Modify: `Sources/CodexSwapApp/TaskBoardView.swift`
+- Modify: `Sources/CodexSwapApp/AppDelegate.swift`
 
 - [ ] **Step 1: Inject the command bridge without changing task actions**
 
@@ -167,6 +170,8 @@ struct TaskBoardView: View {
 ```
 
 Keep every existing task action bound to `model.actions`; window commands remain separate.
+
+Add `applicationShouldHandleReopen` so reopening a windowless menu-bar app calls `showTaskBoard()`, while an already visible CodexSwap window remains unchanged.
 
 - [ ] **Step 2: Add one compact native menu to header actions**
 
@@ -216,7 +221,7 @@ Expected: every command exits `0`, no tests are skipped, and the release build s
 - [ ] **Step 2: Commit and push conventional changes**
 
 ```bash
-git add Sources/SwapKit/TaskBoardWindowPlacement.swift Tests/SwapKitTests/TaskBoardWindowPlacementTests.swift Sources/CodexSwapApp/TaskBoardWindowController.swift Sources/CodexSwapApp/TaskBoardView.swift docs/superpowers/plans/2026-07-15-task-board-window-management.md
+git add Sources/SwapKit/TaskBoardWindowPlacement.swift Tests/SwapKitTests/TaskBoardWindowPlacementTests.swift Sources/CodexSwapApp/TaskBoardWindowCommands.swift Sources/CodexSwapApp/TaskBoardWindowController.swift Sources/CodexSwapApp/TaskBoardView.swift docs/superpowers/specs/2026-07-15-task-board-window-management-design.md docs/superpowers/plans/2026-07-15-task-board-window-management.md
 git commit -m "feat(board): add native window management"
 git push origin main
 ```
