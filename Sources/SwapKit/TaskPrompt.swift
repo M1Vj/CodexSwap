@@ -10,7 +10,7 @@ public enum TaskPrompt {
         - Ensure branch `\(task.branch)` exists. If it is missing, create it from the current HEAD, then check it out.
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine.
+        - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine. If the original prompt specifies commit metadata or trailers, copy it verbatim and inspect the final commit message before continuing; amend any local mismatch.
         - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in `WORKLOG.md`, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
         - Use your native subagents for bounded parallelizable work — deep research sweeps, independent review of a finished unit, broad exploration — while you continue on the critical path. Keep each subagent brief small and timeboxed; narrow or absorb any that overruns its scope. Never sit idle waiting on a subagent and never block the session's end or final commit on one. After one wait without a result, continue useful local work; if none remains, interrupt and absorb the subtask instead of issuing another wait-only turn.
 
@@ -47,7 +47,7 @@ public enum TaskPrompt {
         - Ensure branch `\(task.branch)` exists. If it is missing, create it from the current HEAD, then check it out.
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine.
+        - Commit with clear conventional messages; batching several items — or the whole session's work — into one bulk commit is fine. If the original prompt specifies commit metadata or trailers, copy it verbatim and inspect the final commit message before continuing; amend any local mismatch.
         - You run unattended: no one can answer questions or grant approvals. Never end the session asking for input or "awaiting approval". When a decision has multiple defensible options, pick the most reasonable default yourself, record the decision and rationale in `WORKLOG.md`, and keep going. `STATUS: BLOCKED` is only for genuinely external obstacles (missing credentials, unavailable services) — a design choice is never one.
         - Use your native subagents for bounded parallelizable work — deep research sweeps, independent review of a finished unit, broad exploration — while you continue on the critical path. Keep each subagent brief small and timeboxed; narrow or absorb any that overruns its scope. Never sit idle waiting on a subagent and never block the session's end or final commit on one. After one wait without a result, continue useful local work; if none remains, interrupt and absorb the subtask instead of issuing another wait-only turn.
 
@@ -78,7 +78,7 @@ public enum TaskPrompt {
         - Ensure branch `\(task.branch)` exists. If it is missing, create it from the current HEAD, then check it out.
         - Work only on `\(task.branch)` and never touch other branches.
         - Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        - Commit with clear conventional messages; batching several packages — or the whole session's implementation — into one bulk commit is fine.
+        - Commit with clear conventional messages; batching several packages — or the whole session's implementation — into one bulk commit is fine. If the original prompt specifies commit metadata or trailers, copy it verbatim and inspect the final commit message before continuing; amend any local mismatch.
         - You run unattended: decide autonomously, record rationale in `WORKLOG.md`, and reserve `STATUS: BLOCKED` for genuinely external obstacles.
         - Use your native subagents for bounded parallelizable work — deep research sweeps, independent review of a finished unit, broad exploration — while you continue on the critical path. Keep each subagent brief small and timeboxed; narrow or absorb any that overruns its scope. Never sit idle waiting on a subagent and never block the session's end or final commit on one. After one wait without a result, continue useful local work; if none remains, interrupt and absorb the subtask instead of issuing another wait-only turn.
 
@@ -127,7 +127,7 @@ public enum TaskPrompt {
 
         1. Work only inside the repository. Ensure branch `\(task.branch)` exists; if missing, create it from the current HEAD, then check it out. Work only on that branch and never touch other branches.
         2. Never push, never force-push, never run `git reset --hard`, and never delete anything outside the repository.
-        3. Commit with clear conventional messages; batching the session's work into one bulk commit is fine.
+        3. Commit with clear conventional messages; batching the session's work into one bulk commit is fine. If the original prompt specifies commit metadata or trailers, copy it verbatim and inspect the final commit message before continuing; amend any local mismatch.
         4. Maintain `\(task.planRelativePath)`. If no plan exists, first create it with the task title, the `## Handoff` section described below directly under the title, original prompt, a `## Checklist` of small verifiable `- [ ]` steps, and a final `STATUS: CONTINUE` line; create `WORKLOG.md` next to it, then commit them.
         5. Read the Handoff and checklist, and consult `WORKLOG.md` only when investigating regressions. Work through checklist items in order, completing as many as the session allows. Spot-check recently ticked items with targeted checks only, continue at the first `- [ ]` item, tick each completed item to `- [x]`, and append dated history to `WORKLOG.md`; commits may be batched into one bulk commit for the session, as long as everything including the plan update is committed before the session ends.
         6. Before the session ends, make the plan document's final line `STATUS: COMPLETE` only when all items are ticked and verified, `STATUS: CONTINUE` when work remains, or `STATUS: BLOCKED: <reason>` when external input is required. Commit that update and add nothing after the status line.

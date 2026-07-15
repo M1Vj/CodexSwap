@@ -666,6 +666,13 @@ final class TaskAutomationTests: XCTestCase {
         }
     }
 
+    func testPromptsPreserveUserSpecifiedCommitMetadata() {
+        let task = makeTask()
+        for prompt in [TaskPrompt.firstRun(task: task), TaskPrompt.continuation(task: task), TaskPrompt.replan(task: task), TaskPrompt.export(task: task, planDoc: nil)] {
+            XCTAssertTrue(prompt.contains("copy it verbatim and inspect the final commit message"), "exact commit-metadata gate missing")
+        }
+    }
+
     func testPruneArtifactsKeepsNewestLogsAndFreshSessions() throws {
         let root = try temporaryDirectory(named: "prune-artifacts")
         defer { try? FileManager.default.removeItem(at: root) }
