@@ -15,6 +15,7 @@ struct SettingsActions {
     let openCodexBar: () -> Void
     let addStandaloneAccount: () -> Void
     let setAutomaticWarmup: (Bool) -> Void
+    let setWarmupExcludedAccounts: ([String]) -> Void
     let warmAllAccounts: () -> Void
     let setNotifyOnRotate: (Bool) -> Void
     let setNotifyOnExhausted: (Bool) -> Void

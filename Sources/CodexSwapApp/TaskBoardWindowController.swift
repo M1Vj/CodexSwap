@@ -1,15 +1,21 @@
 import AppKit
 import SwiftUI
+import SwapKit
 
 @MainActor
 final class TaskBoardWindowController: NSWindowController, NSWindowDelegate {
     init(viewModel: TaskBoardViewModel) {
         let hostingController = NSHostingController(rootView: TaskBoardView(model: viewModel))
         let window = NSWindow(contentViewController: hostingController)
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1_440, height: 900)
+        let sizing = TaskBoardWindowSizing.resolve(
+            visibleWidth: visible.width,
+            visibleHeight: visible.height
+        )
         window.title = "CodexSwap Task Board"
         window.styleMask = [.titled, .closable, .resizable]
-        window.setContentSize(NSSize(width: 1_420, height: 760))
-        window.minSize = NSSize(width: 1_320, height: 620)
+        window.setContentSize(NSSize(width: sizing.initialWidth, height: sizing.initialHeight))
+        window.minSize = NSSize(width: sizing.minimumWidth, height: sizing.minimumHeight)
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)

@@ -310,6 +310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             openCodexBar: { [weak self] in self?.openCodexBarForAccount() },
             addStandaloneAccount: { [weak self] in self?.addStandaloneAccount() },
             setAutomaticWarmup: { [weak self] enabled in self?.setAutomaticWarmup(enabled) },
+            setWarmupExcludedAccounts: { [weak self] aliases in
+                self?.updateSettings { $0.warmupExcludedAccounts = Array(Set(aliases)).sorted() }
+            },
             warmAllAccounts: { [weak self] in self?.requestWarmAllAccounts() },
             setNotifyOnRotate: { [weak self] enabled in self?.updateSettings { $0.notifyOnRotate = enabled } },
             setNotifyOnExhausted: { [weak self] enabled in self?.updateSettings { $0.notifyOnExhausted = enabled } },
@@ -656,8 +659,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard confirmWarmup(
-            title: "Automatically warm every account?",
-            message: "CodexSwap will send one small, real Codex request per eligible account when a new 5-hour cycle is available. This consumes a small amount of quota. OpenAI does not guarantee that one request starts every displayed quota window.",
+            title: "Automatically warm allowed accounts?",
+            message: "CodexSwap will send one small, real Codex request per allowed and eligible account when a new 5-hour cycle is available. Protected accounts are never warmed. This consumes a small amount of quota. OpenAI does not guarantee that one request starts every displayed quota window.",
             button: "Enable Automatic Warm-up"
         ) else { return }
 
@@ -673,8 +676,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func requestWarmAllAccounts() {
         guard confirmWarmup(
-            title: "Warm all eligible accounts now?",
-            message: "This forces one small, real Codex request through each eligible account, even if it was already warmed during the current cycle.",
+            title: "Warm all allowed accounts now?",
+            message: "This forces one small, real Codex request through each allowed and eligible account, even if it was already warmed during the current cycle. Protected accounts are never warmed.",
             button: "Warm Accounts"
         ) else { return }
 

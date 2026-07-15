@@ -20,9 +20,10 @@ struct TaskBoardView: View {
             Divider()
 
             HSplitView {
-                HStack(alignment: .top, spacing: 12) {
-                    ForEach(TaskColumn.allCases, id: \.rawValue) { column in
-                        TaskColumnView(
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(TaskColumn.allCases, id: \.rawValue) { column in
+                            TaskColumnView(
                             column: column,
                             tasks: tasks(in: column),
                             allTasks: orderedActiveTasks(in: column),
@@ -48,11 +49,13 @@ struct TaskBoardView: View {
                             archiveTask: model.actions.archiveTask,
                             duplicateTask: model.actions.duplicateTask,
                             deleteTask: { taskToDelete = $0 }
-                        )
+                            )
+                        }
                     }
+                    .padding(14)
+                    .frame(minWidth: 900, maxHeight: .infinity)
                 }
-                .padding(14)
-                .frame(minWidth: 900, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
 
                 if let selectedTask {
                     TaskBoardInspectorView(
@@ -60,11 +63,11 @@ struct TaskBoardView: View {
                         runLogURL: model.actions.runLogURL,
                         planDocument: model.actions.planDocument
                     )
-                    .frame(minWidth: 320, idealWidth: 370, maxWidth: 480, maxHeight: .infinity)
+                    .frame(minWidth: 280, idealWidth: 340, maxWidth: 420, maxHeight: .infinity)
                 }
             }
         }
-        .frame(minWidth: 1_320, minHeight: 620)
+        .frame(minWidth: 760, minHeight: 520)
         .sheet(item: $editor) { presentation in
             TaskEditorView(task: presentation.task, accounts: model.accounts, isNew: presentation.isNew) { task in
                 if presentation.isNew {
@@ -96,9 +99,28 @@ struct TaskBoardView: View {
     }
 
     private var header: some View {
+        ViewThatFits(in: .horizontal) {
+            fullHeader
+            VStack(alignment: .leading, spacing: 10) {
+                headerPrimaryControls
+                headerActionControls
+            }
+        }
+    }
+
+    private var fullHeader: some View {
+        HStack(spacing: 16) {
+            headerPrimaryControls
+            Spacer(minLength: 8)
+            headerActionControls
+        }
+    }
+
+    private var headerPrimaryControls: some View {
         HStack(spacing: 16) {
             Toggle("Automation", isOn: automationEnabledBinding)
                 .toggleStyle(.switch)
+                .fixedSize()
 
             HStack(spacing: 6) {
                 Circle()
@@ -123,9 +145,11 @@ struct TaskBoardView: View {
                 .toggleStyle(.checkbox)
                 .fixedSize()
                 .help("Allows automation to spend a banked 5-hour reset when starting a task.")
+        }
+    }
 
-            Spacer(minLength: 8)
-
+    private var headerActionControls: some View {
+        HStack(spacing: 12) {
             TextField("Search tasks", text: $searchText)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 180)
@@ -399,6 +423,7 @@ private struct TaskColumnView: View {
                 LazyVStack(spacing: 10) {
                     ForEach(regularTasks) { task in
                         taskDropContainer(task)
+                            .id(TaskBoardCardIdentity.value(taskID: task.id, group: .regular))
                     }
                     if column == .inProgress, !attentionTasks.isEmpty {
                         HStack(spacing: 6) {
@@ -414,6 +439,7 @@ private struct TaskColumnView: View {
                     }
                     ForEach(attentionTasks) { task in
                         taskDropContainer(task)
+                            .id(TaskBoardCardIdentity.value(taskID: task.id, group: .attention))
                     }
                     if tasks.isEmpty {
                         TaskInsertionDropZone {
@@ -591,10 +617,13 @@ private struct TaskCardView: View {
                 TaskChip(text: task.reasoningEffort.capitalized)
                 if task.isEvergreen { TaskChip(text: "∞ evergreen") }
                 if !task.accountAliases.isEmpty {
-                    TaskChip(text: task.accountAliases.count == 1 ? task.accountAliases[0] : "\(task.accountAliases.count) acct")
+                    TaskChip(text: task.accountAliases.count == 1 ? TaskAccountLabel.compact(task.accountAliases[0]) : "\(task.accountAliases.count) accounts")
+                        .accessibilityLabel("Selected accounts: \(task.accountAliases.joined(separator: ", "))")
                 }
-                if let aliases = task.runs.last?.servedAliases, !aliases.isEmpty {
-                    TaskChip(text: aliases.count == 1 ? aliases[0] : "\(aliases[0]) +\(aliases.count - 1)")
+                if let aliases = task.runs.last?.servedAliases,
+                   !aliases.isEmpty,
+                   aliases != task.accountAliases {
+                    TaskChip(text: aliases.count == 1 ? "Used \(TaskAccountLabel.compact(aliases[0]))" : "Used \(aliases.count) accounts")
                         .accessibilityLabel("Last run served by \(aliases.joined(separator: ", "))")
                 }
             }
@@ -615,7 +644,11 @@ private struct TaskCardView: View {
                     .lineLimit(2)
             }
 
-            if task.phase == .pausedQuota || task.phase == .retryWaiting {
+            if TaskCardPresentation.showsWaitingReason(
+                column: task.column,
+                phase: task.phase,
+                reason: schedulingReason
+            ) {
                 waitingReason
             }
 
@@ -856,6 +889,8 @@ private struct TaskChip: View {
         Text(text)
             .font(.caption2)
             .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(.quaternary, in: Capsule())
@@ -897,6 +932,7 @@ private struct TaskEditorView: View {
     @State private var customModel: String
     @State private var fallbackModelsText: String
     @State private var branchWasEdited: Bool
+    @State private var repositoryIsValid: Bool
 
     let accounts: [Account]
     let isNew: Bool
@@ -916,6 +952,7 @@ private struct TaskEditorView: View {
             _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
         }
         _branchWasEdited = State(initialValue: !isNew && !task.branch.isEmpty)
+        _repositoryIsValid = State(initialValue: TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath))
         self.accounts = accounts
         self.isNew = isNew
         self.onSave = onSave
@@ -948,6 +985,7 @@ private struct TaskEditorView: View {
                 LabeledContent("Repository") {
                     HStack {
                         TextField("/path/to/repository", text: $draft.repoPath)
+                            .onChange(of: draft.repoPath) { _, path in validateRepository(path) }
                         Button("Choose…", action: chooseRepository)
                     }
                 }
@@ -1024,8 +1062,8 @@ private struct TaskEditorView: View {
             .formStyle(.grouped)
 
             HStack {
-                if !draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !repoExists {
-                    Label("Repository directory does not exist", systemImage: "exclamationmark.triangle.fill")
+                if !draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !repositoryIsValid {
+                    Label("Choose the root of a Git working tree", systemImage: "exclamationmark.triangle.fill")
                         .font(.callout)
                         .foregroundStyle(.red)
                 }
@@ -1067,16 +1105,7 @@ private struct TaskEditorView: View {
             && !draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !draft.branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !selectedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && repoExists
-    }
-
-    private var repoExists: Bool {
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(
-            atPath: draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines),
-            isDirectory: &isDirectory
-        )
-        return exists && isDirectory.boolValue
+            && repositoryIsValid
     }
 
     private func chooseRepository() {
@@ -1088,6 +1117,17 @@ private struct TaskEditorView: View {
         panel.prompt = "Choose Repository"
         if panel.runModal() == .OK, let url = panel.url {
             draft.repoPath = url.path
+        }
+    }
+
+    private func validateRepository(_ path: String) {
+        let candidate = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { @MainActor in
+            let isValid = await Task.detached(priority: .userInitiated) {
+                TaskRepositoryValidator.isGitWorkingTree(at: candidate)
+            }.value
+            guard draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines) == candidate else { return }
+            repositoryIsValid = isValid
         }
     }
 

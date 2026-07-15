@@ -1,4 +1,5 @@
 import SwiftUI
+import SwapKit
 
 struct AutomationSettingsView: View {
     @ObservedObject var model: SettingsViewModel
@@ -6,12 +7,22 @@ struct AutomationSettingsView: View {
     var body: some View {
         Form {
             SettingsSection(title: "Quota Windows") {
-                Toggle("Automatically Warm All Accounts", isOn: automaticWarmupBinding)
+                Toggle("Automatically Warm Allowed Accounts", isOn: automaticWarmupBinding)
                     .disabled(model.snapshot.warmupInProgress)
-                Text("Sends one small real request per eligible account when a new five-hour cycle is observed. This consumes a small amount of quota.")
+                Text("Sends one small real request per allowed and eligible account when a new five-hour cycle is observed. Protected accounts are always skipped.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                Button(model.snapshot.warmupInProgress ? "Warming Accounts…" : "Warm All Accounts Now…") {
+                if !model.snapshot.accounts.isEmpty {
+                    Text("Quota warm-up access")
+                        .font(.callout.weight(.semibold))
+                    ForEach(warmupAccountRows) { row in
+                        WarmupAccountAccessRow(
+                            account: row.account,
+                            isAllowed: warmupAllowedBinding(row.account.alias)
+                        )
+                    }
+                }
+                Button(model.snapshot.warmupInProgress ? "Warming Accounts…" : "Warm Allowed Accounts Now…") {
                     model.actions.warmAllAccounts()
                 }
                 .disabled(model.snapshot.warmupInProgress)
@@ -49,6 +60,31 @@ struct AutomationSettingsView: View {
         Binding(get: { model.settings.automaticallyWarmAccounts }, set: { value in model.actions.setAutomaticWarmup(value) })
     }
 
+    private var warmupAccountRows: [WarmupAccountRow] {
+        model.snapshot.accounts
+            .sorted { $0.alias.localizedStandardCompare($1.alias) == .orderedAscending }
+            .map(WarmupAccountRow.init(account:))
+    }
+
+    private func warmupAllowed(_ alias: String) -> Bool {
+        !model.settings.warmupExcludedAccounts.contains(alias)
+    }
+
+    private func warmupAllowedBinding(_ alias: String) -> Binding<Bool> {
+        Binding(
+            get: { warmupAllowed(alias) },
+            set: { allowed in
+                var excluded = model.settings.warmupExcludedAccounts
+                if allowed {
+                    excluded.removeAll { $0 == alias }
+                } else if !excluded.contains(alias) {
+                    excluded.append(alias)
+                }
+                model.actions.setWarmupExcludedAccounts(excluded)
+            }
+        )
+    }
+
     private var notifyOnRotateBinding: Binding<Bool> {
         Binding(get: { model.settings.notifyOnRotate }, set: { value in model.actions.setNotifyOnRotate(value) })
     }
@@ -81,5 +117,28 @@ struct AutomationSettingsView: View {
             get: { model.settings.automationMaxConcurrent },
             set: { value in model.actions.setAutomationMaxConcurrent(value) }
         )
+    }
+}
+
+private struct WarmupAccountRow: Identifiable {
+    let account: Account
+    var id: String { account.alias }
+}
+
+private struct WarmupAccountAccessRow: View {
+    let account: Account
+    @Binding var isAllowed: Bool
+
+    var body: some View {
+        Toggle(isOn: $isAllowed) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(account.email.isEmpty ? account.alias : account.email)
+                    .lineLimit(1)
+                Text(isAllowed ? "Allowed" : "Protected — no warm-up requests")
+                    .font(.caption)
+                    .foregroundStyle(isAllowed ? Color.secondary : Color.orange)
+            }
+        }
+        .accessibilityLabel("Allow quota warm-up for \(account.alias)")
     }
 }
