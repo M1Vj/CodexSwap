@@ -60,14 +60,6 @@ public actor TaskRunner {
         let baseURL = proxyURL.absoluteString.trimmingTrailingSlash() + "/backend-api/codex"
         let aliases = allowedAliases.joined(separator: ",")
         let provider = "model_providers.codexswap-task={ name=\"CodexSwap Task\", base_url=\"\(tomlEscape(baseURL))\", wire_api=\"responses\", env_key=\"CODEXSWAP_TASK_TOKEN\", http_headers={ \"\(ProxyRequestMode.taskHeader)\"=\"\(tomlEscape(aliases))\", \"\(ProxyRequestMode.taskRunHeader)\"=\"\(runID.uuidString)\" } }"
-        let prompt: String
-        if task.runs.isEmpty {
-            prompt = TaskPrompt.firstRun(task: task)
-        } else if task.runs.last(where: { $0.finishedAt != nil })?.outcome == "replan" {
-            prompt = TaskPrompt.replan(task: task)
-        } else {
-            prompt = TaskPrompt.continuation(task: task)
-        }
         let gitDir = URL(fileURLWithPath: task.repoPath, isDirectory: true)
             .appendingPathComponent(".git", isDirectory: true).path
         var arguments = [
@@ -89,8 +81,20 @@ public actor TaskRunner {
         if let finalMessagePath {
             arguments += ["--output-last-message", finalMessagePath]
         }
-        arguments.append(prompt)
+        // A literal `-` tells `codex exec` to read the prompt from stdin. Keeping task
+        // instructions out of argv prevents them from being exposed by process tools.
+        arguments.append("-")
         return arguments
+    }
+
+    public static func promptInput(task: AutomationTask) -> String {
+        if task.runs.isEmpty {
+            return TaskPrompt.firstRun(task: task)
+        } else if task.runs.last(where: { $0.finishedAt != nil })?.outcome == "replan" {
+            return TaskPrompt.replan(task: task)
+        } else {
+            return TaskPrompt.continuation(task: task)
+        }
     }
 
     public func start(
@@ -139,6 +143,7 @@ public actor TaskRunner {
         Self.pruneArtifacts(taskDir: taskDir, codexHome: codexHome, keepLogs: 10)
 
         let logHandle = try FileHandle(forWritingTo: logURL)
+        let inputPipe = Pipe()
         do {
             try logHandle.truncate(atOffset: 0)
             let process = Process()
@@ -151,6 +156,7 @@ public actor TaskRunner {
                 finalMessagePath: finalMessageURL.path
             )
             process.currentDirectoryURL = URL(fileURLWithPath: task.repoPath, isDirectory: true)
+            process.standardInput = inputPipe
             process.standardOutput = logHandle
             process.standardError = logHandle
             // HOME stays the real home: sandboxed git needs ~/.gitconfig for author identity,
@@ -173,6 +179,11 @@ public actor TaskRunner {
                 "launch task \(Self.shortID(task.id)) run \(runNumber) binary \(binary) cwd \(task.repoPath) model \(task.model) allowNetwork \(task.allowNetwork) allowedAliases \(allowedAliases.count)"
             )
             try process.run()
+            let prompt = Data(Self.promptInput(task: task).utf8)
+            Task.detached(priority: .utility) {
+                try? inputPipe.fileHandleForWriting.write(contentsOf: prompt)
+                try? inputPipe.fileHandleForWriting.close()
+            }
             running[task.id] = RunningTask(
                 process: process,
                 logURL: logURL,
@@ -200,6 +211,7 @@ public actor TaskRunner {
                 await self?.finish(taskID: task.id, exitCode: exitCode, onExit: onExit)
             }
         } catch {
+            try? inputPipe.fileHandleForWriting.close()
             try? logHandle.close()
             throw error
         }
@@ -245,6 +257,9 @@ public actor TaskRunner {
             "exit task \(Self.shortID(taskID)) code \(exitCode) quotaExhausted \(quotaExhausted) stalled \(run.stalled) log \(run.logURL.lastPathComponent)"
         )
         await onExit(taskID, RunExit(exitCode: exitCode, quotaExhausted: quotaExhausted, stderrTail: stderrTail, stalled: run.stalled))
+        Self.pruneTemporaryArtifacts(
+            codexHome: run.logURL.deletingLastPathComponent().appendingPathComponent("codex-home", isDirectory: true)
+        )
     }
 
     private func isCurrentRun(taskID: UUID, runID: UUID) -> Bool {
@@ -341,12 +356,36 @@ public actor TaskRunner {
         }
         let sessions = codexHome.appendingPathComponent("sessions", isDirectory: true)
         let cutoff = now.addingTimeInterval(-7 * 86_400)
-        if let contents = try? fm.contentsOfDirectory(at: sessions, includingPropertiesForKeys: [.contentModificationDateKey]) {
-            for item in contents {
-                let modified = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? now
-                if modified < cutoff { try? fm.removeItem(at: item) }
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey]
+        if let enumerator = fm.enumerator(
+            at: sessions,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) {
+            var directories: [URL] = []
+            while let item = enumerator.nextObject() as? URL {
+                let values = try? item.resourceValues(forKeys: keys)
+                if values?.isDirectory == true {
+                    directories.append(item)
+                } else if (values?.contentModificationDate ?? now) < cutoff {
+                    try? fm.removeItem(at: item)
+                }
+            }
+            for directory in directories.sorted(by: { $0.pathComponents.count > $1.pathComponents.count }) {
+                if (try? fm.contentsOfDirectory(atPath: directory.path).isEmpty) == true {
+                    try? fm.removeItem(at: directory)
+                }
             }
         }
+    }
+
+    /// Codex expands plugin bundles under each task's private home while a run is active.
+    /// They are disposable runtime cache and can dwarf all durable task artifacts, so remove
+    /// them only after the process and outcome ingestion have finished.
+    static func pruneTemporaryArtifacts(codexHome: URL) {
+        try? FileManager.default.removeItem(
+            at: codexHome.appendingPathComponent(".tmp", isDirectory: true)
+        )
     }
 
     private static func logTail(at url: URL, maximumBytes: Int) -> Data {

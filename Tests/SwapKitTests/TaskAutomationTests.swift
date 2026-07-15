@@ -307,7 +307,7 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertNil(selected)
     }
 
-    func testTaskRunnerLaunchArgsContainSandboxModelProviderAndPromptWithoutDanger() throws {
+    func testTaskRunnerLaunchArgsContainSandboxModelProviderAndReadPromptFromStdin() throws {
         let task = makeTask(
             prompt: "The exact runner prompt.",
             model: "gpt-5.6-sol",
@@ -328,7 +328,9 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertTrue(arguments.contains("model_reasoning_effort=\"medium\""))
         XCTAssertTrue(provider.contains("\"X-CodexSwap-Task-Accounts\"=\"a,b\""))
         XCTAssertTrue(provider.contains("env_key=\"CODEXSWAP_TASK_TOKEN\""))
-        XCTAssertEqual(arguments.last, TaskPrompt.firstRun(task: task))
+        XCTAssertEqual(arguments.last, "-")
+        XCTAssertFalse(arguments.contains(TaskPrompt.firstRun(task: task)), "task prompts must not be exposed through process arguments")
+        XCTAssertEqual(TaskRunner.promptInput(task: task), TaskPrompt.firstRun(task: task))
         XCTAssertFalse(arguments.contains { $0.localizedCaseInsensitiveContains("danger") })
     }
 
@@ -363,7 +365,8 @@ final class TaskAutomationTests: XCTestCase {
             allowedAliases: ["a"]
         )
 
-        XCTAssertEqual(arguments.last, TaskPrompt.replan(task: task))
+        XCTAssertEqual(arguments.last, "-")
+        XCTAssertEqual(TaskRunner.promptInput(task: task), TaskPrompt.replan(task: task))
     }
 
     func testReplanPromptRequiresPlanRepairAndImmediateExecution() {
@@ -661,6 +664,36 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertTrue(remaining.contains("run-4.log"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
+    }
+
+    func testPruneArtifactsRecursivelyRemovesExpiredSessionsAndEmptyDirectories() throws {
+        let root = try temporaryDirectory(named: "prune-nested-artifacts")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let codexHome = root.appendingPathComponent("codex-home", isDirectory: true)
+        let day = codexHome.appendingPathComponent("sessions/2026/07/01", isDirectory: true)
+        try FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = day.appendingPathComponent("old-rollout.jsonl")
+        FileManager.default.createFile(atPath: old.path, contents: Data())
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-8 * 86_400)], ofItemAtPath: old.path)
+
+        TaskRunner.pruneArtifacts(taskDir: root, codexHome: codexHome, keepLogs: 10, now: now)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: day.path), "empty nested session directories must not accumulate")
+    }
+
+    func testPruneTemporaryArtifactsRemovesPerTaskPluginCache() throws {
+        let root = try temporaryDirectory(named: "prune-task-temporary-artifacts")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let codexHome = root.appendingPathComponent("codex-home", isDirectory: true)
+        let plugins = codexHome.appendingPathComponent(".tmp/plugins/cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: plugins, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: plugins.appendingPathComponent("bundle.bin").path, contents: Data(repeating: 1, count: 128))
+
+        TaskRunner.pruneTemporaryArtifacts(codexHome: codexHome)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: codexHome.appendingPathComponent(".tmp").path))
     }
 
     func testIsStagnantContinueRequiresThreeIdenticalContinueRuns() {
