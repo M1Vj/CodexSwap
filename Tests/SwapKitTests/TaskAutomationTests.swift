@@ -45,6 +45,25 @@ final class TaskAutomationTests: XCTestCase {
         }
     }
 
+    func testTaskRepositoryValidatorRejectsPlainDirectoriesAndAcceptsGitWorkingTrees() throws {
+        let plain = try temporaryDirectory(named: "plain-task-directory")
+        let repository = try temporaryDirectory(named: "git-task-directory")
+        defer {
+            try? FileManager.default.removeItem(at: plain)
+            try? FileManager.default.removeItem(at: repository)
+        }
+
+        let git = Process()
+        git.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        git.arguments = ["-C", repository.path, "init", "--quiet"]
+        try git.run()
+        git.waitUntilExit()
+        XCTAssertEqual(git.terminationStatus, 0)
+
+        XCTAssertFalse(TaskRepositoryValidator.isGitWorkingTree(at: plain.path))
+        XCTAssertTrue(TaskRepositoryValidator.isGitWorkingTree(at: repository.path))
+    }
+
     func testSettingsDecodeAutomationDefaults() throws {
         let settings = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
 

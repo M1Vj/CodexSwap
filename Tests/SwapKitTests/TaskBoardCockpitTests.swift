@@ -25,6 +25,46 @@ final class TaskBoardCockpitTests: XCTestCase {
         )
     }
 
+    func testQueuedRunFeedbackExplainsWhyItDidNotStart() {
+        XCTAssertEqual(
+            TaskRunNowResult.queued(reason: "zamifaito: banked window not started").feedback,
+            "Queued — zamifaito: banked window not started"
+        )
+    }
+
+    func testTaskBoardWindowSizingFitsTheVisibleDisplay() {
+        let sizing = TaskBoardWindowSizing.resolve(visibleWidth: 1_280, visibleHeight: 720)
+
+        XCTAssertLessThanOrEqual(sizing.initialWidth, 1_240)
+        XCTAssertLessThanOrEqual(sizing.minimumWidth, sizing.initialWidth)
+        XCTAssertLessThanOrEqual(sizing.initialHeight, 680)
+        XCTAssertLessThanOrEqual(sizing.minimumHeight, sizing.initialHeight)
+    }
+
+    func testTaskCardIdentityChangesWhenTaskMovesIntoAttentionGroup() {
+        let id = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+
+        XCTAssertNotEqual(
+            TaskBoardCardIdentity.value(taskID: id, group: .regular),
+            TaskBoardCardIdentity.value(taskID: id, group: .attention)
+        )
+    }
+
+    func testCompactAccountLabelBoundsLongAliasesAndPreservesShortOnes() {
+        XCTAssertEqual(TaskAccountLabel.compact("zamifaito"), "zamifaito")
+        let compact = TaskAccountLabel.compact("this-is-a-very-long-generated-account-alias")
+        XCTAssertLessThanOrEqual(compact.count, 18)
+        XCTAssertTrue(compact.contains("…"))
+        XCTAssertTrue(compact.hasPrefix("this-is"))
+        XCTAssertTrue(compact.hasSuffix("alias"))
+    }
+
+    func testQueuedIdleCardShowsKnownSchedulingReason() {
+        XCTAssertTrue(TaskCardPresentation.showsWaitingReason(column: .queued, phase: .idle, reason: "banked window not started"))
+        XCTAssertFalse(TaskCardPresentation.showsWaitingReason(column: .todo, phase: .idle, reason: "banked window not started"))
+        XCTAssertTrue(TaskCardPresentation.showsWaitingReason(column: .inProgress, phase: .pausedQuota, reason: nil))
+    }
+
     private func temporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("task-board-cockpit-\(UUID().uuidString)", isDirectory: true)

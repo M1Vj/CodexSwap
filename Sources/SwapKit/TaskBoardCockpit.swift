@@ -288,15 +288,61 @@ public enum TaskLogTailReader {
 
 public enum TaskRunNowResult: Sendable, Equatable {
     case started
-    case queued
+    case queued(reason: String)
     case blocked(reason: String)
 
     public var feedback: String {
         switch self {
         case .started: "Started"
-        case .queued: "Queued"
+        case let .queued(reason): "Queued — \(reason)"
         case let .blocked(reason): reason
         }
+    }
+}
+
+public enum TaskBoardCardGroup: String, Sendable {
+    case regular
+    case attention
+}
+
+public enum TaskBoardCardIdentity {
+    public static func value(taskID: UUID, group: TaskBoardCardGroup) -> String {
+        "\(group.rawValue)-\(taskID.uuidString)"
+    }
+}
+
+public enum TaskAccountLabel {
+    public static func compact(_ alias: String, maximumLength: Int = 18) -> String {
+        let limit = max(8, maximumLength)
+        guard alias.count > limit else { return alias }
+        let suffixCount = max(4, limit / 3)
+        let prefixCount = limit - suffixCount - 1
+        return "\(alias.prefix(prefixCount))…\(alias.suffix(suffixCount))"
+    }
+}
+
+public enum TaskCardPresentation {
+    public static func showsWaitingReason(column: TaskColumn, phase: TaskPhase, reason: String?) -> Bool {
+        if phase == .pausedQuota || phase == .retryWaiting { return true }
+        return column == .queued && phase == .idle && reason?.isEmpty == false
+    }
+}
+
+public struct TaskBoardWindowSizing: Sendable, Equatable {
+    public let initialWidth: Double
+    public let initialHeight: Double
+    public let minimumWidth: Double
+    public let minimumHeight: Double
+
+    public static func resolve(visibleWidth: Double, visibleHeight: Double) -> TaskBoardWindowSizing {
+        let availableWidth = max(640, visibleWidth - 40)
+        let availableHeight = max(480, visibleHeight - 40)
+        return TaskBoardWindowSizing(
+            initialWidth: min(1_420, availableWidth),
+            initialHeight: min(760, availableHeight),
+            minimumWidth: min(840, availableWidth),
+            minimumHeight: min(560, availableHeight)
+        )
     }
 }
 

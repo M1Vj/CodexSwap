@@ -19,6 +19,7 @@ public struct Settings: Codable, Sendable, Equatable {
     public var launchAtLogin: Bool
     public var routeCodexAutomatically: Bool
     public var automaticallyWarmAccounts: Bool
+    public var warmupExcludedAccounts: [String]
     public var automationEnabled: Bool
     public var automationAccounts: [String]
     public var automationMaxConcurrent: Int
@@ -45,6 +46,7 @@ public struct Settings: Codable, Sendable, Equatable {
         launchAtLogin: false,
         routeCodexAutomatically: false,
         automaticallyWarmAccounts: false,
+        warmupExcludedAccounts: [],
         automationEnabled: false,
         automationAccounts: [],
         automationMaxConcurrent: 1,
@@ -68,6 +70,7 @@ public struct Settings: Codable, Sendable, Equatable {
         launchAtLogin: Bool,
         routeCodexAutomatically: Bool,
         automaticallyWarmAccounts: Bool,
+        warmupExcludedAccounts: [String],
         automationEnabled: Bool,
         automationAccounts: [String],
         automationMaxConcurrent: Int,
@@ -89,6 +92,7 @@ public struct Settings: Codable, Sendable, Equatable {
         self.launchAtLogin = launchAtLogin
         self.routeCodexAutomatically = routeCodexAutomatically
         self.automaticallyWarmAccounts = automaticallyWarmAccounts
+        self.warmupExcludedAccounts = warmupExcludedAccounts
         self.automationEnabled = automationEnabled
         self.automationAccounts = automationAccounts
         self.automationMaxConcurrent = automationMaxConcurrent
@@ -115,6 +119,7 @@ public struct Settings: Codable, Sendable, Equatable {
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         routeCodexAutomatically = try c.decodeIfPresent(Bool.self, forKey: .routeCodexAutomatically) ?? d.routeCodexAutomatically
         automaticallyWarmAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyWarmAccounts) ?? d.automaticallyWarmAccounts
+        warmupExcludedAccounts = try c.decodeIfPresent([String].self, forKey: .warmupExcludedAccounts) ?? d.warmupExcludedAccounts
         automationEnabled = try c.decodeIfPresent(Bool.self, forKey: .automationEnabled) ?? d.automationEnabled
         automationAccounts = try c.decodeIfPresent([String].self, forKey: .automationAccounts) ?? d.automationAccounts
         let decodedMaxConcurrent = try c.decodeIfPresent(Int.self, forKey: .automationMaxConcurrent) ?? d.automationMaxConcurrent

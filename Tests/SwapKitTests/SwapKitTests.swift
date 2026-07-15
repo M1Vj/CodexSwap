@@ -9,8 +9,18 @@ final class SettingsTests: XCTestCase {
 
         XCTAssertFalse(settings.routeCodexAutomatically)
         XCTAssertFalse(settings.automaticallyWarmAccounts)
+        XCTAssertEqual(settings.warmupExcludedAccounts, [])
         XCTAssertEqual(settings.proxyPort, Settings.defaultProxyPort)
         XCTAssertEqual(settings.proxyPort, 58_432)
+    }
+
+    func testWarmupExclusionsRoundTripThroughSettingsJSON() throws {
+        var settings = Settings.default
+        settings.warmupExcludedAccounts = ["protected-b", "protected-a"]
+
+        let decoded = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(settings))
+
+        XCTAssertEqual(decoded.warmupExcludedAccounts, ["protected-b", "protected-a"])
     }
 
     func testInvalidPersistedProxyPortFallsBackToSafeDefault() throws {

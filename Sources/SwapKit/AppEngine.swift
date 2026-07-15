@@ -532,6 +532,21 @@ public actor AppEngine {
             )
         }
 
+        let queueReason: String
+        if proxyURL == nil {
+            queueReason = "Proxy is unavailable"
+        } else if allowedAliases.isEmpty {
+            queueReason = "No accounts configured"
+        } else if occupiedCount >= maximumConcurrent {
+            queueReason = "Waiting for an available run slot"
+        } else {
+            queueReason = Self.accountEligibilityReasons(
+                aliases: allowedAliases,
+                accounts: hydratedAccounts,
+                settings: settings,
+                now: now
+            )
+        }
         let queueIndex = await taskStore.tasks(in: .queued).count
         await taskStore.move(id: id, to: .queued, index: queueIndex)
         if var queued = await taskStore.task(id: id) {
@@ -539,8 +554,9 @@ public actor AppEngine {
             queued.updatedAt = Date()
             await taskStore.update(queued)
         }
+        schedulingReasons[id.uuidString] = queueReason
         emit(.snapshotChanged)
-        return .queued
+        return .queued(reason: queueReason)
     }
 
     public func requeueTask(id: UUID) async {
@@ -650,11 +666,16 @@ public actor AppEngine {
         return candidates
     }
 
+    static func quotaWarmupEligible(_ account: Account, settings: Settings) -> Bool {
+        !settings.warmupExcludedAccounts.contains(account.alias)
+    }
+
     /// Automatic warm-up may only spend quota on accounts the user has opted into:
-    /// rotation participants (priority > 0) or automation-enabled accounts. Manual
-    /// warm-up remains an explicit action over every account.
+    /// rotation participants (priority > 0) or automation-enabled accounts. Durable
+    /// exclusions apply to both automatic and manual warm-up.
     static func autoWarmupEligible(_ account: Account, settings: Settings) -> Bool {
-        account.priority > 0 || settings.automationAccounts.contains(account.alias)
+        quotaWarmupEligible(account, settings: settings)
+            && (account.priority > 0 || settings.automationAccounts.contains(account.alias))
     }
 
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
@@ -668,7 +689,9 @@ public actor AppEngine {
         }
         warmupInProgress = true
         emit(.snapshotChanged)
-        let summary = await warmupService.run(accounts: candidates, proxyURL: proxyURL, force: force)
+        let settings = await settingsStore.get()
+        let allowedCandidates = candidates.filter { Self.quotaWarmupEligible($0, settings: settings) }
+        let summary = await warmupService.run(accounts: allowedCandidates, proxyURL: proxyURL, force: force)
         if !summary.warmed.isEmpty {
             let aliases = Set(summary.warmed)
             await pollUsage(activeOnly: false, aliases: aliases)
@@ -1104,6 +1127,10 @@ public actor AppEngine {
         reservationHeld: Bool = false,
         preferredInProgressIndex: Int? = nil
     ) async -> TaskStartResult {
+        guard TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath) else {
+            await handleTaskLaunchError(taskID: task.id, error: TaskRunnerError.invalidRepository)
+            return .failed
+        }
         let ownsReservation: Bool
         if reservationHeld {
             guard schedulingTaskIDs.contains(task.id) else { return .unavailable }

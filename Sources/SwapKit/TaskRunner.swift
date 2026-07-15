@@ -9,7 +9,7 @@ public enum TaskRunnerError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .alreadyRunning: "Task is already running"
-        case .invalidRepository: "Task repository is not an existing directory"
+        case .invalidRepository: "Task repository must be the root of a Git working tree"
         case .binaryNotFound: "Codex binary not found"
         case .timedOut: "Task run exceeded the six-hour limit"
         }
@@ -60,8 +60,9 @@ public actor TaskRunner {
         let baseURL = proxyURL.absoluteString.trimmingTrailingSlash() + "/backend-api/codex"
         let aliases = allowedAliases.joined(separator: ",")
         let provider = "model_providers.codexswap-task={ name=\"CodexSwap Task\", base_url=\"\(tomlEscape(baseURL))\", wire_api=\"responses\", env_key=\"CODEXSWAP_TASK_TOKEN\", http_headers={ \"\(ProxyRequestMode.taskHeader)\"=\"\(tomlEscape(aliases))\", \"\(ProxyRequestMode.taskRunHeader)\"=\"\(runID.uuidString)\" } }"
-        let gitDir = URL(fileURLWithPath: task.repoPath, isDirectory: true)
-            .appendingPathComponent(".git", isDirectory: true).path
+        let gitDir = TaskRepositoryValidator.gitDirectory(at: task.repoPath)
+            ?? URL(fileURLWithPath: task.repoPath, isDirectory: true)
+                .appendingPathComponent(".git", isDirectory: true).path
         var arguments = [
             "exec",
             "--json",
@@ -108,8 +109,7 @@ public actor TaskRunner {
     ) async throws {
         guard running[task.id] == nil else { throw TaskRunnerError.alreadyRunning }
 
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: task.repoPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+        guard TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath) else {
             throw TaskRunnerError.invalidRepository
         }
         // Warm-up's resolution order: prefer the real binary over any PATH shim — a write-jailing

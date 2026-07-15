@@ -276,10 +276,14 @@ final class RunTelemetryTests: XCTestCase {
     func testAutoWarmupOnlySpendsOptedInAccounts() {
         var settings = Settings.default
         settings.automationAccounts = ["worker"]
+        settings.warmupExcludedAccounts = ["protected"]
 
         XCTAssertTrue(AppEngine.autoWarmupEligible(Account(alias: "rotator", accessToken: "t", priority: 5), settings: settings))
         XCTAssertTrue(AppEngine.autoWarmupEligible(Account(alias: "worker", accessToken: "t", priority: 0), settings: settings))
         XCTAssertFalse(AppEngine.autoWarmupEligible(Account(alias: "bystander", accessToken: "t", priority: 0), settings: settings), "accounts the user never enabled must not be warmed automatically")
+        XCTAssertFalse(AppEngine.autoWarmupEligible(Account(alias: "protected", accessToken: "t", priority: 10), settings: settings))
+        XCTAssertFalse(AppEngine.quotaWarmupEligible(Account(alias: "protected", accessToken: "t"), settings: settings), "manual warm-up must also respect durable protection")
+        XCTAssertTrue(AppEngine.quotaWarmupEligible(Account(alias: "bystander", accessToken: "t"), settings: settings))
     }
 
     func testReasonFormatterReportsOverThresholdDistinctFromHeadroom() {
