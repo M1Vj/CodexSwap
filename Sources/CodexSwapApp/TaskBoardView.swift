@@ -129,6 +129,9 @@ struct TaskBoardView: View {
                     .accessibilityHidden(true)
                 Text(status.text)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 280, alignment: .leading)
+                    .help(status.text)
             }
             .font(.callout)
 
@@ -421,9 +424,8 @@ private struct TaskColumnView: View {
 
             ScrollView {
                 LazyVStack(spacing: 10) {
-                    ForEach(regularTasks) { task in
-                        taskDropContainer(task)
-                            .id(TaskBoardCardIdentity.value(taskID: task.id, group: .regular))
+                    ForEach(taskRows(regularTasks, group: .regular)) { row in
+                        taskDropContainer(row.task)
                     }
                     if column == .inProgress, !attentionTasks.isEmpty {
                         HStack(spacing: 6) {
@@ -437,9 +439,8 @@ private struct TaskColumnView: View {
                         .padding(.horizontal, 4)
                         .accessibilityElement(children: .combine)
                     }
-                    ForEach(attentionTasks) { task in
-                        taskDropContainer(task)
-                            .id(TaskBoardCardIdentity.value(taskID: task.id, group: .attention))
+                    ForEach(taskRows(attentionTasks, group: .attention)) { row in
+                        taskDropContainer(row.task)
                     }
                     if tasks.isEmpty {
                         TaskInsertionDropZone {
@@ -469,6 +470,10 @@ private struct TaskColumnView: View {
     private var attentionTasks: [AutomationTask] {
         guard column == .inProgress else { return [] }
         return tasks.filter { $0.phase == .failed || $0.phase == .retryWaiting }
+    }
+
+    private func taskRows(_ tasks: [AutomationTask], group: TaskBoardCardGroup) -> [TaskBoardCardRow] {
+        tasks.map { TaskBoardCardRow(task: $0, group: group) }
     }
 
     private var headerCount: String {
@@ -543,6 +548,13 @@ private struct TaskColumnView: View {
     private func acceptDrop(_ id: UUID, at index: Int) -> Bool {
         handleDrop(id, column, max(0, min(index, allTasks.count)))
     }
+}
+
+private struct TaskBoardCardRow: Identifiable {
+    let task: AutomationTask
+    let group: TaskBoardCardGroup
+
+    var id: String { TaskBoardCardIdentity.value(taskID: task.id, group: group) }
 }
 
 private struct TaskLaneShakeEffect: GeometryEffect {

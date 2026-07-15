@@ -18,7 +18,7 @@ struct AutomationSettingsView: View {
                     ForEach(warmupAccountRows) { row in
                         WarmupAccountAccessRow(
                             account: row.account,
-                            isAllowed: warmupAllowedBinding(row.account.alias)
+                            isAllowed: warmupAllowedBinding(row.account)
                         )
                     }
                 }
@@ -66,19 +66,20 @@ struct AutomationSettingsView: View {
             .map(WarmupAccountRow.init(account:))
     }
 
-    private func warmupAllowed(_ alias: String) -> Bool {
-        !model.settings.warmupExcludedAccounts.contains(alias)
+    private func warmupAllowed(_ account: Account) -> Bool {
+        !model.settings.warmupExcludedAccounts.contains(account.id)
+            && !model.settings.warmupExcludedAccounts.contains(account.alias)
     }
 
-    private func warmupAllowedBinding(_ alias: String) -> Binding<Bool> {
+    private func warmupAllowedBinding(_ account: Account) -> Binding<Bool> {
         Binding(
-            get: { warmupAllowed(alias) },
+            get: { warmupAllowed(account) },
             set: { allowed in
                 var excluded = model.settings.warmupExcludedAccounts
                 if allowed {
-                    excluded.removeAll { $0 == alias }
-                } else if !excluded.contains(alias) {
-                    excluded.append(alias)
+                    excluded.removeAll { $0 == account.id || $0 == account.alias }
+                } else if !excluded.contains(account.id) {
+                    excluded.append(account.id)
                 }
                 model.actions.setWarmupExcludedAccounts(excluded)
             }

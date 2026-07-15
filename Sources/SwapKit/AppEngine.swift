@@ -667,7 +667,8 @@ public actor AppEngine {
     }
 
     static func quotaWarmupEligible(_ account: Account, settings: Settings) -> Bool {
-        !settings.warmupExcludedAccounts.contains(account.alias)
+        !settings.warmupExcludedAccounts.contains(account.id)
+            && !settings.warmupExcludedAccounts.contains(account.alias)
     }
 
     /// Automatic warm-up may only spend quota on accounts the user has opted into:

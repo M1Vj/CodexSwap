@@ -284,6 +284,12 @@ final class RunTelemetryTests: XCTestCase {
         XCTAssertFalse(AppEngine.autoWarmupEligible(Account(alias: "protected", accessToken: "t", priority: 10), settings: settings))
         XCTAssertFalse(AppEngine.quotaWarmupEligible(Account(alias: "protected", accessToken: "t"), settings: settings), "manual warm-up must also respect durable protection")
         XCTAssertTrue(AppEngine.quotaWarmupEligible(Account(alias: "bystander", accessToken: "t"), settings: settings))
+
+        settings.warmupExcludedAccounts = ["stable-account-id"]
+        XCTAssertFalse(AppEngine.quotaWarmupEligible(
+            Account(alias: "renamed-alias", accountID: "stable-account-id", accessToken: "t"),
+            settings: settings
+        ), "protection must survive account alias changes")
     }
 
     func testReasonFormatterReportsOverThresholdDistinctFromHeadroom() {
