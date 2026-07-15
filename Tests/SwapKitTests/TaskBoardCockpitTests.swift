@@ -70,6 +70,19 @@ final class TaskBoardCockpitTests: XCTestCase {
         XCTAssertTrue(compact.hasSuffix("alias"))
     }
 
+    func testTaskCardChipLayoutBoundsEveryRowToTwoChips() {
+        let rows = TaskCardChipLayout.rows(
+            for: ["model", "effort", "evergreen", "selected-account", "served-account"]
+        )
+
+        XCTAssertEqual(rows, [
+            ["model", "effort"],
+            ["evergreen", "selected-account"],
+            ["served-account"],
+        ])
+        XCTAssertTrue(rows.allSatisfy { $0.count <= 2 })
+    }
+
     func testQueuedIdleCardShowsKnownSchedulingReason() {
         XCTAssertTrue(TaskCardPresentation.showsWaitingReason(column: .queued, phase: .idle, reason: "banked window not started"))
         XCTAssertFalse(TaskCardPresentation.showsWaitingReason(column: .todo, phase: .idle, reason: "banked window not started"))

@@ -321,6 +321,15 @@ public enum TaskAccountLabel {
     }
 }
 
+public enum TaskCardChipLayout {
+    public static func rows<Value>(for values: [Value], maximumPerRow: Int = 2) -> [[Value]] {
+        let rowSize = max(1, maximumPerRow)
+        return stride(from: 0, to: values.count, by: rowSize).map { start in
+            Array(values[start..<min(start + rowSize, values.count)])
+        }
+    }
+}
+
 public enum TaskCardPresentation {
     public static func showsWaitingReason(column: TaskColumn, phase: TaskPhase, reason: String?) -> Bool {
         if phase == .pausedQuota || phase == .retryWaiting { return true }

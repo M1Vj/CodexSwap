@@ -645,19 +645,13 @@ private struct TaskCardView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
 
-            HStack(spacing: 6) {
-                TaskChip(text: task.model)
-                TaskChip(text: task.reasoningEffort.capitalized)
-                if task.isEvergreen { TaskChip(text: "∞ evergreen") }
-                if !task.accountAliases.isEmpty {
-                    TaskChip(text: task.accountAliases.count == 1 ? TaskAccountLabel.compact(task.accountAliases[0]) : "\(task.accountAliases.count) accounts")
-                        .accessibilityLabel("Selected accounts: \(task.accountAliases.joined(separator: ", "))")
-                }
-                if let aliases = task.runs.last?.servedAliases,
-                   !aliases.isEmpty,
-                   aliases != task.accountAliases {
-                    TaskChip(text: aliases.count == 1 ? "Used \(TaskAccountLabel.compact(aliases[0]))" : "Used \(aliases.count) accounts")
-                        .accessibilityLabel("Last run served by \(aliases.joined(separator: ", "))")
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(chipRows.enumerated()), id: \.offset) { _, row in
+                    HStack(spacing: 6) {
+                        ForEach(row) { chip in
+                            TaskChip(text: chip.text, accessibilityLabel: chip.accessibilityLabel)
+                        }
+                    }
                 }
             }
 
@@ -780,6 +774,37 @@ private struct TaskCardView: View {
 
     private var repoName: String {
         URL(fileURLWithPath: task.repoPath).lastPathComponent
+    }
+
+    private var chipRows: [[TaskChipDescriptor]] {
+        var chips = [
+            TaskChipDescriptor(id: "model", text: task.model),
+            TaskChipDescriptor(id: "effort", text: task.reasoningEffort.capitalized),
+        ]
+        if task.isEvergreen {
+            chips.append(TaskChipDescriptor(id: "evergreen", text: "∞ evergreen"))
+        }
+        if !task.accountAliases.isEmpty {
+            chips.append(TaskChipDescriptor(
+                id: "accounts",
+                text: task.accountAliases.count == 1
+                    ? TaskAccountLabel.compact(task.accountAliases[0])
+                    : "\(task.accountAliases.count) accounts",
+                accessibilityLabel: "Selected accounts: \(task.accountAliases.joined(separator: ", "))"
+            ))
+        }
+        if let aliases = task.runs.last?.servedAliases,
+           !aliases.isEmpty,
+           aliases != task.accountAliases {
+            chips.append(TaskChipDescriptor(
+                id: "served",
+                text: aliases.count == 1
+                    ? "Used \(TaskAccountLabel.compact(aliases[0]))"
+                    : "Used \(aliases.count) accounts",
+                accessibilityLabel: "Last run served by \(aliases.joined(separator: ", "))"
+            ))
+        }
+        return TaskCardChipLayout.rows(for: chips)
     }
 
     private var waitingReason: some View {
@@ -917,17 +942,25 @@ private struct ArchivedTasksView: View {
 
 private struct TaskChip: View {
     let text: String
+    var accessibilityLabel: String? = nil
 
     var body: some View {
         Text(text)
             .font(.caption2)
             .foregroundStyle(.secondary)
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
+            .truncationMode(.middle)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(.quaternary, in: Capsule())
+            .accessibilityLabel(accessibilityLabel ?? text)
     }
+}
+
+private struct TaskChipDescriptor: Identifiable {
+    let id: String
+    let text: String
+    var accessibilityLabel: String? = nil
 }
 
 private struct RunningBadge: View {
@@ -965,6 +998,7 @@ private struct TaskEditorView: View {
     @State private var customModel: String
     @State private var fallbackModelsText: String
     @State private var branchWasEdited: Bool
+    @State private var branchIsValid: Bool
     @State private var repositoryIsValid: Bool
 
     let accounts: [Account]
@@ -985,6 +1019,7 @@ private struct TaskEditorView: View {
             _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
         }
         _branchWasEdited = State(initialValue: !isNew && !task.branch.isEmpty)
+        _branchIsValid = State(initialValue: TaskRepositoryValidator.isValidBranchName(task.branch))
         _repositoryIsValid = State(initialValue: TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath))
         self.accounts = accounts
         self.isNew = isNew
@@ -1001,6 +1036,7 @@ private struct TaskEditorView: View {
                     .onChange(of: draft.title) { _, title in
                         guard isNew, !branchWasEdited else { return }
                         draft.branch = "codexswap/\(slug(for: title))"
+                        validateBranch(draft.branch)
                     }
 
                 VStack(alignment: .leading, spacing: 6) {
@@ -1100,6 +1136,11 @@ private struct TaskEditorView: View {
                         .font(.callout)
                         .foregroundStyle(.red)
                 }
+                if !draft.branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !branchIsValid {
+                    Label("Choose a valid Git branch name", systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -1118,6 +1159,7 @@ private struct TaskEditorView: View {
             set: { value in
                 draft.branch = value
                 branchWasEdited = true
+                validateBranch(value)
             }
         )
     }
@@ -1138,6 +1180,7 @@ private struct TaskEditorView: View {
             && !draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !draft.branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !selectedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && branchIsValid
             && repositoryIsValid
     }
 
@@ -1161,6 +1204,17 @@ private struct TaskEditorView: View {
             }.value
             guard draft.repoPath.trimmingCharacters(in: .whitespacesAndNewlines) == candidate else { return }
             repositoryIsValid = isValid
+        }
+    }
+
+    private func validateBranch(_ branch: String) {
+        let candidate = branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { @MainActor in
+            let isValid = await Task.detached(priority: .userInitiated) {
+                TaskRepositoryValidator.isValidBranchName(candidate)
+            }.value
+            guard draft.branch.trimmingCharacters(in: .whitespacesAndNewlines) == candidate else { return }
+            branchIsValid = isValid
         }
     }
 

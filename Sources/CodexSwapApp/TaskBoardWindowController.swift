@@ -50,7 +50,7 @@ final class TaskBoardWindowController: NSWindowController, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        frameMonitor.scheduleNormalization()
+        frameMonitor.scheduleNormalization(reason: "show")
     }
 
     func toggleFullScreen() {
