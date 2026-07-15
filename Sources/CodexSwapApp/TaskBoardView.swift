@@ -19,7 +19,7 @@ struct TaskBoardView: View {
 
             Divider()
 
-            HSplitView {
+            HStack(spacing: 0) {
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: 12) {
                         ForEach(TaskColumn.allCases, id: \.rawValue) { column in
@@ -58,12 +58,14 @@ struct TaskBoardView: View {
                 .frame(minWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
 
                 if let selectedTask {
+                    Divider()
                     TaskBoardInspectorView(
                         task: selectedTask,
                         runLogURL: model.actions.runLogURL,
                         planDocument: model.actions.planDocument
                     )
-                    .frame(minWidth: 280, idealWidth: 340, maxWidth: 420, maxHeight: .infinity)
+                    .frame(width: 320)
+                    .frame(maxHeight: .infinity)
                 }
             }
         }
