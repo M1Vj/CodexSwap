@@ -210,6 +210,7 @@ final class TaskOutcomeReducerTests: XCTestCase {
     func testFailureClassifierMapsTaskRunnerErrors() {
         let cases: [(TaskRunnerError, TaskFailureKind)] = [
             (.invalidRepository, .invalidRepository),
+            (.invalidBranch, .invalidBranch),
             (.binaryNotFound, .binaryMissing),
             (.timedOut, .timeout),
             (.alreadyRunning, .unknown),
@@ -260,6 +261,11 @@ final class TaskOutcomeReducerTests: XCTestCase {
                 "invalid repository",
                 TaskExitContext(exitCode: 1, launchError: .invalidRepository),
                 .invalidRepository
+            ),
+            (
+                "invalid branch",
+                TaskExitContext(exitCode: 1, launchError: .invalidBranch),
+                .invalidBranch
             ),
             (
                 "missing binary",

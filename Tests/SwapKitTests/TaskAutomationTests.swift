@@ -64,6 +64,15 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertTrue(TaskRepositoryValidator.isGitWorkingTree(at: repository.path))
     }
 
+    func testTaskBranchValidatorMatchesGitBranchRules() {
+        XCTAssertTrue(TaskRepositoryValidator.isValidBranchName("develop"))
+        XCTAssertTrue(TaskRepositoryValidator.isValidBranchName("codexswap/task"))
+        XCTAssertFalse(TaskRepositoryValidator.isValidBranchName("develop/"))
+        XCTAssertFalse(TaskRepositoryValidator.isValidBranchName("HEAD"))
+        XCTAssertFalse(TaskRepositoryValidator.isValidBranchName(""))
+        XCTAssertFalse(TaskRepositoryValidator.isValidBranchName("-unsafe"))
+    }
+
     func testSettingsDecodeAutomationDefaults() throws {
         let settings = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
 

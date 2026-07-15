@@ -3,6 +3,7 @@ import Foundation
 public enum TaskRunnerError: LocalizedError, Sendable {
     case alreadyRunning
     case invalidRepository
+    case invalidBranch
     case binaryNotFound
     case timedOut
 
@@ -10,6 +11,7 @@ public enum TaskRunnerError: LocalizedError, Sendable {
         switch self {
         case .alreadyRunning: "Task is already running"
         case .invalidRepository: "Task repository must be the root of a Git working tree"
+        case .invalidBranch: "Task branch must be a valid Git branch name"
         case .binaryNotFound: "Codex binary not found"
         case .timedOut: "Task run exceeded the six-hour limit"
         }
@@ -111,6 +113,9 @@ public actor TaskRunner {
 
         guard TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath) else {
             throw TaskRunnerError.invalidRepository
+        }
+        guard TaskRepositoryValidator.isValidBranchName(task.branch) else {
+            throw TaskRunnerError.invalidBranch
         }
         // Warm-up's resolution order: prefer the real binary over any PATH shim — a write-jailing
         // shim would deny the isolated CODEX_HOME and fight the runner's own workspace-write sandbox.

@@ -24,6 +24,23 @@ public enum TaskRepositoryValidator {
         return gitOutput(at: path, arguments: ["rev-parse", "--absolute-git-dir"])
     }
 
+    public static func isValidBranchName(_ branch: String) -> Bool {
+        let candidate = branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return false }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["check-ref-format", "--branch", candidate]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
     private static func gitOutput(at path: String, arguments: [String]) -> String? {
         let process = Process()
         let output = Pipe()

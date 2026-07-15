@@ -1132,6 +1132,10 @@ public actor AppEngine {
             await handleTaskLaunchError(taskID: task.id, error: TaskRunnerError.invalidRepository)
             return .failed
         }
+        guard TaskRepositoryValidator.isValidBranchName(task.branch) else {
+            await handleTaskLaunchError(taskID: task.id, error: TaskRunnerError.invalidBranch)
+            return .failed
+        }
         let ownsReservation: Bool
         if reservationHeld {
             guard schedulingTaskIDs.contains(task.id) else { return .unavailable }

@@ -5,6 +5,7 @@ enum TaskFailureKind: String, Sendable, Equatable {
     case modelRejected
     case authentication
     case invalidRepository
+    case invalidBranch
     case binaryMissing
     case timeout
     case unknown
@@ -21,6 +22,8 @@ enum FailureClassifier {
             switch launchError {
             case .invalidRepository:
                 return .invalidRepository
+            case .invalidBranch:
+                return .invalidBranch
             case .binaryNotFound:
                 return .binaryMissing
             case .timedOut:
