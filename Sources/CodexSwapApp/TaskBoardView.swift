@@ -53,9 +53,9 @@ struct TaskBoardView: View {
                         }
                     }
                     .padding(14)
-                    .frame(minWidth: 900, maxHeight: .infinity)
+                    .frame(maxHeight: .infinity)
                 }
-                .frame(minWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if let selectedTask {
                     Divider()
@@ -455,7 +455,8 @@ private struct TaskColumnView: View {
             }
         }
         .padding(10)
-        .frame(minWidth: 225, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(width: 225)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(Color(nsColor: .underPageBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
         .modifier(TaskLaneShakeEffect(trigger: shakeTrigger))
         .dropDestination(for: String.self) { values, _ in
