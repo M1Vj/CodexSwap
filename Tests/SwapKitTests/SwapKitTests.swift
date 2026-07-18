@@ -2881,19 +2881,27 @@ private actor PinLifecycleTaskRunner: TaskRunning {
 
 final class TaskRunPinLifecycleTests: XCTestCase {
     func testPauseAtFinalLaunchGateLeavesNoPinOrRunState() async throws {
+        let probe = LaunchGateProbe()
         let harness = try await makeSchedulerHarness(
             startBehavior: .succeeds,
-            beforeTaskLaunch: { alias, store in await store.setRoutingEnabled(alias, enabled: false) }
+            beforeTaskLaunch: { alias, store, proxy in
+                await probe.record(pinCount: proxy.taskPinCount())
+                await store.setRoutingEnabled(alias, enabled: false)
+            }
         )
         defer { try? FileManager.default.removeItem(at: harness.root) }
 
         let result = await harness.engine.runTaskNow(id: harness.taskID)
         let pinCount = await harness.proxy.taskPinCount()
         let runID = await harness.runner.runID(for: harness.taskID)
+        let observedPinCount = await probe.pinCount()
+        let task = await harness.engine.snapshot().tasks.first { $0.id == harness.taskID }
 
         XCTAssertEqual(result, .blocked(reason: "Task became unavailable during launch"))
+        XCTAssertEqual(observedPinCount, 1)
         XCTAssertEqual(pinCount, 0)
         XCTAssertNil(runID)
+        XCTAssertTrue(task?.runs.isEmpty == true)
         await harness.proxy.stop()
     }
 
@@ -3058,7 +3066,7 @@ final class TaskRunPinLifecycleTests: XCTestCase {
     private func makeSchedulerHarness(
         startBehavior: PinLifecycleTaskRunner.StartBehavior,
         removeTaskDuringStart: Bool = false,
-        beforeTaskLaunch: (@Sendable (String, AccountStore) async -> Void)? = nil
+        beforeTaskLaunch: (@Sendable (String, AccountStore, ProxyServer) async -> Void)? = nil
     ) async throws -> (root: URL, taskID: UUID, runner: PinLifecycleTaskRunner, proxy: ProxyServer, engine: AppEngine) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scheduler-pin-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3099,10 +3107,16 @@ final class TaskRunPinLifecycleTests: XCTestCase {
             taskRunning: runner,
             supportDir: root,
             proxyForTesting: proxy,
-            beforeTaskLaunch: { alias in await beforeTaskLaunch?(alias, store) }
+            beforeTaskLaunch: { alias in await beforeTaskLaunch?(alias, store, proxy) }
         )
         return (root, taskID, runner, proxy, engine)
     }
+}
+
+private actor LaunchGateProbe {
+    private var observedPinCount = -1
+    func record(pinCount: Int) { observedPinCount = pinCount }
+    func pinCount() -> Int { observedPinCount }
 }
 
 final class AccountOwnershipTests: XCTestCase {

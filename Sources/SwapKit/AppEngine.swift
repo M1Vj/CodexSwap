@@ -1425,14 +1425,15 @@ public actor AppEngine {
             await taskStore.move(id: task.id, to: .inProgress, index: preferredInProgressIndex)
         }
 
+        await proxy?.pinTaskStart(runID: runID.uuidString, alias: account.alias)
         await beforeTaskLaunch?(account.alias)
         guard let launchAccount = await store.account(account.alias), launchAccount.isEligible(now: Date()) else {
+            await proxy?.unpinTaskStart(runID: runID.uuidString)
             repositoryLeases.removeValue(forKey: task.id)
             await taskStore.update(task)
             await autoLog.write("tick", "\(Self.taskLabel(task)) account became ineligible at launch gate")
             return .unavailable
         }
-        await proxy?.pinTaskStart(runID: runID.uuidString, alias: account.alias)
         do {
             try await taskRunner.start(
                 task: task,
