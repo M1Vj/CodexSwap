@@ -604,6 +604,15 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertEqual(AppEngine.automationAccount(from: [recent, stale], settings: settings, now: now)?.alias, "stale")
     }
 
+    func testAutomationAccountSkipsRoutingDisabledAccount() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let usage = [UsageWindow(label: "5h", usedPercent: 10, windowSeconds: 18_000, resetAt: nil)]
+        let paused = Account(alias: "paused", accessToken: "t", priority: 10, usage: usage, routingEnabled: false)
+        let enabled = Account(alias: "enabled", accessToken: "t", priority: 1, usage: usage)
+
+        XCTAssertEqual(AppEngine.automationAccount(from: [paused, enabled], settings: .default, now: now)?.alias, "enabled")
+    }
+
     func testSelectProxyAccountTaskModeStickyPreferredLosesTurnOverThreshold() async throws {
         let root = try temporaryDirectory(named: "task-sticky-selection")
         defer { try? FileManager.default.removeItem(at: root) }

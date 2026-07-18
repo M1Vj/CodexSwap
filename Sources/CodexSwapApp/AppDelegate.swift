@@ -275,6 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = acc.alias
             item.state = acc.alias == latest.activeAlias ? .on : .off
+            item.isEnabled = AccountRoutingPresentation.canMakeActive(routingEnabled: acc.routingEnabled)
             menu.addItem(item)
         }
 

@@ -442,6 +442,21 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(requestedAliases, ["cached-clear", "fresh-clear"])
     }
 
+    func testFreshAlternativeSkipsRoutingDisabledAccountWithoutFetchingUsage() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AppEnginePausedAlternative-\(UUID().uuidString)", isDirectory: true)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "current", accountID: "current", accessToken: "current-token"))
+        await store.upsert(Account(alias: "paused", accountID: "paused", accessToken: "paused-token", priority: 10, routingEnabled: false))
+        await store.upsert(Account(alias: "enabled", accountID: "enabled", accessToken: "enabled-token", priority: 1))
+        let usage = AlternativeUsage(values: ["paused": [], "enabled": [UsageWindow(label: "5h", usedPercent: 10, windowSeconds: 18_000, resetAt: nil)]])
+
+        let alternative = await AppEngine.freshAlternative(store: store, usage: usage, currentAlias: "current", allowedAliases: ["paused", "enabled"])
+        let requestedAliases = await usage.requestedAliases()
+
+        XCTAssertEqual(alternative?.alias, "enabled")
+        XCTAssertEqual(requestedAliases, ["enabled"])
+    }
+
     private func makeFixture(
         availableCount: Int,
         expiry: Date? = nil

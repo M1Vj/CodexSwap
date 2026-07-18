@@ -2192,6 +2192,28 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(selected?.alias, "a")
     }
 
+    func testPausedInteractivePinIsOverriddenOnNextSelection() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("paused-turn-pin-\(UUID().uuidString).json"))
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        await store.setRoutingEnabled("a", enabled: false)
+
+        let selected = await selectProxyAccount(store: store, mode: .normal, preferredInteractiveAlias: "a")
+
+        XCTAssertEqual(selected?.alias, "b")
+    }
+
+    func testPausedTaskRunPinIsOverriddenOnNextSelection() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("paused-task-pin-\(UUID().uuidString).json"))
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        await store.setRoutingEnabled("a", enabled: false)
+
+        let selected = await selectProxyAccount(store: store, mode: .task(allowed: ["a", "b"]), hardPinnedTaskAlias: "a")
+
+        XCTAssertEqual(selected?.alias, "b")
+    }
+
     func testBoundedCleanupPreservesCurrentKey() {
         var pins = InteractiveTurnPins(maxCount: 2, maxAge: 10)
         let now = Date(timeIntervalSince1970: 2_000)
@@ -3032,6 +3054,13 @@ final class AccountOwnershipTests: XCTestCase {
 }
 
 final class SettingsPresentationTests: XCTestCase {
+    func testRoutingPausePresentationUsesExactActionsAndRejectsMakeActive() {
+        XCTAssertEqual(AccountRoutingPresentation.status(routingEnabled: false), "Routing Disabled")
+        XCTAssertEqual(AccountRoutingPresentation.action(routingEnabled: false), "Enable Routing")
+        XCTAssertEqual(AccountRoutingPresentation.action(routingEnabled: true), "Disable Routing")
+        XCTAssertFalse(AccountRoutingPresentation.canMakeActive(routingEnabled: false))
+    }
+
     func testAccountRowsExposeOwnershipActiveStateAndUsage() {
         let managed = Account(
             alias: "managed",
@@ -3102,7 +3131,7 @@ final class SettingsInformationArchitectureTests: XCTestCase {
 
     func testEachSettingBelongsToExactlyOneApprovedPane() {
         XCTAssertEqual(SettingsInformationArchitecture.general, [.routing, .launchAtLogin])
-        XCTAssertEqual(SettingsInformationArchitecture.accounts, [.identityAndOwnership, .activeAccount, .priority, .resetCreditStatus, .manualReset, .automaticResetProtection])
+        XCTAssertEqual(SettingsInformationArchitecture.accounts, [.identityAndOwnership, .activeAccount, .accountRouting, .priority, .resetCreditStatus, .manualReset, .automaticResetProtection])
         XCTAssertEqual(SettingsInformationArchitecture.quotaAndResets, [.quotaRefreshStatus, .creditAvailability, .automaticReset, .interactiveExhaustionPolicy, .notifications])
         XCTAssertEqual(SettingsInformationArchitecture.taskBoard, [.automation, .allowedAccounts, .concurrency, .bankedWindow, .taskBoardExhaustionPolicy])
         XCTAssertEqual(SettingsInformationArchitecture.advanced, [.proxyDiagnostics, .terminalShim])

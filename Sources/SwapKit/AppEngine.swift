@@ -1388,6 +1388,10 @@ public actor AppEngine {
             await autoLog.write("tick", "\(Self.taskLabel(task)) repo-busy")
             return .unavailable
         }
+        guard let currentAccount = await store.account(account.alias), currentAccount.isEligible(now: Date()) else {
+            await autoLog.write("tick", "\(Self.taskLabel(task)) account became ineligible before launch")
+            return .unavailable
+        }
         repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
 
         let startGate = TaskStartGate()

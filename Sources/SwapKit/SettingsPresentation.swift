@@ -10,7 +10,7 @@ public enum AccountResetCreditStatus: Sendable, Equatable {
 
 public enum SettingsItem: Sendable, Equatable {
     case routing, launchAtLogin
-    case identityAndOwnership, activeAccount, priority, resetCreditStatus, manualReset, automaticResetProtection
+    case identityAndOwnership, activeAccount, accountRouting, priority, resetCreditStatus, manualReset, automaticResetProtection
     case quotaRefreshStatus, creditAvailability, automaticReset, interactiveExhaustionPolicy, notifications
     case automation, allowedAccounts, concurrency, bankedWindow, taskBoardExhaustionPolicy
     case proxyDiagnostics, terminalShim
@@ -23,7 +23,7 @@ public struct SettingsPaneDefinition: Sendable, Equatable {
 
 public enum SettingsInformationArchitecture {
     public static let general: [SettingsItem] = [.routing, .launchAtLogin]
-    public static let accounts: [SettingsItem] = [.identityAndOwnership, .activeAccount, .priority, .resetCreditStatus, .manualReset, .automaticResetProtection]
+    public static let accounts: [SettingsItem] = [.identityAndOwnership, .activeAccount, .accountRouting, .priority, .resetCreditStatus, .manualReset, .automaticResetProtection]
     public static let quotaAndResets: [SettingsItem] = [.quotaRefreshStatus, .creditAvailability, .automaticReset, .interactiveExhaustionPolicy, .notifications]
     public static let taskBoard: [SettingsItem] = [.automation, .allowedAccounts, .concurrency, .bankedWindow, .taskBoardExhaustionPolicy]
     public static let advanced: [SettingsItem] = [.proxyDiagnostics, .terminalShim]
@@ -35,6 +35,18 @@ public enum SettingsInformationArchitecture {
         SettingsPaneDefinition(title: "Task Board", items: taskBoard),
         SettingsPaneDefinition(title: "Advanced", items: advanced),
     ]
+}
+
+public enum AccountRoutingPresentation {
+    public static func status(routingEnabled: Bool) -> String? {
+        routingEnabled ? nil : "Routing Disabled"
+    }
+
+    public static func action(routingEnabled: Bool) -> String {
+        routingEnabled ? "Disable Routing" : "Enable Routing"
+    }
+
+    public static func canMakeActive(routingEnabled: Bool) -> Bool { routingEnabled }
 }
 
 public struct AccountSettingsRow: Identifiable, Sendable, Equatable {

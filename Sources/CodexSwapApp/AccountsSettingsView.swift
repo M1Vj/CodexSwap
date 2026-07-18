@@ -58,7 +58,9 @@ private struct AccountSettingsRowView: View {
                 HStack(spacing: 8) {
                     Text(account.ownership == .codexBarManaged ? "CodexBar managed" : "Standalone")
                     Text(account.isActive ? "Active" : "Inactive")
-                    if !account.routingEnabled { Text("Routing Disabled").foregroundStyle(.orange) }
+                    if let status = AccountRoutingPresentation.status(routingEnabled: account.routingEnabled) {
+                        Text(status).foregroundStyle(.orange)
+                    }
                     if !account.usageSummary.isEmpty { Text(account.usageSummary) }
                     if account.needsLogin { Text("Needs sign-in").foregroundStyle(.orange) }
                 }
@@ -81,8 +83,8 @@ private struct AccountSettingsRowView: View {
             )
             .frame(width: 135)
 
-            if !account.routingEnabled {
-                Button("Enable Routing") { model.actions.setAccountRouting(account.alias, true) }
+            if !AccountRoutingPresentation.canMakeActive(routingEnabled: account.routingEnabled) {
+                Button(AccountRoutingPresentation.action(routingEnabled: account.routingEnabled)) { model.actions.setAccountRouting(account.alias, true) }
                     .accessibilityLabel("Enable routing for \(account.alias)")
             } else if !account.isActive {
                 Button("Make Active", action: { model.actions.switchAccount(account.alias) })
@@ -92,7 +94,7 @@ private struct AccountSettingsRowView: View {
                     .foregroundStyle(.secondary)
             }
             if account.routingEnabled {
-                Button("Disable Routing") { model.actions.setAccountRouting(account.alias, false) }
+                Button(AccountRoutingPresentation.action(routingEnabled: account.routingEnabled)) { model.actions.setAccountRouting(account.alias, false) }
                     .accessibilityLabel("Disable routing for \(account.alias)")
             }
             Button("Use Reset…") { resetConfirmationPresented = true }
