@@ -244,20 +244,25 @@ rtk grep -n 'Button\("Use"\)|95%|98%|six-second|proactive switch' Sources README
 
 - [x] Run the complete test suite, app build, release-tool checks, and app build
   script.
-- [ ] Run the local ephemeral routing probe; it must report provider `openai`,
+- [x] Run the local ephemeral routing probe; it must report provider `openai`,
   one 426 WebSocket fallback, one successful HTTP request, and no reconnect loop.
 - [x] Add and pass one unified `RoutingContractProbeTests` scenario that proves
   provider identity, one local 426, one successful HTTP POST, and no reconnect
   or extra upstream request. Existing separate tests do not satisfy this gate.
 - [x] Have an independent reviewer inspect history preservation, reset safety,
   Task Board lifecycle pins, setting migration, and credential exposure.
-- [ ] Only after all gates pass, back up the existing application bundle and
+- [x] Only after all gates pass, back up the existing application bundle and
   replace it reversibly. Never delete `~/.codex`, Codex history, or CodexSwap
   application-support data.
-- [ ] After one restart of CodexSwap and Codex, verify normal OpenAI history is
-  visible, routing is model-only, Launch at Login is unchanged, all five panes
-  appear, and reset-credit display remains read-only until the user confirms a
-  manual reset.
+- [x] Restart the installed CodexSwap bundle and launch a fresh routed Codex
+  client. Verify provider `openai`, one 426-to-HTTP fallback, a successful model
+  response, model-only managed configuration, unchanged Launch at Login, and
+  automatic reset still disabled. Directly re-open the exact task that had been
+  hidden by the old provider configuration and confirm it remains readable.
+- [ ] At the next safe Codex desktop restart, visually inspect all five native
+  Settings panes. The installed menu-bar-only Settings command was not reachable
+  through the available UI automation; five-pane order and presentation remain
+  covered by the passing application tests.
 
 Acceptance:
 
@@ -312,8 +317,23 @@ rtk proxy env CODEXSWAP_NULL_STDIN=1 CODEXSWAP_VERBOSE=1 swift run swapd run exe
   multi-chunk streaming for large terminal 429 responses, authoritative
   post-redemption quota status, distinct sanitized authorization/network
   outcomes, and deadline-bounded late-registration cleanup tests.
-- The complete-suite, release bundle, reversible install, and post-restart live
-  verification gates are complete except for the live routed child probe,
-  reversible installed-app replacement, and post-restart verification. No live
-  credit, Codex history database, installed app, or running application has
-  been modified by these checks.
+- 2026-07-18 installed gate: `/Applications/CodexSwap.app` was reversibly
+  replaced with `0.2.0 (2)` after preserving two build-1 rollback copies. The
+  installed app and helper hashes match `dist/CodexSwap.app`; strict codesign
+  verification passes and the app listens only on `127.0.0.1:58432`.
+- The production routing manager installed only `openai_base_url` plus
+  `model_provider = "openai"`; the config and restore record remain mode `0600`.
+  A single WebSocket upgrade probe returned 426, then one fresh ephemeral Codex
+  process reported provider `openai`, fell back to HTTP, returned the exact
+  sentinel, and exited 0. Automatic reset and Launch at Login remained false;
+  no reset action or reset credit was used.
+- The exact previously hidden task ID and this current task are both directly
+  readable through the Codex app task API after routing was enabled. The fresh
+  final verification again passed 377 tests, the application target build,
+  release-tool checks, diff validation, installed codesign, listener, version,
+  and executable-hash comparisons.
+- The only remaining release-evidence item is a visual pass over all five native
+  Settings panes after a safe Codex desktop restart. Restarting the active Codex
+  desktop process would interrupt this verification task, and the installed
+  app's menu-bar-only Settings command was not exposed to the UI automation.
+  Five-pane order and presentation remain covered by passing tests.
