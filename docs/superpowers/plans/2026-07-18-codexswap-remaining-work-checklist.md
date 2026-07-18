@@ -30,6 +30,10 @@ substitute for the final full-suite gate.
   exhaustion decision. Non-usage 429 responses pass through unchanged.
 - Automatic reset is opt-in. Protected accounts are excluded from automatic
   reset but can be manually reset after confirmation.
+- A persistent per-account routing pause is the administrative exception to
+  sticky pins. It takes effect on the next request without cancelling a request
+  already forwarded or a Task Board runner already started. Percentage and
+  quota displays remain observational and never switch pins.
 - A reset always names the earliest-expiring available credit explicitly and
   persists an idempotency record before attempting consumption.
 - Tests use fakes/local loopback servers only. No test consumes a live credit.
@@ -203,15 +207,22 @@ rtk git diff --check
 
 - [x] Bound account priority to integer values `0...10` in model, store, imports,
   updates, tests, and UI.
-- [ ] Add a temporary account-routing disable feature after the routing-pause
-  design is approved.
-  - Preserve OAuth credentials and account records.
-  - Disabled accounts must not be selected for interactive turns, Task Board
-    runs, warm-up, failover, or automatic reset.
-  - Manual reset remains available only after explicit confirmation.
-  - Show `Routing Disabled` and `Enable Routing` in Accounts.
-  - Current recommended behavior is a persistent pause until manually enabled;
-    session-only and timed alternatives were offered and await user approval.
+- [x] Add a persistent per-account routing pause.
+  - Accounts exposes `Disable Routing`, visible `Routing Disabled` status, and
+    `Enable Routing`. The pause persists until explicitly enabled while OAuth
+    credentials, account records, and task account choices remain intact.
+  - A paused account is excluded from normal interactive and Task Board
+    selection, the next request on an existing interactive/run pin,
+    actual-429 alternatives, Task Board scheduling, manual and automatic
+    warm-up, and automatic reset.
+  - An already-forwarded request or started runner is not cancelled. Later
+    proxy selection rebinds the pin to an eligible account or fails when none
+    exists.
+  - Manual reset remains available after explicit confirmation. Automatic
+    reset remains opt-in and skips paused accounts.
+  - Focused routing, Settings presentation, reset-alternative, warm-up, Task
+    Board admission, active-pin, and launch-race regressions cover the feature
+    across commits `6b19cb9`, `ced416e`, `bf9c59a`, and `f7e0e22`.
 
 Acceptance:
 
@@ -332,8 +343,14 @@ rtk proxy env CODEXSWAP_NULL_STDIN=1 CODEXSWAP_VERBOSE=1 swift run swapd run exe
   final verification again passed 377 tests, the application target build,
   release-tool checks, diff validation, installed codesign, listener, version,
   and executable-hash comparisons.
-- The only remaining release-evidence item is a visual pass over all five native
-  Settings panes after a safe Codex desktop restart. Restarting the active Codex
-  desktop process would interrupt this verification task, and the installed
-  app's menu-bar-only Settings command was not exposed to the UI automation.
-  Five-pane order and presentation remain covered by passing tests.
+- Current code review at `f7e0e22` covers the persistent account pause plus
+  follow-up enforcement for active routes, task-launch revalidation, and the
+  final launch race. The focused regressions cover persistence without account
+  data loss, Settings labels, normal and pinned selection, actual-429
+  alternatives, Task Board admission, manual and automatic warm-up, automatic
+  reset exclusion, and manual-reset availability.
+- `/Applications/CodexSwap.app` still contains the earlier build that passed the
+  installed routing gate before the account-pause commits. Do not claim the
+  pause controls or their native presentation are installed until a new bundle
+  is built, installed reversibly, and inspected. The separate unchecked visual
+  pass over all five native Settings panes also remains open.

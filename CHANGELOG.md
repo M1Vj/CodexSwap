@@ -20,6 +20,7 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Independent interactive Codex and Task Board exhaustion policies: Reset Current First, Switch First, or Stop & Notify.
 - Opt-in automatic reset-credit use, per-account automatic-reset protection, and a confirmed manual Use Reset… action that selects the earliest-expiring usable credit.
 - Five focused Settings panes: General, Accounts, Quota & Resets, Task Board, and Advanced. Account actions now say Make Active, while the current account shows Active.
+- Per-account **Disable Routing** control with persistent **Routing Disabled** status and **Enable Routing** recovery. Pausing retains credentials, the account record, and saved task account choices.
 
 ### Changed
 
@@ -36,6 +37,7 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Priority or round-robin selection now applies only when a new interactive turn or Task Board run starts. Active turns and runs remain pinned; usage polling and idle gaps do not trigger proactive switching.
 - Only a semantic upstream `usage_limit_reached` response invokes the independently configured interactive or Task Board exhaustion policy, with one decision and at most one retry.
 - Reset-credit automation is opt-in and respects per-account automatic protection; manual confirmed use remains available for protected accounts. The internal reset endpoint is undocumented and may change.
+- A routing pause takes effect on the next request as an administrative exception to sticky pins. Paused accounts are excluded from new and pinned proxy selection, actual-429 alternatives, Task Board scheduling, warm-up, and automatic reset; an already-forwarded request or started runner continues.
 - Task sessions may batch their commits: the run contract no longer demands a commit per checklist item, only that all work and the plan document are committed before the session ends.
 - Task completion now requires a successful process exit and a non-empty fully checked plan whose final non-blank line reports `STATUS: COMPLETE`.
 

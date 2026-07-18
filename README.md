@@ -70,7 +70,7 @@ Routing safely keeps Codex's built-in `openai` provider identity and changes onl
 | Pane | Controls |
 | --- | --- |
 | **General** | Model routing and the independent Launch at Login setting |
-| **Accounts** | Account identity, **Active** state, priority, reset credits, confirmed **Use Reset…**, and automatic-reset protection; choose **Make Active** on another account |
+| **Accounts** | Account identity, **Active** state, priority, reversible per-account routing pause, reset credits, confirmed **Use Reset…**, and automatic-reset protection; choose **Make Active** on another account |
 | **Quota & Resets** | Quota warm-up, the global automatic-reset opt-in, interactive Codex exhaustion policy, and quota notifications |
 | **Task Board** | Task automation, allowed accounts, concurrency, banked-window behavior, and its separate exhaustion policy |
 | **Advanced** | Proxy diagnostics and safe installation or removal of the optional terminal shim |
@@ -94,6 +94,14 @@ Task runs consume quota on the accounts you enable for automation. The **May con
 Usage polling does not start a quota window. Optional warm-up sends one small, real Codex request per eligible account when a new recorded five-hour cycle becomes available. **Warm all accounts now…** performs the same action manually after confirmation.
 
 Warm-up consumes a small amount of quota. OpenAI does not publicly guarantee that one request starts every displayed five-hour or weekly window, so CodexSwap refreshes usage afterward and reports only reset data returned by the service. The automatic setting is off by default.
+
+### Pause routing for one account
+
+In **Settings → Accounts**, choose **Disable Routing** to pause an account. The row shows **Routing Disabled** and offers **Enable Routing** until you resume it. The pause persists across app restarts. CodexSwap keeps the account record, OAuth credentials, and saved Task Board account choices intact.
+
+A paused account is excluded from new interactive selection, the next request on an existing interactive or Task Board run pin, actual-429 failover, Task Board scheduling, manual and automatic warm-up, and automatic reset. If the account was serving a pinned turn or run, the pause is an administrative exception to sticky routing and takes effect on its next request. Quota percentages and quota displays still do not move a pin.
+
+CodexSwap does not cancel a request that it already forwarded or a Task Board runner that already started. The next proxy selection rebinds the pin to an eligible account or fails when none is eligible. You can still choose **Use Reset…** for the paused account and confirm the manual reset. Automatic reset remains opt-in and never uses a paused account.
 
 ### Exhaustion and reset policies
 

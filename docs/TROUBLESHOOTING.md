@@ -46,6 +46,16 @@ Without CodexBar, choose **Add Standalone…**, finish the standard `codex login
 
 Refresh or sign in through the application that owns the account. For a CodexBar-managed account, use CodexBar. For a standalone account, run the standard Codex login flow and rescan. Removing an account from CodexSwap does not revoke its OpenAI session.
 
+## An account says Routing Disabled
+
+You paused this account in **Settings → Accounts**. The pause persists until you choose **Enable Routing**. CodexSwap retains its OAuth credentials, account record, and saved Task Board account choices.
+
+The account cannot serve new chats, the next request on an existing interactive or Task Board run pin, an actual-429 alternative, Task Board scheduling, warm-up, or automatic reset. This administrative pause overrides a sticky pin on the next request. Percentage and quota displays still do not switch pins.
+
+CodexSwap does not cancel a request that reached the upstream service before the pause or a Task Board runner that already started. On its next request, the proxy rebinds to an eligible account or reports that no account is eligible. The runner can remain alive while its requests use another eligible account.
+
+You can still choose **Use Reset…** and confirm a manual reset for the paused account. Automatic reset remains opt-in and skips paused accounts. **Warm all accounts now…** also skips them.
+
 ## Quota information looks stale
 
 Choose **Refresh Usage** from the menu. Usage polling reads the service's current quota response but does not itself start a quota timer. Optional warm-up makes a real request and consumes a small amount of quota; it cannot guarantee how OpenAI will represent every five-hour or weekly reset window.
