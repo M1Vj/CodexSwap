@@ -73,6 +73,21 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(consumeCount, 1)
     }
 
+    func testAutomaticResetRejectsRoutingDisabledAccountWithoutConsumingCredit() async throws {
+        let fixture = try await makeFixture(availableCount: 1)
+        _ = await fixture.settingsStore.update {
+            $0.automaticallyResetExhaustedAccounts = true
+            $0.autoResetProtectedAccounts = []
+        }
+        await fixture.store.setRoutingEnabled("alpha", enabled: false)
+
+        let result = await fixture.engine.proxyAutomaticResetHandler()("alpha")
+        let consumeCount = await fixture.service.consumeCount()
+
+        XCTAssertEqual(result, .accountUnavailable)
+        XCTAssertEqual(consumeCount, 0)
+    }
+
     func testEnginePublishesOnlySanitizedResetCreditStatuses() async throws {
         let expiry = Date(timeIntervalSince1970: 1_900_000_000)
         let fixture = try await makeFixture(availableCount: 2, expiry: expiry)

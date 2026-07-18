@@ -794,6 +794,11 @@ public actor AppEngine {
         await scheduleResetCreditStatusRefresh()
     }
 
+    public func setAccountRouting(_ alias: String, enabled: Bool) async {
+        await store.setRoutingEnabled(alias, enabled: enabled)
+        emit(.snapshotChanged)
+    }
+
     public func remove(_ alias: String) async {
         await store.remove(alias)
         emit(.snapshotChanged)
@@ -882,7 +887,8 @@ public actor AppEngine {
     }
 
     static func quotaWarmupEligible(_ account: Account, settings: Settings) -> Bool {
-        !settings.warmupExcludedAccounts.contains(account.id)
+        account.routingEnabled
+            && !settings.warmupExcludedAccounts.contains(account.id)
             && !settings.warmupExcludedAccounts.contains(account.alias)
     }
 

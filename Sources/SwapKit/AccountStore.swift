@@ -190,7 +190,7 @@ public actor AccountStore {
     /// Manual switch: clears the target's cooldowns and needs-login, then activates it.
     @discardableResult
     public func setActive(_ alias: String, now: Date = Date()) -> Account? {
-        guard let i = index(alias) else { return nil }
+        guard let i = index(alias), data.accounts[i].routingEnabled else { return nil }
         data.accounts[i].disabledUntil = [:]
         data.accounts[i].needsLogin = false
         data.accounts[i].lastUsedAt = now
@@ -283,6 +283,7 @@ public actor AccountStore {
             merged.priority = data.accounts[i].priority
             merged.alias = data.accounts[i].alias
             merged.disabledUntil = data.accounts[i].disabledUntil
+            merged.routingEnabled = data.accounts[i].routingEnabled
             merged.lastUsedAt = data.accounts[i].lastUsedAt
             merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
             // Imported records never carry usage; the periodic CodexBar sync upserts every
@@ -316,6 +317,13 @@ public actor AccountStore {
         }
         if !reset.isEmpty { persist() }
         return reset
+    }
+
+    public func setRoutingEnabled(_ alias: String, enabled: Bool) {
+        guard let i = index(alias) else { return }
+        data.accounts[i].routingEnabled = enabled
+        if !enabled, data.activeAlias == alias { data.activeAlias = nil }
+        persist()
     }
 }
 

@@ -334,6 +334,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStrategy: { [weak self] strategy in self?.changeStrategy(strategy) },
             switchAccount: { [weak self] alias in self?.activateAccount(alias) },
             setPriority: { [weak self] alias, priority in self?.changePriority(alias, priority: priority) },
+            setAccountRouting: { [weak self] alias, enabled in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.engine.setAccountRouting(alias, enabled: enabled)
+                    await self.refreshSnapshot()
+                }
+            },
             setAutomaticResetProtection: { [weak self] alias, protected in
                 self?.updateSettings {
                     var aliases = Set($0.autoResetProtectedAccounts)

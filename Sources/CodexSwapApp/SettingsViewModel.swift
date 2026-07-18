@@ -10,6 +10,7 @@ struct SettingsActions {
     let setStrategy: (RotationStrategy) -> Void
     let switchAccount: (String) -> Void
     let setPriority: (String, Int) -> Void
+    let setAccountRouting: (String, Bool) -> Void
     let setAutomaticResetProtection: (String, Bool) -> Void
     let useResetCredit: (String, Date?) -> Void
     let removeAccount: (String) -> Void

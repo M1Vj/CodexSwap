@@ -58,6 +58,7 @@ private struct AccountSettingsRowView: View {
                 HStack(spacing: 8) {
                     Text(account.ownership == .codexBarManaged ? "CodexBar managed" : "Standalone")
                     Text(account.isActive ? "Active" : "Inactive")
+                    if !account.routingEnabled { Text("Routing Disabled").foregroundStyle(.orange) }
                     if !account.usageSummary.isEmpty { Text(account.usageSummary) }
                     if account.needsLogin { Text("Needs sign-in").foregroundStyle(.orange) }
                 }
@@ -80,12 +81,19 @@ private struct AccountSettingsRowView: View {
             )
             .frame(width: 135)
 
-            if !account.isActive {
+            if !account.routingEnabled {
+                Button("Enable Routing") { model.actions.setAccountRouting(account.alias, true) }
+                    .accessibilityLabel("Enable routing for \(account.alias)")
+            } else if !account.isActive {
                 Button("Make Active", action: { model.actions.switchAccount(account.alias) })
                     .accessibilityLabel("Make \(account.alias) active")
             } else {
                 Label("Active", systemImage: "checkmark")
                     .foregroundStyle(.secondary)
+            }
+            if account.routingEnabled {
+                Button("Disable Routing") { model.actions.setAccountRouting(account.alias, false) }
+                    .accessibilityLabel("Disable routing for \(account.alias)")
             }
             Button("Use Reset…") { resetConfirmationPresented = true }
                 .disabled(!resetAvailable)

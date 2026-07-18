@@ -1753,6 +1753,55 @@ final class RotationTests: XCTestCase {
         XCTAssertEqual(current?.alias, "high")
     }
 
+    func testRoutingDisabledAccountIsIneligibleAndCannotBeMadeActive() async {
+        var paused = acct("paused", priority: 10)
+        paused.routingEnabled = false
+        let store = await tempStore([paused, acct("enabled", priority: 1)])
+
+        let current = await store.current()
+        let attempted = await store.setActive("paused")
+        let activeAlias = await store.activeAlias()
+        XCTAssertEqual(current?.alias, "enabled")
+        XCTAssertNil(attempted)
+        XCTAssertEqual(activeAlias, "enabled")
+    }
+
+    func testUpsertPreservesExistingRoutingPause() async {
+        var paused = acct("paused")
+        paused.routingEnabled = false
+        let store = await tempStore([paused])
+
+        let imported = await store.upsert(acct("paused", token: "new-token"))
+
+        XCTAssertFalse(imported.routingEnabled)
+        XCTAssertEqual(imported.accessToken, "new-token")
+    }
+
+    func testRoutingPausePersistsWithoutChangingAccountData() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cs-routing-\(UUID().uuidString).json")
+        let store = AccountStore(url: url)
+        let original = Account(alias: "paused", email: "a@example.com", accountID: "account", accessToken: "access", refreshToken: "refresh", idToken: "id", priority: 7, managedHomePath: "/managed")
+        await store.upsert(original)
+        await store.setRoutingEnabled("paused", enabled: false)
+
+        let reloaded = await AccountStore(url: url).account("paused")
+        XCTAssertEqual(reloaded?.routingEnabled, false)
+        XCTAssertEqual(reloaded?.tokens, original.tokens)
+        XCTAssertEqual(reloaded?.priority, 7)
+        XCTAssertEqual(reloaded?.managedHomePath, "/managed")
+    }
+
+    func testLegacyAccountJSONDefaultsRoutingEnabledToTrue() throws {
+        let json = #"{"alias":"legacy","email":"","accountID":"legacy","accessToken":"t","refreshToken":"","idToken":"","priority":0,"disabledUntil":{},"needsLogin":false,"usage":[]}"#.data(using: .utf8)!
+        let account = try JSONDecoder.codex.decode(Account.self, from: json)
+        XCTAssertTrue(account.routingEnabled)
+    }
+
+    func testRoutingPauseExcludesWarmup() {
+        let paused = Account(alias: "paused", accountID: "paused", accessToken: "t", routingEnabled: false)
+        XCTAssertFalse(AppEngine.quotaWarmupEligible(paused, settings: .default))
+    }
+
     func testSkipsCooledDownAndNeedsLogin() async {
         let future = Date().addingTimeInterval(3600)
         let store = await tempStore([

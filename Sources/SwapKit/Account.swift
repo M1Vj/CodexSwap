@@ -49,6 +49,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var usage: [UsageWindow]
     /// If set, this account's tokens are owned by CodexBar; read/write them at this managed CODEX_HOME.
     public var managedHomePath: String?
+    public var routingEnabled: Bool
 
     public var id: String { accountID.isEmpty ? alias : accountID }
 
@@ -65,7 +66,8 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         needsLogin: Bool = false,
         lastUsedAt: Date? = nil,
         usage: [UsageWindow] = [],
-        managedHomePath: String? = nil
+        managedHomePath: String? = nil,
+        routingEnabled: Bool = true
     ) {
         self.alias = alias
         self.email = email
@@ -80,6 +82,30 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.lastUsedAt = lastUsedAt
         self.usage = usage
         self.managedHomePath = managedHomePath
+        self.routingEnabled = routingEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
+        case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, routingEnabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        alias = try c.decode(String.self, forKey: .alias)
+        email = try c.decodeIfPresent(String.self, forKey: .email) ?? ""
+        accountID = try c.decodeIfPresent(String.self, forKey: .accountID) ?? ""
+        planType = try c.decodeIfPresent(String.self, forKey: .planType)
+        accessToken = try c.decodeIfPresent(String.self, forKey: .accessToken) ?? ""
+        refreshToken = try c.decodeIfPresent(String.self, forKey: .refreshToken) ?? ""
+        idToken = try c.decodeIfPresent(String.self, forKey: .idToken) ?? ""
+        priority = AccountPriority.normalize(try c.decodeIfPresent(Int.self, forKey: .priority) ?? 0)
+        disabledUntil = try c.decodeIfPresent([String: Date].self, forKey: .disabledUntil) ?? [:]
+        needsLogin = try c.decodeIfPresent(Bool.self, forKey: .needsLogin) ?? false
+        lastUsedAt = try c.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+        usage = try c.decodeIfPresent([UsageWindow].self, forKey: .usage) ?? []
+        managedHomePath = try c.decodeIfPresent(String.self, forKey: .managedHomePath)
+        routingEnabled = try c.decodeIfPresent(Bool.self, forKey: .routingEnabled) ?? true
     }
 
     public var tokens: CodexTokens {
@@ -92,7 +118,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     }
 
     public func isEligible(now: Date) -> Bool {
-        !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
+        routingEnabled && !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
     }
 
     /// Mirrors the proxy's pre-emptive rotation gate: a reported window at or past its

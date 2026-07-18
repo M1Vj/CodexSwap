@@ -44,6 +44,7 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let ownership: AccountOwnership
     public let isActive: Bool
     public let needsLogin: Bool
+    public let routingEnabled: Bool
     public let usageSummary: String
     public let resetCreditStatus: AccountResetCreditStatus
 
@@ -72,6 +73,7 @@ public struct SettingsPresentation: Sendable, Equatable {
                     ownership: AccountOwnership.classify(account: account),
                     isActive: account.alias == snapshot.activeAlias,
                     needsLogin: account.needsLogin,
+                    routingEnabled: account.routingEnabled,
                     usageSummary: account.usage
                         .map { "\($0.label) \($0.usedPercent)%" }
                         .joined(separator: " · "),

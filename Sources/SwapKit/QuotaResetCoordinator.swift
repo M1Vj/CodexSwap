@@ -118,6 +118,7 @@ public actor QuotaResetCoordinator {
         if trigger == .automatic {
             let current = await settings()
             guard current.automaticallyResetExhaustedAccounts else { return .automaticDisabled }
+            guard await accountStore.account(normalizedAlias)?.routingEnabled == true else { return .accountUnavailable }
             let protected = Set(current.autoResetProtectedAccounts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
             guard !protected.contains(normalizedAlias.lowercased()) else { return .protectedAccount }
         }
