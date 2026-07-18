@@ -23,7 +23,21 @@ public enum RuntimeHandoff {
     /// The shell shim users put on PATH as `codexswap` (or alias `codex` to). It routes Codex through
     /// the app's running proxy, splicing config overrides after the subcommand token.
     public static func shimScript() -> String {
-        """
+        shimScript(legacyBackendRouting: false)
+    }
+
+    static func legacyBackendRoutingShimScript() -> String {
+        shimScript(legacyBackendRouting: true)
+    }
+
+    private static func shimScript(legacyBackendRouting: Bool) -> String {
+        let providerLine = legacyBackendRouting
+            ? #"PROVIDER='model_providers.codexswap={ name="CodexSwap", base_url="'"$CODEXBASE"'", wire_api="responses", requires_openai_auth=true }'"#
+            : ""
+        let configLine = legacyBackendRouting
+            ? #"CFG=(-c "chatgpt_base_url=\"$BASE\"" -c "$PROVIDER" -c 'model_provider="codexswap"')"#
+            : #"CFG=(-c "openai_base_url=\"$CODEXBASE\"" -c 'model_provider="openai"')"#
+        return """
         #!/usr/bin/env bash
         # codexswap — routes the Codex CLI through the running CodexSwap proxy.
         set -euo pipefail
@@ -42,8 +56,8 @@ public enum RuntimeHandoff {
         URL="$(cat "$URL_FILE")"
         BASE="$URL/backend-api"
         CODEXBASE="$BASE/codex"
-        PROVIDER='model_providers.codexswap={ name="CodexSwap", base_url="'"$CODEXBASE"'", wire_api="responses", requires_openai_auth=true }'
-        CFG=(-c "chatgpt_base_url=\\"$BASE\\"" -c "$PROVIDER" -c 'model_provider="codexswap"')
+        \(providerLine)
+        \(configLine)
         if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
           SUB="$1"; shift
           exec "$REAL_CODEX" "$SUB" "${CFG[@]}" "$@"

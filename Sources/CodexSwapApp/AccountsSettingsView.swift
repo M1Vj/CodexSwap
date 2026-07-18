@@ -45,6 +45,7 @@ struct AccountsSettingsView: View {
 private struct AccountSettingsRowView: View {
     let account: AccountSettingsRow
     @ObservedObject var model: SettingsViewModel
+    @State private var resetConfirmationPresented = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -56,29 +57,39 @@ private struct AccountSettingsRowView: View {
                 Text(account.email.isEmpty ? account.alias : account.email).fontWeight(.medium)
                 HStack(spacing: 8) {
                     Text(account.ownership == .codexBarManaged ? "CodexBar managed" : "Standalone")
+                    Text(account.isActive ? "Active" : "Inactive")
                     if !account.usageSummary.isEmpty { Text(account.usageSummary) }
                     if account.needsLogin { Text("Needs sign-in").foregroundStyle(.orange) }
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                Text(resetCreditDescription)
+                    .font(.callout)
+                    .foregroundStyle(resetCreditColor)
+                Toggle("Protect from Automatic Reset", isOn: resetProtectionBinding)
+                    .toggleStyle(.checkbox)
+                    .help("Blocks automatic resets only. You can still use a reset manually after confirmation.")
             }
 
             Spacer()
 
-            Picker("Priority", selection: priorityBinding) {
-                Text("10 — Highest").tag(10)
-                Text("5 — High").tag(5)
-                Text("2 — Medium").tag(2)
-                Text("1 — Low").tag(1)
-                Text("0 — Lowest").tag(0)
-            }
-            .labelsHidden()
-            .frame(width: 125)
+            Stepper(
+                "Priority: \(account.priority)",
+                value: priorityBinding,
+                in: AccountPriority.allowedValues
+            )
+            .frame(width: 135)
 
             if !account.isActive {
-                Button("Use", action: { model.actions.switchAccount(account.alias) })
-                    .accessibilityLabel("Use \(account.alias)")
+                Button("Make Active", action: { model.actions.switchAccount(account.alias) })
+                    .accessibilityLabel("Make \(account.alias) active")
+            } else {
+                Label("Active", systemImage: "checkmark")
+                    .foregroundStyle(.secondary)
             }
+            Button("Use Reset…") { resetConfirmationPresented = true }
+                .disabled(!resetAvailable)
+                .accessibilityLabel("Use reset credit for \(account.alias)")
             if account.ownership == .codexBarManaged {
                 Button("Manage", action: model.actions.openCodexBar)
                     .help("Remove or reauthenticate this account in CodexBar")
@@ -89,6 +100,18 @@ private struct AccountSettingsRowView: View {
             }
         }
         .padding(.vertical, 4)
+        .confirmationDialog(
+            resetConfirmationTitle,
+            isPresented: $resetConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Use Reset for \(account.alias)", role: .destructive) {
+                model.actions.useResetCredit(account.alias, earliestExpiry)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This is a manual reset. Automatic-reset protection does not block it.")
+        }
     }
 
     private var priorityBinding: Binding<Int> {
@@ -96,5 +119,48 @@ private struct AccountSettingsRowView: View {
             get: { account.priority },
             set: { model.actions.setPriority(account.alias, $0) }
         )
+    }
+
+    private var resetProtectionBinding: Binding<Bool> {
+        Binding(
+            get: { model.settings.autoResetProtectedAccounts.contains(account.alias) },
+            set: { model.actions.setAutomaticResetProtection(account.alias, $0) }
+        )
+    }
+
+    private var resetAvailable: Bool {
+        if case .available(let count, _) = account.resetCreditStatus { return count > 0 }
+        return false
+    }
+
+    private var earliestExpiry: Date? {
+        if case .available(_, let expiry) = account.resetCreditStatus { return expiry }
+        return nil
+    }
+
+    private var resetCreditDescription: String {
+        switch account.resetCreditStatus {
+        case .loading: "Checking reset credits…"
+        case .noCredit: "No reset credit available"
+        case let .available(count, expiry):
+            expiry.map { "\(count) reset credit\(count == 1 ? "" : "s") · earliest expires \($0.formatted(date: .abbreviated, time: .shortened))" }
+                ?? "\(count) reset credit\(count == 1 ? "" : "s") available"
+        case .unavailable: "Reset-credit status unavailable"
+        case .networkFailure: "Could not refresh reset credits — check your network"
+        }
+    }
+
+    private var resetCreditColor: Color {
+        switch account.resetCreditStatus {
+        case .networkFailure: .orange
+        default: .secondary
+        }
+    }
+
+    private var resetConfirmationTitle: String {
+        if let expiry = earliestExpiry {
+            return "Use the earliest-expiring reset credit for \(account.alias) (expires \(expiry.formatted(date: .abbreviated, time: .shortened)))?"
+        }
+        return "Use a reset credit for \(account.alias)?"
     }
 }

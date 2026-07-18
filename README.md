@@ -14,10 +14,10 @@ CodexSwap is a local macOS menu-bar app for switching and rotating multiple Code
 
 - Native Settings window and focused menu-bar controls—no terminal required for normal use.
 - Reversible **Route Codex through CodexSwap** setting with backups of displaced Codex configuration.
-- Independent **Launch at Login** setting, automatically suggested when routing is enabled.
+- Independent **Launch at Login** setting that routing never changes.
 - CodexBar-first account onboarding, plus a standalone `codex login` fallback.
-- Priority or round-robin rotation and automatic switching after usage-limit responses.
-- Usage refresh, notifications, and optional automatic or manual quota warm-up.
+- Priority or round-robin selection for new work, with active turns and runs pinned to their selected account.
+- Usage refresh, notifications, quota warm-up, and opt-in automatic or confirmed manual reset-credit use.
 - Kanban task board that queues prompts and runs them automatically as sandboxed background `codex exec` sessions whenever quota returns, with plan-first documents for cross-window resumption and portable prompt export.
 - Optional `codexswap` terminal shim for users who specifically want a wrapper command.
 
@@ -61,15 +61,18 @@ Requires macOS 14 or newer and Xcode Command Line Tools with a Swift 6-compatibl
 5. In **General**, enable **Route Codex through CodexSwap**.
 6. Restart existing Codex CLI or desktop sessions once so they load the new provider configuration.
 
-Routing safely manages only CodexSwap's provider values in `~/.codex/config.toml`. The original content is recorded under `~/Library/Application Support/CodexSwap/` and restored when routing is disabled. If the managed block changes externally, Settings offers **Repair Routing…** instead of overwriting it silently.
+Routing safely keeps Codex's built-in `openai` provider identity and changes only the model `openai_base_url` in `~/.codex/config.toml`. Earlier CodexSwap routing selected a custom `codexswap` provider, which hid the signed-in account's old history; it did not delete that history. The repaired route does not replace Codex's ChatGPT identity backend, so login and chat history remain tied to the account signed in to Codex. The original provider content is recorded under `~/Library/Application Support/CodexSwap/` and restored when routing is disabled. If the managed block changes externally, Settings offers **Repair Routing…** instead of overwriting it silently.
+
+**Launch CodexSwap at Login** is independent. Enabling or repairing routing never turns it on; enable it yourself only when you want the proxy ready immediately after signing in to the Mac.
 
 ## Settings
 
 | Pane | Controls |
 | --- | --- |
-| **General** | Codex routing, Launch at Login, priority or round-robin rotation |
-| **Accounts** | Account ownership, quota state, priority, switching, adding, removal, rescanning |
-| **Automation** | Automatic quota warm-up, manual warm-up, task automation switches, rotation and limit notifications |
+| **General** | Model routing and the independent Launch at Login setting |
+| **Accounts** | Account identity, **Active** state, priority, reset credits, confirmed **Use Reset…**, and automatic-reset protection; choose **Make Active** on another account |
+| **Quota & Resets** | Quota warm-up, the global automatic-reset opt-in, interactive Codex exhaustion policy, and quota notifications |
+| **Task Board** | Task automation, allowed accounts, concurrency, banked-window behavior, and its separate exhaustion policy |
 | **Advanced** | Proxy diagnostics and safe installation or removal of the optional terminal shim |
 
 ### Task board automation
@@ -78,7 +81,7 @@ Routing safely manages only CodexSwap's provider values in `~/.codex/config.toml
 
 **Task Board…** (`⌘T` from the menu) opens a kanban board with **To Do**, **In Queue**, **In Progress**, and **Done** columns. Each task holds its own settings: a prompt, the repository folder the Codex CLI opens in, a working branch, the model with an optional fallback chain, reasoning effort, sandbox network access, and an optional per-task account list. Queued tasks reorder by drag with precise positioning, cards duplicate in one action, and finished work archives (with restore) instead of cluttering the board.
 
-When automation is enabled, queued tasks start as background `codex exec` runs as soon as an enabled account has quota — including after a five-hour or weekly window reset. Task runs follow the same rotation settings as normal proxy traffic and admission requires configurable quota headroom, so a run never starts on a nearly exhausted account; a mid-run limit pauses only the affected run and resumes it on the next window. Transient failures retry with bounded backoff, a rejected model falls back down the task's model chain, and repeated no-progress sessions trigger one automatic plan repair before the task is surfaced for attention. Runs execute with the workspace-write sandbox and never with approval bypass: writes stay confined to the task's repository (plus its `.git`) and the run's private `CODEX_HOME`.
+When automation is enabled, queued tasks start as background `codex exec` runs as soon as an enabled account has quota — including after a five-hour or weekly window reset. Priority or round-robin selection applies when a new run starts, then that Task Board run stays pinned to one account for the lifetime of its `codex exec` process. Usage polling and idle time never move it. Only a semantic upstream `usage_limit_reached` response may invoke the Task Board exhaustion policy described below. Transient failures retry with bounded backoff, a rejected model falls back down the task's model chain, and repeated no-progress sessions trigger one automatic plan repair before the task is surfaced for attention. Runs execute with the workspace-write sandbox and never with approval bypass: writes stay confined to the task's repository (plus its `.git`) and the run's private `CODEX_HOME`.
 
 Every task plans first, maintaining `.codexswap/tasks/<slug>/PLAN.md` on its branch with a bounded Handoff section, a checklist, and a final `STATUS:` line, while chronological history lives in `WORKLOG.md`; a task retires to Done only when its run exits cleanly with every checklist item ticked. Evergreen tasks loop forever in bounded cycles, archiving each finished cycle to `CYCLES.md` before reseeding a fresh checklist. **Export Prompt** copies a self-contained handoff for any other AI tool.
 
@@ -92,19 +95,30 @@ Usage polling does not start a quota window. Optional warm-up sends one small, r
 
 Warm-up consumes a small amount of quota. OpenAI does not publicly guarantee that one request starts every displayed five-hour or weekly window, so CodexSwap refreshes usage afterward and reports only reset data returned by the service. The automatic setting is off by default.
 
+### Exhaustion and reset policies
+
+CodexSwap does not switch accounts at a usage percentage or after an idle gap. An active interactive turn stays pinned to the account selected for its first model request, just as each Task Board run stays pinned for its process lifetime. OpenAI's Codex protocol documents continuation state for an active turn, but that is not a promise that continuation remains available after a turn is stopped or that a new turn receives the same treatment.
+
+Interactive Codex and Task Board have independent exhaustion policies. Each offers **Reset Current First**, **Switch First**, and **Stop & Notify**. A policy runs only for a semantic upstream `usage_limit_reached` response and makes at most one decision with one retry; it does not loop through accounts or consume multiple reset credits for one rejected request.
+
+Automatic reset-credit use is off by default. It requires the global opt-in, and **Protect from Automatic Reset** affects only automatic use. The manual **Use Reset…** action always asks for confirmation, including on a protected account. When several credits are available, CodexSwap chooses the earliest-expiring credit first. Reset-credit access uses an undocumented internal endpoint and may stop working or change without notice.
+
 ## How routing works
 
-Codex normally keeps authentication in memory for the lifetime of a process. Replacing an auth file therefore cannot reliably switch an already-running session. CodexSwap instead configures Codex to use a local provider and replaces the authorization headers for each proxied request.
+Codex normally keeps authentication in memory for the lifetime of a process. Replacing an auth file therefore cannot reliably switch an already-running session. CodexSwap keeps `model_provider = "openai"`, changes only `openai_base_url` to point model requests at the local proxy, and replaces authorization headers on those requests. Identity and history traffic continues to Codex's normal ChatGPT backend under the account signed in to Codex.
 
 ```mermaid
 flowchart LR
-    C["Codex CLI or app"] --> P["CodexSwap on 127.0.0.1"]
+    C["Codex CLI or app"] -->|"identity and history"| H["Signed-in Codex account"]
+    C -->|"model requests"| P["CodexSwap on 127.0.0.1"]
     P --> R{"Eligible account"}
     R --> B["CodexBar-managed auth"]
     R --> S["Standalone Codex auth"]
     B --> O["OpenAI Codex service"]
     S --> O
 ```
+
+Builds that previously routed the whole ChatGPT backend or selected a separate `codexswap` provider are migrated automatically to this built-in-provider layout when CodexSwap starts. The optional terminal shim is upgraded the same way. Restart Codex once afterward to reload the corrected route.
 
 CodexBar remains the credential owner for CodexBar-managed accounts. CodexSwap reads its roster and fresher tokens but does not register accounts by modifying CodexBar's private data.
 

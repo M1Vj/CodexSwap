@@ -1,5 +1,13 @@
 import Foundation
 
+public enum AccountPriority {
+    public static let allowedValues = 0...10
+
+    public static func normalize(_ value: Int) -> Int {
+        min(max(value, allowedValues.lowerBound), allowedValues.upperBound)
+    }
+}
+
 public struct UsageWindow: Codable, Sendable, Equatable {
     public var label: String
     public var usedPercent: Int
@@ -66,7 +74,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.idToken = idToken
-        self.priority = priority
+        self.priority = AccountPriority.normalize(priority)
         self.disabledUntil = disabledUntil
         self.needsLogin = needsLogin
         self.lastUsedAt = lastUsedAt

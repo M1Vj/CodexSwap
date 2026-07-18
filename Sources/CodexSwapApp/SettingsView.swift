@@ -3,20 +3,26 @@ import SwiftUI
 enum SettingsPane: String, CaseIterable, Identifiable {
     case general
     case accounts
-    case automation
+    case quotaAndResets
+    case taskBoard
     case advanced
 
     var id: Self { self }
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .quotaAndResets: "Quota & Resets"
+        case .taskBoard: "Task Board"
+        default: rawValue.capitalized
+        }
     }
 
     var symbol: String {
         switch self {
         case .general: "gearshape"
         case .accounts: "person.2"
-        case .automation: "bolt"
+        case .quotaAndResets: "gauge.with.dots.needle.67percent"
+        case .taskBoard: "rectangle.3.group"
         case .advanced: "wrench.and.screwdriver"
         }
     }
@@ -38,7 +44,8 @@ struct SettingsView: View {
                 switch selection {
                 case .general: GeneralSettingsView(model: model)
                 case .accounts: AccountsSettingsView(model: model)
-                case .automation: AutomationSettingsView(model: model)
+                case .quotaAndResets: QuotaResetsSettingsView(model: model)
+                case .taskBoard: TaskBoardSettingsView(model: model)
                 case .advanced: AdvancedSettingsView(model: model)
                 }
             }

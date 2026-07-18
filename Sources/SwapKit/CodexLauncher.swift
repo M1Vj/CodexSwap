@@ -1,18 +1,14 @@
 import Foundation
 
 public enum CodexLauncher {
-    public static let providerName = "codexswap"
-
-    /// The `-c` overrides that route Codex's ChatGPT + Codex traffic through our proxy.
-    /// Codex still attaches its own auth; the proxy overwrites it with the active account's token.
+    /// Route the built-in OpenAI provider's model traffic through the proxy without
+    /// changing the provider identity used by Codex history and thread metadata.
     public static func configArgs(proxyURL: URL) -> [String] {
         let base = proxyURL.absoluteString.trimmingTrailingSlash()
-        let chatgptBase = "\(base)/backend-api"
-        let codexBase = "\(chatgptBase)/codex"
+        let codexBase = "\(base)/backend-api/codex"
         return [
-            "-c", "chatgpt_base_url=\"\(chatgptBase)\"",
-            "-c", "model_providers.\(providerName)={ name=\"CodexSwap\", base_url=\"\(codexBase)\", wire_api=\"responses\", requires_openai_auth=true }",
-            "-c", "model_provider=\"\(providerName)\"",
+            "-c", "openai_base_url=\"\(codexBase)\"",
+            "-c", "model_provider=\"openai\"",
         ]
     }
 

@@ -1,5 +1,11 @@
 import Foundation
 
+public enum QuotaExhaustionPolicy: String, Codable, Sendable, CaseIterable {
+    case resetCurrentFirst
+    case switchFirst
+    case stopAndNotify
+}
+
 public struct Settings: Codable, Sendable, Equatable {
     public var rotationStrategy: RotationStrategy
     /// Pre-emptively rotate away from the active account when its primary (5h) window reaches this percent.
@@ -20,6 +26,10 @@ public struct Settings: Codable, Sendable, Equatable {
     public var routeCodexAutomatically: Bool
     public var automaticallyWarmAccounts: Bool
     public var warmupExcludedAccounts: [String]
+    public var automaticallyResetExhaustedAccounts: Bool
+    public var interactiveExhaustionPolicy: QuotaExhaustionPolicy
+    public var taskBoardExhaustionPolicy: QuotaExhaustionPolicy
+    public var autoResetProtectedAccounts: [String]
     public var automationEnabled: Bool
     public var automationAccounts: [String]
     public var automationMaxConcurrent: Int
@@ -47,6 +57,10 @@ public struct Settings: Codable, Sendable, Equatable {
         routeCodexAutomatically: false,
         automaticallyWarmAccounts: false,
         warmupExcludedAccounts: [],
+        automaticallyResetExhaustedAccounts: false,
+        interactiveExhaustionPolicy: .resetCurrentFirst,
+        taskBoardExhaustionPolicy: .stopAndNotify,
+        autoResetProtectedAccounts: [],
         automationEnabled: false,
         automationAccounts: [],
         automationMaxConcurrent: 1,
@@ -71,6 +85,10 @@ public struct Settings: Codable, Sendable, Equatable {
         routeCodexAutomatically: Bool,
         automaticallyWarmAccounts: Bool,
         warmupExcludedAccounts: [String],
+        automaticallyResetExhaustedAccounts: Bool = false,
+        interactiveExhaustionPolicy: QuotaExhaustionPolicy = .resetCurrentFirst,
+        taskBoardExhaustionPolicy: QuotaExhaustionPolicy = .stopAndNotify,
+        autoResetProtectedAccounts: [String] = [],
         automationEnabled: Bool,
         automationAccounts: [String],
         automationMaxConcurrent: Int,
@@ -93,6 +111,10 @@ public struct Settings: Codable, Sendable, Equatable {
         self.routeCodexAutomatically = routeCodexAutomatically
         self.automaticallyWarmAccounts = automaticallyWarmAccounts
         self.warmupExcludedAccounts = warmupExcludedAccounts
+        self.automaticallyResetExhaustedAccounts = automaticallyResetExhaustedAccounts
+        self.interactiveExhaustionPolicy = interactiveExhaustionPolicy
+        self.taskBoardExhaustionPolicy = taskBoardExhaustionPolicy
+        self.autoResetProtectedAccounts = autoResetProtectedAccounts
         self.automationEnabled = automationEnabled
         self.automationAccounts = automationAccounts
         self.automationMaxConcurrent = automationMaxConcurrent
@@ -120,6 +142,12 @@ public struct Settings: Codable, Sendable, Equatable {
         routeCodexAutomatically = try c.decodeIfPresent(Bool.self, forKey: .routeCodexAutomatically) ?? d.routeCodexAutomatically
         automaticallyWarmAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyWarmAccounts) ?? d.automaticallyWarmAccounts
         warmupExcludedAccounts = try c.decodeIfPresent([String].self, forKey: .warmupExcludedAccounts) ?? d.warmupExcludedAccounts
+        automaticallyResetExhaustedAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyResetExhaustedAccounts) ?? d.automaticallyResetExhaustedAccounts
+        let interactivePolicyRaw = try c.decodeIfPresent(String.self, forKey: .interactiveExhaustionPolicy)
+        interactiveExhaustionPolicy = interactivePolicyRaw.flatMap(QuotaExhaustionPolicy.init(rawValue:)) ?? d.interactiveExhaustionPolicy
+        let taskBoardPolicyRaw = try c.decodeIfPresent(String.self, forKey: .taskBoardExhaustionPolicy)
+        taskBoardExhaustionPolicy = taskBoardPolicyRaw.flatMap(QuotaExhaustionPolicy.init(rawValue:)) ?? d.taskBoardExhaustionPolicy
+        autoResetProtectedAccounts = try c.decodeIfPresent([String].self, forKey: .autoResetProtectedAccounts) ?? d.autoResetProtectedAccounts
         automationEnabled = try c.decodeIfPresent(Bool.self, forKey: .automationEnabled) ?? d.automationEnabled
         automationAccounts = try c.decodeIfPresent([String].self, forKey: .automationAccounts) ?? d.automationAccounts
         let decodedMaxConcurrent = try c.decodeIfPresent(Int.self, forKey: .automationMaxConcurrent) ?? d.automationMaxConcurrent

@@ -17,6 +17,9 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Crash and shutdown recovery: runs interrupted by quit or crash are closed as `interrupted` and resume automatically on the next quota window.
 - Typed task-failure handling with bounded exponential retry for transient network errors and timeouts.
 - Automatic plan repair after repeated checklist stagnation, with one recovery attempt before terminal failure.
+- Independent interactive Codex and Task Board exhaustion policies: Reset Current First, Switch First, or Stop & Notify.
+- Opt-in automatic reset-credit use, per-account automatic-reset protection, and a confirmed manual Use Reset… action that selects the earliest-expiring usable credit.
+- Five focused Settings panes: General, Accounts, Quota & Resets, Task Board, and Advanced. Account actions now say Make Active, while the current account shows Active.
 
 ### Changed
 
@@ -30,12 +33,16 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 - Run history is capped per task with older records archived as JSONL; run logs and codex session artifacts prune automatically.
 
 
-- Task runs follow the same rotation settings as normal proxy traffic: the configured strategy (priority or round-robin), per-account priorities, and the pre-emptive usage thresholds. Tasks prefer accounts still under threshold and move off an account before it hard-limits, falling back to the best over-threshold account only when none has headroom.
+- Priority or round-robin selection now applies only when a new interactive turn or Task Board run starts. Active turns and runs remain pinned; usage polling and idle gaps do not trigger proactive switching.
+- Only a semantic upstream `usage_limit_reached` response invokes the independently configured interactive or Task Board exhaustion policy, with one decision and at most one retry.
+- Reset-credit automation is opt-in and respects per-account automatic protection; manual confirmed use remains available for protected accounts. The internal reset endpoint is undocumented and may change.
 - Task sessions may batch their commits: the run contract no longer demands a commit per checklist item, only that all work and the plan document are committed before the session ends.
 - Task completion now requires a successful process exit and a non-empty fully checked plan whose final non-blank line reports `STATUS: COMPLETE`.
 
 ### Fixed
 
+- Automatic routing now preserves the built-in `openai` provider identity and changes only model `openai_base_url`; Codex identity and history continue using the signed-in account. Earlier routing through a custom `codexswap` provider hid old history rather than deleting it. Exact legacy backend-wide routing blocks and installed shims migrate safely at startup without discarding unrelated config edits.
+- Enabling routing no longer turns on Launch at Login; both settings remain independent.
 - Unattended task prompts now preserve user-specified commit metadata and require a final-message inspection before continuing.
 - Unattended task prompts now stop repeated wait-only turns after one unanswered subagent wait, continuing useful local work or absorbing the subtask instead.
 - Stall watchdog: a run whose log stops growing for 15 minutes (a half-open upstream stream) is killed by the runner and retried with the normal transient backoff instead of pinning its concurrency slot forever.
@@ -49,7 +56,7 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ### Added
 
-- Native four-pane Settings window.
+- Original native four-pane Settings window, superseded by the current five-pane layout described above.
 - Production release, notarization, Homebrew, and repository-governance infrastructure.
 - Menu-controlled automatic Codex routing and reversible config management.
 - CodexBar-first account onboarding with a standalone fallback.

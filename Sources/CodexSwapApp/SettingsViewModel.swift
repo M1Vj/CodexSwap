@@ -10,17 +10,23 @@ struct SettingsActions {
     let setStrategy: (RotationStrategy) -> Void
     let switchAccount: (String) -> Void
     let setPriority: (String, Int) -> Void
+    let setAutomaticResetProtection: (String, Bool) -> Void
+    let useResetCredit: (String, Date?) -> Void
     let removeAccount: (String) -> Void
     let importAccounts: () -> Void
     let openCodexBar: () -> Void
     let addStandaloneAccount: () -> Void
     let setAutomaticWarmup: (Bool) -> Void
+    let setAutomaticReset: (Bool) -> Void
+    let setInteractiveExhaustionPolicy: (QuotaExhaustionPolicy) -> Void
+    let setTaskBoardExhaustionPolicy: (QuotaExhaustionPolicy) -> Void
     let setWarmupExcludedAccounts: ([String]) -> Void
     let warmAllAccounts: () -> Void
     let setNotifyOnRotate: (Bool) -> Void
     let setNotifyOnExhausted: (Bool) -> Void
     let setNotifyOnWindowReset: (Bool) -> Void
     let setAutomationEnabled: (Bool) -> Void
+    let setAutomationAccounts: ([String]) -> Void
     let setNotifyOnTaskEvents: (Bool) -> Void
     let setAutomationConsumeBankedWindow: (Bool) -> Void
     let setAutomationMaxConcurrent: (Int) -> Void

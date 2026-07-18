@@ -46,6 +46,56 @@ enum ProxyRequestMode: Equatable, Sendable {
     }
 }
 
+enum ExhaustionDecision: Equatable, Sendable {
+    case retryCurrent
+    case switchTo(String)
+    case stopAndNotify
+}
+
+struct ExhaustionPolicyHandler: Sendable {
+    typealias Reset = @Sendable (String) async -> ResetAttemptResult
+    private let reset: Reset
+
+    init(reset: @escaping Reset) { self.reset = reset }
+
+    func decide(settings: Settings, mode: ProxyRequestMode, currentAlias: String, alternativeAlias: String?) async -> ExhaustionDecision {
+        let policy = mode.isTask ? settings.taskBoardExhaustionPolicy : settings.interactiveExhaustionPolicy
+        return await decide(policy: policy, currentAlias: currentAlias, alternativeAlias: alternativeAlias)
+    }
+
+    func decide(
+        settings: Settings,
+        mode: ProxyRequestMode,
+        currentAlias: String,
+        resolveAlternative: @Sendable () async -> Account?
+    ) async -> (decision: ExhaustionDecision, alternative: Account?) {
+        let policy = mode.isTask ? settings.taskBoardExhaustionPolicy : settings.interactiveExhaustionPolicy
+        if policy == .stopAndNotify { return (.stopAndNotify, nil) }
+        if policy == .switchFirst, let alternative = await resolveAlternative() {
+            return (.switchTo(alternative.alias), alternative)
+        }
+        let result = await reset(currentAlias)
+        if case .reset = result { return (.retryCurrent, nil) }
+        if result == .alreadyRedeemed { return (.retryCurrent, nil) }
+        if result == .ambiguousFailure || result == .cancelled { return (.stopAndNotify, nil) }
+        if policy == .resetCurrentFirst, let alternative = await resolveAlternative() {
+            return (.switchTo(alternative.alias), alternative)
+        }
+        return (.stopAndNotify, nil)
+    }
+
+    func decide(policy: QuotaExhaustionPolicy, currentAlias: String, alternativeAlias: String?) async -> ExhaustionDecision {
+        if policy == .stopAndNotify { return .stopAndNotify }
+        if policy == .switchFirst, let alternativeAlias { return .switchTo(alternativeAlias) }
+        let result = await reset(currentAlias)
+        if case .reset = result { return .retryCurrent }
+        if result == .alreadyRedeemed { return .retryCurrent }
+        if result == .ambiguousFailure || result == .cancelled { return .stopAndNotify }
+        if policy == .resetCurrentFirst, let alternativeAlias { return .switchTo(alternativeAlias) }
+        return .stopAndNotify
+    }
+}
+
 func taskTurnKey(for mode: ProxyRequestMode) -> String? {
     guard case .task(let allowed, let runID) = mode else { return nil }
     return runID ?? allowed.joined(separator: ",")
@@ -53,6 +103,15 @@ func taskTurnKey(for mode: ProxyRequestMode) -> String? {
 
 func refusesInteractiveTraffic(mode: ProxyRequestMode, routingEnabled: Bool) -> Bool {
     mode == .normal && !routingEnabled
+}
+
+func isWebSocketPrewarmRequest(headers: HTTPHeaders, method: HTTPMethod, path: String) -> Bool {
+    guard method == .GET, splitPathQuery(path).0.hasSuffix("/responses") else { return false }
+    return headers[canonicalForm: "upgrade"].contains { value in
+        value.split(separator: ",").contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare("websocket") == .orderedSame
+        }
+    }
 }
 
 func proxyRequestMode(headers: HTTPHeaders, method: HTTPMethod, path: String, loopbackOnly: Bool) -> ProxyRequestMode {
@@ -66,10 +125,17 @@ func selectProxyAccount(
     primaryThreshold: Int = Int.max,
     secondaryThreshold: Int = Int.max,
     preferredTaskAlias: String? = nil,
+    hardPinnedTaskAlias: String? = nil,
+    preferredInteractiveAlias: String? = nil,
     now: Date = Date()
 ) async -> Account? {
     switch mode {
     case .normal:
+        if let preferredInteractiveAlias,
+           let pinned = await store.account(preferredInteractiveAlias),
+           pinned.isEligible(now: now) {
+            return pinned
+        }
         return await store.current(now: now)
     case .warmup(let alias):
         // Hydrate managed tokens before judging eligibility, exactly like normal traffic does:
@@ -84,6 +150,11 @@ func selectProxyAccount(
         // Round-robin turn stickiness: requests inside the same turn stay on one account
         // (per-account prompt caches upstream), but an account that crossed its threshold
         // loses the turn, matching how proactive rotation ignores turn boundaries.
+        if let pinned = hardPinnedTaskAlias, allowed.contains(pinned),
+           let account = await store.account(pinned), account.isEligible(now: now) {
+            await store.touchLastUsed(pinned, now: now)
+            return account
+        }
         if let preferred = preferredTaskAlias, allowed.contains(preferred),
            let sticky = await store.account(preferred), sticky.isEligible(now: now),
            sticky.isWithinRotationThresholds(primaryPercent: primaryThreshold, secondaryPercent: secondaryThreshold) {
@@ -171,8 +242,161 @@ public struct NullEventSink: ProxyEventSink {
     public func handle(_ event: ProxyEvent) async {}
 }
 
-typealias TaskTurn = (alias: String, at: Date)
+private func normalizedTurnValue(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalized.isEmpty, normalized.utf8.count <= 4_096 else { return nil }
+    return normalized
+}
 
+func interactiveTurnKey(headers: HTTPHeaders, body: Data) -> String? {
+    if body.count <= 1_048_576,
+       let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+       let metadata = object["client_metadata"] as? [String: Any],
+       let value = normalizedTurnValue(metadata["x-codex-turn-metadata"] as? String) {
+        return value
+    }
+    return normalizedTurnValue(headers.first(name: "x-codex-turn-metadata"))
+        ?? normalizedTurnValue(headers.first(name: "x-codex-turn-state"))
+}
+
+struct InteractiveTurnPins {
+    private struct Entry { var alias: String; var at: Date }
+    private var entries: [String: Entry] = [:]
+    private let maxCount: Int
+    private let maxAge: TimeInterval
+
+    init(maxCount: Int = 512, maxAge: TimeInterval = 86_400) {
+        self.maxCount = max(1, maxCount)
+        self.maxAge = max(1, maxAge)
+    }
+
+    var count: Int { entries.count }
+
+    mutating func alias(for key: String, now: Date = Date()) -> String? {
+        cleanup(now: now, preserving: key)
+        guard var entry = entries[key] else { return nil }
+        entry.at = now
+        entries[key] = entry
+        return entry.alias
+    }
+
+    mutating func bind(_ key: String, alias: String, now: Date = Date(), preserving currentKey: String?) {
+        entries[key] = Entry(alias: alias, at: now)
+        cleanup(now: now, preserving: currentKey ?? key)
+    }
+
+    private mutating func cleanup(now: Date, preserving currentKey: String?) {
+        let cutoff = now.addingTimeInterval(-maxAge)
+        entries = entries.filter { key, entry in key == currentKey || entry.at >= cutoff }
+        while entries.count > maxCount {
+            guard let oldest = entries
+                .filter({ $0.key != currentKey })
+                .min(by: { $0.value.at < $1.value.at })?.key else { break }
+            entries.removeValue(forKey: oldest)
+        }
+    }
+}
+
+actor InteractiveTurnSelector {
+    typealias Selection = @Sendable () async -> String?
+
+    private var pins: InteractiveTurnPins
+    private var inflight: [String: (id: UUID, task: Task<String?, Never>)] = [:]
+    private var serializedTail: Task<Void, Never>?
+    private let maxInflight: Int
+
+    init(maxCount: Int = 512, maxAge: TimeInterval = 86_400) {
+        pins = InteractiveTurnPins(maxCount: maxCount, maxAge: maxAge)
+        maxInflight = max(1, maxCount)
+    }
+
+    func pinnedAlias(for key: String) -> String? {
+        pins.alias(for: key)
+    }
+
+    func bind(_ key: String, alias: String, preserving currentKey: String?) {
+        pins.bind(key, alias: alias, preserving: currentKey)
+    }
+
+    func inflightCount() -> Int { inflight.count }
+
+    func selectAlias(for key: String, selection: @escaping Selection) async -> String? {
+        if let pinned = pins.alias(for: key) { return pinned }
+        if let running = inflight[key] { return await running.task.value }
+        guard inflight.count < maxInflight else { return nil }
+
+        let id = UUID()
+        let predecessor = serializedTail
+        let task = Task<String?, Never> { [weak self] in
+            _ = await predecessor?.value
+            guard let self else { return nil }
+            return await self.performNewSelection(for: key, selection: selection)
+        }
+        inflight[key] = (id, task)
+        serializedTail = Task { _ = await task.value }
+
+        let result = await task.value
+        if inflight[key]?.id == id { inflight.removeValue(forKey: key) }
+        return result
+    }
+
+    private func performNewSelection(for key: String, selection: Selection) async -> String? {
+        // The key can become pinned while this operation waits behind another new turn.
+        if let pinned = pins.alias(for: key) { return pinned }
+        guard let alias = await selection() else { return nil }
+        pins.bind(key, alias: alias, preserving: key)
+        return alias
+    }
+}
+
+struct TaskRunPins {
+    private var aliases: [String: String] = [:]
+    private var insertionOrder: [String] = []
+    private let maxCount: Int
+    var count: Int { aliases.count }
+
+    init(maxCount: Int = 512) {
+        self.maxCount = max(1, maxCount)
+    }
+
+    private func normalized(_ value: String, maxBytes: Int) -> String? {
+        let result = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !result.isEmpty, result.utf8.count <= maxBytes else { return nil }
+        return result
+    }
+
+    mutating func pin(runID: String, alias: String) {
+        guard let runID = normalized(runID, maxBytes: 128),
+              let alias = normalized(alias, maxBytes: 256) else { return }
+        if aliases[runID] == nil {
+            insertionOrder.append(runID)
+        }
+        aliases[runID] = alias
+        while aliases.count > maxCount, let oldest = insertionOrder.first {
+            insertionOrder.removeFirst()
+            aliases.removeValue(forKey: oldest)
+        }
+    }
+    mutating func update(runID: String, alias: String) {
+        guard let runID = normalized(runID, maxBytes: 128), aliases[runID] != nil,
+              let alias = normalized(alias, maxBytes: 256) else { return }
+        aliases[runID] = alias
+    }
+    mutating func unpin(runID: String) {
+        guard let runID = normalized(runID, maxBytes: 128) else { return }
+        aliases.removeValue(forKey: runID)
+        insertionOrder.removeAll { $0 == runID }
+    }
+    func alias(for runID: String) -> String? {
+        guard let runID = normalized(runID, maxBytes: 128) else { return nil }
+        return aliases[runID]
+    }
+}
+
+// Kept as a compatibility seam for persisted/test migration only. Proxy routing no
+// longer uses idle-age task turns; run lifecycle pins are authoritative instead.
+typealias TaskTurn = (alias: String, at: Date)
 func pruneTaskTurns(_ turns: inout [String: TaskTurn], olderThan cutoff: Date) {
     turns = turns.filter { $0.value.at >= cutoff }
 }
@@ -193,6 +417,16 @@ actor RefreshBurnGuard {
 }
 
 public actor ProxyServer {
+    enum LifecycleError: Error {
+        case alreadyStopped
+    }
+
+    struct ShutdownTrackingSnapshot: Equatable, Sendable {
+        let tasks: Int
+        let channels: Int
+        let waiters: Int
+    }
+
     public struct Config: Sendable {
         public var host: String = "127.0.0.1"
         public var port: Int = 0
@@ -206,6 +440,8 @@ public actor ProxyServer {
     private let settingsProvider: @Sendable () async -> Settings
     private let routingEnabledProvider: @Sendable () async -> Bool
     private let sink: ProxyEventSink
+    private let exhaustionHandler: ExhaustionPolicyHandler
+    private let freshAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?
     private let config: Config
     private let group: MultiThreadedEventLoopGroup
     private let httpClient: HTTPClient
@@ -213,13 +449,24 @@ public actor ProxyServer {
 
     private var boundPort: Int?
     private var serving = false
+    private var serverChannel: Channel?
+    private var serverTask: Task<Void, Never>?
+    private var connectionTasks: [UUID: Task<Void, Never>] = [:]
+    private var connectionChannels: [UUID: Channel] = [:]
+    private var connectionTrackingWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var startTask: Task<Void, Error>?
+    private var stopTask: Task<Void, Never>?
+    private var httpClientShutdown = false
+    private var eventLoopGroupShutdown = false
+    private var lifecycleAfterBindTestHook: (@Sendable () async -> Void)?
+    private var lifecycleStopCommittedTestHook: (@Sendable () async -> Void)?
+    private var lifecycleStartCallerTestHook: (@Sendable () async -> Void)?
     private let verbose: Bool
     private var servedCount = 0
     private var lastActivityAt: Date?
     private var lastActivityAlias: String?
-    private var lastTurnAt: Date?
-    private var taskTurns: [String: TaskTurn] = [:]
-    private var taskStartPins: [String: (alias: String, at: Date)] = [:]
+    private let interactiveSelector = InteractiveTurnSelector()
+    private var taskRunPins = TaskRunPins()
     private var inflightRefresh: [String: Task<CodexTokens, Error>] = [:]
 
     public struct Activity: Sendable {
@@ -247,6 +494,8 @@ public actor ProxyServer {
         config: Config = Config(),
         settingsProvider: @escaping @Sendable () async -> Settings,
         routingEnabledProvider: @escaping @Sendable () async -> Bool = { true },
+        automaticQuotaReset: @escaping @Sendable (String) async -> ResetAttemptResult = { _ in .automaticDisabled },
+        freshAlternative: @escaping @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account? = { _, _ in nil },
         sink: ProxyEventSink = NullEventSink(),
         verbose: Bool = false
     ) {
@@ -255,6 +504,8 @@ public actor ProxyServer {
         self.refresher = refresher
         self.config = config
         self.settingsProvider = settingsProvider
+        self.exhaustionHandler = ExhaustionPolicyHandler(reset: automaticQuotaReset)
+        self.freshAlternative = freshAlternative
         self.sink = sink
         self.verbose = verbose
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -266,17 +517,61 @@ public actor ProxyServer {
 
     public func port() -> Int? { boundPort }
 
-    /// Pins the scheduler-admitted account as the preferred alias for a run's requests.
-    /// The pin is a preference, not a mandate: selection still validates eligibility and
-    /// thresholds per request, so a pinned account that goes hot degrades to rotation.
+    /// Pins the scheduler-admitted account for the full run lifecycle. Only explicit
+    /// failover, account invalidation/removal, or unpinning may change this selection.
     public func pinTaskStart(runID: String, alias: String) {
-        let cutoff = Date().addingTimeInterval(-86_400)
-        taskStartPins = taskStartPins.filter { $0.value.at >= cutoff }
-        taskStartPins[runID] = (alias, Date())
+        taskRunPins.pin(runID: runID, alias: alias)
     }
 
     public func unpinTaskStart(runID: String) {
-        taskStartPins.removeValue(forKey: runID)
+        taskRunPins.unpin(runID: runID)
+    }
+
+    func taskPinCount() -> Int { taskRunPins.count }
+    func taskPinnedAlias(runID: String) -> String? { taskRunPins.alias(for: runID) }
+
+    func selectInteractiveAccount(key: String, settings: Settings) async -> Account? {
+        let store = self.store
+        let alias = await interactiveSelector.selectAlias(for: key) {
+            if settings.rotationStrategy == .roundRobin {
+                _ = await store.advanceRoundRobin()
+            }
+            return await selectProxyAccount(store: store, mode: .normal)?.alias
+        }
+        guard let alias else { return nil }
+        return await selectProxyAccount(
+            store: store,
+            mode: .normal,
+            preferredInteractiveAlias: alias
+        )
+    }
+
+    func interactivePinnedAlias(for key: String) async -> String? {
+        await interactiveSelector.pinnedAlias(for: key)
+    }
+
+    func bindResponseTurnState(
+        headers: HTTPHeaders,
+        mode: ProxyRequestMode,
+        method: HTTPMethod,
+        path: String,
+        alias: String,
+        requestKey: String?
+    ) async {
+        guard mode == .normal, method == .POST, path.hasSuffix("/responses"),
+              let state = normalizedTurnValue(headers.first(name: "x-codex-turn-state")) else { return }
+        await interactiveSelector.bind(state, alias: alias, preserving: requestKey ?? state)
+    }
+
+    func selectTaskAccount(mode: ProxyRequestMode, settings: Settings) async -> Account? {
+        let preferred = mode.taskRunID.flatMap { taskRunPins.alias(for: $0) }
+        return await selectProxyAccount(
+            store: store,
+            mode: mode,
+            primaryThreshold: settings.primaryThresholdPercent,
+            secondaryThreshold: settings.secondaryThresholdPercent,
+            hardPinnedTaskAlias: preferred
+        )
     }
 
     public func proxyURL() -> URL? {
@@ -285,29 +580,61 @@ public actor ProxyServer {
     }
 
     public func start() async throws {
+        guard stopTask == nil else { throw LifecycleError.alreadyStopped }
         guard !serving else { return }
-        let channel = try await ServerBootstrap(group: group)
-            .serverChannelOption(.backlog, value: 256)
-            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
-            .bind(host: config.host, port: config.port) { childChannel in
-                childChannel.eventLoop.makeCompletedFuture {
-                    try childChannel.pipeline.syncOperations.configureHTTPServerPipeline()
-                    return try NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>(
-                        wrappingChannelSynchronously: childChannel
-                    )
+        if let startTask {
+            await lifecycleStartCallerTestHook?()
+            try await startTask.value
+            return
+        }
+        let task = Task { try await self.performStart() }
+        startTask = task
+        await lifecycleStartCallerTestHook?()
+        do {
+            try await task.value
+            startTask = nil
+        } catch {
+            startTask = nil
+            if stopTask == nil { await stop() }
+            throw error
+        }
+    }
+
+    private func performStart() async throws {
+        let channel: NIOAsyncChannel<NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>, Never>
+        do {
+            channel = try await ServerBootstrap(group: group)
+                .serverChannelOption(.backlog, value: 256)
+                .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+                .bind(host: config.host, port: config.port) { childChannel in
+                    childChannel.eventLoop.makeCompletedFuture {
+                        try childChannel.pipeline.syncOperations.configureHTTPServerPipeline()
+                        return try NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>(
+                            wrappingChannelSynchronously: childChannel
+                        )
+                    }
                 }
+        } catch {
+            if stopTask != nil {
+                throw LifecycleError.alreadyStopped
             }
+            throw error
+        }
+        await lifecycleAfterBindTestHook?()
+        guard stopTask == nil else {
+            try? await channel.channel.close()
+            throw LifecycleError.alreadyStopped
+        }
         boundPort = channel.channel.localAddress?.port
+        serverChannel = channel.channel
         serving = true
 
-        Task { [weak self] in
+        serverTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await channel.executeThenClose { inbound in
                     for try await connection in inbound {
-                        Task { [weak self] in
-                            try? await self?.handleConnection(connection)
-                        }
+                        await self.startTrackedConnection(connection)
                     }
                 }
             } catch {}
@@ -315,9 +642,82 @@ public actor ProxyServer {
     }
 
     public func stop() async {
+        if let stopTask {
+            await stopTask.value
+            return
+        }
+        let task = Task { await self.performStop() }
+        stopTask = task
+        await task.value
+    }
+
+    private func performStop() async {
+        await lifecycleStopCommittedTestHook?()
         serving = false
-        try? await httpClient.shutdown()
-        try? await group.shutdownGracefully()
+        try? await serverChannel?.close()
+        _ = await serverTask?.value
+        let channels = Array(connectionChannels.values)
+        for channel in channels { try? await channel.close() }
+        let tasks = Array(connectionTasks.values)
+        for task in tasks { task.cancel() }
+        if !httpClientShutdown {
+            httpClientShutdown = true
+            try? await httpClient.shutdown()
+        }
+        for task in tasks { await task.value }
+        connectionTasks.removeAll()
+        connectionChannels.removeAll()
+        let waiters = connectionTrackingWaiters
+        connectionTrackingWaiters.removeAll()
+        for waiter in waiters.values { waiter.resume() }
+        serverChannel = nil
+        serverTask = nil
+        boundPort = nil
+        if !eventLoopGroupShutdown {
+            eventLoopGroupShutdown = true
+            try? await group.shutdownGracefully()
+        }
+    }
+
+    func shutdownTrackingSnapshot() -> ShutdownTrackingSnapshot {
+        ShutdownTrackingSnapshot(
+            tasks: connectionTasks.count,
+            channels: connectionChannels.count,
+            waiters: connectionTrackingWaiters.count
+        )
+    }
+
+    func setLifecycleTestHooks(
+        afterBind: (@Sendable () async -> Void)?,
+        stopCommitted: (@Sendable () async -> Void)?,
+        startCaller: (@Sendable () async -> Void)? = nil
+    ) {
+        lifecycleAfterBindTestHook = afterBind
+        lifecycleStopCommittedTestHook = stopCommitted
+        lifecycleStartCallerTestHook = startCaller
+    }
+
+    private func startTrackedConnection(_ connection: NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>) {
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.waitUntilConnectionIsTracked(id)
+            try? await self.handleConnection(connection)
+            await self.finishTrackedConnection(id)
+        }
+        connectionTasks[id] = task
+        connectionChannels[id] = connection.channel
+        connectionTrackingWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func waitUntilConnectionIsTracked(_ id: UUID) async {
+        guard connectionTasks[id] == nil else { return }
+        await withCheckedContinuation { connectionTrackingWaiters[id] = $0 }
+    }
+
+    private func finishTrackedConnection(_ id: UUID) {
+        connectionTasks.removeValue(forKey: id)
+        connectionChannels.removeValue(forKey: id)
     }
 
     // MARK: - Connection handling
@@ -358,8 +758,17 @@ public actor ProxyServer {
         body: Data,
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
     ) async throws {
-        let settings = await settingsProvider()
         let (rawPath, query) = splitPathQuery(head.uri)
+        if isWebSocketPrewarmRequest(headers: head.headers, method: head.method, path: rawPath) {
+            try await writeError(
+                outbound,
+                status: .upgradeRequired,
+                message: "WebSocket transport is unsupported; use HTTP fallback"
+            )
+            return
+        }
+
+        let settings = await settingsProvider()
         let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
         let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
 
@@ -372,53 +781,33 @@ public actor ProxyServer {
             return
         }
 
-        // Round-robin load balancing: at each new turn (a model call after an idle gap), advance to the
-        // next account so usage spreads across all of them. Codex is stateless (store=false, no
-        // previous_response_id), so switching between turns never breaks the conversation.
-        if mode == .normal, settings.rotationStrategy == .roundRobin, head.method == .POST, rawPath.hasSuffix("/responses") {
-            let now = Date()
-            if let last = lastTurnAt, now.timeIntervalSince(last) > TimeInterval(settings.roundRobinTurnGapSeconds) {
-                await store.advanceRoundRobin(now: now)
-            }
-            lastTurnAt = now
+        let interactiveKey = mode == .normal && head.method == .POST && rawPath.hasSuffix("/responses")
+            ? interactiveTurnKey(headers: head.headers, body: body)
+            : nil
+        var preferredInteractiveAlias: String?
+        if let interactiveKey {
+            preferredInteractiveAlias = (await selectInteractiveAccount(key: interactiveKey, settings: settings))?.alias
         }
-
-        var preferredTaskAlias: String?
-        if mode.isTask {
-            pruneTaskTurns(
-                &taskTurns,
-                olderThan: Date().addingTimeInterval(-TimeInterval(settings.roundRobinTurnGapSeconds))
-            )
-        }
-        if mode.isTask, settings.rotationStrategy == .roundRobin,
-           let key = taskTurnKey(for: mode) {
-            if let turn = taskTurns[key],
-               Date().timeIntervalSince(turn.at) <= TimeInterval(settings.roundRobinTurnGapSeconds) {
-                preferredTaskAlias = turn.alias
-            }
-        }
-        // One-shot: the pin steers only the run's first selection so round-robin
-        // spreading (rule 27) governs every later turn.
-        if preferredTaskAlias == nil, let runID = mode.taskRunID,
-           let pin = taskStartPins.removeValue(forKey: runID) {
-            preferredTaskAlias = pin.alias
-        }
+        let preferredTaskAlias = mode.taskRunID.flatMap { taskRunPins.alias(for: $0) }
 
         guard var account = await selectProxyAccount(
             store: store,
             mode: mode,
             primaryThreshold: settings.primaryThresholdPercent,
             secondaryThreshold: settings.secondaryThresholdPercent,
-            preferredTaskAlias: preferredTaskAlias
+            hardPinnedTaskAlias: preferredTaskAlias,
+            preferredInteractiveAlias: preferredInteractiveAlias
         ) else {
             log("\(head.method.rawValue) \(rawPath) -> no eligible account")
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
         }
-        await recordTaskSelection(account.alias, mode: mode)
+        await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
         var tokenRefreshed = false
+        var exhaustionHandled = false
+        var finalReplay = false
         var attempts = 0
         // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
         while attempts < 8 {
@@ -435,6 +824,14 @@ public actor ProxyServer {
                 resp = try await forward(head: head, body: body, account: account, target: target)
             } catch {
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
+                return
+            }
+
+            // A quota decision permits exactly one replay. Its response is final: do
+            // not refresh, fail over, or make another exhaustion decision from it.
+            if finalReplay {
+                recordActivity(account.alias)
+                try await streamResponse(outbound, response: resp)
                 return
             }
 
@@ -470,6 +867,7 @@ public actor ProxyServer {
                     }
                     account = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
                     if account.needsLogin { return }
+                    await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                     tokenRefreshed = false
                     continue
                 } catch {
@@ -505,6 +903,7 @@ public actor ProxyServer {
                     }
                     if let next = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
+                        await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                         tokenRefreshed = false
                         continue
                     }
@@ -517,44 +916,59 @@ public actor ProxyServer {
 
             // 429 usage limit -> rotate
             if resp.status == .tooManyRequests {
-                let errBody = try await collect(resp.body, cap: 64 * 1024)
-                if bodyHasUsageLimit(errBody) {
-                    let (limit, resetAt) = limitInfo(headers: resp.headers, body: errBody)
+                let classified = try await collectClassificationPrefix(resp.body, cap: 64 * 1024)
+                if bodyHasUsageLimit(classified.prefix) {
+                    let (limit, resetAt) = limitInfo(headers: resp.headers, body: classified.prefix)
                     if mode.isWarmup {
-                        await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
-                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
+                        try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
                         return
                     }
-                    if mode.isTask {
-                        await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
-                        if let next = await selectNextTaskAccount(mode: mode, excluding: account.alias) {
-                            account = next
-                            tokenRefreshed = false
-                            continue
+                    guard !exhaustionHandled else {
+                        try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                        return
+                    }
+                    exhaustionHandled = true
+                    await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
+                    let currentAlias = account.alias
+                    let allowedAliases: [String]?
+                    if case .task(let allowed, _) = mode { allowedAliases = allowed }
+                    else { allowedAliases = nil }
+                    let outcome = await exhaustionHandler.decide(
+                        settings: settings,
+                        mode: mode,
+                        currentAlias: currentAlias,
+                        resolveAlternative: { [freshAlternative] in
+                            await freshAlternative(currentAlias, allowedAliases)
                         }
-                        await sink.handle(ProxyEvent.taskScoped(
-                            kind: .exhausted,
-                            from: account.alias,
-                            to: nil,
-                            limit: limit,
-                            resetAt: resetAt,
-                            mode: mode
-                        ))
-                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
+                    )
+                    switch outcome.decision {
+                    case .retryCurrent:
+                        tokenRefreshed = false
+                        finalReplay = true
+                        continue
+                    case .switchTo:
+                        guard let alternative = outcome.alternative else {
+                            try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                            return
+                        }
+                        await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
+                        account = alternative
+                        await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
+                        tokenRefreshed = false
+                        finalReplay = true
+                        continue
+                    case .stopAndNotify:
+                        await sink.handle(ProxyEvent.taskScoped(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt, mode: mode))
+                        try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
                         return
                     }
-                    let result = await store.rotateFrom(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
-                    if let next = result.next, result.rotated {
-                        await sink.handle(ProxyEvent(kind: .rotated, from: account.alias, to: next.alias, limit: limit, resetAt: resetAt))
-                        account = next
-                        tokenRefreshed = false
-                        continue
-                    }
-                    await sink.handle(ProxyEvent(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt))
-                    try await writeError(outbound, status: .tooManyRequests, message: "all CodexSwap accounts are usage limited")
-                    return
                 }
-                try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
+                try await streamClassifiedResponse(
+                    outbound,
+                    status: resp.status,
+                    headers: resp.headers,
+                    classified: classified
+                )
                 return
             }
 
@@ -567,10 +981,32 @@ public actor ProxyServer {
             }
             recordActivity(account.alias)
             log("\(head.method.rawValue) \(rawPath) account=\(account.alias) -> \(resp.status.code)")
+            await bindResponseTurnState(
+                headers: resp.headers,
+                mode: mode,
+                method: head.method,
+                path: rawPath,
+                alias: account.alias,
+                requestKey: interactiveKey
+            )
             try await streamResponse(outbound, response: resp)
             return
         }
         try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
+    }
+
+    private func eligibleAlternative(mode: ProxyRequestMode, excluding alias: String, settings: Settings) async -> Account? {
+        let allowed: [String]
+        if case .task(let taskAliases, _) = mode {
+            allowed = taskAliases
+        } else {
+            allowed = await store.all().map(\.alias)
+        }
+        return await store.bestEligible(
+            among: allowed.filter { $0 != alias },
+            primaryThreshold: settings.primaryThresholdPercent,
+            secondaryThreshold: settings.secondaryThresholdPercent
+        )
     }
 
     private func selectNextTaskAccount(mode: ProxyRequestMode, excluding alias: String) async -> Account? {
@@ -581,14 +1017,16 @@ public actor ProxyServer {
             primaryThreshold: settings.primaryThresholdPercent,
             secondaryThreshold: settings.secondaryThresholdPercent
         ), next.alias != alias else { return nil }
-        await recordTaskSelection(next.alias, mode: mode)
+        await recordSelection(next.alias, mode: mode, interactiveKey: nil)
         return next
     }
 
-    private func recordTaskSelection(_ alias: String, mode: ProxyRequestMode) async {
-        guard let key = taskTurnKey(for: mode) else { return }
-        taskTurns[key] = (alias, Date())
+    func recordSelection(_ alias: String, mode: ProxyRequestMode, interactiveKey: String?) async {
+        if let interactiveKey {
+            await interactiveSelector.bind(interactiveKey, alias: alias, preserving: interactiveKey)
+        }
         guard let runID = mode.taskRunID else { return }
+        taskRunPins.update(runID: runID, alias: alias)
         await sink.handle(ProxyEvent(
             kind: .served,
             from: alias,
@@ -704,7 +1142,7 @@ public actor ProxyServer {
         try await outbound.write(.end(nil))
     }
 
-    private func filteredResponseHeaders(_ headers: HTTPHeaders) -> HTTPHeaders {
+    nonisolated private func filteredResponseHeaders(_ headers: HTTPHeaders) -> HTTPHeaders {
         var out = HTTPHeaders()
         let drop: Set<String> = ["transfer-encoding", "connection", "keep-alive", "proxy-connection", "upgrade"]
         for (name, value) in headers where !drop.contains(name.lowercased()) {
@@ -721,6 +1159,53 @@ public actor ProxyServer {
         }
         return buf
     }
+
+    private struct ClassifiedResponseBody {
+        let prefix: ByteBuffer
+        let boundaryRemainder: ByteBuffer?
+        var iterator: HTTPClientResponse.Body.AsyncIterator
+    }
+
+    private func collectClassificationPrefix(
+        _ body: HTTPClientResponse.Body,
+        cap: Int
+    ) async throws -> sending ClassifiedResponseBody {
+        var prefix = ByteBuffer()
+        var iterator = body.makeAsyncIterator()
+        while prefix.readableBytes < cap, var chunk = try await iterator.next() {
+            let remaining = cap - prefix.readableBytes
+            if chunk.readableBytes <= remaining {
+                prefix.writeImmutableBuffer(chunk)
+            } else {
+                if let prefixSlice = chunk.readSlice(length: remaining) {
+                    prefix.writeImmutableBuffer(prefixSlice)
+                }
+                return ClassifiedResponseBody(prefix: prefix, boundaryRemainder: chunk, iterator: iterator)
+            }
+        }
+        return ClassifiedResponseBody(prefix: prefix, boundaryRemainder: nil, iterator: iterator)
+    }
+
+    nonisolated private func streamClassifiedResponse(
+        _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        status: HTTPResponseStatus,
+        headers upstreamHeaders: HTTPHeaders,
+        classified: sending ClassifiedResponseBody
+    ) async throws {
+        let headers = filteredResponseHeaders(upstreamHeaders)
+        try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
+        if classified.prefix.readableBytes > 0 {
+            try await outbound.write(.body(.byteBuffer(classified.prefix)))
+        }
+        if let remainder = classified.boundaryRemainder, remainder.readableBytes > 0 {
+            try await outbound.write(.body(.byteBuffer(remainder)))
+        }
+        var iterator = classified.iterator
+        while let chunk = try await iterator.next() {
+            try await outbound.write(.body(.byteBuffer(chunk)))
+        }
+        try await outbound.write(.end(nil))
+    }
 }
 
 // MARK: - Detection helpers
@@ -733,17 +1218,11 @@ func splitPathQuery(_ uri: String) -> (String, String?) {
 }
 
 func bodyHasUsageLimit(_ buffer: ByteBuffer) -> Bool {
-    guard let obj = try? JSONSerialization.jsonObject(with: Data(buffer.readableBytesView)) else { return false }
-    return jsonHasStringValue(obj, want: "usage_limit_reached")
-}
-
-func jsonHasStringValue(_ value: Any, want: String) -> Bool {
-    switch value {
-    case let s as String: return s == want
-    case let arr as [Any]: return arr.contains { jsonHasStringValue($0, want: want) }
-    case let dict as [String: Any]: return dict.values.contains { jsonHasStringValue($0, want: want) }
-    default: return false
+    guard let root = try? JSONSerialization.jsonObject(with: Data(buffer.readableBytesView)) as? [String: Any] else {
+        return false
     }
+    let error = root["error"] as? [String: Any] ?? root
+    return [error["code"], error["type"]].contains { ($0 as? String) == "usage_limit_reached" }
 }
 
 func isSessionInvalidated(_ buffer: ByteBuffer) -> Bool {

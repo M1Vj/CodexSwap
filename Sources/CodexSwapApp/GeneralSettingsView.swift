@@ -19,18 +19,11 @@ struct GeneralSettingsView: View {
 
             SettingsSection(title: "Startup") {
                 Toggle("Launch CodexSwap at Login", isOn: launchAtLoginBinding)
-                Text("Keep this enabled when automatic routing is on so the local proxy is available after restarting your Mac.")
+                Text("Independent from routing. Enable this only if you want the local proxy ready automatically after signing in to your Mac.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
 
-            SettingsSection(title: "Account Rotation") {
-                Picker("Strategy", selection: strategyBinding) {
-                    Text("Priority — use highest first").tag(RotationStrategy.priority)
-                    Text("Round Robin — balance usage").tag(RotationStrategy.roundRobin)
-                }
-                .pickerStyle(.radioGroup)
-            }
         }
         .formStyle(.grouped)
     }
@@ -49,16 +42,9 @@ struct GeneralSettingsView: View {
         )
     }
 
-    private var strategyBinding: Binding<RotationStrategy> {
-        Binding(
-            get: { model.settings.rotationStrategy },
-            set: { value in model.actions.setStrategy(value) }
-        )
-    }
-
     private var routingDescription: String {
         switch model.snapshot.routingState {
-        case .enabled: "Enabled. Restart existing Codex sessions after changing routing."
+        case .enabled: "Enabled for model requests only. Restart Codex after changing routing; your signed-in account still owns history and login."
         case .disabled: "Disabled. Codex is using its previous provider configuration."
         case .needsRepair: "The managed routing block changed outside CodexSwap and needs review."
         }

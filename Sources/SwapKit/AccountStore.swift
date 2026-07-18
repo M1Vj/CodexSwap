@@ -19,7 +19,13 @@ public actor AccountStore {
     public init(url: URL = AppPaths.storeFile(), strategy: RotationStrategy = .priority) {
         self.url = url
         self.strategy = strategy
-        self.data = AccountStore.loadFrom(url) ?? StoreData()
+        var loaded = AccountStore.loadFrom(url) ?? StoreData()
+        loaded.accounts = loaded.accounts.map { account in
+            var normalized = account
+            normalized.priority = AccountPriority.normalize(account.priority)
+            return normalized
+        }
+        self.data = loaded
     }
 
     public func setStrategy(_ s: RotationStrategy) { strategy = s }
@@ -242,7 +248,7 @@ public actor AccountStore {
 
     public func setPriority(_ alias: String, priority: Int) {
         guard let i = index(alias) else { return }
-        data.accounts[i].priority = priority
+        data.accounts[i].priority = AccountPriority.normalize(priority)
         persist()
     }
 
@@ -269,6 +275,8 @@ public actor AccountStore {
     /// Insert or update an account keyed by accountID (falling back to alias). Preserves priority on update.
     @discardableResult
     public func upsert(_ account: Account) -> Account {
+        var account = account
+        account.priority = AccountPriority.normalize(account.priority)
         if let i = data.accounts.firstIndex(where: { !$0.accountID.isEmpty && $0.accountID == account.accountID })
             ?? data.accounts.firstIndex(where: { $0.alias == account.alias }) {
             var merged = account

@@ -6,9 +6,22 @@ CodexSwap is a menu-bar application. Look for the circular-arrow icon in the mac
 
 ## Routed Codex requests cannot connect
 
-Open CodexSwap before starting Codex. In **Settings → General**, confirm that routing is enabled and in **Advanced** confirm that the proxy reports `127.0.0.1:58432`. Enable **Launch CodexSwap at Login** if routed sessions should work immediately after signing in to the Mac.
+Open CodexSwap before starting Codex. In **Settings → General**, confirm that routing is enabled and in **Advanced** confirm that the proxy reports `127.0.0.1:58432`. **Launch CodexSwap at Login** is independent and never changes when routing is enabled; turn it on yourself if routed sessions should work immediately after signing in to the Mac.
 
 Existing Codex sessions must be restarted once after routing is enabled or disabled because they load provider configuration at startup.
+
+## Codex history disappears while routing is enabled
+
+Earlier CodexSwap routing changed provider identity to a custom `codexswap` provider. That could hide the history belonging to the built-in `openai` provider, but it did not delete the history. Repaired routing preserves `model_provider = "openai"` and changes only model `openai_base_url`; identity and history remain on Codex's normal ChatGPT backend and stay tied to the account signed in to Codex.
+
+Use these safe recovery steps:
+
+1. Open **Settings → General** and read the routing status.
+2. If it says repair is needed, read the displayed reason, choose **Repair Routing…**, and wait for routing to report enabled.
+3. Quit and reopen Codex once so it reloads the repaired provider configuration.
+4. Confirm Codex is signed in to the same account that owns the missing history.
+
+Never copy, edit, replace, or otherwise mutate Codex history databases. Do not delete or rewrite `~/.codex`, Codex application data, or CodexSwap's support directory while troubleshooting history visibility.
 
 ## Settings says routing needs repair
 
@@ -36,6 +49,16 @@ Refresh or sign in through the application that owns the account. For a CodexBar
 ## Quota information looks stale
 
 Choose **Refresh Usage** from the menu. Usage polling reads the service's current quota response but does not itself start a quota timer. Optional warm-up makes a real request and consumes a small amount of quota; it cannot guarantee how OpenAI will represent every five-hour or weekly reset window.
+
+CodexSwap does not switch because a displayed usage percentage is high and does not use idle time as a switch trigger. Active interactive turns and Task Board runs remain pinned. OpenAI's Codex protocol documents active-turn continuation state, but it does not promise continuity after stopping a turn or starting a new one.
+
+Only a semantic upstream `usage_limit_reached` response invokes the configured exhaustion policy. Interactive Codex and Task Board policies are separate, and each can be **Reset Current First**, **Switch First**, or **Stop & Notify**. CodexSwap makes one policy decision and retries at most once for that response.
+
+## Reset credits are unavailable or not used
+
+Automatic reset-credit use is off until **Automatically Use Reset When Exhausted** is enabled. **Protect from Automatic Reset** blocks only automatic use; it does not disable the manual **Use Reset…** action. Manual use always presents a confirmation, and CodexSwap chooses the earliest-expiring usable credit when more than one exists.
+
+Reset-credit access relies on an undocumented internal endpoint that may change without notice. A read or consume failure does not mean ordinary routing or account history is broken. Do not repeatedly submit a reset action after an ambiguous network failure; refresh the account state first.
 
 ## Homebrew cannot find the cask
 

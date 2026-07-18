@@ -47,6 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
 
         if hasBundle {
+            do {
+                _ = try ShimManager().migrateLegacyShimIfNeeded()
+            } catch {
+                notify(title: "CodexSwap", body: "The optional terminal shim could not be upgraded: \(error.localizedDescription)")
+            }
             let notificationCenter = UNUserNotificationCenter.current()
             notificationCenter.delegate = self
             registerTaskNotificationCategories(on: notificationCenter)
@@ -64,8 +69,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do { try await engine.start() } catch {
                 self.notify(title: "CodexSwap", body: "Failed to start proxy: \(error.localizedDescription)")
             }
-            if self.latest.accounts.isEmpty { await self.engine.importAccounts() }
-            await self.refreshSnapshot()
+            if self.latest.accounts.isEmpty {
+                await self.engine.importAccounts()
+                await self.refreshSnapshot()
+            } else {
+                await self.refreshSettingsSnapshot()
+            }
         }
     }
 
@@ -94,6 +103,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshSnapshot() async {
         settings = await SettingsStoreBridge.current()
         latest = await engine.snapshot()
+        publishSnapshot()
+    }
+
+    private func refreshSettingsSnapshot() async {
+        settings = await SettingsStoreBridge.current()
+        latest = await engine.settingsSnapshot()
+        publishSnapshot()
+    }
+
+    private func publishSnapshot() {
         settingsViewModel?.update(snapshot: latest, settings: settings)
         taskBoardViewModel?.update(snapshot: latest, settings: settings)
         rebuildMenu()
@@ -315,11 +334,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStrategy: { [weak self] strategy in self?.changeStrategy(strategy) },
             switchAccount: { [weak self] alias in self?.activateAccount(alias) },
             setPriority: { [weak self] alias, priority in self?.changePriority(alias, priority: priority) },
+            setAutomaticResetProtection: { [weak self] alias, protected in
+                self?.updateSettings {
+                    var aliases = Set($0.autoResetProtectedAccounts)
+                    if protected { aliases.insert(alias) } else { aliases.remove(alias) }
+                    $0.autoResetProtectedAccounts = aliases.sorted()
+                }
+            },
+            useResetCredit: { [weak self] alias, _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let result = await self.engine.resetQuota(alias: alias, trigger: .manual)
+                    self.settingsViewModel.showMessage(ManualResetOutcomePresentation.message(for: result, alias: alias))
+                    await self.refreshSnapshot()
+                }
+            },
             removeAccount: { [weak self] alias in self?.removeStandaloneAccount(alias) },
             importAccounts: { [weak self] in self?.rescanAccounts() },
             openCodexBar: { [weak self] in self?.openCodexBarForAccount() },
             addStandaloneAccount: { [weak self] in self?.addStandaloneAccount() },
             setAutomaticWarmup: { [weak self] enabled in self?.setAutomaticWarmup(enabled) },
+            setAutomaticReset: { [weak self] enabled in self?.updateSettings { $0.automaticallyResetExhaustedAccounts = enabled } },
+            setInteractiveExhaustionPolicy: { [weak self] policy in self?.updateSettings { $0.interactiveExhaustionPolicy = policy } },
+            setTaskBoardExhaustionPolicy: { [weak self] policy in self?.updateSettings { $0.taskBoardExhaustionPolicy = policy } },
             setWarmupExcludedAccounts: { [weak self] aliases in
                 self?.updateSettings { $0.warmupExcludedAccounts = Array(Set(aliases)).sorted() }
             },
@@ -328,6 +365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setNotifyOnExhausted: { [weak self] enabled in self?.updateSettings { $0.notifyOnExhausted = enabled } },
             setNotifyOnWindowReset: { [weak self] enabled in self?.updateSettings { $0.notifyOnWindowReset = enabled } },
             setAutomationEnabled: { [weak self] enabled in self?.updateSettings { $0.automationEnabled = enabled } },
+            setAutomationAccounts: { [weak self] aliases in self?.updateSettings { $0.automationAccounts = Array(Set(aliases)).sorted() } },
             setNotifyOnTaskEvents: { [weak self] enabled in self?.updateSettings { $0.notifyOnTaskEvents = enabled } },
             setAutomationConsumeBankedWindow: { [weak self] enabled in
                 self?.updateSettings { $0.automationConsumeBankedWindow = enabled }
@@ -486,6 +524,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsWindowController = SettingsWindowController(viewModel: settingsViewModel)
         }
         settingsWindowController?.show()
+        Task { @MainActor in
+            await engine.refreshResetCreditStatuses()
+            await refreshSnapshot()
+        }
     }
 
     private func openAutomationLog() {
@@ -632,9 +674,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             do {
                 if enabled {
-                    await enableLaunchAtLoginForRouting()
                     try await engine.setAutomaticRouting(true)
-                    presentMessage("Routing enabled. Restart existing Codex sessions to apply automatic account routing.")
+                    presentMessage("Routing enabled for model requests only. Restart Codex once; history remains tied to your signed-in Codex account.")
                 } else {
                     try await engine.setAutomaticRouting(false)
                     presentMessage("Routing disabled. Your previous Codex provider settings were restored.")
@@ -708,20 +749,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func enableLaunchAtLoginForRouting() async {
-        guard !settings.launchAtLogin else { return }
-        guard hasBundle else {
-            notify(title: "Launch at login unavailable", body: "Install and open the packaged CodexSwap.app to enable launch at login.")
-            return
-        }
-        do {
-            try SMAppService.mainApp.register()
-            settings = await SettingsStoreBridge.update { $0.launchAtLogin = true }
-        } catch {
-            notify(title: "Launch at login unchanged", body: error.localizedDescription)
-        }
-    }
-
     private func setLaunchAtLogin(_ enabled: Bool) {
         guard hasBundle else {
             presentMessage("Launch at Login requires the packaged CodexSwap app.")
@@ -739,9 +766,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateSettings(_ mutate: @escaping @Sendable (inout Settings) -> Void) {
         Task {
+            let previousSettings = settings
             settings = await SettingsStoreBridge.update(mutate)
-            await engine.automationTick()
-            await refreshSnapshot()
+            await engine.settingsDidChange(from: previousSettings, to: settings) { @MainActor [weak self] in
+                await self?.refreshSnapshot()
+            }
+            Task { await engine.automationTick() }
         }
     }
 

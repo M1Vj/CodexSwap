@@ -33,6 +33,7 @@ public struct EngineSnapshot: Sendable {
     public let routingState: CodexRoutingState
     public let warmupSummary: WarmupSummary?
     public let warmupInProgress: Bool
+    public let resetCreditStatuses: [String: AccountResetCreditStatus]
     public let tasks: [AutomationTask]
     public let runningTaskIDs: Set<UUID>
     public let schedulingReasons: [String: String]
@@ -42,7 +43,8 @@ public struct EngineSnapshot: Sendable {
     public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy,
                 servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil,
                 routingState: CodexRoutingState = .disabled, warmupSummary: WarmupSummary? = nil,
-                warmupInProgress: Bool = false, tasks: [AutomationTask] = [],
+                warmupInProgress: Bool = false,
+                resetCreditStatuses: [String: AccountResetCreditStatus] = [:], tasks: [AutomationTask] = [],
                 runningTaskIDs: Set<UUID> = [], schedulingReasons: [String: String] = [:]) {
         self.accounts = accounts
         self.activeAlias = activeAlias
@@ -54,6 +56,7 @@ public struct EngineSnapshot: Sendable {
         self.routingState = routingState
         self.warmupSummary = warmupSummary
         self.warmupInProgress = warmupInProgress
+        self.resetCreditStatuses = resetCreditStatuses
         self.tasks = tasks
         self.runningTaskIDs = runningTaskIDs
         self.schedulingReasons = schedulingReasons
@@ -94,6 +97,7 @@ public actor AppEngine {
     private let refresher: TokenRefresher
     private let configManager: CodexConfigManager
     private let warmupService: QuotaWarmupService
+    private let quotaResetCoordinator: QuotaResetCoordinator
     private let taskStore: TaskStore
     private let taskRunner: any TaskRunning
     private let autoLog: AutomationLog
@@ -103,6 +107,11 @@ public actor AppEngine {
     private var onEvent: (@Sendable (AppEvent) -> Void)?
     private var watcher: CodexBarWatcher?
     private var warmupInProgress = false
+    private var resetRefreshTask: Task<Void, Never>?
+    private var resetRefreshPending = false
+    private var resetRefreshAllAccounts = false
+    private var resetRefreshAliases: Set<String> = []
+    private var resetRefreshGeneration: UInt64 = 0
     private var schedulingTaskIDs: Set<UUID> = []
     private var interruptingTaskIDs: Set<UUID> = []
     private var repositoryLeases: [UUID: String] = [:]
@@ -115,6 +124,7 @@ public actor AppEngine {
         refresher: TokenRefresher = TokenRefresher(),
         configManager: CodexConfigManager = CodexConfigManager(),
         warmupService: QuotaWarmupService = QuotaWarmupService(),
+        quotaResetCoordinator: QuotaResetCoordinator? = nil,
         taskStore: TaskStore = TaskStore(),
         taskRunner: TaskRunner? = nil,
         autoLog: AutomationLog = AutomationLog(),
@@ -126,6 +136,13 @@ public actor AppEngine {
         self.refresher = refresher
         self.configManager = configManager
         self.warmupService = warmupService
+        self.quotaResetCoordinator = quotaResetCoordinator ?? QuotaResetCoordinator(
+            accountStore: store,
+            settings: { [settingsStore] in await settingsStore.get() },
+            resetService: QuotaResetClient(),
+            usageService: usage,
+            pendingRecordURL: supportDir.appendingPathComponent("pending-quota-reset.json")
+        )
         self.taskStore = taskStore
         self.autoLog = autoLog
         self.supportDir = supportDir
@@ -141,10 +158,12 @@ public actor AppEngine {
         refresher: TokenRefresher = TokenRefresher(),
         configManager: CodexConfigManager = CodexConfigManager(),
         warmupService: QuotaWarmupService = QuotaWarmupService(),
+        quotaResetCoordinator: QuotaResetCoordinator? = nil,
         taskStore: TaskStore = TaskStore(),
         taskRunning: any TaskRunning,
         autoLog: AutomationLog = AutomationLog(),
-        supportDir: URL = AppPaths.supportDir()
+        supportDir: URL = AppPaths.supportDir(),
+        proxyForTesting: ProxyServer? = nil
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -152,10 +171,18 @@ public actor AppEngine {
         self.refresher = refresher
         self.configManager = configManager
         self.warmupService = warmupService
+        self.quotaResetCoordinator = quotaResetCoordinator ?? QuotaResetCoordinator(
+            accountStore: store,
+            settings: { [settingsStore] in await settingsStore.get() },
+            resetService: QuotaResetClient(),
+            usageService: usage,
+            pendingRecordURL: supportDir.appendingPathComponent("pending-quota-reset.json")
+        )
         self.taskStore = taskStore
         self.taskRunner = taskRunning
         self.autoLog = autoLog
         self.supportDir = supportDir
+        self.proxy = proxyForTesting
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -172,6 +199,10 @@ public actor AppEngine {
         var proxyConfig = ProxyServer.Config()
         proxyConfig.port = settings.proxyPort
         let stableURL = stableProxyURL(port: settings.proxyPort)
+        if settings.routeCodexAutomatically {
+            _ = try? configManager.migrateLegacyBackendRouting(proxyURL: stableURL)
+        }
+        let automaticQuotaReset = proxyAutomaticResetHandler()
         let proxy = ProxyServer(
             store: store,
             refresher: refresher,
@@ -179,6 +210,15 @@ public actor AppEngine {
             settingsProvider: { [settingsStore] in await settingsStore.get() },
             routingEnabledProvider: { [configManager] in
                 (try? configManager.state(proxyURL: stableURL)) == .enabled
+            },
+            automaticQuotaReset: automaticQuotaReset,
+            freshAlternative: { [store, usage] currentAlias, allowedAliases in
+                await Self.freshAlternative(
+                    store: store,
+                    usage: usage,
+                    currentAlias: currentAlias,
+                    allowedAliases: allowedAliases
+                )
             },
             sink: sink,
             verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
@@ -233,7 +273,13 @@ public actor AppEngine {
         pollerTask?.cancel()
         pollerTask = nil
         let runningIDs = await taskRunner.runningIDs()
+        let shutdownRunIDs = (await taskStore.all())
+            .filter { runningIDs.contains($0.id) }
+            .compactMap { task in task.runs.last(where: { $0.finishedAt == nil })?.id.uuidString }
         interruptingTaskIDs.formUnion(runningIDs)
+        for runID in shutdownRunIDs {
+            await proxy?.unpinTaskStart(runID: runID)
+        }
         for taskID in runningIDs {
             await taskRunner.stop(taskID: taskID)
         }
@@ -271,8 +317,17 @@ public actor AppEngine {
     /// Reconcile our roster with CodexBar's live account list: add new, drop removed, keep our overlay.
     public func syncCodexBar() async {
         guard CodexBarBridge.isPresent() else { return }
-        for acc in AccountImporter.codexBarAccounts() { await store.upsert(acc) }
-        await store.reconcileManaged(present: CodexBarBridge.rosterAccountIDs())
+        await reconcileManagedAccounts(
+            AccountImporter.codexBarAccounts(),
+            presentAccountIDs: CodexBarBridge.rosterAccountIDs()
+        )
+    }
+
+    func reconcileManagedAccounts(_ accounts: [Account], presentAccountIDs: Set<String>) async {
+        for account in accounts { await store.upsert(account) }
+        await store.reconcileManaged(present: presentAccountIDs)
+        emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
     }
 
     public func snapshot() async -> EngineSnapshot {
@@ -291,10 +346,144 @@ public actor AppEngine {
             routingState: routingState,
             warmupSummary: warmupSummary,
             warmupInProgress: warmupInProgress,
+            resetCreditStatuses: await sanitizedResetCreditStatuses(),
             tasks: await taskStore.all(),
             runningTaskIDs: await taskRunner.runningIDs(),
             schedulingReasons: schedulingReasons
         )
+    }
+
+    /// Refreshes the reset-credit cache before returning the snapshot published by Settings.
+    /// Keep generic event-driven snapshots on `snapshot()` so task activity does not trigger
+    /// reset-credit network requests.
+    public func settingsSnapshot() async -> EngineSnapshot {
+        await scheduleResetCreditStatusRefresh()
+        return await snapshot()
+    }
+
+    public func refreshResetCreditStatuses(aliases: Set<String>? = nil) async {
+        await refreshResetCreditsAndEmitSnapshot(aliases: aliases)
+    }
+
+    private func refreshResetCreditsAndEmitSnapshot(aliases: Set<String>? = nil) async {
+        await quotaResetCoordinator.refreshCredits(aliases: aliases)
+        emit(.snapshotChanged)
+    }
+
+    private func scheduleResetCreditStatusRefresh(aliases: Set<String>? = nil) async {
+        resetRefreshGeneration = await quotaResetCoordinator.reserveOperationGeneration()
+        resetRefreshPending = true
+        if let aliases, !resetRefreshAllAccounts {
+            resetRefreshAliases.formUnion(aliases)
+        } else {
+            resetRefreshAllAccounts = true
+            resetRefreshAliases.removeAll()
+        }
+        guard resetRefreshTask == nil else { return }
+        resetRefreshTask = Task { [weak self] in
+            await self?.drainResetCreditStatusRefreshes()
+        }
+    }
+
+    private func drainResetCreditStatusRefreshes() async {
+        while resetRefreshPending {
+            let generation = resetRefreshGeneration
+            let aliases = resetRefreshAllAccounts ? nil : resetRefreshAliases
+            resetRefreshPending = false
+            resetRefreshAllAccounts = false
+            resetRefreshAliases.removeAll()
+            let committed = await quotaResetCoordinator.refreshCredits(aliases: aliases, generation: generation)
+            if !committed {
+                await quotaResetCoordinator.waitForInFlightResets()
+                await scheduleResetCreditStatusRefresh(aliases: aliases)
+            } else if generation == resetRefreshGeneration {
+                emit(.snapshotChanged)
+            }
+        }
+        resetRefreshTask = nil
+    }
+
+    public func settingsDidChange(
+        from previous: Settings,
+        to current: Settings,
+        publish: (@Sendable () async -> Void)? = nil
+    ) async {
+        await publish?()
+        let resetPolicyChanged = previous.automaticallyResetExhaustedAccounts
+            != current.automaticallyResetExhaustedAccounts
+            || previous.autoResetProtectedAccounts != current.autoResetProtectedAccounts
+        guard resetPolicyChanged else { return }
+        emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
+    }
+
+    public func resetQuota(alias: String, trigger: ResetTrigger) async -> ResetAttemptResult {
+        let result = await quotaResetCoordinator.reset(alias: alias, trigger: trigger)
+        await quotaResetCoordinator.refreshCredits(aliases: [alias])
+        emit(.snapshotChanged)
+        return result
+    }
+
+    func proxyAutomaticResetHandler() -> @Sendable (String) async -> ResetAttemptResult {
+        let coordinator = quotaResetCoordinator
+        return { alias in
+            await coordinator.reset(alias: alias, trigger: .automatic)
+        }
+    }
+
+    static func freshAlternative(
+        store: AccountStore,
+        usage: any UsageFetching,
+        currentAlias: String,
+        allowedAliases: [String]?
+    ) async -> Account? {
+        let allowed = allowedAliases.map(Set.init)
+        let candidates = await store.all().filter { account in
+            account.alias != currentAlias
+                && (allowed?.contains(account.alias) ?? true)
+                && account.isEligible(now: Date())
+        }
+        var verifiedAliases: [String] = []
+        for candidate in candidates {
+            guard let fresh = await store.hydrateFromManagedHome(candidate.alias),
+                  !fresh.accessToken.isEmpty,
+                  let windows = try? await usage.fetch(
+                    accessToken: fresh.accessToken,
+                    accountID: fresh.accountID
+                  ),
+                  !windows.isEmpty,
+                  windows.allSatisfy({ $0.usedPercent < 100 }) else { continue }
+            await store.updateUsage(candidate.alias, windows: windows)
+            verifiedAliases.append(candidate.alias)
+        }
+        return await store.bestEligible(among: verifiedAliases)
+    }
+
+    private func sanitizedResetCreditStatuses() async -> [String: AccountResetCreditStatus] {
+        let coordinatorStatuses = await quotaResetCoordinator.cachedStatuses()
+        let snapshots = await quotaResetCoordinator.cachedCreditSnapshots()
+        var result: [String: AccountResetCreditStatus] = [:]
+        for account in await store.all() {
+            switch coordinatorStatuses[account.alias] {
+            case .refreshing:
+                result[account.alias] = .loading
+            case .ready:
+                guard let snapshot = snapshots[account.alias] else {
+                    result[account.alias] = .unavailable
+                    continue
+                }
+                result[account.alias] = snapshot.availableCount > 0
+                    ? .available(count: snapshot.availableCount, earliestExpiry: snapshot.earliestAvailable?.expiresAt)
+                    : .noCredit
+            case .failed:
+                result[account.alias] = account.needsLogin || account.accessToken.isEmpty
+                    ? .unavailable
+                    : .networkFailure
+            case .idle, nil:
+                result[account.alias] = .unavailable
+            }
+        }
+        return result
     }
 
     public func tasks() async -> [AutomationTask] {
@@ -388,10 +577,14 @@ public actor AppEngine {
 
     public func removeTask(id: UUID) async {
         let task = await taskStore.task(id: id)
+        let openRunIDs = task?.runs.filter { $0.finishedAt == nil }.map(\.id) ?? []
         if let task {
             await autoLog.write("api", "removeTask \(Self.taskLabel(task))")
         }
         let wasRunning = await taskRunner.runningIDs().contains(id)
+        for runID in openRunIDs {
+            await proxy?.unpinTaskStart(runID: runID.uuidString)
+        }
         await taskStore.remove(id: id)
         if wasRunning { await taskRunner.stop(taskID: id) }
         if let task {
@@ -517,7 +710,11 @@ public actor AppEngine {
                 schedulingReasons[id.uuidString] = reason
                 return .blocked(reason: reason)
             case .unavailable:
-                break
+                schedulingTaskIDs.remove(id)
+                reservationHeld = false
+                let reason = "Task became unavailable during launch"
+                schedulingReasons[id.uuidString] = reason
+                return .blocked(reason: reason)
             }
         } else if !allowedAliases.isEmpty {
             let reasons = Self.accountEligibilityReasons(
@@ -585,14 +782,29 @@ public actor AppEngine {
 
     // MARK: - Actions
 
-    public func setPriority(_ alias: String, priority: Int) async { await store.setPriority(alias, priority: priority) }
-    public func switchTo(_ alias: String) async { await store.setActive(alias); emit(.snapshotChanged) }
-    public func remove(_ alias: String) async { await store.remove(alias); emit(.snapshotChanged) }
+    public func setPriority(_ alias: String, priority: Int) async {
+        await store.setPriority(alias, priority: priority)
+        emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
+    }
+
+    public func switchTo(_ alias: String) async {
+        await store.setActive(alias)
+        emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
+    }
+
+    public func remove(_ alias: String) async {
+        await store.remove(alias)
+        emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
+    }
 
     public func setStrategy(_ s: RotationStrategy) async {
         _ = await settingsStore.update { $0.rotationStrategy = s }
         await store.setStrategy(s)
         emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
     }
 
     public func setAutomaticRouting(_ enabled: Bool, proxyURL override: URL? = nil) async throws {
@@ -627,6 +839,9 @@ public actor AppEngine {
             throw AppEngineError.proxyNotRunning
         }
         try configManager.repair(proxyURL: url)
+        guard try configManager.state(proxyURL: url) == .enabled else {
+            throw CodexConfigManagerError.damagedManagedBlock
+        }
         _ = await settingsStore.update { $0.routeCodexAutomatically = true }
         emit(.snapshotChanged)
     }
@@ -722,9 +937,15 @@ public actor AppEngine {
 
     public func importAccounts() async {
         await syncCodexBar()
-        if let current = AccountImporter.currentCodexAccount() { await store.upsert(current) }
-        for acc in AccountImporter.existingCodexAuthAccounts() { await store.upsert(acc) }
+        var imported = AccountImporter.existingCodexAuthAccounts()
+        if let current = AccountImporter.currentCodexAccount() { imported.append(current) }
+        await reconcileImportedAccounts(imported)
+    }
+
+    func reconcileImportedAccounts(_ accounts: [Account]) async {
+        for account in accounts { await store.upsert(account) }
         emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
     }
 
     public func refreshAllUsage() async {
@@ -1212,6 +1433,7 @@ public actor AppEngine {
         }
 
         guard await taskStore.task(id: task.id) != nil else {
+            await proxy?.unpinTaskStart(runID: runID.uuidString)
             await taskRunner.stop(taskID: task.id)
             await startGate.release()
             return .unavailable
@@ -1468,9 +1690,6 @@ public actor AppEngine {
                 await self.expireCooldownsAndNotify()
                 await self.pollUsage(activeOnly: true)
                 await self.pollRunningTaskUsage(settings: settings)
-                if await self.verifiedRoutingState(settings: settings) == .enabled {
-                    await self.proactiveSwitchIfNeeded(settings: settings)
-                }
                 await self.automationTick()
                 if settings.automaticallyWarmAccounts,
                    let url = await self.proxy?.proxyURL() {
@@ -1523,24 +1742,6 @@ public actor AppEngine {
         }
     }
 
-    private func proactiveSwitchIfNeeded(settings: Settings) async {
-        guard let alias = await store.activeAlias(), let account = await store.account(alias) else { return }
-        guard await store.all().filter({ $0.alias != alias && $0.isEligible(now: Date()) }).isEmpty == false else { return }
-        for window in account.usage {
-            let threshold = window.windowSeconds >= 604800 ? settings.secondaryThresholdPercent : settings.primaryThresholdPercent
-            if window.usedPercent >= threshold {
-                let result = await store.rotateFrom(alias, limit: window.label, resetAt: window.resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
-                if result.rotated, let next = result.next {
-                    await autoLog.write(
-                        "proxy",
-                        "proactive switch from \(Self.oneLine(alias)) to \(Self.oneLine(next.alias)) (\(Self.oneLine(window.label)) \(window.usedPercent)% used)"
-                    )
-                    emit(.rotated(from: alias, to: next.alias, limit: window.label, resetAt: window.resetAt))
-                }
-                return
-            }
-        }
-    }
 }
 
 struct EngineSink: ProxyEventSink {

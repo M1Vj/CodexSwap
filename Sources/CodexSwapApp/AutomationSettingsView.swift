@@ -1,7 +1,7 @@
 import SwiftUI
 import SwapKit
 
-struct AutomationSettingsView: View {
+struct QuotaResetsSettingsView: View {
     @ObservedObject var model: SettingsViewModel
 
     var body: some View {
@@ -31,20 +31,19 @@ struct AutomationSettingsView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
+                Text("Reset-credit availability and earliest expiry are shown per account in Accounts.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
 
-            SettingsSection(title: "Task Automation") {
-                Toggle("Automation", isOn: automationEnabledBinding)
-                Toggle("Notify on task events", isOn: notifyOnTaskEventsBinding)
-                Toggle("May consume banked window", isOn: consumeBankedBinding)
-                Stepper(
-                    "Maximum concurrent tasks: \(model.settings.automationMaxConcurrent)",
-                    value: maxConcurrentBinding,
-                    in: 1...4
-                )
-                Text("Choose which accounts automation may use from the Task Board window.")
-                    .font(.caption)
+            SettingsSection(title: "Automatic Resets") {
+                Toggle("Automatically use reset credits when exhausted", isOn: automaticResetBinding)
+                Text("Per-account protection in Accounts prevents automatic resets only; manual reset remains available.")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
+                Picker("Interactive exhaustion policy", selection: interactivePolicyBinding) {
+                    ExhaustionPolicyChoices()
+                }
             }
 
             SettingsSection(title: "Notifications") {
@@ -58,6 +57,14 @@ struct AutomationSettingsView: View {
 
     private var automaticWarmupBinding: Binding<Bool> {
         Binding(get: { model.settings.automaticallyWarmAccounts }, set: { value in model.actions.setAutomaticWarmup(value) })
+    }
+
+    private var automaticResetBinding: Binding<Bool> {
+        Binding(get: { model.settings.automaticallyResetExhaustedAccounts }, set: { model.actions.setAutomaticReset($0) })
+    }
+
+    private var interactivePolicyBinding: Binding<QuotaExhaustionPolicy> {
+        Binding(get: { model.settings.interactiveExhaustionPolicy }, set: { model.actions.setInteractiveExhaustionPolicy($0) })
     }
 
     private var warmupAccountRows: [WarmupAccountRow] {
@@ -98,26 +105,73 @@ struct AutomationSettingsView: View {
         Binding(get: { model.settings.notifyOnWindowReset }, set: { value in model.actions.setNotifyOnWindowReset(value) })
     }
 
+}
+
+struct TaskBoardSettingsView: View {
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        Form {
+            SettingsSection(title: "Task Automation") {
+                Toggle("Automation", isOn: automationEnabledBinding)
+                Toggle("Notify on task events", isOn: notifyOnTaskEventsBinding)
+                Toggle("May consume banked window", isOn: consumeBankedBinding)
+                Stepper("Maximum concurrent tasks: \(model.settings.automationMaxConcurrent)", value: maxConcurrentBinding, in: 1...4)
+                Picker("When Task Board accounts are exhausted", selection: taskBoardPolicyBinding) {
+                    ExhaustionPolicyChoices()
+                }
+            }
+
+            SettingsSection(title: "Allowed Accounts") {
+                if model.snapshot.accounts.isEmpty {
+                    Text("No accounts available for Task Board automation.").foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.snapshot.accounts.sorted { $0.alias < $1.alias }) { account in
+                        Toggle(account.email.isEmpty ? account.alias : account.email, isOn: automationAccountBinding(account.alias))
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
     private var automationEnabledBinding: Binding<Bool> {
-        Binding(get: { model.settings.automationEnabled }, set: { value in model.actions.setAutomationEnabled(value) })
+        Binding(get: { model.settings.automationEnabled }, set: { model.actions.setAutomationEnabled($0) })
     }
 
     private var notifyOnTaskEventsBinding: Binding<Bool> {
-        Binding(get: { model.settings.notifyOnTaskEvents }, set: { value in model.actions.setNotifyOnTaskEvents(value) })
+        Binding(get: { model.settings.notifyOnTaskEvents }, set: { model.actions.setNotifyOnTaskEvents($0) })
     }
 
     private var consumeBankedBinding: Binding<Bool> {
-        Binding(
-            get: { model.settings.automationConsumeBankedWindow },
-            set: { value in model.actions.setAutomationConsumeBankedWindow(value) }
-        )
+        Binding(get: { model.settings.automationConsumeBankedWindow }, set: { model.actions.setAutomationConsumeBankedWindow($0) })
     }
 
     private var maxConcurrentBinding: Binding<Int> {
+        Binding(get: { model.settings.automationMaxConcurrent }, set: { model.actions.setAutomationMaxConcurrent($0) })
+    }
+
+    private var taskBoardPolicyBinding: Binding<QuotaExhaustionPolicy> {
+        Binding(get: { model.settings.taskBoardExhaustionPolicy }, set: { model.actions.setTaskBoardExhaustionPolicy($0) })
+    }
+
+    private func automationAccountBinding(_ alias: String) -> Binding<Bool> {
         Binding(
-            get: { model.settings.automationMaxConcurrent },
-            set: { value in model.actions.setAutomationMaxConcurrent(value) }
+            get: { model.settings.automationAccounts.contains(alias) },
+            set: { allowed in
+                var aliases = Set(model.settings.automationAccounts)
+                if allowed { aliases.insert(alias) } else { aliases.remove(alias) }
+                model.actions.setAutomationAccounts(aliases.sorted())
+            }
         )
+    }
+}
+
+private struct ExhaustionPolicyChoices: View {
+    var body: some View {
+        Text("Use reset on current account first").tag(QuotaExhaustionPolicy.resetCurrentFirst)
+        Text("Switch account first").tag(QuotaExhaustionPolicy.switchFirst)
+        Text("Stop and notify").tag(QuotaExhaustionPolicy.stopAndNotify)
     }
 }
 

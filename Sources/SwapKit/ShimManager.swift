@@ -26,6 +26,18 @@ public struct ShimManager: Sendable {
     public func isInstalled() -> Bool {
         guard let value = try? String(contentsOf: url, encoding: .utf8) else { return false }
         return value == RuntimeHandoff.shimScript()
+            || value == RuntimeHandoff.legacyBackendRoutingShimScript()
+    }
+
+    @discardableResult
+    public func migrateLegacyShimIfNeeded() throws -> Bool {
+        guard let value = try? String(contentsOf: url, encoding: .utf8),
+              value == RuntimeHandoff.legacyBackendRoutingShimScript() else {
+            return false
+        }
+        try RuntimeHandoff.shimScript().write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return true
     }
 
     public func install() throws {
