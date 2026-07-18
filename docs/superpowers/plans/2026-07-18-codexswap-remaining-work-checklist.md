@@ -270,10 +270,13 @@ rtk grep -n 'Button\("Use"\)|95%|98%|six-second|proactive switch' Sources README
   response, model-only managed configuration, unchanged Launch at Login, and
   automatic reset still disabled. Directly re-open the exact task that had been
   hidden by the old provider configuration and confirm it remains readable.
-- [ ] At the next safe Codex desktop restart, visually inspect all five native
-  Settings panes. The installed menu-bar-only Settings command was not reachable
-  through the available UI automation; five-pane order and presentation remain
-  covered by the passing application tests.
+- [x] After the reversible CodexSwap restart, visually inspect all five native
+  Settings panes. Direct macOS accessibility reached the menu-bar-only Settings
+  window without restarting the active Codex desktop. General, Accounts, Quota
+  & Resets, Task Board, and Advanced rendered in order. Accounts displayed four
+  `Disable Routing` controls and one `Enable Routing` control for the account
+  already paused during inspection; no routing, reset, warm-up, priority, or
+  account-management control was invoked.
 
 Acceptance:
 
@@ -349,8 +352,26 @@ rtk proxy env CODEXSWAP_NULL_STDIN=1 CODEXSWAP_VERBOSE=1 swift run swapd run exe
   data loss, Settings labels, normal and pinned selection, actual-429
   alternatives, Task Board admission, manual and automatic warm-up, automatic
   reset exclusion, and manual-reset availability.
-- `/Applications/CodexSwap.app` still contains the earlier build that passed the
-  installed routing gate before the account-pause commits. Do not claim the
-  pause controls or their native presentation are installed until a new bundle
-  is built, installed reversibly, and inspected. The separate unchecked visual
-  pass over all five native Settings panes also remains open.
+- 2026-07-18 account-pause release gate: `rtk git diff --check` and the complete
+  Swift package suite passed at `8bef732` with 392 tests and zero failures. The
+  application target and release-tool checks passed. The build script, run with
+  `BUILD_NUMBER=3`, assembled ad-hoc-signed arm64 bundle `0.2.0 (3)`, and
+  `codesign --verify --deep --strict` passed. The application and helper SHA-256
+  values are `72326274a5b844bee5355e28a1e39cbe53e6c3ddc876c609e7c12f6d24d05036`
+  and `746c9947a9707222c2429b3d1af97c9726ba7b0518ea03c5be4eafd4e4258466`.
+- The installed build 2 bundle and its mode-`0600` settings/accounts files were
+  copied byte-for-byte to permanent rollback storage before replacement. The
+  live build 2 bundle was then moved intact to a second rollback path, build 3
+  was copied into `/Applications`, and the installed binaries were verified
+  byte-for-byte against `dist/CodexSwap.app` before launch.
+- `/Applications/CodexSwap.app` now reports `0.2.0 (3)`, passes strict codesign,
+  and listens only on `127.0.0.1:58432`. Account migration preserved all five
+  records, wrote an explicit `routingEnabled` value for each, and retained the
+  live state of four enabled accounts plus one paused account. Both account and
+  settings files remain mode `0600`; model-only routing remains enabled while
+  automatic reset and Launch at Login remain disabled.
+- Read-only native inspection verified General, Accounts, Quota & Resets, Task
+  Board, and Advanced. Accounts visibly exposed `Disable Routing` for enabled
+  accounts and `Enable Routing` for the paused account. The automatic-reset
+  switch was visibly off. No reset action or reset credit was used during the
+  release, migration, or inspection.
