@@ -1509,6 +1509,20 @@ final class WarmupEngineTests: XCTestCase {
         return "e30.\(payload).sig"
     }
 
+    func testManualWarmupNeverInvokesRunnerForRoutingDisabledAccount() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-paused-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "paused", accountID: "id-paused", accessToken: freshToken(), routingEnabled: false))
+        await store.upsert(Account(alias: "enabled", accountID: "id-enabled", accessToken: freshToken()))
+        let runner = FakeWarmupRunner()
+        let engine = AppEngine(store: store, warmupService: QuotaWarmupService(runner: runner, ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))))
+
+        _ = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        let calls = await runner.calls()
+
+        XCTAssertEqual(calls, ["enabled"])
+    }
+
     func testManualWarmupForcesRunRefreshesUsageAndPublishesSummary() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-\(UUID().uuidString)")
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
@@ -2214,6 +2228,35 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(selected?.alias, "b")
     }
 
+    func testProxyServerRebindsPausedInteractivePinOnNextSelection() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("paused-server-turn-\(UUID().uuidString).json"))
+        await store.upsert(account("a")); await store.upsert(account("b"))
+        let server = ProxyServer(store: store, settingsProvider: { .default })
+        await server.recordSelection("a", mode: .normal, interactiveKey: "turn")
+        await store.setRoutingEnabled("a", enabled: false)
+        let selected = await server.selectInteractiveAccount(key: "turn", settings: .default)
+        if let selected { await server.recordSelection(selected.alias, mode: .normal, interactiveKey: "turn") }
+        let pin = await server.interactivePinnedAlias(for: "turn")
+        await server.stop()
+        XCTAssertEqual(selected?.alias, "b")
+        XCTAssertEqual(pin, "b")
+    }
+
+    func testProxyServerRebindsPausedTaskPinOnNextSelection() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("paused-server-task-\(UUID().uuidString).json"))
+        await store.upsert(account("a")); await store.upsert(account("b"))
+        let server = ProxyServer(store: store, settingsProvider: { .default })
+        let mode = ProxyRequestMode.task(allowed: ["a", "b"], runID: "run")
+        await server.pinTaskStart(runID: "run", alias: "a")
+        await store.setRoutingEnabled("a", enabled: false)
+        let selected = await server.selectTaskAccount(mode: mode, settings: .default)
+        if let selected { await server.recordSelection(selected.alias, mode: mode, interactiveKey: nil) }
+        let pin = await server.taskPinnedAlias(runID: "run")
+        await server.stop()
+        XCTAssertEqual(selected?.alias, "b")
+        XCTAssertEqual(pin, "b")
+    }
+
     func testBoundedCleanupPreservesCurrentKey() {
         var pins = InteractiveTurnPins(maxCount: 2, maxAge: 10)
         let now = Date(timeIntervalSince1970: 2_000)
@@ -2837,6 +2880,23 @@ private actor PinLifecycleTaskRunner: TaskRunning {
 }
 
 final class TaskRunPinLifecycleTests: XCTestCase {
+    func testPauseAtFinalLaunchGateLeavesNoPinOrRunState() async throws {
+        let harness = try await makeSchedulerHarness(
+            startBehavior: .succeeds,
+            beforeTaskLaunch: { alias, store in await store.setRoutingEnabled(alias, enabled: false) }
+        )
+        defer { try? FileManager.default.removeItem(at: harness.root) }
+
+        let result = await harness.engine.runTaskNow(id: harness.taskID)
+        let pinCount = await harness.proxy.taskPinCount()
+        let runID = await harness.runner.runID(for: harness.taskID)
+
+        XCTAssertEqual(result, .blocked(reason: "Task became unavailable during launch"))
+        XCTAssertEqual(pinCount, 0)
+        XCTAssertNil(runID)
+        await harness.proxy.stop()
+    }
+
     func testPostLaunchTaskDisappearanceStopsRunnerAndReleasesKnownRunPin() async throws {
         let harness = try await makeSchedulerHarness(startBehavior: .succeeds, removeTaskDuringStart: true)
         defer { try? FileManager.default.removeItem(at: harness.root) }
@@ -2997,7 +3057,8 @@ final class TaskRunPinLifecycleTests: XCTestCase {
 
     private func makeSchedulerHarness(
         startBehavior: PinLifecycleTaskRunner.StartBehavior,
-        removeTaskDuringStart: Bool = false
+        removeTaskDuringStart: Bool = false,
+        beforeTaskLaunch: (@Sendable (String, AccountStore) async -> Void)? = nil
     ) async throws -> (root: URL, taskID: UUID, runner: PinLifecycleTaskRunner, proxy: ProxyServer, engine: AppEngine) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scheduler-pin-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -3037,7 +3098,8 @@ final class TaskRunPinLifecycleTests: XCTestCase {
             taskStore: taskStore,
             taskRunning: runner,
             supportDir: root,
-            proxyForTesting: proxy
+            proxyForTesting: proxy,
+            beforeTaskLaunch: { alias in await beforeTaskLaunch?(alias, store) }
         )
         return (root, taskID, runner, proxy, engine)
     }

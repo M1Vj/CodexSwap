@@ -102,6 +102,7 @@ public actor AppEngine {
     private let taskRunner: any TaskRunning
     private let autoLog: AutomationLog
     private let supportDir: URL
+    private let beforeTaskLaunch: (@Sendable (String) async -> Void)?
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
@@ -146,6 +147,7 @@ public actor AppEngine {
         self.taskStore = taskStore
         self.autoLog = autoLog
         self.supportDir = supportDir
+        self.beforeTaskLaunch = nil
         self.taskRunner = taskRunner ?? TaskRunner { [autoLog] category, message in
             await autoLog.write(category, message)
         }
@@ -163,7 +165,8 @@ public actor AppEngine {
         taskRunning: any TaskRunning,
         autoLog: AutomationLog = AutomationLog(),
         supportDir: URL = AppPaths.supportDir(),
-        proxyForTesting: ProxyServer? = nil
+        proxyForTesting: ProxyServer? = nil,
+        beforeTaskLaunch: (@Sendable (String) async -> Void)? = nil
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -183,6 +186,7 @@ public actor AppEngine {
         self.autoLog = autoLog
         self.supportDir = supportDir
         self.proxy = proxyForTesting
+        self.beforeTaskLaunch = beforeTaskLaunch
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -1421,6 +1425,13 @@ public actor AppEngine {
             await taskStore.move(id: task.id, to: .inProgress, index: preferredInProgressIndex)
         }
 
+        await beforeTaskLaunch?(account.alias)
+        guard let launchAccount = await store.account(account.alias), launchAccount.isEligible(now: Date()) else {
+            repositoryLeases.removeValue(forKey: task.id)
+            await taskStore.update(task)
+            await autoLog.write("tick", "\(Self.taskLabel(task)) account became ineligible at launch gate")
+            return .unavailable
+        }
         await proxy?.pinTaskStart(runID: runID.uuidString, alias: account.alias)
         do {
             try await taskRunner.start(
