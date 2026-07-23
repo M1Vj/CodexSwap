@@ -3205,6 +3205,12 @@ final class SettingsInformationArchitectureTests: XCTestCase {
         )
     }
 
+    func testAccountRowsUseCompactLayoutBelowWideControlRequirement() {
+        XCTAssertEqual(AccountSettingsLayoutPresentation.rowLayout(availableWidth: 919), .compact)
+        XCTAssertEqual(AccountSettingsLayoutPresentation.rowLayout(availableWidth: 920), .wide)
+        XCTAssertEqual(AccountSettingsLayoutPresentation.rowLayout(availableWidth: 1_200), .wide)
+    }
+
     func testEachSettingBelongsToExactlyOneApprovedPane() {
         XCTAssertEqual(SettingsInformationArchitecture.general, [.routing, .launchAtLogin])
         XCTAssertEqual(SettingsInformationArchitecture.accounts, [.identityAndOwnership, .activeAccount, .accountRouting, .priority, .resetCreditStatus, .manualReset, .automaticResetProtection])

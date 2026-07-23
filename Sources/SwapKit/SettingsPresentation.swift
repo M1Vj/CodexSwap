@@ -49,6 +49,19 @@ public enum AccountRoutingPresentation {
     public static func canMakeActive(routingEnabled: Bool) -> Bool { routingEnabled }
 }
 
+public enum AccountSettingsRowLayout: Sendable, Equatable {
+    case wide
+    case compact
+}
+
+public enum AccountSettingsLayoutPresentation {
+    public static let wideRowMinimumWidth: CGFloat = 920
+
+    public static func rowLayout(availableWidth: CGFloat) -> AccountSettingsRowLayout {
+        availableWidth >= wideRowMinimumWidth ? .wide : .compact
+    }
+}
+
 public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let alias: String
     public let email: String
