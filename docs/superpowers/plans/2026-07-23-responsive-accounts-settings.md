@@ -16,7 +16,7 @@
 - Modify: `Sources/SwapKit/SettingsPresentation.swift`
 - Test: `Tests/SwapKitTests/SwapKitTests.swift`
 
-- [ ] **Step 1: Write the failing boundary test**
+- [x] **Step 1: Write the failing boundary test**
 
 Add this test to `SettingsInformationArchitectureTests`:
 
@@ -28,7 +28,7 @@ func testAccountRowsUseCompactLayoutBelowWideControlRequirement() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -38,7 +38,7 @@ rtk proxy swift test --filter SettingsInformationArchitectureTests/testAccountRo
 
 Expected: compilation fails because `AccountSettingsLayoutPresentation` does not exist.
 
-- [ ] **Step 3: Implement the minimal presentation policy**
+- [x] **Step 3: Implement the minimal presentation policy**
 
 Add this beside `AccountRoutingPresentation`:
 
@@ -57,11 +57,11 @@ public enum AccountSettingsLayoutPresentation {
 }
 ```
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run the same filtered command. Expected: one test passes with zero failures.
 
-- [ ] **Step 5: Commit the layout policy**
+- [x] **Step 5: Commit the layout policy**
 
 ```sh
 rtk git add Sources/SwapKit/SettingsPresentation.swift Tests/SwapKitTests/SwapKitTests.swift
@@ -73,7 +73,7 @@ rtk git commit -m "test(settings): define responsive account layout"
 **Files:**
 - Modify: `Sources/CodexSwapApp/AccountsSettingsView.swift`
 
-- [ ] **Step 1: Make the complete pane vertically scrollable**
+- [x] **Step 1: Make the complete pane vertically scrollable**
 
 Wrap the existing pane content in a width-reading root:
 
@@ -144,7 +144,7 @@ private func content(rowLayout: AccountSettingsRowLayout) -> some View {
 
 Pass `rowLayout` into every `AccountSettingsRowView`.
 
-- [ ] **Step 2: Split the account row into shared subviews**
+- [x] **Step 2: Split the account row into shared subviews**
 
 Add `layout: AccountSettingsRowLayout` and select the composition:
 
@@ -185,7 +185,7 @@ enabled-account disable action into `routingControl`, and the reset/manage or
 remove buttons into `secondaryActions`. Preserve their existing bindings,
 disabled states, help, accessibility labels, and confirmation dialog.
 
-- [ ] **Step 3: Compose wide and compact rows**
+- [x] **Step 3: Compose wide and compact rows**
 
 Use the existing desktop order in the wide row:
 
@@ -225,7 +225,7 @@ Make account metadata a joined, wrapping line rather than several competing
 single-line `Text` views. Keep routing/sign-in warnings on their own orange line
 so compact rows remain understandable.
 
-- [ ] **Step 4: Build the application target**
+- [x] **Step 4: Build the application target**
 
 Run:
 
@@ -235,7 +235,7 @@ rtk proxy swift build --target CodexSwapApp
 
 Expected: build succeeds.
 
-- [ ] **Step 5: Commit the SwiftUI repair**
+- [x] **Step 5: Commit the SwiftUI repair**
 
 ```sh
 rtk git add Sources/CodexSwapApp/AccountsSettingsView.swift
@@ -247,7 +247,7 @@ rtk git commit -m "fix(settings): make account rows responsive"
 **Files:**
 - Modify: `docs/superpowers/plans/2026-07-23-responsive-accounts-settings.md`
 
-- [ ] **Step 1: Run automated gates**
+- [x] **Step 1: Run automated gates**
 
 ```sh
 rtk git diff --check
@@ -260,7 +260,7 @@ rtk proxy codesign --verify --deep --strict --verbose=2 dist/CodexSwap.app
 
 Expected: all commands exit zero and the full suite has zero failures.
 
-- [ ] **Step 2: Back up and replace the installed app**
+- [x] **Step 2: Back up and replace the installed app**
 
 Preserve the installed bundle and mode-`0600` state files under
 `/Users/vjmabansag/Applications/CodexSwap-backups/`, terminate CodexSwap
@@ -268,7 +268,7 @@ normally, move the old bundle intact into rollback storage, copy build 4 into
 `/Applications`, and relaunch it. Do not invoke reset, warm-up, routing, or
 account-management controls.
 
-- [ ] **Step 3: Verify native constrained-window behavior**
+- [x] **Step 3: Verify native constrained-window behavior**
 
 Using read-only Mac UI control:
 
@@ -280,7 +280,7 @@ Using read-only Mac UI control:
 6. Confirm account count, enabled/paused counts, routing state, automatic-reset
    state, and Launch at Login are unchanged.
 
-- [ ] **Step 4: Record evidence and commit**
+- [x] **Step 4: Record evidence and commit**
 
 Update this plan with the test count, build number, codesign result, installed
 hashes, scroll/compact/wide UI evidence, rollback paths, and unchanged live
@@ -291,3 +291,52 @@ rtk git add docs/superpowers/plans/2026-07-23-responsive-accounts-settings.md
 rtk git commit -m "docs(settings): record responsive UI verification"
 rtk git push origin fix/routing-preserve-history
 ```
+
+## Execution evidence
+
+Completed on 2026-07-23:
+
+- TDD RED: the focused boundary test failed to compile because
+  `AccountSettingsLayoutPresentation` did not exist.
+- TDD GREEN: the same focused test passed after adding the compact/wide
+  presentation policy; all four settings information-architecture tests then
+  passed.
+- Automated gates: `git diff --check`, the application-target build, and the
+  release-tool tests exited zero. The full Swift suite passed 393 tests with
+  zero failures.
+- Independent review: approved with no Critical or Important findings after
+  checking correctness, readability, architecture, security, performance,
+  accessibility, compatibility, the immutable diff, and the verification
+  commands.
+- Release bundle: `Scripts/build-app.sh` produced CodexSwap `0.2.0 (4)`;
+  strict deep code-signature verification passed and both executables are
+  arm64.
+- Dist and installed hashes match:
+  - CodexSwap:
+    `2662a7d3b039fa388be596fb5a97b5d0a7fcb885cf8e42c1b692ee0ca35c63db`
+  - swapd:
+    `df72101b67cebc6790ad7216b69c637717b35413124461f2d9c3dae422c03bc8`
+- Native constrained-window verification: at the supported minimum
+  `720 x 480` window, the Accounts detail is a `499 x 432` vertical scroll
+  region. Compact rows exposed activation, routing, reset-credit, and Manage
+  actions without horizontal scrolling. Setting the detail scrollbar to its
+  bottom value (`1.0`) made all three footer controls visible.
+- Wide-layout boundary: the deterministic policy test proves compact below
+  920 detail points and wide at 920 and above. The local 1280-point display
+  capped the Settings window at 1115 points, so its detail pane remained below
+  that boundary and correctly stayed compact during native verification.
+- The Accounts window was returned to `900 x 600` with its detail scroll
+  position at the top after verification.
+- Installed live state remained unchanged: six accounts, four routing-enabled,
+  two routing-paused, automatic reset off, routing on, and Launch at Login off.
+  Account and settings files remained mode `0600`; the helper continued to
+  listen only on loopback.
+- No reset-credit, warm-up, routing-toggle, account-activation, login, or
+  account-management action was invoked during verification.
+
+Rollback material:
+
+- `/Users/vjmabansag/Applications/CodexSwap-backups/CodexSwap.app-20260723-1237-before-responsive-settings`
+- `/Users/vjmabansag/Applications/CodexSwap-backups/CodexSwap.app-20260723-1238-replaced-live`
+- `/Users/vjmabansag/Applications/CodexSwap-backups/state-20260723-1237-before-responsive-settings/settings.json`
+- `/Users/vjmabansag/Applications/CodexSwap-backups/state-20260723-1237-before-responsive-settings/accounts.json`
