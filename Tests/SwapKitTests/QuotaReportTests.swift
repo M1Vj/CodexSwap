@@ -355,20 +355,31 @@ private actor StubQuotaCredits: QuotaResetServing {
 }
 
 private actor SharedLookupProbe {
+    private struct EntryWaiter {
+        let target: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private var active = 0
     private var maximum = 0
     private var entered = 0
     private var released = false
-    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var entryWaiters: [EntryWaiter] = []
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
     func enter() {
         active += 1
         entered += 1
         maximum = max(maximum, active)
-        let ready = entryWaiters
-        entryWaiters.removeAll()
-        ready.forEach { $0.resume() }
+        var pending: [EntryWaiter] = []
+        for waiter in entryWaiters {
+            if entered >= waiter.target {
+                waiter.continuation.resume()
+            } else {
+                pending.append(waiter)
+            }
+        }
+        entryWaiters = pending
     }
 
     func leave() {
@@ -385,7 +396,11 @@ private actor SharedLookupProbe {
     func waitUntilEntered(atLeast target: Int) async {
         if entered >= target || released { return }
         await withCheckedContinuation { continuation in
-            entryWaiters.append(continuation)
+            if entered >= target || released {
+                continuation.resume()
+            } else {
+                entryWaiters.append(EntryWaiter(target: target, continuation: continuation))
+            }
         }
     }
 
@@ -396,7 +411,7 @@ private actor SharedLookupProbe {
         releaseWaiters.forEach { $0.resume() }
         let entryWaiters = self.entryWaiters
         self.entryWaiters.removeAll()
-        entryWaiters.forEach { $0.resume() }
+        entryWaiters.forEach { $0.continuation.resume() }
     }
 
     func maximumActive() -> Int { maximum }
