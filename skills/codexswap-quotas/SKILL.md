@@ -8,7 +8,7 @@ description: Use when the user asks for current Codex quota, usage, remaining ca
 Run exactly:
 
 ```bash
-rtk proxy bash /Users/vjmabansag/.codex/skills/codexswap-quotas/scripts/check-quotas.sh
+/Users/vjmabansag/.local/bin/rtk proxy /bin/bash /Users/vjmabansag/.codex/skills/codexswap-quotas/scripts/check-quotas.sh
 ```
 
 Treat the helper output as the only quota source. Present every returned account

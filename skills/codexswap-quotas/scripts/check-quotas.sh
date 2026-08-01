@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 candidates=(
@@ -12,7 +12,7 @@ for binary in "${candidates[@]}"; do
 
   if output="$("$binary" quota --json 2>/dev/null)"; then
     if normalized="$(
-      printf '%s\n' "$output" | python3 -c '
+      printf '%s\n' "$output" | /usr/bin/python3 -c '
 import json
 import re
 import sys

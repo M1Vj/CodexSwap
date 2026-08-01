@@ -133,6 +133,30 @@ final class QuotaReportTests: XCTestCase {
         XCTAssertEqual(report.accounts.map(\.state), [.active, .paused, .signInRequired, .available])
     }
 
+    func testOnlyFirstCaseInsensitiveActiveAliasIsMarkedActive() async throws {
+        let snapshot = ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date())
+        let usage = StubQuotaUsage(results: [
+            "upper-token": .success([UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: nil)]),
+            "lower-token": .success([UsageWindow(label: "5h", usedPercent: 2, windowSeconds: 18_000, resetAt: nil)]),
+        ])
+        let credits = StubQuotaCredits(results: [
+            "upper-token": .success(snapshot),
+            "lower-token": .success(snapshot),
+        ])
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: Date.init)
+
+        let report = try await service.fetch(
+            accounts: [
+                Account(alias: "alpha", accessToken: "lower-token"),
+                Account(alias: "ALPHA", accessToken: "upper-token"),
+            ],
+            activeAlias: "Alpha"
+        )
+
+        XCTAssertEqual(report.accounts.map(\.alias), ["ALPHA", "Account 1"])
+        XCTAssertEqual(report.accounts.map(\.state), [.active, .available])
+    }
+
     func testReportSanitizesIdentityLabelsAndPlansBeforeSerialization() async throws {
         let now = Date(timeIntervalSince1970: 1_751_414_400)
         let tokens = [
@@ -202,6 +226,35 @@ final class QuotaReportTests: XCTestCase {
         }
     }
 
+    func testReportRejectsPrivateValuesEmbeddedInAliasesAndPlansAcrossAccounts() async throws {
+        let now = Date(timeIntervalSince1970: 1_751_414_400)
+        let tokens = ["token-a", "token-b", "token-c"]
+        let usage = StubQuotaUsage(results: Dictionary(uniqueKeysWithValues: tokens.map {
+            ($0, Result<[UsageWindow], Error>.success([UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: nil)]))
+        }))
+        let snapshot = ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)
+        let credits = StubQuotaCredits(results: Dictionary(uniqueKeysWithValues: tokens.map {
+            ($0, Result<ResetCreditSnapshot, Error>.success(snapshot))
+        }))
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [
+                Account(alias: "alpha", accountID: "alpha-private-id", planType: "plus", accessToken: "token-a"),
+                Account(alias: "Friendly alpha-private-id suffix", accountID: "beta-private-id", planType: "standard", accessToken: "token-b"),
+                Account(alias: "beta", accountID: "gamma-private-id", planType: "tier alpha-private-id", accessToken: "token-c"),
+            ],
+            activeAlias: nil
+        )
+
+        XCTAssertEqual(report.accounts.map(\.alias), ["alpha", "beta", "Account 1"])
+        XCTAssertNil(report.accounts.first { $0.alias == "beta" }?.plan)
+        XCTAssertFalse(report.accounts.map(\.alias).contains { $0.localizedCaseInsensitiveContains("alpha-private-id") })
+        let encoded = try QuotaReportJSON.encode(report)
+        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("alpha-private-id"))
+    }
+
     func testEmptyAccountListProducesValidEmptyReport() async throws {
         let now = Date(timeIntervalSince1970: 1_754_044_800)
         let service = QuotaReportService(usageService: StubQuotaUsage(results: [:]), resetService: StubQuotaCredits(results: [:]), clock: { now })
@@ -221,8 +274,34 @@ final class QuotaReportTests: XCTestCase {
 
         let report = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
 
-        XCTAssertEqual(report.accounts[0].windows[0].usedPercent, 125)
+        XCTAssertEqual(report.accounts[0].windows[0].usedPercent, 100)
         XCTAssertEqual(report.accounts[0].windows[0].remainingPercent, 0)
+    }
+
+    func testUsedPercentageClampsAtLowerBound() async throws {
+        let service = QuotaReportService(
+            usageService: StubQuotaUsage(results: ["alpha": .success([UsageWindow(label: "5h", usedPercent: -25, windowSeconds: 18_000, resetAt: nil)])]),
+            resetService: StubQuotaCredits(results: ["alpha": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date()))]),
+            clock: Date.init
+        )
+
+        let report = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
+
+        XCTAssertEqual(report.accounts[0].windows[0].usedPercent, 0)
+        XCTAssertEqual(report.accounts[0].windows[0].remainingPercent, 100)
+    }
+
+    func testSuccessfulEmptyUsageMapsToMalformedResponse() async throws {
+        let service = QuotaReportService(
+            usageService: StubQuotaUsage(results: ["alpha": .success([])]),
+            resetService: StubQuotaCredits(results: ["alpha": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date()))]),
+            clock: Date.init
+        )
+
+        let report = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
+
+        XCTAssertEqual(report.accounts[0].usageStatus, .malformedResponse)
+        XCTAssertTrue(report.accounts[0].windows.isEmpty)
     }
 
     func testLookupErrorsMapToSafeCategories() async throws {

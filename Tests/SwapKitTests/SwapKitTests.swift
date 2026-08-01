@@ -1690,6 +1690,29 @@ final class UsageParseTests: XCTestCase {
         XCTAssertTrue(UsageClient.parse(Data("{}".utf8)).isEmpty)
     }
 
+    func testFetchRejectsMalformedHTTP200Payloads() async {
+        for body in ["{}", #"{"rate_limit":{}}"#, #"{"rate_limit":{"primary_window":null,"secondary_window":null}}"#] {
+            QuotaResetURLProtocol.respond(status: 200, body: body)
+            let client = UsageClient(
+                session: QuotaResetURLProtocol.session(),
+                url: QuotaResetClient.defaultCreditsEndpoint
+            )
+
+            do {
+                _ = try await client.fetch(accessToken: "token", accountID: "account")
+                XCTFail("Expected malformed response for HTTP 200 payload")
+            } catch let error as UsageClient.UsageError {
+                if case .malformed = error {
+                    // Expected.
+                } else {
+                    XCTFail("Expected malformed response, got \(error)")
+                }
+            } catch {
+                XCTFail("Unexpected error: \(type(of: error))")
+            }
+        }
+    }
+
     func testParseWeeklyOnlyPrimarySlotWithNullSecondary() {
         // Shape observed while the 5h limit is suspended: the weekly window moves into the
         // primary slot and secondary_window is null.

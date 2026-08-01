@@ -118,6 +118,9 @@ public struct QuotaReportService: Sendable {
                 return lhs.offset < rhs.offset
             }
             .map(\.element)
+        let activeAccountIndex = activeKey.flatMap { key in
+            orderedAccounts.firstIndex { Self.normalizedAlias($0.alias) == key }
+        }
         let privateContext = Self.privateContext(for: orderedAccounts)
         let displayAliases = Self.displayAliases(for: orderedAccounts, privateContext: privateContext)
 
@@ -136,6 +139,7 @@ public struct QuotaReportService: Sendable {
                         privateContext: privateContext,
                         index: index,
                         activeAlias: activeKey,
+                        activeAccountIndex: activeAccountIndex,
                         usageService: self.usageService,
                         resetService: self.resetService
                     )
@@ -157,6 +161,7 @@ public struct QuotaReportService: Sendable {
                         privateContext: privateContext,
                         index: index,
                         activeAlias: activeKey,
+                        activeAccountIndex: activeAccountIndex,
                         usageService: self.usageService,
                         resetService: self.resetService
                     )
@@ -230,8 +235,14 @@ public struct QuotaReportService: Sendable {
     private static func isUnsafeIdentityValue(_ candidate: String, in context: PrivateIdentityContext) -> Bool {
         let normalizedCandidate = normalizedPrivateValue(candidate)
         guard !normalizedCandidate.isEmpty else { return false }
-        return context.normalizedValues.contains(normalizedCandidate)
-            || hasAccountIDPrefix(candidate, in: context)
+        if context.normalizedValues.contains(normalizedCandidate) || hasAccountIDPrefix(candidate, in: context) {
+            return true
+        }
+        guard normalizedCandidate.unicodeScalars.count >= 6 else { return false }
+        return context.normalizedValues.contains { privateValue in
+            guard privateValue.unicodeScalars.count >= 6 else { return false }
+            return normalizedCandidate.contains(privateValue)
+        }
     }
 
     private static func safeAliasCandidate(for account: Account, privateContext: PrivateIdentityContext) -> String? {
@@ -294,12 +305,17 @@ public struct QuotaReportService: Sendable {
         return plan
     }
 
-    private static func state(for account: Account, activeAlias: String?) -> AccountQuotaState {
+    private static func state(
+        for account: Account,
+        activeAlias: String?,
+        index: Int,
+        activeAccountIndex: Int?
+    ) -> AccountQuotaState {
         if account.needsLogin || account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .signInRequired
         }
         if !account.routingEnabled { return .paused }
-        if normalizedAlias(account.alias) == activeAlias { return .active }
+        if index == activeAccountIndex, normalizedAlias(account.alias) == activeAlias { return .active }
         return .available
     }
 
@@ -309,11 +325,17 @@ public struct QuotaReportService: Sendable {
         privateContext: PrivateIdentityContext,
         index: Int,
         activeAlias: String?,
+        activeAccountIndex: Int?,
         usageService: any UsageFetching,
         resetService: any QuotaResetServing
     ) async throws -> IndexedAccountReport {
         try Task.checkCancellation()
-        let state = Self.state(for: account, activeAlias: activeAlias)
+        let state = Self.state(
+            for: account,
+            activeAlias: activeAlias,
+            index: index,
+            activeAccountIndex: activeAccountIndex
+        )
         guard !account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !account.needsLogin else {
             return IndexedAccountReport(
@@ -359,14 +381,16 @@ public struct QuotaReportService: Sendable {
         do {
             let windows = try await service.fetch(accessToken: account.accessToken, accountID: account.accountID)
                 .map { window in
-                    QuotaWindowReport(
+                    let usedPercent = min(max(window.usedPercent, 0), 100)
+                    return QuotaWindowReport(
                         label: window.label,
-                        usedPercent: window.usedPercent,
-                        remainingPercent: max(0, 100 - window.usedPercent),
+                        usedPercent: usedPercent,
+                        remainingPercent: 100 - usedPercent,
                         resetAt: window.resetAt
                     )
                 }
             try Task.checkCancellation()
+            guard !windows.isEmpty else { return (.malformedResponse, []) }
             return (.ok, windows)
         } catch is CancellationError {
             throw CancellationError()
