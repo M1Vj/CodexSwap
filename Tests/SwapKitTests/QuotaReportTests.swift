@@ -10,7 +10,7 @@ final class QuotaReportTests: XCTestCase {
                 UsageWindow(label: "5h", usedPercent: 35, windowSeconds: 18_000, resetAt: now.addingTimeInterval(3_600)),
                 UsageWindow(label: "Weekly", usedPercent: 80, windowSeconds: 604_800, resetAt: now.addingTimeInterval(86_400)),
             ]),
-            "beta": .success([
+            "BETA-ACCESS-TOKEN": .success([
                 UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: now.addingTimeInterval(7_200)),
             ]),
         ])
@@ -22,12 +22,12 @@ final class QuotaReportTests: XCTestCase {
                 ],
                 fetchedAt: now
             )),
-            "beta": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)),
+            "BETA-ACCESS-TOKEN": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)),
         ])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
         let accounts = [
             Account(alias: "alpha", email: "SECRET-EMAIL", accountID: "SECRET-ACCOUNT-ID", planType: "plus", accessToken: "SECRET-ACCESS-TOKEN", refreshToken: "SECRET-REFRESH"),
-            Account(alias: "beta", accessToken: "beta", routingEnabled: false),
+            Account(alias: "beta", accessToken: "BETA-ACCESS-TOKEN", routingEnabled: false),
         ]
 
         let report = try await service.fetch(accounts: accounts, activeAlias: "alpha")
@@ -54,19 +54,19 @@ final class QuotaReportTests: XCTestCase {
     func testPartialFailuresPreserveSuccessfulDataAndUseSafeCategories() async throws {
         let now = Date(timeIntervalSince1970: 1_754_044_800)
         let usage = StubQuotaUsage(results: [
-            "alpha": .success([UsageWindow(label: "5h", usedPercent: 42, windowSeconds: 18_000, resetAt: now)]),
-            "beta": .failure(UsageClient.UsageError.unauthorized),
+            "alpha-usage-token": .success([UsageWindow(label: "5h", usedPercent: 42, windowSeconds: 18_000, resetAt: now)]),
+            "beta-usage-token": .failure(UsageClient.UsageError.unauthorized),
         ])
         let credits = StubQuotaCredits(results: [
-            "alpha": .failure(QuotaResetClientError.transport(.timeout)),
-            "beta": .success(ResetCreditSnapshot(availableCount: 3, credits: [], fetchedAt: now)),
+            "alpha-usage-token": .failure(QuotaResetClientError.transport(.timeout)),
+            "beta-usage-token": .success(ResetCreditSnapshot(availableCount: 3, credits: [], fetchedAt: now)),
         ])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
         let report = try await service.fetch(
             accounts: [
-                Account(alias: "alpha", accessToken: "alpha"),
-                Account(alias: "beta", accessToken: "beta"),
+                Account(alias: "alpha", accessToken: "alpha-usage-token"),
+                Account(alias: "beta", accessToken: "beta-usage-token"),
             ],
             activeAlias: nil
         )
@@ -110,11 +110,11 @@ final class QuotaReportTests: XCTestCase {
 
     func testAccountStatePrecedenceAndDeterministicCaseInsensitiveOrder() async throws {
         let usage = StubQuotaUsage(results: [
-            "alpha": .success([]),
+            "alpha-state-token": .success([]),
             "available": .success([]),
         ])
         let credits = StubQuotaCredits(results: [
-            "alpha": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date())),
+            "alpha-state-token": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date())),
             "available": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date())),
         ])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: Date.init)
@@ -122,7 +122,7 @@ final class QuotaReportTests: XCTestCase {
         let report = try await service.fetch(
             accounts: [
                 Account(alias: "zeta", accessToken: "available"),
-                Account(alias: "Alpha", accessToken: "alpha"),
+                Account(alias: "Alpha", accessToken: "alpha-state-token"),
                 Account(alias: "paused", accessToken: "available", routingEnabled: false),
                 Account(alias: "signed-out", accessToken: "available", needsLogin: true),
             ],
@@ -131,6 +131,45 @@ final class QuotaReportTests: XCTestCase {
 
         XCTAssertEqual(report.accounts.map(\.alias), ["Alpha", "paused", "signed-out", "zeta"])
         XCTAssertEqual(report.accounts.map(\.state), [.active, .paused, .signInRequired, .available])
+    }
+
+    func testReportSanitizesIdentityLabelsAndPlansBeforeSerialization() async throws {
+        let now = Date(timeIntervalSince1970: 1_751_414_400)
+        let tokens = [
+            "safe-account-1", "duplicate-token-1", "duplicate-token-2", "email-token",
+            "plan-token", "prefix-token", "PROMPT-TOKEN", "TOKEN-MARKER",
+        ]
+        let usage = StubQuotaUsage(results: Dictionary(uniqueKeysWithValues: tokens.map { ($0, Result<[UsageWindow], Error>.success([])) }))
+        let snapshot = ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)
+        let credits = StubQuotaCredits(results: Dictionary(uniqueKeysWithValues: tokens.map { ($0, Result<ResetCreditSnapshot, Error>.success(snapshot)) }))
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+        let accounts = [
+            Account(alias: "Account 1", accountID: "safe-account-id", planType: "plus", accessToken: "safe-account-1"),
+            Account(alias: "Duplicate", accountID: "id-duplicate-1", accessToken: "duplicate-token-1"),
+            Account(alias: "duplicate", accountID: "id-duplicate-2", accessToken: "duplicate-token-2"),
+            Account(alias: "EMAIL-MARKER@example.com", email: "EMAIL-MARKER@example.com", accountID: "email-account-id", accessToken: "email-token"),
+            Account(alias: "plan-bad", accountID: "plan-account-id", planType: "Bearer account-id: private", accessToken: "plan-token"),
+            Account(alias: "PREFIX1234", accountID: "PREFIX123456789", accessToken: "prefix-token"),
+            Account(alias: "show\n token", accountID: "prompt-account-id", accessToken: "PROMPT-TOKEN"),
+            Account(alias: "TOKEN-MARKER", accountID: "token-account-id", accessToken: "TOKEN-MARKER"),
+        ]
+
+        let report = try await service.fetch(accounts: accounts, activeAlias: "PREFIX1234")
+
+        XCTAssertEqual(report.accounts.map(\.alias), ["Account 2", "Account 1", "Duplicate", "Account 3", "Account 4", "plan-bad", "Account 5", "Account 6"])
+        XCTAssertEqual(report.accounts.map { $0.alias.lowercased() }.count, Set<String>(report.accounts.map { $0.alias.lowercased() }).count)
+        XCTAssertEqual(report.accounts.first { $0.state == .active }?.alias, "Account 2")
+        XCTAssertNil(report.accounts.first { $0.alias == "plan-bad" }?.plan)
+        XCTAssertEqual(report.accounts.first { $0.alias == "Account 1" }?.plan, "plus")
+
+        let encoded = try QuotaReportJSON.encode(report)
+        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        for forbidden in [
+            "EMAIL-MARKER@example.com", "PREFIX123456789", "PROMPT-TOKEN", "TOKEN-MARKER",
+            "show\n token", "Bearer account-id: private",
+        ] {
+            XCTAssertFalse(text.contains(forbidden), "serialized report leaked marker: \(forbidden)")
+        }
     }
 
     func testEmptyAccountListProducesValidEmptyReport() async throws {
@@ -230,25 +269,25 @@ final class QuotaReportTests: XCTestCase {
         let probe = SharedLookupProbe()
         let snapshot = ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)
         let usage = StubQuotaUsage(results: [
-            "a": .success([]),
-            "b": .success([]),
-            "c": .success([]),
-            "d": .success([]),
+            "a-concurrency-token": .success([]),
+            "b-concurrency-token": .success([]),
+            "c-concurrency-token": .success([]),
+            "d-concurrency-token": .success([]),
         ], probe: probe)
         let credits = StubQuotaCredits(results: [
-            "a": .success(snapshot),
-            "b": .success(snapshot),
-            "c": .success(snapshot),
-            "d": .success(snapshot),
+            "a-concurrency-token": .success(snapshot),
+            "b-concurrency-token": .success(snapshot),
+            "c-concurrency-token": .success(snapshot),
+            "d-concurrency-token": .success(snapshot),
         ], probe: probe)
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
         let task = Task {
             try await service.fetch(
                 accounts: [
-                    Account(alias: "d", accessToken: "d"),
-                    Account(alias: "b", accessToken: "b"),
-                    Account(alias: "c", accessToken: "c"),
-                    Account(alias: "a", accessToken: "a"),
+                    Account(alias: "d", accessToken: "d-concurrency-token"),
+                    Account(alias: "b", accessToken: "b-concurrency-token"),
+                    Account(alias: "c", accessToken: "c-concurrency-token"),
+                    Account(alias: "a", accessToken: "a-concurrency-token"),
                 ],
                 activeAlias: "c"
             )

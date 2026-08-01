@@ -113,6 +113,7 @@ public struct QuotaReportService: Sendable {
                 return lhs.offset < rhs.offset
             }
             .map(\.element)
+        let displayAliases = Self.displayAliases(for: orderedAccounts)
 
         var reports = Array<AccountQuotaReport?>(repeating: nil, count: orderedAccounts.count)
         var nextIndex = 0
@@ -121,9 +122,11 @@ public struct QuotaReportService: Sendable {
             while nextIndex < min(Self.maxConcurrentAccounts, orderedAccounts.count) {
                 let index = nextIndex
                 let account = orderedAccounts[index]
+                let displayAlias = displayAliases[index]
                 group.addTask {
                     try await Self.fetchAccount(
                         account: account,
+                        displayAlias: displayAlias,
                         index: index,
                         activeAlias: activeKey,
                         usageService: self.usageService,
@@ -139,9 +142,11 @@ public struct QuotaReportService: Sendable {
                 guard nextIndex < orderedAccounts.count else { continue }
                 let index = nextIndex
                 let account = orderedAccounts[index]
+                let displayAlias = displayAliases[index]
                 group.addTask {
                     try await Self.fetchAccount(
                         account: account,
+                        displayAlias: displayAlias,
                         index: index,
                         activeAlias: activeKey,
                         usageService: self.usageService,
@@ -161,6 +166,107 @@ public struct QuotaReportService: Sendable {
         return alias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    private static func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizedPrivateValue(_ value: String) -> String {
+        trimmed(value).lowercased()
+    }
+
+    private static func privateValues(for account: Account) -> [String] {
+        [account.email, account.accountID, account.accessToken, account.refreshToken, account.idToken]
+    }
+
+    private static func isAllowedLabelScalar(_ scalar: Unicode.Scalar) -> Bool {
+        if CharacterSet.alphanumerics.contains(scalar) { return true }
+        switch scalar.value {
+        case 0x20, 0x2E, 0x2D, 0x2B, 0x5F: return true // space, dot, hyphen, plus, underscore
+        default: return false
+        }
+    }
+
+    private static func isSafeLabelText(_ value: String, maximumScalars: Int) -> Bool {
+        let scalarCount = value.unicodeScalars.count
+        guard (1...maximumScalars).contains(scalarCount) else { return false }
+        return value.unicodeScalars.allSatisfy(Self.isAllowedLabelScalar)
+    }
+
+    private static func equalsPrivateValue(_ candidate: String, account: Account) -> Bool {
+        let normalizedCandidate = normalizedPrivateValue(candidate)
+        guard !normalizedCandidate.isEmpty else { return false }
+        return privateValues(for: account).contains { value in
+            let normalizedValue = normalizedPrivateValue(value)
+            return !normalizedValue.isEmpty && normalizedValue == normalizedCandidate
+        }
+    }
+
+    private static func safeAliasCandidate(for account: Account) -> String? {
+        let candidate = trimmed(account.alias)
+        guard isSafeLabelText(candidate, maximumScalars: 64), !equalsPrivateValue(candidate, account: account) else {
+            return nil
+        }
+
+        let normalizedCandidate = normalizedPrivateValue(candidate)
+        let accountID = trimmed(account.accountID)
+        guard !accountID.isEmpty else { return candidate }
+        let normalizedAccountID = normalizedPrivateValue(accountID)
+        let fallbackPrefix = normalizedPrivateValue(String(accountID.prefix(8)))
+        if normalizedCandidate == fallbackPrefix { return nil }
+        if candidate.unicodeScalars.count >= 6, normalizedAccountID.hasPrefix(normalizedCandidate) { return nil }
+        return candidate
+    }
+
+    private static func displayAliases(for accounts: [Account]) -> [String] {
+        let candidates = accounts.map(safeAliasCandidate)
+        var reserved = Set(candidates.compactMap { candidate in
+            candidate.map(normalizedPrivateValue)
+        })
+        for account in accounts {
+            for value in privateValues(for: account) {
+                let normalized = normalizedPrivateValue(value)
+                if !normalized.isEmpty { reserved.insert(normalized) }
+            }
+        }
+
+        var used = Set<String>()
+        var nextGenericNumber = 1
+        return candidates.map { candidate in
+            if let candidate {
+                let normalized = normalizedPrivateValue(candidate)
+                if !used.contains(normalized) {
+                    used.insert(normalized)
+                    return candidate
+                }
+            }
+
+            while true {
+                let generic = "Account \(nextGenericNumber)"
+                nextGenericNumber += 1
+                let normalized = normalizedPrivateValue(generic)
+                guard !reserved.contains(normalized), !used.contains(normalized) else { continue }
+                used.insert(normalized)
+                return generic
+            }
+        }
+    }
+
+    private static let unsafePlanKeywords = [
+        "email", "token", "accountid", "account id", "account-id", "account_id",
+        "creditid", "credit id", "credit-id", "credit_id", "authorization", "bearer",
+    ]
+
+    private static func sanitizedPlan(for account: Account) -> String? {
+        guard let rawPlan = account.planType else { return nil }
+        let plan = trimmed(rawPlan)
+        guard isSafeLabelText(plan, maximumScalars: 32), !equalsPrivateValue(plan, account: account) else {
+            return nil
+        }
+        let normalizedPlan = normalizedPrivateValue(plan)
+        guard !unsafePlanKeywords.contains(where: normalizedPlan.contains) else { return nil }
+        return plan
+    }
+
     private static func state(for account: Account, activeAlias: String?) -> AccountQuotaState {
         if account.needsLogin || account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .signInRequired
@@ -172,6 +278,7 @@ public struct QuotaReportService: Sendable {
 
     private static func fetchAccount(
         account: Account,
+        displayAlias: String,
         index: Int,
         activeAlias: String?,
         usageService: any UsageFetching,
@@ -184,8 +291,8 @@ public struct QuotaReportService: Sendable {
             return IndexedAccountReport(
                 index: index,
                 report: AccountQuotaReport(
-                    alias: account.alias,
-                    plan: account.planType,
+                    alias: displayAlias,
+                    plan: sanitizedPlan(for: account),
                     state: state,
                     usageStatus: .signInRequired,
                     windows: [],
@@ -204,8 +311,8 @@ public struct QuotaReportService: Sendable {
         return IndexedAccountReport(
             index: index,
             report: AccountQuotaReport(
-                alias: account.alias,
-                plan: account.planType,
+                alias: displayAlias,
+                plan: sanitizedPlan(for: account),
                 state: state,
                 usageStatus: usage.status,
                 windows: usage.windows,
