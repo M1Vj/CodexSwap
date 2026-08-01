@@ -67,6 +67,28 @@ case "usage":
         }
     }
 
+case "quota":
+    guard args.count == 2, args[1] == "--json" else {
+        FileHandle.standardError.write(Data("usage: swapd quota --json\n".utf8))
+        exit(64)
+    }
+
+    do {
+        let service = QuotaReportService(usageService: UsageClient(), resetService: QuotaResetClient())
+        let accounts = await store.all()
+        let activeAlias = await store.activeAlias()
+        let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias)
+        let encoded = try QuotaReportJSON.encode(report)
+        FileHandle.standardOutput.write(encoded)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    } catch is CancellationError {
+        FileHandle.standardError.write(Data("quota request cancelled\n".utf8))
+        exit(130)
+    } catch {
+        FileHandle.standardError.write(Data("quota request failed\n".utf8))
+        exit(1)
+    }
+
 case "priority":
     guard args.count >= 3, let p = Int(args[2]) else { print("usage: swapd priority <alias> <int>"); break }
     guard await store.account(args[1]) != nil else { print("no such account: \(args[1])"); exit(1) }
@@ -129,6 +151,7 @@ func printHelp() {
       import           auto-detect and import codex accounts
       list             list accounts, priority, usage, cooldowns
       usage            poll wham/usage for each account
+      quota --json     fresh read-only usage/reset-credit status for every account
       priority <a> <n> set account priority (higher consumed first)
       switch <a>       set active account
       shim             print the codexswap shim script
