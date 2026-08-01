@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodexSwap Quotas"
+  short_description: "Check every local CodexSwap account quota"
+  default_prompt: "Use $codexswap-quotas to show every current CodexSwap account quota without changing anything."
