@@ -75,6 +75,13 @@ public struct CodexQuotaReport: Codable, Sendable, Equatable {
 }
 
 public struct QuotaReportService: Sendable {
+    private static let maxConcurrentAccounts = 3
+
+    private struct IndexedAccountReport: Sendable {
+        let index: Int
+        let report: AccountQuotaReport
+    }
+
     private let usageService: any UsageFetching
     private let resetService: any QuotaResetServing
     private let clock: @Sendable () -> Date
@@ -89,7 +96,8 @@ public struct QuotaReportService: Sendable {
         self.clock = clock
     }
 
-    public func fetch(accounts: [Account], activeAlias: String?) async -> CodexQuotaReport {
+    public func fetch(accounts: [Account], activeAlias: String?) async throws -> CodexQuotaReport {
+        try Task.checkCancellation()
         let fetchedAt = clock()
         let activeKey = Self.normalizedAlias(activeAlias)
         let orderedAccounts = accounts.enumerated()
@@ -106,48 +114,46 @@ public struct QuotaReportService: Sendable {
             }
             .map(\.element)
 
-        var reports: [AccountQuotaReport] = []
-        reports.reserveCapacity(orderedAccounts.count)
+        var reports = Array<AccountQuotaReport?>(repeating: nil, count: orderedAccounts.count)
+        var nextIndex = 0
 
-        for account in orderedAccounts {
-            let state = Self.state(for: account, activeAlias: activeKey)
-            guard !account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  !account.needsLogin else {
-                reports.append(AccountQuotaReport(
-                    alias: account.alias,
-                    plan: account.planType,
-                    state: state,
-                    usageStatus: .signInRequired,
-                    windows: [],
-                    resetCreditStatus: .signInRequired,
-                    availableResetCredits: nil,
-                    earliestResetCreditExpiry: nil
-                ))
-                continue
+        try await withThrowingTaskGroup(of: IndexedAccountReport.self) { group in
+            while nextIndex < min(Self.maxConcurrentAccounts, orderedAccounts.count) {
+                let index = nextIndex
+                let account = orderedAccounts[index]
+                group.addTask {
+                    try await Self.fetchAccount(
+                        account: account,
+                        index: index,
+                        activeAlias: activeKey,
+                        usageService: self.usageService,
+                        resetService: self.resetService
+                    )
+                }
+                nextIndex += 1
             }
 
-            let usageResult = await Self.fetchUsage(
-                service: usageService,
-                account: account
-            )
-            let creditResult = await Self.fetchCredits(
-                service: resetService,
-                account: account
-            )
-
-            reports.append(AccountQuotaReport(
-                alias: account.alias,
-                plan: account.planType,
-                state: state,
-                usageStatus: usageResult.status,
-                windows: usageResult.windows,
-                resetCreditStatus: creditResult.status,
-                availableResetCredits: creditResult.snapshot?.availableCount,
-                earliestResetCreditExpiry: creditResult.snapshot?.earliestAvailable?.expiresAt
-            ))
+            while let completed = try await group.next() {
+                try Task.checkCancellation()
+                reports[completed.index] = completed.report
+                guard nextIndex < orderedAccounts.count else { continue }
+                let index = nextIndex
+                let account = orderedAccounts[index]
+                group.addTask {
+                    try await Self.fetchAccount(
+                        account: account,
+                        index: index,
+                        activeAlias: activeKey,
+                        usageService: self.usageService,
+                        resetService: self.resetService
+                    )
+                }
+                nextIndex += 1
+            }
         }
 
-        return CodexQuotaReport(schemaVersion: 1, fetchedAt: fetchedAt, accounts: reports)
+        try Task.checkCancellation()
+        return CodexQuotaReport(schemaVersion: 1, fetchedAt: fetchedAt, accounts: reports.compactMap { $0 })
     }
 
     private static func normalizedAlias(_ alias: String?) -> String? {
@@ -164,10 +170,57 @@ public struct QuotaReportService: Sendable {
         return .available
     }
 
+    private static func fetchAccount(
+        account: Account,
+        index: Int,
+        activeAlias: String?,
+        usageService: any UsageFetching,
+        resetService: any QuotaResetServing
+    ) async throws -> IndexedAccountReport {
+        try Task.checkCancellation()
+        let state = Self.state(for: account, activeAlias: activeAlias)
+        guard !account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !account.needsLogin else {
+            return IndexedAccountReport(
+                index: index,
+                report: AccountQuotaReport(
+                    alias: account.alias,
+                    plan: account.planType,
+                    state: state,
+                    usageStatus: .signInRequired,
+                    windows: [],
+                    resetCreditStatus: .signInRequired,
+                    availableResetCredits: nil,
+                    earliestResetCreditExpiry: nil
+                )
+            )
+        }
+
+        async let usageResult = Self.fetchUsage(service: usageService, account: account)
+        async let creditResult = Self.fetchCredits(service: resetService, account: account)
+        let (usage, credits) = try await (usageResult, creditResult)
+        try Task.checkCancellation()
+
+        return IndexedAccountReport(
+            index: index,
+            report: AccountQuotaReport(
+                alias: account.alias,
+                plan: account.planType,
+                state: state,
+                usageStatus: usage.status,
+                windows: usage.windows,
+                resetCreditStatus: credits.status,
+                availableResetCredits: credits.snapshot?.availableCount,
+                earliestResetCreditExpiry: credits.snapshot?.earliestAvailable?.expiresAt
+            )
+        )
+    }
+
     private static func fetchUsage(
         service: any UsageFetching,
         account: Account
-    ) async -> (status: QuotaLookupStatus, windows: [QuotaWindowReport]) {
+    ) async throws -> (status: QuotaLookupStatus, windows: [QuotaWindowReport]) {
+        try Task.checkCancellation()
         do {
             let windows = try await service.fetch(accessToken: account.accessToken, accountID: account.accountID)
                 .map { window in
@@ -178,7 +231,10 @@ public struct QuotaReportService: Sendable {
                         resetAt: window.resetAt
                     )
                 }
+            try Task.checkCancellation()
             return (.ok, windows)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return (usageStatus(for: error), [])
         }
@@ -187,10 +243,14 @@ public struct QuotaReportService: Sendable {
     private static func fetchCredits(
         service: any QuotaResetServing,
         account: Account
-    ) async -> (status: QuotaLookupStatus, snapshot: ResetCreditSnapshot?) {
+    ) async throws -> (status: QuotaLookupStatus, snapshot: ResetCreditSnapshot?) {
+        try Task.checkCancellation()
         do {
             let snapshot = try await service.credits(accessToken: account.accessToken, accountID: account.accountID)
+            try Task.checkCancellation()
             return (.ok, snapshot)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return (resetCreditStatus(for: error), nil)
         }

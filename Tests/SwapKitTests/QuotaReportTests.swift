@@ -30,7 +30,7 @@ final class QuotaReportTests: XCTestCase {
             Account(alias: "beta", accessToken: "beta", routingEnabled: false),
         ]
 
-        let report = await service.fetch(accounts: accounts, activeAlias: "alpha")
+        let report = try await service.fetch(accounts: accounts, activeAlias: "alpha")
 
         XCTAssertEqual(report.schemaVersion, 1)
         XCTAssertEqual(report.fetchedAt, now)
@@ -63,7 +63,7 @@ final class QuotaReportTests: XCTestCase {
         ])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
-        let report = await service.fetch(
+        let report = try await service.fetch(
             accounts: [
                 Account(alias: "alpha", accessToken: "alpha"),
                 Account(alias: "beta", accessToken: "beta"),
@@ -87,7 +87,7 @@ final class QuotaReportTests: XCTestCase {
         let credits = StubQuotaCredits(results: [:])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: Date.init)
 
-        let report = await service.fetch(
+        let report = try await service.fetch(
             accounts: [
                 Account(alias: "needs-flag", accessToken: "marker", needsLogin: true),
                 Account(alias: "needs-token"),
@@ -119,7 +119,7 @@ final class QuotaReportTests: XCTestCase {
         ])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: Date.init)
 
-        let report = await service.fetch(
+        let report = try await service.fetch(
             accounts: [
                 Account(alias: "zeta", accessToken: "available"),
                 Account(alias: "Alpha", accessToken: "alpha"),
@@ -137,7 +137,7 @@ final class QuotaReportTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 1_754_044_800)
         let service = QuotaReportService(usageService: StubQuotaUsage(results: [:]), resetService: StubQuotaCredits(results: [:]), clock: { now })
 
-        let report = await service.fetch(accounts: [], activeAlias: nil)
+        let report = try await service.fetch(accounts: [], activeAlias: nil)
 
         XCTAssertEqual(report, CodexQuotaReport(schemaVersion: 1, fetchedAt: now, accounts: []))
         XCTAssertEqual(try QuotaReportJSON.encode(report), try QuotaReportJSON.encode(report))
@@ -150,16 +150,50 @@ final class QuotaReportTests: XCTestCase {
             clock: Date.init
         )
 
-        let report = await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
+        let report = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
 
         XCTAssertEqual(report.accounts[0].windows[0].usedPercent, 125)
         XCTAssertEqual(report.accounts[0].windows[0].remainingPercent, 0)
     }
 
+    func testLookupErrorsMapToSafeCategories() async throws {
+        let now = Date(timeIntervalSince1970: 1_751_414_400)
+        let usageCases: [(Error, QuotaLookupStatus)] = [
+            (URLError(.timedOut), .timeout),
+            (URLError(.notConnectedToInternet), .network),
+            (UsageClient.UsageError.malformed, .malformedResponse),
+        ]
+        for (error, expectedStatus) in usageCases {
+            let usage = StubQuotaUsage(results: ["alpha": .failure(error)])
+            let credits = StubQuotaCredits(results: [
+                "alpha": .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)),
+            ])
+            let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+            let report = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
+
+            XCTAssertEqual(report.accounts[0].usageStatus, expectedStatus)
+        }
+
+        let resetCases: [(Error, QuotaLookupStatus)] = [
+            (QuotaResetClientError.malformedResponse, .malformedResponse),
+            (QuotaResetClientError.httpStatus(503), .serviceError),
+        ]
+        for (error, expectedStatus) in resetCases {
+            let usage = StubQuotaUsage(results: ["alpha": .success([])])
+            let credits = StubQuotaCredits(results: ["alpha": .failure(error)])
+            let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+            let report = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
+
+            XCTAssertEqual(report.accounts[0].resetCreditStatus, expectedStatus)
+        }
+    }
+
     func testJSONEncodingIsStableAndISO8601() async throws {
         let now = Date(timeIntervalSince1970: 1_751_414_400)
         let service = QuotaReportService(usageService: StubQuotaUsage(results: [:]), resetService: StubQuotaCredits(results: [:]), clock: { now })
-        let report = await service.fetch(accounts: [], activeAlias: nil)
+        let report = try await service.fetch(accounts: [], activeAlias: nil)
 
         let encoded = try QuotaReportJSON.encode(report)
         let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
@@ -186,9 +220,76 @@ final class QuotaReportTests: XCTestCase {
             clock: Date.init
         )
 
-        _ = await service.fetch(accounts: accounts, activeAlias: "alpha")
+        _ = try await service.fetch(accounts: accounts, activeAlias: "alpha")
 
         XCTAssertEqual(accounts, before)
+    }
+
+    func testConcurrentLookupsExceedOneWithDeterministicProbe() async throws {
+        let now = Date(timeIntervalSince1970: 1_751_414_400)
+        let probe = SharedLookupProbe()
+        let snapshot = ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)
+        let usage = StubQuotaUsage(results: [
+            "a": .success([]),
+            "b": .success([]),
+            "c": .success([]),
+            "d": .success([]),
+        ], probe: probe)
+        let credits = StubQuotaCredits(results: [
+            "a": .success(snapshot),
+            "b": .success(snapshot),
+            "c": .success(snapshot),
+            "d": .success(snapshot),
+        ], probe: probe)
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+        let task = Task {
+            try await service.fetch(
+                accounts: [
+                    Account(alias: "d", accessToken: "d"),
+                    Account(alias: "b", accessToken: "b"),
+                    Account(alias: "c", accessToken: "c"),
+                    Account(alias: "a", accessToken: "a"),
+                ],
+                activeAlias: "c"
+            )
+        }
+        let watchdog = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await probe.release()
+        }
+
+        await probe.waitUntilEntered(atLeast: 2)
+        await probe.release()
+        await watchdog.value
+        let report = try await task.value
+
+        let maximumActive = await probe.maximumActive()
+        XCTAssertGreaterThan(maximumActive, 1)
+        XCTAssertEqual(report.accounts.map(\.alias), ["c", "a", "b", "d"])
+    }
+
+    func testCancellationFromEitherLookupPropagates() async throws {
+        let now = Date(timeIntervalSince1970: 1_751_414_400)
+        for cancelUsage in [true, false] {
+            let usageResult: Result<[UsageWindow], Error> = cancelUsage
+                ? .failure(CancellationError())
+                : .success([])
+            let creditResult: Result<ResetCreditSnapshot, Error> = cancelUsage
+                ? .success(ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now))
+                : .failure(CancellationError())
+            let usage = StubQuotaUsage(results: ["alpha": usageResult])
+            let credits = StubQuotaCredits(results: ["alpha": creditResult])
+            let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+            do {
+                _ = try await service.fetch(accounts: [Account(alias: "alpha", accessToken: "alpha")], activeAlias: nil)
+                XCTFail("Expected cancellation from \(cancelUsage ? "usage" : "credits") lookup")
+            } catch is CancellationError {
+                // Expected: cancellation must not become a serviceError report.
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
     }
 }
 
@@ -198,14 +299,21 @@ private actor StubQuotaUsage: UsageFetching {
     }
 
     private var results: [String: Result<[UsageWindow], Error>]
+    private let probe: SharedLookupProbe?
     private var calls: [(accessToken: String, accountID: String)] = []
 
-    init(results: [String: Result<[UsageWindow], Error>]) {
+    init(results: [String: Result<[UsageWindow], Error>], probe: SharedLookupProbe? = nil) {
         self.results = results
+        self.probe = probe
     }
 
     func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
         calls.append((accessToken, accountID))
+        if let probe {
+            await probe.enter()
+            await probe.waitForRelease()
+            await probe.leave()
+        }
         guard let result = results[accessToken] else { throw StubFailure.missing }
         return try result.get()
     }
@@ -219,14 +327,21 @@ private actor StubQuotaCredits: QuotaResetServing {
     }
 
     private var results: [String: Result<ResetCreditSnapshot, Error>]
+    private let probe: SharedLookupProbe?
     private var calls: [(kind: String, accessToken: String, accountID: String)] = []
 
-    init(results: [String: Result<ResetCreditSnapshot, Error>]) {
+    init(results: [String: Result<ResetCreditSnapshot, Error>], probe: SharedLookupProbe? = nil) {
         self.results = results
+        self.probe = probe
     }
 
     func credits(accessToken: String, accountID: String) async throws -> ResetCreditSnapshot {
         calls.append(("credits", accessToken, accountID))
+        if let probe {
+            await probe.enter()
+            await probe.waitForRelease()
+            await probe.leave()
+        }
         guard let result = results[accessToken] else { throw StubFailure.missing }
         return try result.get()
     }
@@ -237,4 +352,52 @@ private actor StubQuotaCredits: QuotaResetServing {
     }
 
     func callCount() -> Int { calls.count }
+}
+
+private actor SharedLookupProbe {
+    private var active = 0
+    private var maximum = 0
+    private var entered = 0
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() {
+        active += 1
+        entered += 1
+        maximum = max(maximum, active)
+        let ready = entryWaiters
+        entryWaiters.removeAll()
+        ready.forEach { $0.resume() }
+    }
+
+    func leave() {
+        active -= 1
+    }
+
+    func waitForRelease() async {
+        if released { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered(atLeast target: Int) async {
+        if entered >= target || released { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let releaseWaiters = self.releaseWaiters
+        self.releaseWaiters.removeAll()
+        releaseWaiters.forEach { $0.resume() }
+        let entryWaiters = self.entryWaiters
+        self.entryWaiters.removeAll()
+        entryWaiters.forEach { $0.resume() }
+    }
+
+    func maximumActive() -> Int { maximum }
 }
