@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-candidates=()
-if [[ -n "${CODEXSWAP_QUOTA_BINARY:-}" ]]; then
-  candidates+=("$CODEXSWAP_QUOTA_BINARY")
-fi
-candidates+=(
+candidates=(
   "/Applications/CodexSwap.app/Contents/MacOS/swapd"
   "/Users/vjmabansag/Projects/CodexSwap/.build/release/swapd"
   "/Users/vjmabansag/Projects/CodexSwap/.build/debug/swapd"
@@ -82,6 +78,14 @@ def optional_string(value):
         reject()
 
 
+def display_string(value, maximum):
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        reject()
+    optional_string(value)
+    if any(not (character.isalnum() or character in " ._+-") for character in value):
+        reject()
+
+
 def require_timestamp(value):
     if not isinstance(value, str):
         reject()
@@ -120,10 +124,12 @@ try:
         alias = account["alias"]
         if not isinstance(alias, str) or alias in aliases:
             reject()
-        optional_string(alias)
+        display_string(alias, 64)
         aliases.add(alias)
 
-        optional_string(account.get("plan"))
+        plan = account.get("plan")
+        if plan is not None:
+            display_string(plan, 32)
         if account["state"] not in {"active", "available", "paused", "signInRequired"}:
             reject()
         usage_status = account["usageStatus"]

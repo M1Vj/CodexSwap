@@ -12,8 +12,9 @@ rtk proxy bash /Users/vjmabansag/.codex/skills/codexswap-quotas/scripts/check-qu
 ```
 
 Treat the helper output as the only quota source. Present every returned account
-alias with its state and plan (or “unknown”), each `5h` and `Weekly` window's
-used and remaining percentages, and reset time converted to `Asia/Manila`.
+alias with its state and plan (or “unknown”), and each returned `5h` or `Weekly`
+window's used and remaining percentages and reset time converted to
+`Asia/Manila`.
 Include the available reset-credit count, earliest expiry, report fetch time,
 and each account's usage/reset-credit status. Keep partial successes and label
 safe failure categories such as sign-in required, timeout, network, unauthorized,
