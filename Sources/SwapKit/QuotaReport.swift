@@ -82,6 +82,11 @@ public struct QuotaReportService: Sendable {
         let report: AccountQuotaReport
     }
 
+    private struct PrivateIdentityContext: Sendable {
+        let normalizedValues: Set<String>
+        let normalizedAccountIDs: Set<String>
+    }
+
     private let usageService: any UsageFetching
     private let resetService: any QuotaResetServing
     private let clock: @Sendable () -> Date
@@ -113,7 +118,8 @@ public struct QuotaReportService: Sendable {
                 return lhs.offset < rhs.offset
             }
             .map(\.element)
-        let displayAliases = Self.displayAliases(for: orderedAccounts)
+        let privateContext = Self.privateContext(for: orderedAccounts)
+        let displayAliases = Self.displayAliases(for: orderedAccounts, privateContext: privateContext)
 
         var reports = Array<AccountQuotaReport?>(repeating: nil, count: orderedAccounts.count)
         var nextIndex = 0
@@ -127,6 +133,7 @@ public struct QuotaReportService: Sendable {
                     try await Self.fetchAccount(
                         account: account,
                         displayAlias: displayAlias,
+                        privateContext: privateContext,
                         index: index,
                         activeAlias: activeKey,
                         usageService: self.usageService,
@@ -147,6 +154,7 @@ public struct QuotaReportService: Sendable {
                     try await Self.fetchAccount(
                         account: account,
                         displayAlias: displayAlias,
+                        privateContext: privateContext,
                         index: index,
                         activeAlias: activeKey,
                         usageService: self.usageService,
@@ -178,6 +186,27 @@ public struct QuotaReportService: Sendable {
         [account.email, account.accountID, account.accessToken, account.refreshToken, account.idToken]
     }
 
+    private static func privateContext(for accounts: [Account]) -> PrivateIdentityContext {
+        var normalizedValues = Set<String>()
+        var normalizedAccountIDs = Set<String>()
+        for account in accounts {
+            for value in privateValues(for: account) {
+                let normalized = normalizedPrivateValue(value)
+                if !normalized.isEmpty { normalizedValues.insert(normalized) }
+            }
+
+            let normalizedAccountID = normalizedPrivateValue(account.accountID)
+            guard !normalizedAccountID.isEmpty else { continue }
+            normalizedAccountIDs.insert(normalizedAccountID)
+            let fallbackPrefix = normalizedPrivateValue(String(trimmed(account.accountID).prefix(8)))
+            if !fallbackPrefix.isEmpty { normalizedValues.insert(fallbackPrefix) }
+        }
+        return PrivateIdentityContext(
+            normalizedValues: normalizedValues,
+            normalizedAccountIDs: normalizedAccountIDs
+        )
+    }
+
     private static func isAllowedLabelScalar(_ scalar: Unicode.Scalar) -> Bool {
         if CharacterSet.alphanumerics.contains(scalar) { return true }
         switch scalar.value {
@@ -192,42 +221,37 @@ public struct QuotaReportService: Sendable {
         return value.unicodeScalars.allSatisfy(Self.isAllowedLabelScalar)
     }
 
-    private static func equalsPrivateValue(_ candidate: String, account: Account) -> Bool {
+    private static func hasAccountIDPrefix(_ candidate: String, in context: PrivateIdentityContext) -> Bool {
         let normalizedCandidate = normalizedPrivateValue(candidate)
-        guard !normalizedCandidate.isEmpty else { return false }
-        return privateValues(for: account).contains { value in
-            let normalizedValue = normalizedPrivateValue(value)
-            return !normalizedValue.isEmpty && normalizedValue == normalizedCandidate
-        }
+        guard normalizedCandidate.unicodeScalars.count >= 6 else { return false }
+        return context.normalizedAccountIDs.contains { $0.hasPrefix(normalizedCandidate) }
     }
 
-    private static func safeAliasCandidate(for account: Account) -> String? {
+    private static func isUnsafeIdentityValue(_ candidate: String, in context: PrivateIdentityContext) -> Bool {
+        let normalizedCandidate = normalizedPrivateValue(candidate)
+        guard !normalizedCandidate.isEmpty else { return false }
+        return context.normalizedValues.contains(normalizedCandidate)
+            || hasAccountIDPrefix(candidate, in: context)
+    }
+
+    private static func safeAliasCandidate(for account: Account, privateContext: PrivateIdentityContext) -> String? {
         let candidate = trimmed(account.alias)
-        guard isSafeLabelText(candidate, maximumScalars: 64), !equalsPrivateValue(candidate, account: account) else {
+        guard isSafeLabelText(candidate, maximumScalars: 64),
+              !isUnsafeIdentityValue(candidate, in: privateContext) else {
             return nil
         }
-
-        let normalizedCandidate = normalizedPrivateValue(candidate)
-        let accountID = trimmed(account.accountID)
-        guard !accountID.isEmpty else { return candidate }
-        let normalizedAccountID = normalizedPrivateValue(accountID)
-        let fallbackPrefix = normalizedPrivateValue(String(accountID.prefix(8)))
-        if normalizedCandidate == fallbackPrefix { return nil }
-        if candidate.unicodeScalars.count >= 6, normalizedAccountID.hasPrefix(normalizedCandidate) { return nil }
         return candidate
     }
 
-    private static func displayAliases(for accounts: [Account]) -> [String] {
-        let candidates = accounts.map(safeAliasCandidate)
+    private static func displayAliases(
+        for accounts: [Account],
+        privateContext: PrivateIdentityContext
+    ) -> [String] {
+        let candidates = accounts.map { safeAliasCandidate(for: $0, privateContext: privateContext) }
         var reserved = Set(candidates.compactMap { candidate in
             candidate.map(normalizedPrivateValue)
         })
-        for account in accounts {
-            for value in privateValues(for: account) {
-                let normalized = normalizedPrivateValue(value)
-                if !normalized.isEmpty { reserved.insert(normalized) }
-            }
-        }
+        reserved.formUnion(privateContext.normalizedValues)
 
         var used = Set<String>()
         var nextGenericNumber = 1
@@ -244,7 +268,9 @@ public struct QuotaReportService: Sendable {
                 let generic = "Account \(nextGenericNumber)"
                 nextGenericNumber += 1
                 let normalized = normalizedPrivateValue(generic)
-                guard !reserved.contains(normalized), !used.contains(normalized) else { continue }
+                guard !reserved.contains(normalized),
+                      !used.contains(normalized),
+                      !hasAccountIDPrefix(generic, in: privateContext) else { continue }
                 used.insert(normalized)
                 return generic
             }
@@ -256,10 +282,11 @@ public struct QuotaReportService: Sendable {
         "creditid", "credit id", "credit-id", "credit_id", "authorization", "bearer",
     ]
 
-    private static func sanitizedPlan(for account: Account) -> String? {
+    private static func sanitizedPlan(for account: Account, privateContext: PrivateIdentityContext) -> String? {
         guard let rawPlan = account.planType else { return nil }
         let plan = trimmed(rawPlan)
-        guard isSafeLabelText(plan, maximumScalars: 32), !equalsPrivateValue(plan, account: account) else {
+        guard isSafeLabelText(plan, maximumScalars: 32),
+              !isUnsafeIdentityValue(plan, in: privateContext) else {
             return nil
         }
         let normalizedPlan = normalizedPrivateValue(plan)
@@ -279,6 +306,7 @@ public struct QuotaReportService: Sendable {
     private static func fetchAccount(
         account: Account,
         displayAlias: String,
+        privateContext: PrivateIdentityContext,
         index: Int,
         activeAlias: String?,
         usageService: any UsageFetching,
@@ -292,7 +320,7 @@ public struct QuotaReportService: Sendable {
                 index: index,
                 report: AccountQuotaReport(
                     alias: displayAlias,
-                    plan: sanitizedPlan(for: account),
+                    plan: sanitizedPlan(for: account, privateContext: privateContext),
                     state: state,
                     usageStatus: .signInRequired,
                     windows: [],
@@ -312,7 +340,7 @@ public struct QuotaReportService: Sendable {
             index: index,
             report: AccountQuotaReport(
                 alias: displayAlias,
-                plan: sanitizedPlan(for: account),
+                plan: sanitizedPlan(for: account, privateContext: privateContext),
                 state: state,
                 usageStatus: usage.status,
                 windows: usage.windows,

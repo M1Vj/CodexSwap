@@ -172,6 +172,36 @@ final class QuotaReportTests: XCTestCase {
         }
     }
 
+    func testReportSanitizesIdentityLabelsAgainstAllAccountsBeforeSerialization() async throws {
+        let now = Date(timeIntervalSince1970: 1_751_414_400)
+        let tokens = ["a-token", "B-TOKEN", "Account 1", "d-token", "e-token"]
+        let usage = StubQuotaUsage(results: Dictionary(uniqueKeysWithValues: tokens.map { ($0, Result<[UsageWindow], Error>.success([])) }))
+        let snapshot = ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)
+        let credits = StubQuotaCredits(results: Dictionary(uniqueKeysWithValues: tokens.map { ($0, Result<ResetCreditSnapshot, Error>.success(snapshot)) }))
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+        let accounts = [
+            Account(alias: "B-TOKEN", accountID: "a-account-id", planType: "B-EMAIL", accessToken: "a-token"),
+            Account(alias: "BETA", email: "B-EMAIL", accountID: "b-account-id", accessToken: "B-TOKEN"),
+            Account(alias: "GLOBALID", accountID: "c-account-id", planType: "c-plan", accessToken: "Account 1"),
+            Account(alias: "DELTA", accountID: "GLOBALID-account-d", accessToken: "d-token"),
+            Account(alias: "EPSILON", accountID: "Account 2-private", accessToken: "e-token"),
+        ]
+
+        let report = try await service.fetch(accounts: accounts, activeAlias: nil)
+
+        XCTAssertEqual(report.accounts.map(\.alias), ["Account 3", "BETA", "DELTA", "EPSILON", "Account 4"])
+        XCTAssertNil(report.accounts.first { $0.alias == "Account 3" }?.plan)
+        XCTAssertEqual(report.accounts.first { $0.alias == "Account 4" }?.plan, "c-plan")
+        XCTAssertFalse(report.accounts.map { $0.alias.lowercased() }.contains("b-token"))
+        XCTAssertFalse(report.accounts.map { $0.alias.lowercased() }.contains("globalid"))
+
+        let encoded = try QuotaReportJSON.encode(report)
+        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        for forbidden in ["B-TOKEN", "B-EMAIL", "GLOBALID-account-d", "Account 1", "Account 2"] {
+            XCTAssertFalse(text.contains(forbidden), "serialized report leaked cross-account marker: \(forbidden)")
+        }
+    }
+
     func testEmptyAccountListProducesValidEmptyReport() async throws {
         let now = Date(timeIntervalSince1970: 1_754_044_800)
         let service = QuotaReportService(usageService: StubQuotaUsage(results: [:]), resetService: StubQuotaCredits(results: [:]), clock: { now })
