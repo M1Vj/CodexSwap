@@ -6,7 +6,7 @@ final class QuotaReportTests: XCTestCase {
     func testReportShowsAllAccountQuotaDataWithoutSecrets() async throws {
         let now = Date(timeIntervalSince1970: 1_751_414_400)
         let usage = StubQuotaUsage(results: [
-            "alpha": .success([
+            "SECRET-ACCESS-TOKEN": .success([
                 UsageWindow(label: "5h", usedPercent: 35, windowSeconds: 18_000, resetAt: now.addingTimeInterval(3_600)),
                 UsageWindow(label: "Weekly", usedPercent: 80, windowSeconds: 604_800, resetAt: now.addingTimeInterval(86_400)),
             ]),
@@ -15,7 +15,7 @@ final class QuotaReportTests: XCTestCase {
             ]),
         ])
         let credits = StubQuotaCredits(results: [
-            "alpha": .success(ResetCreditSnapshot(
+            "SECRET-ACCESS-TOKEN": .success(ResetCreditSnapshot(
                 availableCount: 2,
                 credits: [
                     ResetCredit(id: "SECRET-CREDIT-ID", resetType: "manual", status: "available", grantedAt: now, expiresAt: now.addingTimeInterval(172_800))
@@ -26,7 +26,7 @@ final class QuotaReportTests: XCTestCase {
         ])
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
         let accounts = [
-            Account(alias: "alpha", email: "SECRET-EMAIL", accountID: "SECRET-ACCOUNT-ID", planType: "plus", accessToken: "alpha", refreshToken: "SECRET-REFRESH"),
+            Account(alias: "alpha", email: "SECRET-EMAIL", accountID: "SECRET-ACCOUNT-ID", planType: "plus", accessToken: "SECRET-ACCESS-TOKEN", refreshToken: "SECRET-REFRESH"),
             Account(alias: "beta", accessToken: "beta", routingEnabled: false),
         ]
 
@@ -46,7 +46,7 @@ final class QuotaReportTests: XCTestCase {
 
         let encoded = try QuotaReportJSON.encode(report)
         let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
-        for forbidden in ["SECRET-EMAIL", "SECRET-ACCOUNT-ID", "SECRET-REFRESH", "SECRET-CREDIT-ID"] {
+        for forbidden in ["SECRET-EMAIL", "SECRET-ACCOUNT-ID", "SECRET-ACCESS-TOKEN", "SECRET-REFRESH", "SECRET-CREDIT-ID"] {
             XCTAssertFalse(text.contains(forbidden), "serialized report leaked marker: \(forbidden)")
         }
     }
