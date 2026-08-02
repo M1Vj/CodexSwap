@@ -76,8 +76,9 @@ case "quota":
     do {
         let service = QuotaReportService(usageService: UsageClient(), resetService: QuotaResetClient())
         let accounts = await store.all()
+        let prefetched = (try? await CodexBarQuotaClient().fetch(accounts: accounts)) ?? [:]
         let activeAlias = await store.activeAlias()
-        let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias)
+        let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias, prefetched: prefetched)
         let encoded = try QuotaReportJSON.encode(report)
         FileHandle.standardOutput.write(encoded)
         FileHandle.standardOutput.write(Data("\n".utf8))
