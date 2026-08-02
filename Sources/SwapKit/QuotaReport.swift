@@ -355,14 +355,12 @@ public struct QuotaReportService: Sendable {
         async let usageResult = Self.fetchUsage(
             service: usageService,
             account: account,
-            prefetchedWindows: prefetchedWindows,
-            allowDirectLookupWithoutLocalAuth: hasPrefetchedAuthorization
+            prefetchedWindows: prefetchedWindows
         )
         async let creditResult = Self.fetchCredits(
             service: resetService,
             account: account,
-            prefetchedCredits: prefetchedCredits,
-            allowDirectLookupWithoutLocalAuth: hasPrefetchedAuthorization
+            prefetchedCredits: prefetchedCredits
         )
         let (usage, credits) = try await (usageResult, creditResult)
         try Task.checkCancellation()
@@ -385,15 +383,13 @@ public struct QuotaReportService: Sendable {
     private static func fetchUsage(
         service: any UsageFetching,
         account: Account,
-        prefetchedWindows: [UsageWindow]?,
-        allowDirectLookupWithoutLocalAuth: Bool
+        prefetchedWindows: [UsageWindow]?
     ) async throws -> (status: QuotaLookupStatus, windows: [QuotaWindowReport]) {
         try Task.checkCancellation()
         if let prefetchedWindows {
             return (.ok, prefetchedWindows.map(Self.quotaWindowReport))
         }
-        guard allowDirectLookupWithoutLocalAuth
-                || (!account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !account.needsLogin) else {
+        guard Self.hasLocalAuthorization(for: account) else {
             return (.signInRequired, [])
         }
         do {
@@ -412,15 +408,13 @@ public struct QuotaReportService: Sendable {
     private static func fetchCredits(
         service: any QuotaResetServing,
         account: Account,
-        prefetchedCredits: ResetCreditSnapshot?,
-        allowDirectLookupWithoutLocalAuth: Bool
+        prefetchedCredits: ResetCreditSnapshot?
     ) async throws -> (status: QuotaLookupStatus, snapshot: ResetCreditSnapshot?) {
         try Task.checkCancellation()
         if let prefetchedCredits {
             return (.ok, prefetchedCredits)
         }
-        guard allowDirectLookupWithoutLocalAuth
-                || (!account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !account.needsLogin) else {
+        guard Self.hasLocalAuthorization(for: account) else {
             return (.signInRequired, nil)
         }
         do {
@@ -432,6 +426,10 @@ public struct QuotaReportService: Sendable {
         } catch {
             return (resetCreditStatus(for: error), nil)
         }
+    }
+
+    private static func hasLocalAuthorization(for account: Account) -> Bool {
+        !account.needsLogin && !account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private static func quotaWindowReport(_ window: UsageWindow) -> QuotaWindowReport {
