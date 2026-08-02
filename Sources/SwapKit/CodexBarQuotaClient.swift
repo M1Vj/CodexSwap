@@ -91,10 +91,21 @@ public struct CodexBarQuotaClient: Sendable {
               result.stderr.count <= Self.maximumOutputBytes else {
             throw CodexBarQuotaError.oversizedOutput
         }
-        guard result.exitCode == 0 else {
+
+        do {
+            let snapshots = try Self.parse(result.stdout, accounts: accounts)
+            guard result.exitCode == 0 || !snapshots.isEmpty else {
+                throw CodexBarQuotaError.commandFailed
+            }
+            return snapshots
+        } catch let error as CodexBarQuotaError {
+            if result.exitCode != 0 {
+                throw CodexBarQuotaError.commandFailed
+            }
+            throw error
+        } catch {
             throw CodexBarQuotaError.commandFailed
         }
-        return try Self.parse(result.stdout, accounts: accounts)
     }
 
     private static func parse(_ data: Data, accounts: [Account]) throws -> [String: PrefetchedQuotaSnapshot] {

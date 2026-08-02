@@ -201,6 +201,25 @@ final class CodexBarQuotaClientTests: XCTestCase {
         }
     }
 
+    func testFetchKeepsValidSnapshotsFromNonzeroPartialDocument() async throws {
+        let fixture = """
+        [
+          {"account":"alpha","usage":{"primary":{"resetsAt":null,"usedPercent":25,"windowMinutes":300}}},
+          {"account":"beta","error":"RAW-PER-ACCOUNT-ERROR-MARKER"}
+        ]
+        """
+        let client = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 1)
+        }
+
+        let snapshots = try await client.fetch(accounts: [
+            Account(alias: "alpha", accountID: "alpha-id")
+        ])
+
+        XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 25)
+        XCTAssertFalse(String(describing: snapshots).contains("RAW-PER-ACCOUNT-ERROR-MARKER"))
+    }
+
     func testProcessRunnerRejectsStdoutOverflow() async throws {
         do {
             _ = try await runSyntheticProcess(
