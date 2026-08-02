@@ -30,21 +30,48 @@ public struct UsageClient: UsageFetching, Sendable {
         guard let http = response as? HTTPURLResponse else { throw UsageError.malformed }
         if http.statusCode == 401 { throw UsageError.unauthorized }
         guard http.statusCode == 200 else { throw UsageError.http(http.statusCode) }
-        return Self.parse(data)
+        return try Self.parseStrict(data)
     }
 
     static func parse(_ data: Data) -> [UsageWindow] {
+        (try? parseStrict(data)) ?? []
+    }
+
+    private static func parseStrict(_ data: Data) throws -> [UsageWindow] {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rate = obj["rate_limit"] as? [String: Any] else { return [] }
+              let rate = obj["rate_limit"] as? [String: Any] else {
+            throw UsageError.malformed
+        }
+
         var windows: [UsageWindow] = []
         for key in ["primary_window", "secondary_window"] {
-            guard let w = rate[key] as? [String: Any] else { continue }
-            let seconds = (w["limit_window_seconds"] as? Int) ?? Int((w["limit_window_seconds"] as? Double) ?? 0)
-            let percent = (w["used_percent"] as? Int) ?? Int((w["used_percent"] as? Double) ?? 0)
-            let resetRaw = (w["reset_at"] as? Int) ?? Int((w["reset_at"] as? Double) ?? 0)
-            let reset = resetRaw > 0 ? Date(timeIntervalSince1970: TimeInterval(resetRaw)) : nil
+            guard let rawWindow = rate[key] else { continue }
+            if rawWindow is NSNull { continue }
+            guard let w = rawWindow as? [String: Any],
+                  let seconds = integerValue(w["limit_window_seconds"]),
+                  let percent = integerValue(w["used_percent"]) else {
+                throw UsageError.malformed
+            }
+
+            var reset: Date?
+            if let rawReset = w["reset_at"], !(rawReset is NSNull) {
+                guard let resetRaw = integerValue(rawReset) else { throw UsageError.malformed }
+                reset = resetRaw > 0 ? Date(timeIntervalSince1970: TimeInterval(resetRaw)) : nil
+            } else {
+                reset = nil
+            }
             windows.append(UsageWindow(label: UsageWindow.label(forWindowSeconds: seconds), usedPercent: percent, windowSeconds: seconds, resetAt: reset))
         }
+
+        guard !windows.isEmpty else { throw UsageError.malformed }
         return windows
+    }
+
+    private static func integerValue(_ raw: Any?) -> Int? {
+        if let value = raw as? Int { return value }
+        if let value = raw as? Double, value.isFinite, value.rounded() == value {
+            return Int(exactly: value)
+        }
+        return nil
     }
 }
