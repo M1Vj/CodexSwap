@@ -61,11 +61,11 @@ final class CodexBarQuotaClientTests: XCTestCase {
         ])
 
         let snapshot = try XCTUnwrap(snapshots["alpha-id"])
-        XCTAssertEqual(snapshot.windows?.map(\.windowSeconds), [1_800, 18_000, 604_800])
-        XCTAssertEqual(snapshot.windows?.map(\.label), ["30m", "5h", "Weekly"])
-        XCTAssertEqual(snapshot.windows?.map(\.usedPercent), [0, 35, 100])
-        XCTAssertEqual(snapshot.windows?[1].resetAt, parsedDate("2026-08-02T00:00:00Z"))
-        XCTAssertEqual(snapshot.windows?[2].resetAt, parsedDate("2026-08-09T00:00:00.250Z"))
+        XCTAssertEqual(snapshot.windows?.map(\.windowSeconds), [18_000, 604_800])
+        XCTAssertEqual(snapshot.windows?.map(\.label), ["5h", "Weekly"])
+        XCTAssertEqual(snapshot.windows?.map(\.usedPercent), [35, 100])
+        XCTAssertEqual(snapshot.windows?[0].resetAt, parsedDate("2026-08-02T00:00:00Z"))
+        XCTAssertEqual(snapshot.windows?[1].resetAt, parsedDate("2026-08-09T00:00:00.250Z"))
         XCTAssertEqual(snapshot.resetCredits?.availableCount, 2)
         XCTAssertEqual(snapshot.resetCredits?.earliestAvailable?.expiresAt, parsedDate("2026-08-03T00:00:00.500Z"))
     }
@@ -218,6 +218,83 @@ final class CodexBarQuotaClientTests: XCTestCase {
 
         XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 25)
         XCTAssertFalse(String(describing: snapshots).contains("RAW-PER-ACCOUNT-ERROR-MARKER"))
+    }
+
+    func testValidSnapshotSurvivesMalformedUsageFromAnotherMatchedAccount() async throws {
+        let fixture = """
+        [
+          {"account":"alpha","usage":{"primary":{"resetsAt":null,"usedPercent":25,"windowMinutes":300}}},
+          {"account":"beta","usage":{"primary":{"resetsAt":"RAW-BAD-BETA-TIMESTAMP","usedPercent":10,"windowMinutes":300}}}
+        ]
+        """
+        let client = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
+        }
+
+        let snapshots = try await client.fetch(accounts: [
+            Account(alias: "alpha", accountID: "alpha-id"),
+            Account(alias: "beta", accountID: "beta-id"),
+        ])
+
+        XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 25)
+        XCTAssertNil(snapshots["beta-id"])
+    }
+
+    func testMalformedUsagePreservesValidCreditsForSameMatchedAccount() async throws {
+        let fixture = """
+        [{
+          "account":"alpha",
+          "usage":{
+            "primary":{"resetsAt":"RAW-BAD-USAGE-TIMESTAMP","usedPercent":10,"windowMinutes":300},
+            "codexResetCredits":{"availableCount":2,"credits":[]}
+          }
+        }]
+        """
+        let client = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
+        }
+
+        let snapshots = try await client.fetch(accounts: [Account(alias: "alpha", accountID: "alpha-id")])
+
+        XCTAssertNil(snapshots["alpha-id"]?.windows)
+        XCTAssertEqual(snapshots["alpha-id"]?.resetCredits?.availableCount, 2)
+    }
+
+    func testValidUsagePreservesMalformedCreditsForSameMatchedAccount() async throws {
+        let fixture = """
+        [{
+          "account":"alpha",
+          "usage":{
+            "primary":{"resetsAt":null,"usedPercent":10,"windowMinutes":300},
+            "codexResetCredits":"RAW-BAD-CREDITS"
+          }
+        }]
+        """
+        let client = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
+        }
+
+        let snapshots = try await client.fetch(accounts: [Account(alias: "alpha", accountID: "alpha-id")])
+
+        XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 10)
+        XCTAssertNil(snapshots["alpha-id"]?.resetCredits)
+    }
+
+    func testAllMatchedDataMalformedAtExitZeroRemainsMalformedResponse() async throws {
+        let fixture = """
+        [{"account":"alpha","usage":{"primary":{"resetsAt":"RAW-BAD-ONLY-TIMESTAMP","usedPercent":10,"windowMinutes":300}}}]
+        """
+        let client = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
+        }
+
+        do {
+            _ = try await client.fetch(accounts: [Account(alias: "alpha", accountID: "alpha-id")])
+            XCTFail("Expected malformed response")
+        } catch let error as CodexBarQuotaError {
+            XCTAssertEqual(error, .malformedResponse)
+            XCTAssertFalse(String(describing: error).contains("RAW-BAD-ONLY-TIMESTAMP"))
+        }
     }
 
     func testProcessRunnerRejectsStdoutOverflow() async throws {

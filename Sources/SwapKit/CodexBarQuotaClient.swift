@@ -54,6 +54,11 @@ enum CodexBarQuotaClientConstants {
 public struct CodexBarQuotaClient: Sendable {
     typealias Runner = @Sendable (URL, [String], Duration, Int) async throws -> CodexBarCommandResult
 
+    private struct ParseResult: Sendable {
+        let snapshots: [String: PrefetchedQuotaSnapshot]
+        let matchedMalformed: Bool
+    }
+
     private static let commandTimeout: Duration = .seconds(20)
     private static let maximumOutputBytes = 1_048_576
 
@@ -93,11 +98,14 @@ public struct CodexBarQuotaClient: Sendable {
         }
 
         do {
-            let snapshots = try Self.parse(result.stdout, accounts: accounts)
-            guard result.exitCode == 0 || !snapshots.isEmpty else {
+            let parsed = try Self.parse(result.stdout, accounts: accounts)
+            guard result.exitCode == 0 || !parsed.snapshots.isEmpty else {
                 throw CodexBarQuotaError.commandFailed
             }
-            return snapshots
+            if result.exitCode == 0, parsed.snapshots.isEmpty, parsed.matchedMalformed {
+                throw CodexBarQuotaError.malformedResponse
+            }
+            return parsed.snapshots
         } catch let error as CodexBarQuotaError {
             if result.exitCode != 0 {
                 throw CodexBarQuotaError.commandFailed
@@ -108,7 +116,7 @@ public struct CodexBarQuotaClient: Sendable {
         }
     }
 
-    private static func parse(_ data: Data, accounts: [Account]) throws -> [String: PrefetchedQuotaSnapshot] {
+    private static func parse(_ data: Data, accounts: [Account]) throws -> ParseResult {
         guard let root = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
             throw CodexBarQuotaError.malformedResponse
         }
@@ -128,13 +136,14 @@ public struct CodexBarQuotaClient: Sendable {
 
         let accountCandidates = accounts.map(Self.matchingCandidates(for:))
         var snapshots: [String: PrefetchedQuotaSnapshot] = [:]
+        var matchedMalformed = false
 
         for item in items {
-            guard item["error"] == nil || item["error"] is NSNull,
-                  let usage = item["usage"] as? [String: Any] else {
+            guard item["error"] == nil || item["error"] is NSNull else {
                 continue
             }
-            let rawCandidates = Self.rawCandidates(item: item, usage: usage)
+            let usage = item["usage"] as? [String: Any]
+            let rawCandidates = Self.rawCandidates(item: item, usage: usage ?? [:])
             guard !rawCandidates.isEmpty,
                   let accountIndex = Self.uniqueAccountIndex(
                       rawCandidates: rawCandidates,
@@ -143,8 +152,27 @@ public struct CodexBarQuotaClient: Sendable {
                 continue
             }
 
-            let windows = try Self.parseWindows(from: usage)
-            let resetCredits = try Self.parseResetCredits(from: usage["codexResetCredits"])
+            guard let usage else {
+                matchedMalformed = true
+                continue
+            }
+
+            var windows: [UsageWindow]?
+            do {
+                windows = try Self.parseWindows(from: usage)
+            } catch {
+                matchedMalformed = true
+                windows = nil
+            }
+
+            var resetCredits: ResetCreditSnapshot?
+            do {
+                resetCredits = try Self.parseResetCredits(from: usage["codexResetCredits"])
+            } catch {
+                matchedMalformed = true
+                resetCredits = nil
+            }
+
             guard windows != nil || resetCredits != nil else { continue }
 
             let account = accounts[accountIndex]
@@ -159,7 +187,7 @@ public struct CodexBarQuotaClient: Sendable {
             }
         }
 
-        return snapshots
+        return ParseResult(snapshots: snapshots, matchedMalformed: matchedMalformed)
     }
 
     private static func rawCandidates(item: [String: Any], usage: [String: Any]) -> Set<String> {
@@ -211,6 +239,7 @@ public struct CodexBarQuotaClient: Sendable {
     }
 
     private static func parseWindows(from usage: [String: Any]) throws -> [UsageWindow]? {
+        let supportedWindowSeconds: Set<Int> = [18_000, 604_800]
         var windows: [UsageWindow] = []
         for key in ["primary", "secondary", "tertiary"] {
             guard let raw = usage[key], !(raw is NSNull) else {
@@ -218,13 +247,16 @@ public struct CodexBarQuotaClient: Sendable {
             }
             guard let window = raw as? [String: Any],
                   let minutes = integerValue(window["windowMinutes"]),
-                  minutes >= 0,
-                  let usedPercent = integerValue(window["usedPercent"]) else {
+                  minutes >= 0 else {
                 throw CodexBarQuotaError.malformedResponse
             }
             let duration = minutes.multipliedReportingOverflow(by: 60)
             guard !duration.overflow else { throw CodexBarQuotaError.malformedResponse }
             let seconds = duration.partialValue
+            guard supportedWindowSeconds.contains(seconds) else { continue }
+            guard let usedPercent = integerValue(window["usedPercent"]) else {
+                throw CodexBarQuotaError.malformedResponse
+            }
 
             let resetAt: Date?
             if let rawReset = window["resetsAt"], !(rawReset is NSNull) {

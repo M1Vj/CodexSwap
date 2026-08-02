@@ -466,6 +466,50 @@ final class QuotaReportTests: XCTestCase {
         XCTAssertEqual(creditCalls, 0)
     }
 
+    func testCodexBarPrefetchFiltersUnsupportedWindowsBeforeQuotaReportEncoding() async throws {
+        let now = Date(timeIntervalSince1970: 1_754_044_800)
+        let fixture = """
+        [{
+          "account":"alpha",
+          "usage":{
+            "primary":{"resetsAt":null,"usedPercent":25,"windowMinutes":300},
+            "secondary":{"resetsAt":null,"usedPercent":40,"windowMinutes":10080},
+            "tertiary":{"resetsAt":null,"usedPercent":5,"windowMinutes":30},
+            "codexResetCredits":{"availableCount":1,"credits":[]}
+          }
+        }]
+        """
+        let codexBar = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
+        }
+        let account = Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)
+        let prefetched = try await codexBar.fetch(accounts: [account])
+        let usage = StubQuotaUsage(results: [:])
+        let credits = StubQuotaCredits(results: [:])
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [account],
+            activeAlias: "alpha",
+            prefetched: prefetched
+        )
+        let encoded = try QuotaReportJSON.encode(report)
+        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let encodedAccounts = try XCTUnwrap(object["accounts"] as? [[String: Any]])
+        let encodedWindows = try XCTUnwrap(encodedAccounts.first?["windows"] as? [[String: Any]])
+
+        XCTAssertEqual(report.accounts[0].state, .active)
+        XCTAssertEqual(report.accounts[0].usageStatus, .ok)
+        XCTAssertEqual(report.accounts[0].resetCreditStatus, .ok)
+        XCTAssertEqual(encodedWindows.compactMap { $0["label"] as? String }, ["5h", "Weekly"])
+        XCTAssertFalse(text.contains("30m"))
+        let usageCalls = await usage.callCount()
+        let creditCalls = await credits.callCount()
+        XCTAssertEqual(usageCalls, 0)
+        XCTAssertEqual(creditCalls, 0)
+    }
+
     func testPrefetchedAuthorizationOverridesStaleLocalCredentialState() async throws {
         let now = Date(timeIntervalSince1970: 1_754_044_800)
         let usage = StubQuotaUsage(results: [:])
