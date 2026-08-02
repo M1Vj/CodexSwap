@@ -101,7 +101,11 @@ public struct QuotaReportService: Sendable {
         self.clock = clock
     }
 
-    public func fetch(accounts: [Account], activeAlias: String?) async throws -> CodexQuotaReport {
+    public func fetch(
+        accounts: [Account],
+        activeAlias: String?,
+        prefetched: [String: PrefetchedQuotaSnapshot] = [:]
+    ) async throws -> CodexQuotaReport {
         try Task.checkCancellation()
         let fetchedAt = clock()
         let activeKey = Self.normalizedAlias(activeAlias)
@@ -132,6 +136,7 @@ public struct QuotaReportService: Sendable {
                 let index = nextIndex
                 let account = orderedAccounts[index]
                 let displayAlias = displayAliases[index]
+                let prefetchedSnapshot = prefetched[account.id]
                 group.addTask {
                     try await Self.fetchAccount(
                         account: account,
@@ -141,7 +146,8 @@ public struct QuotaReportService: Sendable {
                         activeAlias: activeKey,
                         activeAccountIndex: activeAccountIndex,
                         usageService: self.usageService,
-                        resetService: self.resetService
+                        resetService: self.resetService,
+                        prefetched: prefetchedSnapshot
                     )
                 }
                 nextIndex += 1
@@ -154,6 +160,7 @@ public struct QuotaReportService: Sendable {
                 let index = nextIndex
                 let account = orderedAccounts[index]
                 let displayAlias = displayAliases[index]
+                let prefetchedSnapshot = prefetched[account.id]
                 group.addTask {
                     try await Self.fetchAccount(
                         account: account,
@@ -163,7 +170,8 @@ public struct QuotaReportService: Sendable {
                         activeAlias: activeKey,
                         activeAccountIndex: activeAccountIndex,
                         usageService: self.usageService,
-                        resetService: self.resetService
+                        resetService: self.resetService,
+                        prefetched: prefetchedSnapshot
                     )
                 }
                 nextIndex += 1
@@ -309,9 +317,11 @@ public struct QuotaReportService: Sendable {
         for account: Account,
         activeAlias: String?,
         index: Int,
-        activeAccountIndex: Int?
+        activeAccountIndex: Int?,
+        hasPrefetchedAuthorization: Bool
     ) -> AccountQuotaState {
-        if account.needsLogin || account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !hasPrefetchedAuthorization,
+           account.needsLogin || account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .signInRequired
         }
         if !account.routingEnabled { return .paused }
@@ -327,34 +337,33 @@ public struct QuotaReportService: Sendable {
         activeAlias: String?,
         activeAccountIndex: Int?,
         usageService: any UsageFetching,
-        resetService: any QuotaResetServing
+        resetService: any QuotaResetServing,
+        prefetched: PrefetchedQuotaSnapshot?
     ) async throws -> IndexedAccountReport {
         try Task.checkCancellation()
+        let prefetchedWindows = prefetched?.windows
+        let prefetchedCredits = prefetched?.resetCredits
+        let hasPrefetchedAuthorization = prefetchedWindows != nil || prefetchedCredits != nil
         let state = Self.state(
             for: account,
             activeAlias: activeAlias,
             index: index,
-            activeAccountIndex: activeAccountIndex
+            activeAccountIndex: activeAccountIndex,
+            hasPrefetchedAuthorization: hasPrefetchedAuthorization
         )
-        guard !account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !account.needsLogin else {
-            return IndexedAccountReport(
-                index: index,
-                report: AccountQuotaReport(
-                    alias: displayAlias,
-                    plan: sanitizedPlan(for: account, privateContext: privateContext),
-                    state: state,
-                    usageStatus: .signInRequired,
-                    windows: [],
-                    resetCreditStatus: .signInRequired,
-                    availableResetCredits: nil,
-                    earliestResetCreditExpiry: nil
-                )
-            )
-        }
 
-        async let usageResult = Self.fetchUsage(service: usageService, account: account)
-        async let creditResult = Self.fetchCredits(service: resetService, account: account)
+        async let usageResult = Self.fetchUsage(
+            service: usageService,
+            account: account,
+            prefetchedWindows: prefetchedWindows,
+            allowDirectLookupWithoutLocalAuth: hasPrefetchedAuthorization
+        )
+        async let creditResult = Self.fetchCredits(
+            service: resetService,
+            account: account,
+            prefetchedCredits: prefetchedCredits,
+            allowDirectLookupWithoutLocalAuth: hasPrefetchedAuthorization
+        )
         let (usage, credits) = try await (usageResult, creditResult)
         try Task.checkCancellation()
 
@@ -375,20 +384,21 @@ public struct QuotaReportService: Sendable {
 
     private static func fetchUsage(
         service: any UsageFetching,
-        account: Account
+        account: Account,
+        prefetchedWindows: [UsageWindow]?,
+        allowDirectLookupWithoutLocalAuth: Bool
     ) async throws -> (status: QuotaLookupStatus, windows: [QuotaWindowReport]) {
         try Task.checkCancellation()
+        if let prefetchedWindows {
+            return (.ok, prefetchedWindows.map(Self.quotaWindowReport))
+        }
+        guard allowDirectLookupWithoutLocalAuth
+                || (!account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !account.needsLogin) else {
+            return (.signInRequired, [])
+        }
         do {
             let windows = try await service.fetch(accessToken: account.accessToken, accountID: account.accountID)
-                .map { window in
-                    let usedPercent = min(max(window.usedPercent, 0), 100)
-                    return QuotaWindowReport(
-                        label: window.label,
-                        usedPercent: usedPercent,
-                        remainingPercent: 100 - usedPercent,
-                        resetAt: window.resetAt
-                    )
-                }
+                .map(Self.quotaWindowReport)
             try Task.checkCancellation()
             guard !windows.isEmpty else { return (.malformedResponse, []) }
             return (.ok, windows)
@@ -401,9 +411,18 @@ public struct QuotaReportService: Sendable {
 
     private static func fetchCredits(
         service: any QuotaResetServing,
-        account: Account
+        account: Account,
+        prefetchedCredits: ResetCreditSnapshot?,
+        allowDirectLookupWithoutLocalAuth: Bool
     ) async throws -> (status: QuotaLookupStatus, snapshot: ResetCreditSnapshot?) {
         try Task.checkCancellation()
+        if let prefetchedCredits {
+            return (.ok, prefetchedCredits)
+        }
+        guard allowDirectLookupWithoutLocalAuth
+                || (!account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !account.needsLogin) else {
+            return (.signInRequired, nil)
+        }
         do {
             let snapshot = try await service.credits(accessToken: account.accessToken, accountID: account.accountID)
             try Task.checkCancellation()
@@ -413,6 +432,16 @@ public struct QuotaReportService: Sendable {
         } catch {
             return (resetCreditStatus(for: error), nil)
         }
+    }
+
+    private static func quotaWindowReport(_ window: UsageWindow) -> QuotaWindowReport {
+        let usedPercent = min(max(window.usedPercent, 0), 100)
+        return QuotaWindowReport(
+            label: window.label,
+            usedPercent: usedPercent,
+            remainingPercent: 100 - usedPercent,
+            resetAt: window.resetAt
+        )
     }
 
     private static func usageStatus(for error: Error) -> QuotaLookupStatus {

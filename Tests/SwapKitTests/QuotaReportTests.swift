@@ -439,6 +439,140 @@ final class QuotaReportTests: XCTestCase {
             }
         }
     }
+
+    func testPrefetchedSnapshotBypassesDirectUsageAndCredits() async throws {
+        let now = Date(timeIntervalSince1970: 1_754_044_800)
+        let usage = StubQuotaUsage(results: [:])
+        let credits = StubQuotaCredits(results: [:])
+        let snapshot = PrefetchedQuotaSnapshot(
+            windows: [UsageWindow(label: "5h", usedPercent: 44, windowSeconds: 18_000, resetAt: now)],
+            resetCredits: ResetCreditSnapshot(availableCount: 2, credits: [], fetchedAt: now)
+        )
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "stale")],
+            activeAlias: nil,
+            prefetched: ["alpha-id": snapshot]
+        )
+
+        XCTAssertEqual(report.accounts[0].usageStatus, .ok)
+        XCTAssertEqual(report.accounts[0].windows.map(\.usedPercent), [44])
+        XCTAssertEqual(report.accounts[0].resetCreditStatus, .ok)
+        XCTAssertEqual(report.accounts[0].availableResetCredits, 2)
+        let usageCalls = await usage.callCount()
+        let creditCalls = await credits.callCount()
+        XCTAssertEqual(usageCalls, 0)
+        XCTAssertEqual(creditCalls, 0)
+    }
+
+    func testPrefetchedAuthorizationOverridesStaleLocalCredentialState() async throws {
+        let now = Date(timeIntervalSince1970: 1_754_044_800)
+        let usage = StubQuotaUsage(results: [:])
+        let credits = StubQuotaCredits(results: [:])
+        let snapshot = PrefetchedQuotaSnapshot(
+            windows: [UsageWindow(label: "5h", usedPercent: 12, windowSeconds: 18_000, resetAt: now)],
+            resetCredits: ResetCreditSnapshot(availableCount: 1, credits: [], fetchedAt: now)
+        )
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)],
+            activeAlias: "alpha",
+            prefetched: ["alpha-id": snapshot]
+        )
+
+        XCTAssertEqual(report.accounts[0].state, .active)
+        XCTAssertEqual(report.accounts[0].usageStatus, .ok)
+        XCTAssertEqual(report.accounts[0].resetCreditStatus, .ok)
+        let usageCalls = await usage.callCount()
+        let creditCalls = await credits.callCount()
+        XCTAssertEqual(usageCalls, 0)
+        XCTAssertEqual(creditCalls, 0)
+    }
+
+    func testMissingPrefetchedUsageFallsBackWithoutRefetchingCredits() async throws {
+        let now = Date(timeIntervalSince1970: 1_754_044_800)
+        let usage = StubQuotaUsage(results: [
+            "alpha-token": .success([UsageWindow(label: "5h", usedPercent: 33, windowSeconds: 18_000, resetAt: now)])
+        ])
+        let credits = StubQuotaCredits(results: [:])
+        let snapshot = PrefetchedQuotaSnapshot(
+            windows: nil,
+            resetCredits: ResetCreditSnapshot(availableCount: 3, credits: [], fetchedAt: now)
+        )
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")],
+            activeAlias: nil,
+            prefetched: ["alpha-id": snapshot]
+        )
+
+        XCTAssertEqual(report.accounts[0].usageStatus, .ok)
+        XCTAssertEqual(report.accounts[0].windows.map(\.usedPercent), [33])
+        XCTAssertEqual(report.accounts[0].resetCreditStatus, .ok)
+        XCTAssertEqual(report.accounts[0].availableResetCredits, 3)
+        let usageCalls = await usage.callCount()
+        let creditCalls = await credits.callCount()
+        XCTAssertEqual(usageCalls, 1)
+        XCTAssertEqual(creditCalls, 0)
+    }
+
+    func testMissingPrefetchedCreditsFallsBackWithoutRefetchingUsage() async throws {
+        let now = Date(timeIntervalSince1970: 1_754_044_800)
+        let usage = StubQuotaUsage(results: [:])
+        let credits = StubQuotaCredits(results: [
+            "alpha-token": .success(ResetCreditSnapshot(availableCount: 4, credits: [], fetchedAt: now))
+        ])
+        let snapshot = PrefetchedQuotaSnapshot(
+            windows: [UsageWindow(label: "5h", usedPercent: 55, windowSeconds: 18_000, resetAt: now)],
+            resetCredits: nil
+        )
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")],
+            activeAlias: nil,
+            prefetched: ["alpha-id": snapshot]
+        )
+
+        XCTAssertEqual(report.accounts[0].usageStatus, .ok)
+        XCTAssertEqual(report.accounts[0].windows.map(\.usedPercent), [55])
+        XCTAssertEqual(report.accounts[0].resetCreditStatus, .ok)
+        XCTAssertEqual(report.accounts[0].availableResetCredits, 4)
+        let usageCalls = await usage.callCount()
+        let creditCalls = await credits.callCount()
+        XCTAssertEqual(usageCalls, 0)
+        XCTAssertEqual(creditCalls, 1)
+    }
+
+    func testUnmatchedAccountUsesExistingDirectLookup() async throws {
+        let now = Date(timeIntervalSince1970: 1_754_044_800)
+        let usage = StubQuotaUsage(results: [
+            "alpha-token": .success([UsageWindow(label: "5h", usedPercent: 21, windowSeconds: 18_000, resetAt: now)])
+        ])
+        let credits = StubQuotaCredits(results: [
+            "alpha-token": .success(ResetCreditSnapshot(availableCount: 5, credits: [], fetchedAt: now))
+        ])
+        let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
+
+        let report = try await service.fetch(
+            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")],
+            activeAlias: nil,
+            prefetched: ["different-id": PrefetchedQuotaSnapshot(
+                windows: [UsageWindow(label: "5h", usedPercent: 99, windowSeconds: 18_000, resetAt: now)],
+                resetCredits: ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: now)
+            )]
+        )
+
+        XCTAssertEqual(report.accounts[0].windows.map(\.usedPercent), [21])
+        XCTAssertEqual(report.accounts[0].availableResetCredits, 5)
+        let usageCalls = await usage.callCount()
+        let creditCalls = await credits.callCount()
+        XCTAssertEqual(usageCalls, 1)
+        XCTAssertEqual(creditCalls, 1)
+    }
 }
 
 private actor StubQuotaUsage: UsageFetching {
