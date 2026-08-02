@@ -172,6 +172,161 @@ final class CodexBarQuotaClientTests: XCTestCase {
         }
     }
 
+    func testProcessRunnerCapturesNormalStdoutAndStderr() async throws {
+        let result = try await runSyntheticProcess(
+            "printf SYNTHETIC-STDOUT; printf SYNTHETIC-STDERR >&2"
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "SYNTHETIC-STDOUT")
+        XCTAssertEqual(String(data: result.stderr, encoding: .utf8), "SYNTHETIC-STDERR")
+    }
+
+    func testProcessRunnerNonzeroExitMapsToSafeError() async throws {
+        let client = CodexBarQuotaClient(runner: { _, _, _, _ in
+            try await CodexBarProcessRunner.run(
+                URL(fileURLWithPath: "/bin/sh"),
+                ["-c", "printf RAW-NONZERO-MARKER >&2; exit 7"],
+                .seconds(2),
+                1_048_576
+            )
+        })
+
+        do {
+            _ = try await client.fetch(accounts: [])
+            XCTFail("Expected nonzero process failure")
+        } catch let error as CodexBarQuotaError {
+            XCTAssertEqual(error, .commandFailed)
+            XCTAssertFalse(String(describing: error).contains("RAW-NONZERO-MARKER"))
+        }
+    }
+
+    func testProcessRunnerRejectsStdoutOverflow() async throws {
+        do {
+            _ = try await runSyntheticProcess(
+                "dd if=/dev/zero bs=2048 count=1 2>/dev/null",
+                maxOutputBytes: 1_024
+            )
+            XCTFail("Expected stdout overflow")
+        } catch let error as CodexBarQuotaError {
+            XCTAssertEqual(error, .oversizedOutput)
+        }
+    }
+
+    func testProcessRunnerRejectsStderrOverflowWithoutRetainingMarker() async throws {
+        let marker = "RAW-STDERR-OVERFLOW-MARKER"
+        let command = "printf '\(marker)'; dd if=/dev/zero bs=2048 count=1 1>&2 2>/dev/null"
+        do {
+            _ = try await runSyntheticProcess(command, maxOutputBytes: 1_024)
+            XCTFail("Expected stderr overflow")
+        } catch let error as CodexBarQuotaError {
+            XCTAssertEqual(error, .oversizedOutput)
+            XCTAssertFalse(String(describing: error).contains(marker))
+        }
+    }
+
+    func testProcessRunnerTimeoutEscalatesAfterIgnoredTermination() async throws {
+        let probe = ProcessOutcomeProbe()
+        let completed = expectation(description: "timeout runner completes")
+        Task {
+            do {
+                _ = try await runSyntheticProcess(
+                    "trap '' TERM; (sleep 0.3; kill -KILL $$) & wait",
+                    timeout: .milliseconds(40)
+                )
+                await probe.record(.success)
+            } catch let error as CodexBarQuotaError {
+                await probe.record(.failure(error))
+            } catch {
+                await probe.record(.other)
+            }
+            completed.fulfill()
+        }
+
+        await fulfillment(of: [completed], timeout: 2)
+        let outcome = await probe.outcome()
+        XCTAssertEqual(outcome, .failure(.timeout))
+    }
+
+    func testProcessRunnerCancellationTerminatesAndPropagatesCancellation() async throws {
+        let probe = ProcessOutcomeProbe()
+        let completed = expectation(description: "cancelled runner completes")
+        let task = Task {
+            do {
+                _ = try await runSyntheticProcess(
+                    "trap '' TERM; (sleep 0.3; kill -KILL $$) & wait",
+                    timeout: .seconds(5)
+                )
+                await probe.record(.success)
+            } catch is CancellationError {
+                await probe.record(.cancelled)
+            } catch let error as CodexBarQuotaError {
+                await probe.record(.failure(error))
+            } catch {
+                await probe.record(.other)
+            }
+            completed.fulfill()
+        }
+
+        try await Task.sleep(for: .milliseconds(40))
+        task.cancel()
+        await fulfillment(of: [completed], timeout: 2)
+        let outcome = await probe.outcome()
+        XCTAssertEqual(outcome, .cancelled)
+    }
+
+    func testProcessRunnerMapsUnavailableExecutableToSafeError() async throws {
+        do {
+            _ = try await CodexBarProcessRunner.run(
+                URL(fileURLWithPath: "/definitely/not-a-real-CodexBarCLI"),
+                [],
+                .seconds(1),
+                1_024
+            )
+            XCTFail("Expected unavailable executable")
+        } catch let error as CodexBarQuotaError {
+            XCTAssertEqual(error, .unavailable)
+            XCTAssertFalse(String(describing: error).contains("not-a-real-CodexBarCLI"))
+        }
+    }
+
+    func testMalformedTimestampAndFieldTypesProduceSafeError() async throws {
+        let malformedFixtures = [
+            "[{\"account\":\"alpha\",\"usage\":{\"primary\":{\"resetsAt\":\"RAW-BAD-TIMESTAMP\",\"usedPercent\":10,\"windowMinutes\":300}}}]",
+            "[{\"account\":\"alpha\",\"usage\":{\"primary\":{\"resetsAt\":null,\"usedPercent\":\"RAW-BAD-FIELD\",\"windowMinutes\":300}}}]",
+        ]
+        for fixture in malformedFixtures {
+            let client = CodexBarQuotaClient { _, _, _, _ in
+                CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
+            }
+            do {
+                _ = try await client.fetch(accounts: [Account(alias: "alpha")])
+                XCTFail("Expected malformed response")
+            } catch let error as CodexBarQuotaError {
+                XCTAssertEqual(error, .malformedResponse)
+                XCTAssertFalse(String(describing: error).contains("RAW-BAD"))
+            }
+        }
+    }
+
+    func testOversizedStderrMapsToSafeErrorWithoutMarker() async throws {
+        let marker = "RAW-OVERSIZED-STDERR-MARKER"
+        let client = CodexBarQuotaClient { _, _, _, _ in
+            CodexBarCommandResult(
+                stdout: Data("[]".utf8),
+                stderr: Data(repeating: 0x41, count: 2_000_000) + Data(marker.utf8),
+                exitCode: 0
+            )
+        }
+        do {
+            _ = try await client.fetch(accounts: [])
+            XCTFail("Expected oversized stderr")
+        } catch let error as CodexBarQuotaError {
+            XCTAssertEqual(error, .oversizedOutput)
+            XCTAssertFalse(String(describing: error).contains(marker))
+        }
+    }
+
     private func parsedDate(_ value: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -195,4 +350,34 @@ private actor InvocationProbe {
     }
 
     func invocation() -> Invocation? { value }
+}
+
+private actor ProcessOutcomeProbe {
+    enum Outcome: Sendable, Equatable {
+        case success
+        case failure(CodexBarQuotaError)
+        case cancelled
+        case other
+    }
+
+    private var value: Outcome?
+
+    func record(_ outcome: Outcome) {
+        value = outcome
+    }
+
+    func outcome() -> Outcome? { value }
+}
+
+private func runSyntheticProcess(
+    _ command: String,
+    timeout: Duration = .seconds(2),
+    maxOutputBytes: Int = 1_048_576
+) async throws -> CodexBarCommandResult {
+    try await CodexBarProcessRunner.run(
+        URL(fileURLWithPath: "/bin/sh"),
+        ["-c", command],
+        timeout,
+        maxOutputBytes
+    )
 }

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public struct PrefetchedQuotaSnapshot: Sendable, Equatable {
     public let windows: [UsageWindow]?
@@ -10,19 +13,19 @@ public struct PrefetchedQuotaSnapshot: Sendable, Equatable {
     }
 }
 
-public struct CodexBarCommandResult: Sendable {
-    public let stdout: Data
-    public let stderr: Data
-    public let exitCode: Int32
+struct CodexBarCommandResult: Sendable {
+    let stdout: Data
+    let stderr: Data
+    let exitCode: Int32
 
-    public init(stdout: Data, stderr: Data = Data(), exitCode: Int32) {
+    init(stdout: Data, stderr: Data = Data(), exitCode: Int32) {
         self.stdout = stdout
         self.stderr = stderr
         self.exitCode = exitCode
     }
 }
 
-public enum CodexBarQuotaError: Error, Sendable, Equatable, LocalizedError {
+enum CodexBarQuotaError: Error, Sendable, Equatable, LocalizedError {
     case unavailable
     case timeout
     case commandFailed
@@ -40,23 +43,27 @@ public enum CodexBarQuotaError: Error, Sendable, Equatable, LocalizedError {
     }
 }
 
-public enum CodexBarQuotaClientConstants {
-    public static let executableURL = URL(fileURLWithPath: "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI")
-    public static let arguments = [
+enum CodexBarQuotaClientConstants {
+    static let executableURL = URL(fileURLWithPath: "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI")
+    static let arguments = [
         "usage", "--provider", "codex", "--all-accounts",
         "--source", "oauth", "--format", "json", "--json-only",
     ]
 }
 
 public struct CodexBarQuotaClient: Sendable {
-    public typealias Runner = @Sendable (URL, [String], Duration, Int) async throws -> CodexBarCommandResult
+    typealias Runner = @Sendable (URL, [String], Duration, Int) async throws -> CodexBarCommandResult
 
     private static let commandTimeout: Duration = .seconds(20)
     private static let maximumOutputBytes = 1_048_576
 
     private let runner: Runner
 
-    public init(runner: @escaping Runner = CodexBarProcessRunner.run) {
+    public init() {
+        self.runner = CodexBarProcessRunner.run
+    }
+
+    init(runner: @escaping Runner) {
         self.runner = runner
     }
 
@@ -88,12 +95,6 @@ public struct CodexBarQuotaClient: Sendable {
             throw CodexBarQuotaError.commandFailed
         }
         return try Self.parse(result.stdout, accounts: accounts)
-    }
-
-    private struct RawItem {
-        let candidates: Set<String>
-        let windows: [UsageWindow]?
-        let resetCredits: ResetCreditSnapshot?
     }
 
     private static func parse(_ data: Data, accounts: [Account]) throws -> [String: PrefetchedQuotaSnapshot] {
@@ -131,8 +132,8 @@ public struct CodexBarQuotaClient: Sendable {
                 continue
             }
 
-            let windows = Self.parseWindows(from: usage)
-            let resetCredits = Self.parseResetCredits(from: usage["codexResetCredits"])
+            let windows = try Self.parseWindows(from: usage)
+            let resetCredits = try Self.parseResetCredits(from: usage["codexResetCredits"])
             guard windows != nil || resetCredits != nil else { continue }
 
             let account = accounts[accountIndex]
@@ -198,25 +199,27 @@ public struct CodexBarQuotaClient: Sendable {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    private static func parseWindows(from usage: [String: Any]) -> [UsageWindow]? {
+    private static func parseWindows(from usage: [String: Any]) throws -> [UsageWindow]? {
         var windows: [UsageWindow] = []
         for key in ["primary", "secondary", "tertiary"] {
-            guard let raw = usage[key], !(raw is NSNull),
-                  let window = raw as? [String: Any],
+            guard let raw = usage[key], !(raw is NSNull) else {
+                continue
+            }
+            guard let window = raw as? [String: Any],
                   let minutes = integerValue(window["windowMinutes"]),
                   minutes >= 0,
                   let usedPercent = integerValue(window["usedPercent"]) else {
-                continue
+                throw CodexBarQuotaError.malformedResponse
             }
             let duration = minutes.multipliedReportingOverflow(by: 60)
-            guard !duration.overflow else { continue }
+            guard !duration.overflow else { throw CodexBarQuotaError.malformedResponse }
             let seconds = duration.partialValue
 
             let resetAt: Date?
             if let rawReset = window["resetsAt"], !(rawReset is NSNull) {
                 guard let resetString = rawReset as? String,
                       let parsed = parseISO8601(resetString) else {
-                    continue
+                    throw CodexBarQuotaError.malformedResponse
                 }
                 resetAt = parsed
             } else {
@@ -238,25 +241,30 @@ public struct CodexBarQuotaClient: Sendable {
         }
     }
 
-    private static func parseResetCredits(from raw: Any?) -> ResetCreditSnapshot? {
+    private static func parseResetCredits(from raw: Any?) throws -> ResetCreditSnapshot? {
+        guard let raw, !(raw is NSNull) else { return nil }
         guard let object = raw as? [String: Any],
               let availableCount = integerValue(object["availableCount"]),
               availableCount >= 0 else {
-            return nil
+            throw CodexBarQuotaError.malformedResponse
         }
 
         var safeCredits: [ResetCredit] = []
-        if let credits = object["credits"] as? [[String: Any]] {
+        if let rawCredits = object["credits"] {
+            guard let credits = rawCredits as? [[String: Any]] else {
+                throw CodexBarQuotaError.malformedResponse
+            }
             for (index, credit) in credits.enumerated() {
                 guard let status = credit["status"] as? String,
                       status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "available" else {
-                    continue
+                    if credit["status"] is String { continue }
+                    throw CodexBarQuotaError.malformedResponse
                 }
                 let expiresAt: Date?
                 if let rawExpiry = credit["expires_at"], !(rawExpiry is NSNull) {
                     guard let expiryString = rawExpiry as? String,
                           let parsed = parseISO8601(expiryString) else {
-                        continue
+                        throw CodexBarQuotaError.malformedResponse
                     }
                     expiresAt = parsed
                 } else {
@@ -305,8 +313,11 @@ public struct CodexBarQuotaClient: Sendable {
     }
 }
 
-public enum CodexBarProcessRunner {
-    public static func run(
+enum CodexBarProcessRunner {
+    private static let terminationGrace: Duration = .milliseconds(250)
+    private static let killGrace: Duration = .milliseconds(250)
+
+    static func run(
         _ executable: URL,
         _ arguments: [String],
         _ timeout: Duration,
@@ -335,52 +346,81 @@ public enum CodexBarProcessRunner {
 
         let stdoutReader = BoundedPipeReader(handle: stdoutPipe.fileHandleForReading, limit: maxOutputBytes)
         let stderrReader = BoundedPipeReader(handle: stderrPipe.fileHandleForReading, limit: maxOutputBytes)
-        let stdoutTask = Task { await stdoutReader.read() }
-        let stderrTask = Task { await stderrReader.read() }
+        stdoutReader.start()
+        stderrReader.start()
 
         do {
             try process.run()
         } catch {
             stdoutPipe.fileHandleForWriting.closeFile()
             stderrPipe.fileHandleForWriting.closeFile()
-            processBox.terminate()
-            _ = await stdoutTask.value
-            _ = await stderrTask.value
+            processBox.requestTermination()
+            stdoutReader.stop()
+            stderrReader.stop()
+            _ = await readResult(stdoutReader, timeout: .seconds(1))
+            _ = await readResult(stderrReader, timeout: .seconds(1))
             throw CodexBarQuotaError.unavailable
         }
 
+        let exitCode: Int32
         do {
-            _ = try await withTaskCancellationHandler(operation: {
+            exitCode = try await withTaskCancellationHandler(operation: {
                 try await waitForTermination(termination, processBox: processBox, timeout: timeout)
             }, onCancel: {
-                processBox.terminate()
+                processBox.requestTermination()
+                termination.requestCancellation()
             })
+            try Task.checkCancellation()
         } catch is CancellationError {
-            processBox.terminate()
-            _ = await termination.wait()
-            _ = await stdoutTask.value
-            _ = await stderrTask.value
+            let terminated = await stopProcess(processBox: processBox, termination: termination)
+            if !terminated {
+                stdoutReader.stop()
+                stderrReader.stop()
+            }
+            _ = await readResult(stdoutReader, timeout: .seconds(1))
+            _ = await readResult(stderrReader, timeout: .seconds(1))
             throw CancellationError()
         } catch {
-            processBox.terminate()
-            _ = await termination.wait()
-            _ = await stdoutTask.value
-            _ = await stderrTask.value
+            let terminated = await stopProcess(processBox: processBox, termination: termination)
+            if !terminated {
+                stdoutReader.stop()
+                stderrReader.stop()
+            }
+            _ = await readResult(stdoutReader, timeout: .seconds(1))
+            _ = await readResult(stderrReader, timeout: .seconds(1))
             if let error = error as? CodexBarQuotaError {
                 throw error
             }
             throw CodexBarQuotaError.commandFailed
         }
 
-        let stdout = await stdoutTask.value
-        let stderr = await stderrTask.value
+        let stdout = await readResult(stdoutReader, timeout: .seconds(1))
+        let stderr = await readResult(stderrReader, timeout: .seconds(1))
         if stdout.overflow || stderr.overflow {
             throw CodexBarQuotaError.oversizedOutput
         }
         if stdout.failed || stderr.failed {
             throw CodexBarQuotaError.commandFailed
         }
-        return CodexBarCommandResult(stdout: stdout.data, stderr: stderr.data, exitCode: termination.status ?? -1)
+        return CodexBarCommandResult(stdout: stdout.data, stderr: stderr.data, exitCode: exitCode)
+    }
+
+    private static func readResult(
+        _ reader: BoundedPipeReader,
+        timeout: Duration
+    ) async -> PipeReadResult {
+        switch await reader.wait(for: timeout) {
+        case .complete(let result):
+            return result
+        case .timedOut:
+            reader.stop()
+            switch await reader.wait(for: .milliseconds(100)) {
+            case .complete(let result):
+                return result
+            case .timedOut:
+                return PipeReadResult(data: Data(), overflow: false, failed: true)
+            }
+        }
     }
 
     private static func waitForTermination(
@@ -388,26 +428,32 @@ public enum CodexBarProcessRunner {
         processBox: ProcessBox,
         timeout: Duration
     ) async throws -> Int32 {
-        try await withThrowingTaskGroup(of: Int32.self) { group in
-            group.addTask { await termination.wait() }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw CodexBarQuotaError.timeout
-            }
-
-            do {
-                guard let result = try await group.next() else {
-                    throw CodexBarQuotaError.commandFailed
-                }
-                group.cancelAll()
-                return result
-            } catch {
-                group.cancelAll()
-                processBox.terminate()
-                _ = await termination.wait()
-                throw error
-            }
+        switch await termination.wait(for: timeout) {
+        case .terminated(let status):
+            return status
+        case .cancelled:
+            _ = await stopProcess(processBox: processBox, termination: termination)
+            throw CancellationError()
+        case .timedOut:
+            _ = await stopProcess(processBox: processBox, termination: termination)
+            throw CodexBarQuotaError.timeout
         }
+    }
+
+    private static func stopProcess(
+        processBox: ProcessBox,
+        termination: ProcessTermination
+    ) async -> Bool {
+        processBox.requestTermination()
+        if case .terminated = await termination.wait(for: terminationGrace, observingCancellation: false) {
+            return true
+        }
+
+        processBox.forceKill()
+        if case .terminated = await termination.wait(for: killGrace, observingCancellation: false) {
+            return true
+        }
+        return false
     }
 }
 
@@ -419,39 +465,96 @@ private final class ProcessBox: @unchecked Sendable {
         self.process = process
     }
 
-    func terminate() {
+    func requestTermination() {
         lock.lock()
         defer { lock.unlock() }
         if process.isRunning { process.terminate() }
     }
+
+    func forceKill() {
+        lock.lock()
+        let pid = process.processIdentifier
+        let running = process.isRunning
+        lock.unlock()
+        guard running, pid > 0 else { return }
+        #if canImport(Darwin)
+        _ = Darwin.kill(pid, SIGKILL)
+        #else
+        _ = kill(pid, SIGKILL)
+        #endif
+    }
+}
+
+private enum TerminationWaitResult: Sendable {
+    case terminated(Int32)
+    case timedOut
+    case cancelled
 }
 
 private final class ProcessTermination: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<Int32, Never>?
-    fileprivate private(set) var status: Int32?
+    private var status: Int32?
+    private var cancellationRequested = false
+    private var nextWaiterID = 0
+    private var waiters: [Int: CheckedContinuation<TerminationWaitResult, Never>] = [:]
 
     func finish(_ status: Int32) {
         lock.lock()
+        guard self.status == nil else {
+            lock.unlock()
+            return
+        }
         self.status = status
-        let continuation = self.continuation
-        self.continuation = nil
+        let waiters = Array(self.waiters.values)
+        self.waiters.removeAll()
         lock.unlock()
-        continuation?.resume(returning: status)
+        waiters.forEach { $0.resume(returning: .terminated(status)) }
     }
 
-    func wait() async -> Int32 {
+    func requestCancellation() {
+        lock.lock()
+        cancellationRequested = true
+        let waiters = Array(self.waiters.values)
+        self.waiters.removeAll()
+        lock.unlock()
+        waiters.forEach { $0.resume(returning: .cancelled) }
+    }
+
+    func wait(
+        for timeout: Duration?,
+        observingCancellation: Bool = true
+    ) async -> TerminationWaitResult {
         await withCheckedContinuation { continuation in
             lock.lock()
             if let status {
                 lock.unlock()
-                continuation.resume(returning: status)
-            } else {
-                self.continuation = continuation
+                continuation.resume(returning: .terminated(status))
+            } else if observingCancellation && cancellationRequested {
                 lock.unlock()
+                continuation.resume(returning: .cancelled)
+            } else {
+                let waiterID = nextWaiterID
+                nextWaiterID += 1
+                waiters[waiterID] = continuation
+                lock.unlock()
+                if let timeout {
+                    DispatchQueue.global(qos: .utility).asyncAfter(
+                        deadline: codexBarDispatchDeadline(after: timeout)
+                    ) { [weak self] in
+                        self?.expire(waiterID)
+                    }
+                }
             }
         }
     }
+
+    private func expire(_ waiterID: Int) {
+        lock.lock()
+        let waiter = waiters.removeValue(forKey: waiterID)
+        lock.unlock()
+        waiter?.resume(returning: .timedOut)
+    }
+
 }
 
 private struct PipeReadResult: Sendable {
@@ -460,36 +563,121 @@ private struct PipeReadResult: Sendable {
     let failed: Bool
 }
 
+private enum PipeReadWaitResult: Sendable {
+    case complete(PipeReadResult)
+    case timedOut
+}
+
 private final class BoundedPipeReader: @unchecked Sendable {
+    private let lock = NSLock()
     private let handle: FileHandle
     private let limit: Int
+    private var stopped = false
+    private var started = false
+    private var result: PipeReadResult?
+    private var nextWaiterID = 0
+    private var waiters: [Int: CheckedContinuation<PipeReadWaitResult, Never>] = [:]
 
     init(handle: FileHandle, limit: Int) {
         self.handle = handle
         self.limit = max(0, limit)
     }
 
-    func read() async -> PipeReadResult {
+    func start() {
+        lock.lock()
+        guard !started else {
+            lock.unlock()
+            return
+        }
+        started = true
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            readLoop()
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        guard !stopped else {
+            lock.unlock()
+            return
+        }
+        stopped = true
+        lock.unlock()
+        handle.closeFile()
+    }
+
+    func wait(for timeout: Duration?) async -> PipeReadWaitResult {
         await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                var data = Data()
-                var overflow = false
-                var failed = false
-                while true {
-                    do {
-                        guard let chunk = try self.handle.read(upToCount: 64 * 1024), !chunk.isEmpty else {
-                            break
-                        }
-                        let room = max(0, self.limit - data.count)
-                        if chunk.count > room { overflow = true }
-                        if room > 0 { data.append(chunk.prefix(room)) }
-                    } catch {
-                        failed = true
-                        break
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: .complete(result))
+            } else {
+                let waiterID = nextWaiterID
+                nextWaiterID += 1
+                waiters[waiterID] = continuation
+                lock.unlock()
+                if let timeout {
+                    DispatchQueue.global(qos: .utility).asyncAfter(
+                        deadline: codexBarDispatchDeadline(after: timeout)
+                    ) { [weak self] in
+                        self?.expire(waiterID)
                     }
                 }
-                continuation.resume(returning: PipeReadResult(data: data, overflow: overflow, failed: failed))
             }
         }
     }
+
+    private func readLoop() {
+        var data = Data()
+        var overflow = false
+        var failed = false
+        while true {
+            lock.lock()
+            let stopped = self.stopped
+            lock.unlock()
+            if stopped { break }
+            do {
+                guard let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty else {
+                    break
+                }
+                let room = max(0, limit - data.count)
+                if chunk.count > room { overflow = true }
+                if room > 0 { data.append(chunk.prefix(room)) }
+            } catch {
+                failed = true
+                break
+            }
+        }
+        finish(PipeReadResult(data: data, overflow: overflow, failed: failed))
+    }
+
+    private func finish(_ value: PipeReadResult) {
+        lock.lock()
+        guard result == nil else {
+            lock.unlock()
+            return
+        }
+        result = value
+        let waiters = Array(self.waiters.values)
+        self.waiters.removeAll()
+        lock.unlock()
+        waiters.forEach { $0.resume(returning: .complete(value)) }
+    }
+
+    private func expire(_ waiterID: Int) {
+        lock.lock()
+        let waiter = waiters.removeValue(forKey: waiterID)
+        lock.unlock()
+        waiter?.resume(returning: .timedOut)
+    }
+}
+
+private func codexBarDispatchDeadline(after duration: Duration) -> DispatchTime {
+    let components = duration.components
+    let rawNanoseconds = Double(components.seconds) * 1_000_000_000
+        + Double(components.attoseconds) / 1_000_000_000
+    let clampedNanoseconds = min(max(rawNanoseconds, 0), Double(Int.max))
+    return .now() + .nanoseconds(Int(clampedNanoseconds))
 }
