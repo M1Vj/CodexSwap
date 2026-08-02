@@ -24,6 +24,7 @@
 <p align="center">
   <a href="#quick-start"><strong>Quick start</strong></a> ·
   <a href="#how-routing-works">How it works</a> ·
+  <a href="#ask-codex-about-quota">Quota in chat</a> ·
   <a href="#task-board">Task Board</a> ·
   <a href="docs/TROUBLESHOOTING.md">Troubleshooting</a>
 </p>
@@ -53,7 +54,7 @@ CodexSwap solves the problem at the routing layer:
 | --- | --- | --- |
 | 🔁 | **Quota-aware routing** | Select an eligible account for each new turn or run without replacing auth files mid-session. |
 | 📌 | **Sticky active work** | Usage polling and idle time never move an active turn or Task Board run. |
-| 📊 | **Quota cockpit** | Monitor account usage, reset times, routing pauses, and sign-in state from a native menu-bar app. |
+| 📊 | **Quota cockpit** | Monitor usage in the menu bar—or ask Codex for a safe, live all-account quota report. |
 | 🧭 | **Clear exhaustion policies** | Choose Reset Current First, Switch First, or Stop & Notify separately for interactive work and automation. |
 | 🗂️ | **Automated Task Board** | Queue plan-first `codex exec` work for the next available quota window. |
 | ♾️ | **Evergreen tasks** | Run bounded improvement cycles continuously, with archived plans and resumable handoffs. |
@@ -161,6 +162,24 @@ Reset-credit access uses an undocumented internal endpoint and may change withou
 Usage polling does not start a quota window. Optional warm-up sends one small, real Codex request to an eligible account, refreshes usage afterward, and reports only reset data returned by the service.
 
 Warm-up consumes quota, cannot guarantee how OpenAI will represent every window, and is disabled by default. **Warm all accounts now…** offers the same operation with confirmation.
+
+## Ask Codex about quota
+
+CodexSwap includes an optional `codexswap-quotas` skill, so quota checks can be as simple as asking:
+
+> How much Codex quota do I have across every account?
+
+Install the bundled skill once after placing `CodexSwap.app` in `/Applications` or `~/Applications`:
+
+```bash
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$codex_home/skills"
+ditto skills/codexswap-quotas "$codex_home/skills/codexswap-quotas"
+```
+
+Restart Codex after the first install so it discovers the skill. The report is read-only: it returns account aliases, plan and sign-in state, five-hour and weekly windows, reset times, and reset-credit availability without exposing emails, account IDs, tokens, or raw private responses. Partial account failures remain isolated instead of hiding successful results from other accounts.
+
+For scripts and local integrations, the same sanitized report is available through `swapd quota --json`.
 
 ## Privacy and security
 
