@@ -8,13 +8,13 @@ description: Use when the user asks for current Codex quota, usage, remaining ca
 Run exactly:
 
 ```bash
-/Users/vjmabansag/.local/bin/rtk proxy /bin/bash /Users/vjmabansag/.codex/skills/codexswap-quotas/scripts/check-quotas.sh
+/bin/bash "${CODEX_HOME:-$HOME/.codex}/skills/codexswap-quotas/scripts/check-quotas.sh"
 ```
 
 Treat the helper output as the only quota source. Present every returned account
 alias with its state and plan (or “unknown”), and each returned `5h` or `Weekly`
 window's used and remaining percentages and reset time converted to
-`Asia/Manila`.
+the user's local time zone.
 Include the available reset-credit count, earliest expiry, report fetch time,
 and each account's usage/reset-credit status. Keep partial successes and label
 safe failure categories such as sign-in required, timeout, network, unauthorized,

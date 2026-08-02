@@ -4,7 +4,7 @@
 
 **Goal:** Add a globally discoverable Codex skill that safely reports fresh usage windows and reset-credit availability for every account managed by CodexSwap.
 
-**Architecture:** A new SwapKit report service converts private `Account` values and two existing read-only clients into sanitized Codable report values. `swapd quota --json` exposes that report without mutating CodexSwap state, and a personal skill invokes the installed command through a small schema-validating helper.
+**Architecture:** A new SwapKit report service converts private `Account` values and two existing read-only clients into sanitized Codable report values. `swapd quota --json` exposes that report without mutating CodexSwap state, and an installable Codex skill invokes the command through a small schema-validating helper.
 
 **Tech Stack:** Swift 6, Swift Package Manager, XCTest, Bash, Python 3, Codex Agent Skills.
 
@@ -291,7 +291,7 @@ rtk git commit -m "feat: expose read-only quota JSON command"
 Read `references/openai_yaml.md` from the system `skill-creator` directory. Then run:
 
 ```bash
-rtk proxy python3 /Users/vjmabansag/.codex/skills/.system/skill-creator/scripts/init_skill.py codexswap-quotas --path skills --resources scripts --interface 'display_name=CodexSwap Quotas' --interface 'short_description=Check every local CodexSwap account quota' --interface 'default_prompt=Show the current CodexSwap quotas for all accounts without changing anything.'
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/init_skill.py" codexswap-quotas --path skills --resources scripts --interface 'display_name=CodexSwap Quotas' --interface 'short_description=Check every local CodexSwap account quota' --interface 'default_prompt=Show the current CodexSwap quotas for all accounts without changing anything.'
 ```
 
 - [ ] **Step 2: Write the deterministic helper**
@@ -302,10 +302,14 @@ Replace the generated placeholder with `scripts/check-quotas.sh`:
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd -P)"
+
 candidates=(
   "/Applications/CodexSwap.app/Contents/MacOS/swapd"
-  "/Users/vjmabansag/Projects/CodexSwap/.build/release/swapd"
-  "/Users/vjmabansag/Projects/CodexSwap/.build/debug/swapd"
+  "$HOME/Applications/CodexSwap.app/Contents/MacOS/swapd"
+  "$repo_root/.build/release/swapd"
+  "$repo_root/.build/debug/swapd"
 )
 
 for binary in "${candidates[@]}"; do
@@ -340,31 +344,24 @@ description: Use when the user asks for current Codex quota, usage, remaining ca
 ---
 ```
 
-In the body, require running the helper through `rtk proxy`, reporting every account alias with 5-hour/weekly used and remaining percentages, reset times in Asia/Manila, reset-credit count/expiry, fetched time, and partial errors. Explicitly prohibit account switching, warm-up, import, reset redemption, and disclosure of emails, tokens, account IDs, credit IDs, or raw JSON fields outside the sanitized schema.
+In the body, require running the helper through `/bin/bash`, reporting every account alias with 5-hour/weekly used and remaining percentages, reset times in the user's local time zone, reset-credit count/expiry, fetched time, and partial errors. Explicitly prohibit account switching, warm-up, import, reset redemption, and disclosure of emails, tokens, account IDs, credit IDs, or raw JSON fields outside the sanitized schema.
 
 - [ ] **Step 4: Validate and install the skill**
 
 Run:
 
 ```bash
-rtk proxy python3 /Users/vjmabansag/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/codexswap-quotas
-rtk proxy bash skills/codexswap-quotas/scripts/check-quotas.sh
-rtk proxy mkdir -p /Users/vjmabansag/.codex/skills/codexswap-quotas
-rtk proxy ditto skills/codexswap-quotas /Users/vjmabansag/.codex/skills/codexswap-quotas
-rtk proxy python3 /Users/vjmabansag/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/vjmabansag/.codex/skills/codexswap-quotas
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+python3 "$codex_home/skills/.system/skill-creator/scripts/quick_validate.py" skills/codexswap-quotas
+/bin/bash skills/codexswap-quotas/scripts/check-quotas.sh
+mkdir -p "$codex_home/skills"
+ditto skills/codexswap-quotas "$codex_home/skills/codexswap-quotas"
+python3 "$codex_home/skills/.system/skill-creator/scripts/quick_validate.py" "$codex_home/skills/codexswap-quotas"
 ```
 
 Expected: both validation runs pass; the helper emits schema version 1 and an account array.
 
-- [ ] **Step 5: Register the personal skill installation**
-
-Register the small, reversible user-scoped skill copy in the privacy-safe hygiene ledger using an opaque resource ID and rollback reference:
-
-```bash
-rtk proxy python3 /Users/vjmabansag/.codex/hygiene/hygiene_ledger.py register 74f32068ab9f2d76492df72a719ff65b --category skill --manager codex --scope user --owner-task 019fbdabec867bc2b12dc61626116d5c --removal-test codexswap-quota-skill-copy --rollback-ref 5ef23a1e975c1ed6cb3cd3917d483c5f --reversible
-```
-
-- [ ] **Step 6: Commit the skill source**
+- [ ] **Step 5: Commit the skill source**
 
 ```bash
 rtk git add skills/codexswap-quotas
@@ -383,7 +380,7 @@ rtk git commit -m "feat: add CodexSwap quota chat skill"
 Dispatch a fresh general-purpose subagent with:
 
 ```text
-Use $codexswap-quotas at /Users/vjmabansag/.codex/skills/codexswap-quotas to answer: What are my current Codex quotas for every CodexSwap account? Include five-hour and weekly windows plus manual reset credits. Do not change accounts or quota. Return the user-facing answer, commands and exit codes, secret-safety check, unresolved risks, and confidence.
+Use $codexswap-quotas to answer: What are my current Codex quotas for every CodexSwap account? Include five-hour and weekly windows plus manual reset credits. Do not change accounts or quota. Return the user-facing answer, commands and exit codes, secret-safety check, unresolved risks, and confidence.
 ```
 
 Expected: the agent runs only the helper, reports all available accounts, and exposes none of the forbidden fields.
@@ -418,23 +415,11 @@ Expected: signing verification passes and installed help contains `quota --json`
 From `/private/tmp`, run:
 
 ```bash
-rtk proxy bash /Users/vjmabansag/.codex/skills/codexswap-quotas/scripts/check-quotas.sh
+/bin/bash "${CODEX_HOME:-$HOME/.codex}/skills/codexswap-quotas/scripts/check-quotas.sh"
 ```
 
 Validate the output with Python: schema version 1, unique aliases, expected quota fields, and absence of keys or values matching `email`, `token`, `accountID`, `creditID`, `Authorization`, or bearer-token patterns.
 
-- [ ] **Step 5: Reconcile managed-resource hygiene**
-
-Run:
-
-```bash
-rtk proxy python3 /Users/vjmabansag/.codex/hygiene/hygiene_ledger.py use 74f32068ab9f2d76492df72a719ff65b
-rtk proxy python3 /Users/vjmabansag/.codex/hygiene/hygiene_ledger.py reconcile
-rtk proxy python3 /Users/vjmabansag/.codex/hygiene/hygiene_ledger.py verify
-```
-
-Expected: the resource use is recorded and ledger verification returns success.
-
-- [ ] **Step 6: Record acceptance evidence**
+- [ ] **Step 5: Record acceptance evidence**
 
 Report every Gherkin scenario from the design as passed, failed, blocked, or not tested, with the exact test/build/runtime command supporting the status. Record the installed command path, skill path, and final commit IDs. Do not include live account aliases or quota values in commit messages or persistent metadata.

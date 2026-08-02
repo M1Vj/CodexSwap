@@ -15,7 +15,7 @@ or expose authentication material.
 The personal Codex skill triggers on requests for current CodexSwap quota,
 usage, remaining capacity, reset times, or reset-credit availability across
 accounts. It invokes one deterministic helper and summarizes the result in the
-user's local timezone, Asia/Manila.
+user's local time zone.
 
 A successful report shows, for each account alias:
 
@@ -57,7 +57,7 @@ The service does not persist tokens, quota results, cooldowns, active-account
 selection, or settings. It may use the current in-memory account information,
 but it must not call account mutation methods.
 
-### Personal Codex skill
+### Codex skill
 
 Keep the version-controlled skill source at
 `skills/codexswap-quotas/`. Install a copy at
@@ -139,7 +139,7 @@ Feature: Ask Codex for all CodexSwap quotas
   Rule: The skill works outside the repository directory
 
     Scenario: Ask from another Codex chat
-      Given the personal skill is installed and CodexSwap is installed
+      Given the Codex skill is installed and CodexSwap is installed
       When the user asks “What are my Codex quotas?” from another workspace
       Then Codex invokes the installed CodexSwap quota command
       And returns the sanitized all-account report

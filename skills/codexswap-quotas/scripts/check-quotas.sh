@@ -1,10 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd -P)"
+
 candidates=(
   "/Applications/CodexSwap.app/Contents/MacOS/swapd"
-  "/Users/vjmabansag/Projects/CodexSwap/.build/release/swapd"
-  "/Users/vjmabansag/Projects/CodexSwap/.build/debug/swapd"
+  "$HOME/Applications/CodexSwap.app/Contents/MacOS/swapd"
+  "$repo_root/.build/release/swapd"
+  "$repo_root/.build/debug/swapd"
 )
 
 for binary in "${candidates[@]}"; do
