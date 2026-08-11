@@ -23,8 +23,8 @@ grep -Fq 'permissions:' .github/workflows/ci.yml || fail "CI must declare least-
 grep -Fq 'contents: read' .github/workflows/ci.yml || fail "CI must only read repository contents"
 [[ "$(grep -F 'runs-on: macos-15' .github/workflows/ci.yml .github/workflows/release.yml | wc -l | tr -d ' ')" == "2" ]] \
   || fail "Swift 6 workflows must use the macOS 15 runner"
-[[ "$(grep -F 'uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' .github/workflows/ci.yml .github/workflows/release.yml | wc -l | tr -d ' ')" == "2" ]] \
-  || fail "workflows must pin checkout v7.0.0 to its immutable SHA"
+[[ "$(grep -F 'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' .github/workflows/ci.yml .github/workflows/release.yml | wc -l | tr -d ' ')" == "2" ]] \
+  || fail "workflows must pin checkout v7.0.1 to its immutable SHA"
 grep -A6 -F 'Check out tagged source' .github/workflows/release.yml | grep -Fq 'persist-credentials: false' \
   || fail "release checkout must not persist a write credential"
 grep -Fq 'gh auth setup-git' .github/workflows/release.yml || fail "cask publication does not explicitly configure git authentication"
