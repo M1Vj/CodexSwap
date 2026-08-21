@@ -160,11 +160,32 @@ private struct AccountSettingsRowView: View {
     }
 
     private var priorityControl: some View {
-        Stepper(
-            "Priority: \(account.priority)",
-            value: priorityBinding,
-            in: AccountPriority.allowedValues
-        )
+        HStack(spacing: 6) {
+            Text("Rank #\(account.rank)")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(account.rank == 1 ? .primary : .secondary)
+                .accessibilityLabel("Rank \(account.rank) of \(account.rankCount)")
+            VStack(spacing: 2) {
+                Button {
+                    model.actions.reorderRank(account.alias, account.rank - 2)
+                } label: {
+                    Image(systemName: "chevron.up")
+                }
+                .disabled(account.rank <= 1)
+                .help("Move up in rotation ranking")
+                .accessibilityLabel("Move \(account.alias) up")
+                Button {
+                    model.actions.reorderRank(account.alias, account.rank)
+                } label: {
+                    Image(systemName: "chevron.down")
+                }
+                .disabled(account.rank >= account.rankCount)
+                .help("Move down in rotation ranking")
+                .accessibilityLabel("Move \(account.alias) down")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+        }
         .fixedSize()
     }
 
@@ -229,6 +250,7 @@ private struct AccountSettingsRowView: View {
         [
             AccountRoutingPresentation.status(routingEnabled: account.routingEnabled),
             account.needsLogin ? "Needs sign-in" : nil,
+            account.isDraining ? "Draining from other users" : nil,
         ]
         .compactMap { $0 }
         .joined(separator: " · ")

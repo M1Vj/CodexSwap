@@ -46,12 +46,13 @@ case "list":
     let accounts = await store.all()
     let active = await store.activeAlias()
     if accounts.isEmpty { print("no accounts. run: swapd import"); break }
-    for a in accounts.sorted(by: { $0.priority > $1.priority }) {
+    let ranked = accounts.sorted(by: { $0.priority > $1.priority })
+    for (rank, a) in ranked.enumerated() {
         let mark = a.alias == active ? "*" : " "
         let cooldown = a.cooldownUntil(now: Date()).map { " limited→\(fmtReset($0))" } ?? ""
         let needs = a.needsLogin ? " NEEDS-LOGIN" : ""
         let usage = a.usage.map { "\($0.label):\($0.usedPercent)%" }.joined(separator: " ")
-        print("\(mark) [p\(a.priority)] \(a.alias)  <\(a.email)>  \(usage)\(cooldown)\(needs)")
+        print("\(mark) [rank #\(rank + 1)/\(ranked.count)] \(a.alias)  <\(a.email)>  \(usage)\(cooldown)\(needs)")
     }
 
 case "usage":

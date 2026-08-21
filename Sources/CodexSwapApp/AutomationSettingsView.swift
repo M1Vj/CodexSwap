@@ -50,6 +50,10 @@ struct QuotaResetsSettingsView: View {
                 Toggle("When CodexSwap switches accounts", isOn: notifyOnRotateBinding)
                 Toggle("When every account is exhausted", isOn: notifyOnExhaustedBinding)
                 Toggle("When a quota window resets", isOn: notifyOnResetBinding)
+                Toggle("When an account needs sign-in", isOn: notifyOnNeedsLoginBinding)
+                Text("Sign-in reminders fire once per logged-out episode, not on every failed request.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -103,6 +107,10 @@ struct QuotaResetsSettingsView: View {
 
     private var notifyOnResetBinding: Binding<Bool> {
         Binding(get: { model.settings.notifyOnWindowReset }, set: { value in model.actions.setNotifyOnWindowReset(value) })
+    }
+
+    private var notifyOnNeedsLoginBinding: Binding<Bool> {
+        Binding(get: { model.settings.notifyOnNeedsLogin }, set: { value in model.actions.setNotifyOnNeedsLogin(value) })
     }
 
 }

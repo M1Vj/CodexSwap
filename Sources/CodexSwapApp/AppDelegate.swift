@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private var taskBoardViewModel: TaskBoardViewModel!
     private var taskBoardWindowController: TaskBoardWindowController?
+    private var usageMonitorWindowController: UsageMonitorWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -130,7 +131,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 notify(title: "All accounts limited", body: "Every account is out on \(limit). Codex will error until one resets.")
             }
         case let .needsLogin(alias):
-            notify(title: "Account needs sign-in", body: "\(alias) was signed out. Re-add it via Add account…")
+            // The engine dedupes to one event per logged-out episode; this gate lets the
+            // user silence even that single reminder.
+            if settings.notifyOnNeedsLogin {
+                notify(title: "Account needs sign-in", body: "\(alias) was signed out. Re-add it via Add account…")
+            }
         case let .windowReset(alias):
             if settings.notifyOnWindowReset {
                 notify(title: "Quota reset", body: "\(alias) is back in rotation.")
@@ -211,6 +216,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status.isEnabled = false
         menu.addItem(status)
 
+        let pool = UsageAnalytics.poolSummary(accounts: latest.accounts, drainingAliases: latest.drainingAliases)
+        if !latest.accounts.isEmpty {
+            var poolParts = ["\(pool.healthyCount)/\(pool.accountCount) healthy"]
+            if settings.smartSwitchEnabled {
+                poolParts.append("\(pool.drainingCount) draining by others")
+            }
+            let poolLine = NSMenuItem(
+                title: "Pool · \(poolParts.joined(separator: " · "))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            poolLine.isEnabled = false
+            menu.addItem(poolLine)
+        }
+
         let active = NSMenuItem(title: "Active account: \(latest.activeAlias ?? "none")", action: nil, keyEquivalent: "")
         active.isEnabled = false
         menu.addItem(active)
@@ -270,12 +290,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(empty)
         }
 
-        for acc in latest.accounts.sorted(by: { $0.priority > $1.priority }) {
-            let item = NSMenuItem(title: label(for: acc), action: #selector(switchAccount(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = acc.alias
-            item.state = acc.alias == latest.activeAlias ? .on : .off
-            item.isEnabled = AccountRoutingPresentation.canMakeActive(routingEnabled: acc.routingEnabled)
+        // Rank display order everywhere: priority desc, alias asc for stable ties.
+        let rankedAccounts = latest.accounts.sorted {
+            $0.priority == $1.priority
+                ? $0.alias.localizedCaseInsensitiveCompare($1.alias) == .orderedAscending
+                : $0.priority > $1.priority
+        }
+        for (index, acc) in rankedAccounts.enumerated() {
+            let row = MenuAccountRow(
+                rank: index + 1,
+                alias: acc.alias,
+                isActive: acc.alias == latest.activeAlias,
+                isEnabled: AccountRoutingPresentation.canMakeActive(routingEnabled: acc.routingEnabled),
+                needsLogin: acc.needsLogin,
+                isDraining: latest.drainingAliases.contains(acc.alias),
+                cooldownUntil: acc.cooldownUntil(now: Date()),
+                windows: acc.usage,
+                costEstimate: acc.usageStats.map { UsageAnalytics.estimatedCost($0) }
+            )
+            let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
+            let alias = acc.alias
+            let rowEnabled = AccountRoutingPresentation.canMakeActive(routingEnabled: acc.routingEnabled)
+            item.view = MenuRowContainer(row: row, width: 360, isEnabled: rowEnabled) { [weak self] in
+                self?.activateAccount(alias)
+            }
             menu.addItem(item)
         }
 
@@ -287,6 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         warm.isEnabled = !latest.warmupInProgress
         menu.addItem(warm)
         menu.addItem(.separator())
+        addAction("Usage Monitor…", #selector(showUsageMonitor))
         let taskBoard = NSMenuItem(title: "Task Board…", action: #selector(showTaskBoard), keyEquivalent: "t")
         taskBoard.target = self
         taskBoard.keyEquivalentModifierMask = [.command]
@@ -335,6 +374,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStrategy: { [weak self] strategy in self?.changeStrategy(strategy) },
             switchAccount: { [weak self] alias in self?.activateAccount(alias) },
             setPriority: { [weak self] alias, priority in self?.changePriority(alias, priority: priority) },
+            reorderRank: { [weak self] alias, toIndex in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.engine.reorderRank(alias, toIndex: toIndex)
+                    await self.refreshSnapshot()
+                }
+            },
             setAccountRouting: { [weak self] alias, enabled in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -372,6 +418,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setNotifyOnRotate: { [weak self] enabled in self?.updateSettings { $0.notifyOnRotate = enabled } },
             setNotifyOnExhausted: { [weak self] enabled in self?.updateSettings { $0.notifyOnExhausted = enabled } },
             setNotifyOnWindowReset: { [weak self] enabled in self?.updateSettings { $0.notifyOnWindowReset = enabled } },
+            setNotifyOnNeedsLogin: { [weak self] enabled in self?.updateSettings { $0.notifyOnNeedsLogin = enabled } },
+            setSmartSwitch: { [weak self] enabled in self?.updateSettings { $0.smartSwitchEnabled = enabled } },
             setAutomationEnabled: { [weak self] enabled in self?.updateSettings { $0.automationEnabled = enabled } },
             setAutomationAccounts: { [weak self] aliases in self?.updateSettings { $0.automationAccounts = Array(Set(aliases)).sorted() } },
             setNotifyOnTaskEvents: { [weak self] enabled in self?.updateSettings { $0.notifyOnTaskEvents = enabled } },
@@ -493,6 +541,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         taskBoardWindowController?.show()
     }
 
+    @objc private func showUsageMonitor() {
+        if usageMonitorWindowController == nil {
+            usageMonitorWindowController = UsageMonitorWindowController(engine: engine)
+        }
+        usageMonitorWindowController?.show()
+    }
+
     @discardableResult
     private func focusTaskBoard(taskID: UUID) -> TaskBoardFocusResult {
         let result = taskBoardViewModel.focusTask(taskID)
@@ -583,11 +638,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             presentMessage("The latest run log could not be opened.")
             return
         }
-    }
-
-    @objc private func switchAccount(_ sender: NSMenuItem) {
-        guard let alias = sender.representedObject as? String else { return }
-        activateAccount(alias)
     }
 
     private func activateAccount(_ alias: String) {

@@ -39,6 +39,10 @@ public struct Settings: Codable, Sendable, Equatable {
     public var automationMinHeadroomPercent: Int
     public var automationDefaultModel: String
     public var notifyOnTaskEvents: Bool
+    /// Post a notification when an account is flagged as needing sign-in (deduplicated per episode).
+    public var notifyOnNeedsLogin: Bool
+    /// Prefer accounts whose quota is draining from other users' activity when picking the next account.
+    public var smartSwitchEnabled: Bool
     public var proxyPort: Int
 
     public static let defaultProxyPort = 58_432
@@ -68,6 +72,8 @@ public struct Settings: Codable, Sendable, Equatable {
         automationMinHeadroomPercent: 5,
         automationDefaultModel: "gpt-5.6-sol",
         notifyOnTaskEvents: true,
+        notifyOnNeedsLogin: true,
+        smartSwitchEnabled: false,
         proxyPort: defaultProxyPort
     )
 
@@ -96,6 +102,8 @@ public struct Settings: Codable, Sendable, Equatable {
         automationMinHeadroomPercent: Int = 5,
         automationDefaultModel: String,
         notifyOnTaskEvents: Bool,
+        notifyOnNeedsLogin: Bool = true,
+        smartSwitchEnabled: Bool = false,
         proxyPort: Int
     ) {
         self.rotationStrategy = rotationStrategy
@@ -122,6 +130,8 @@ public struct Settings: Codable, Sendable, Equatable {
         self.automationMinHeadroomPercent = min(max(automationMinHeadroomPercent, 0), 50)
         self.automationDefaultModel = automationDefaultModel
         self.notifyOnTaskEvents = notifyOnTaskEvents
+        self.notifyOnNeedsLogin = notifyOnNeedsLogin
+        self.smartSwitchEnabled = smartSwitchEnabled
         self.proxyPort = proxyPort
     }
 
@@ -157,6 +167,8 @@ public struct Settings: Codable, Sendable, Equatable {
         automationMinHeadroomPercent = (0...50).contains(decodedHeadroom) ? decodedHeadroom : d.automationMinHeadroomPercent
         automationDefaultModel = try c.decodeIfPresent(String.self, forKey: .automationDefaultModel) ?? d.automationDefaultModel
         notifyOnTaskEvents = try c.decodeIfPresent(Bool.self, forKey: .notifyOnTaskEvents) ?? d.notifyOnTaskEvents
+        notifyOnNeedsLogin = try c.decodeIfPresent(Bool.self, forKey: .notifyOnNeedsLogin) ?? d.notifyOnNeedsLogin
+        smartSwitchEnabled = try c.decodeIfPresent(Bool.self, forKey: .smartSwitchEnabled) ?? d.smartSwitchEnabled
         let decodedPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
         proxyPort = (1...65_535).contains(decodedPort) ? decodedPort : d.proxyPort
     }

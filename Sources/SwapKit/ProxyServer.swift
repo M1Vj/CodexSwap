@@ -189,14 +189,31 @@ func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHead
     return headers
 }
 
+/// Token totals extracted from one completed upstream response.
+public struct ProxyUsageSample: Sendable, Equatable {
+    public let model: String
+    public let inputTokens: Int
+    public let cachedInputTokens: Int
+    public let outputTokens: Int
+
+    public init(model: String, inputTokens: Int, cachedInputTokens: Int, outputTokens: Int) {
+        self.model = model
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.outputTokens = outputTokens
+    }
+}
+
 public struct ProxyEvent: Sendable {
-    public enum Kind: Sendable { case rotated, exhausted, needsLogin, refreshed, tokensUpdated, served }
+    public enum Kind: Sendable { case rotated, exhausted, needsLogin, refreshed, tokensUpdated, served, usage }
     public let kind: Kind
     public let from: String?
     public let to: String?
     public let limit: String?
     public let resetAt: Date?
     public let runID: String?
+    /// Present only for `.usage` events.
+    public let usage: ProxyUsageSample?
 
     public init(
         kind: Kind,
@@ -204,7 +221,8 @@ public struct ProxyEvent: Sendable {
         to: String?,
         limit: String?,
         resetAt: Date?,
-        runID: String? = nil
+        runID: String? = nil,
+        usage: ProxyUsageSample? = nil
     ) {
         self.kind = kind
         self.from = from
@@ -212,6 +230,7 @@ public struct ProxyEvent: Sendable {
         self.limit = limit
         self.resetAt = resetAt
         self.runID = runID
+        self.usage = usage
     }
 
     static func taskScoped(
@@ -831,7 +850,7 @@ public actor ProxyServer {
             // not refresh, fail over, or make another exhaustion decision from it.
             if finalReplay {
                 recordActivity(account.alias)
-                try await streamResponse(outbound, response: resp)
+                try await streamResponse(outbound, response: resp, accountAlias: account.alias)
                 return
             }
 
@@ -989,7 +1008,7 @@ public actor ProxyServer {
                 alias: account.alias,
                 requestKey: interactiveKey
             )
-            try await streamResponse(outbound, response: resp)
+            try await streamResponse(outbound, response: resp, accountAlias: account.alias)
             return
         }
         try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
@@ -1110,12 +1129,39 @@ public actor ProxyServer {
 
     // MARK: - Response writing
 
-    private func streamResponse(_ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, response: HTTPClientResponse) async throws {
+    private func streamResponse(
+        _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        response: HTTPClientResponse,
+        accountAlias: String
+    ) async throws {
         let headers = filteredResponseHeaders(response.headers)
         let respHead = HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)
         try await outbound.write(.head(respHead))
+        var scanner = SSEUsageScanner()
         for try await chunk in response.body {
             try await outbound.write(.body(.byteBuffer(chunk)))
+            scanner.feed(chunk)
+            if let sample = scanner.consume() {
+                await sink.handle(ProxyEvent(
+                    kind: .usage,
+                    from: accountAlias,
+                    to: nil,
+                    limit: nil,
+                    resetAt: nil,
+                    usage: sample
+                ))
+            }
+        }
+        // Streams may end without a trailing newline; flush any tail line.
+        if let sample = scanner.finish() {
+            await sink.handle(ProxyEvent(
+                kind: .usage,
+                from: accountAlias,
+                to: nil,
+                limit: nil,
+                resetAt: nil,
+                usage: sample
+            ))
         }
         try await outbound.write(.end(nil))
     }
@@ -1209,6 +1255,90 @@ public actor ProxyServer {
 }
 
 // MARK: - Detection helpers
+
+/// Incremental observer for streamed SSE bodies. Forwards nothing; it only watches
+/// complete lines for `response.completed` payloads and extracts token usage once.
+/// Memory stays bounded: partial lines beyond the cap are discarded until the next newline.
+struct SSEUsageScanner {
+    static let maxLineBytes = 1024 * 1024
+
+    private var pending = [UInt8]()
+    private var oversizedLine = false
+    /// Set when a completed response's usage has been parsed; consume via `consume()`.
+    private var extracted: ProxyUsageSample?
+
+    /// Returns and clears the extracted sample, if any.
+    mutating func consume() -> ProxyUsageSample? {
+        guard let sample = extracted else { return nil }
+        extracted = nil
+        return sample
+    }
+
+    /// Processes any unterminated tail line when the stream ends without a newline.
+    mutating func finish() -> ProxyUsageSample? {
+        if !oversizedLine, !pending.isEmpty {
+            processLine(pending)
+            pending.removeAll(keepingCapacity: true)
+        }
+        oversizedLine = false
+        return consume()
+    }
+
+    mutating func feed(_ chunk: ByteBuffer) {
+        guard extracted == nil else { return }
+        let bytes = chunk.getBytes(at: chunk.readerIndex, length: chunk.readableBytes) ?? []
+        for byte in bytes {
+            if byte == UInt8(ascii: "\n") {
+                if !oversizedLine { processLine(pending) }
+                pending.removeAll(keepingCapacity: true)
+                oversizedLine = false
+                if extracted != nil { return }
+            } else {
+                if pending.count < Self.maxLineBytes {
+                    pending.append(byte)
+                } else {
+                    oversizedLine = true
+                }
+            }
+        }
+    }
+
+    private mutating func processLine(_ raw: [UInt8]) {
+        // SSE frames the payload after "data:"; plain JSON bodies also parse fine here.
+        var line = raw
+        if line.count > 5, line[0] == UInt8(ascii: "d"), line[1] == UInt8(ascii: "a"),
+           line[2] == UInt8(ascii: "t"), line[3] == UInt8(ascii: "a") {
+            var start = 4
+            if start < line.count, line[start] == UInt8(ascii: ":") { start += 1 }
+            while start < line.count, line[start] == UInt8(ascii: " ") || line[start] == UInt8(ascii: "\t") { start += 1 }
+            line = Array(line[start...])
+        }
+        guard line.contains(UInt8(ascii: "{")) else { return }
+        guard let object = try? JSONSerialization.jsonObject(
+            with: Data(line),
+            options: [.fragmentsAllowed]
+        ) as? [String: Any] else { return }
+        guard (object["type"] as? String) == "response.completed" else { return }
+        guard let response = object["response"] as? [String: Any],
+              let model = response["model"] as? String,
+              !model.isEmpty,
+              let usage = response["usage"] as? [String: Any] else { return }
+        func intField(_ name: String) -> Int? {
+            if let n = usage[name] as? Int { return n }
+            if let d = usage[name] as? Double, d >= 0, d.rounded() == d { return Int(d) }
+            return nil
+        }
+        guard let input = intField("input_tokens"),
+              let output = intField("output_tokens") else { return }
+        let cached = intField("cached_input_tokens") ?? 0
+        extracted = ProxyUsageSample(
+            model: model,
+            inputTokens: input,
+            cachedInputTokens: cached,
+            outputTokens: output
+        )
+    }
+}
 
 func splitPathQuery(_ uri: String) -> (String, String?) {
     if let idx = uri.firstIndex(of: "?") {

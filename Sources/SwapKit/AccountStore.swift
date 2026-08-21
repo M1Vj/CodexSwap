@@ -15,6 +15,9 @@ public actor AccountStore {
     private let url: URL
     private var data: StoreData
     public private(set) var strategy: RotationStrategy
+    /// Aliases currently assessed as draining from other users' activity (smart switch).
+    private var drainingAliases: Set<String> = []
+    private static let historyCap = 64
 
     public init(url: URL = AppPaths.storeFile(), strategy: RotationStrategy = .priority) {
         self.url = url
@@ -67,9 +70,15 @@ public actor AccountStore {
     }
 
     private func eligibleSorted(now: Date) -> [Account] {
-        data.accounts
-            .filter { $0.isEligible(now: now) }
-            .sorted { Self.selectionOrder($0, $1, strategy: .priority) }
+        strategySorted(data.accounts.filter { $0.isEligible(now: now) }, strategy: .priority)
+    }
+
+    /// Applies the configured strategy order, then floats smart-switch draining accounts ahead.
+    private func strategySorted(_ accounts: [Account], strategy: RotationStrategy) -> [Account] {
+        let base = accounts.sorted { Self.selectionOrder($0, $1, strategy: strategy) }
+        guard !drainingAliases.isEmpty else { return base }
+        let drainState = Dictionary(uniqueKeysWithValues: base.map { ($0.alias, drainingAliases.contains($0.alias)) })
+        return SmartSwitchPolicy.sortWithDrainingFirst(base, drainState: drainState)
     }
 
     /// Best allowed account under the configured rotation strategy, preferring accounts
@@ -83,9 +92,10 @@ public actor AccountStore {
         now: Date = Date()
     ) -> Account? {
         let allowed = Set(aliases)
-        let ordered = data.accounts
-            .filter { allowed.contains($0.alias) && $0.isEligible(now: now) }
-            .sorted { Self.selectionOrder($0, $1, strategy: strategy) }
+        let ordered = strategySorted(
+            data.accounts.filter { allowed.contains($0.alias) && $0.isEligible(now: now) },
+            strategy: strategy
+        )
         return ordered.first {
             $0.isWithinRotationThresholds(primaryPercent: primaryThreshold, secondaryPercent: secondaryThreshold)
         } ?? ordered.first
@@ -236,12 +246,79 @@ public actor AccountStore {
         // empty response must not wipe a real reading off the display.
         if windows.isEmpty, !data.accounts[i].usage.isEmpty { return }
         data.accounts[i].usage = windows
+        appendHistorySamples(at: i, windows: windows)
         // Fresh usage reporting headroom supersedes a recorded cooldown: a limit hit before
         // an early reset (or lifted upstream) must not park the account until the stale
         // resets_at. A limit that still holds re-establishes its cooldown on the next 429.
         if !windows.isEmpty, windows.allSatisfy({ $0.usedPercent < 100 }),
            !data.accounts[i].disabledUntil.isEmpty {
             data.accounts[i].disabledUntil = [:]
+        }
+        persist()
+    }
+
+    /// Appends fresh window readings to the burn-rate history ring (newest last).
+    private func appendHistorySamples(at i: Int, windows: [UsageWindow]) {
+        let samples = UsageAnalytics.samples(from: windows)
+        var history = data.accounts[i].usageHistory ?? []
+        history.append(contentsOf: samples)
+        if history.count > Self.historyCap {
+            history.removeFirst(history.count - Self.historyCap)
+        }
+        data.accounts[i].usageHistory = history
+    }
+
+    /// Folds one completed proxied response into the account's lifetime token totals.
+    public func updateUsageStats(
+        _ alias: String,
+        model: String,
+        inputTokens: Int,
+        cachedInputTokens: Int,
+        outputTokens: Int
+    ) {
+        guard let i = index(alias) else { return }
+        var stats = data.accounts[i].usageStats ?? UsageStats()
+        stats.accumulate(
+            model: model,
+            inputTokens: inputTokens,
+            cachedInputTokens: cachedInputTokens,
+            outputTokens: outputTokens
+        )
+        data.accounts[i].usageStats = stats
+        persist()
+    }
+
+    /// Stamps when CodexSwap itself last routed traffic on this account (drain attribution).
+    public func markServed(_ alias: String, date: Date = Date()) {
+        guard let i = index(alias) else { return }
+        data.accounts[i].lastServedByUs = date
+        persist()
+    }
+
+    public func setDrainingAliases(_ aliases: Set<String>) {
+        drainingAliases = aliases
+    }
+
+    public func currentDrainingAliases() -> Set<String> { drainingAliases }
+
+    /// Moves an account within the priority-sorted ranking and reassigns the existing
+    /// priority values along the path so every other account keeps a distinct slot.
+    /// `toIndex` is a position in the current ranking where 0 is the top rank.
+    public func reorderAccount(_ alias: String, toIndex target: Int) {
+        let ranked = data.accounts.sorted { Self.selectionOrder($0, $1, strategy: .priority) }
+        guard ranked.count > 1 else { return }
+        guard let from = ranked.firstIndex(where: { $0.alias == alias }) else { return }
+        let to = min(max(target, 0), ranked.count - 1)
+        guard from != to else { return }
+        var reordered = ranked
+        let moved = reordered.remove(at: from)
+        reordered.insert(moved, at: to)
+        // Every slot keeps the priority value it held before the move, so accounts shifted
+        // along the path inherit their new rank's value.
+        for (position, entry) in reordered.enumerated() {
+            if let i = index(entry.alias) {
+                data.accounts[i].priority = AccountPriority.normalize(ranked[position].priority)
+            }
         }
         persist()
     }
@@ -286,10 +363,18 @@ public actor AccountStore {
             merged.routingEnabled = data.accounts[i].routingEnabled
             merged.lastUsedAt = data.accounts[i].lastUsedAt
             merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
+            // needsLogin is runtime overlay state, not import data: the periodic CodexBar
+            // sync upserts every account, and imports always carry false, so copying the
+            // incoming value here silently re-arms a logged-out account every poll cycle.
+            merged.needsLogin = data.accounts[i].needsLogin
             // Imported records never carry usage; the periodic CodexBar sync upserts every
             // account, so dropping the stored windows here blanks the display (and the
             // banked-window gate's input) for up to a poll interval each minute.
             if merged.usage.isEmpty { merged.usage = data.accounts[i].usage }
+            // Same preservation for locally observed telemetry: imports never carry it.
+            if merged.usageStats == nil { merged.usageStats = data.accounts[i].usageStats }
+            if (merged.usageHistory ?? []).isEmpty { merged.usageHistory = data.accounts[i].usageHistory }
+            if merged.lastServedByUs == nil { merged.lastServedByUs = data.accounts[i].lastServedByUs }
             // Keep whichever token bundle expires later so a stale on-disk copy never
             // clobbers a fresher one, independent of import order.
             let existingExp = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast

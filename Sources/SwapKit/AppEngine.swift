@@ -37,6 +37,8 @@ public struct EngineSnapshot: Sendable {
     public let tasks: [AutomationTask]
     public let runningTaskIDs: Set<UUID>
     public let schedulingReasons: [String: String]
+    /// Aliases currently assessed as draining from other users' activity (smart switch).
+    public let drainingAliases: Set<String>
 
     public var isRunning: Bool { proxyURL != nil }
 
@@ -45,7 +47,8 @@ public struct EngineSnapshot: Sendable {
                 routingState: CodexRoutingState = .disabled, warmupSummary: WarmupSummary? = nil,
                 warmupInProgress: Bool = false,
                 resetCreditStatuses: [String: AccountResetCreditStatus] = [:], tasks: [AutomationTask] = [],
-                runningTaskIDs: Set<UUID> = [], schedulingReasons: [String: String] = [:]) {
+                runningTaskIDs: Set<UUID> = [], schedulingReasons: [String: String] = [:],
+                drainingAliases: Set<String> = []) {
         self.accounts = accounts
         self.activeAlias = activeAlias
         self.proxyURL = proxyURL
@@ -60,6 +63,7 @@ public struct EngineSnapshot: Sendable {
         self.tasks = tasks
         self.runningTaskIDs = runningTaskIDs
         self.schedulingReasons = schedulingReasons
+        self.drainingAliases = drainingAliases
     }
 }
 
@@ -117,6 +121,8 @@ public actor AppEngine {
     private var interruptingTaskIDs: Set<UUID> = []
     private var repositoryLeases: [UUID: String] = [:]
     private var schedulingReasons: [String: String] = [:]
+    /// Aliases whose logged-out episode already raised a notification; cleared on recovery.
+    private var needsLoginNotified: Set<String> = []
 
     public init(
         store: AccountStore = AccountStore(),
@@ -353,7 +359,8 @@ public actor AppEngine {
             resetCreditStatuses: await sanitizedResetCreditStatuses(),
             tasks: await taskStore.all(),
             runningTaskIDs: await taskRunner.runningIDs(),
-            schedulingReasons: schedulingReasons
+            schedulingReasons: schedulingReasons,
+            drainingAliases: await store.currentDrainingAliases()
         )
     }
 
@@ -363,6 +370,23 @@ public actor AppEngine {
     public func settingsSnapshot() async -> EngineSnapshot {
         await scheduleResetCreditStatusRefresh()
         return await snapshot()
+    }
+
+    /// Analytics-enriched view of the whole pool for the usage monitor UI.
+    public func usageOverview() async -> PoolUsageOverview {
+        let settings = await settingsStore.get()
+        return UsageOverviewBuilder.build(
+            accounts: await store.all(),
+            activeAlias: await store.activeAlias(),
+            drainingAliases: await store.currentDrainingAliases(),
+            smartSwitchEnabled: settings.smartSwitchEnabled
+        )
+    }
+
+    /// Moves an account within the priority ranking; `toIndex` 0 is the top rank.
+    public func reorderRank(_ alias: String, toIndex: Int) async {
+        await store.reorderAccount(alias, toIndex: toIndex)
+        emit(.snapshotChanged)
     }
 
     public func refreshResetCreditStatuses(aliases: Set<String>? = nil) async {
@@ -793,6 +817,8 @@ public actor AppEngine {
     }
 
     public func switchTo(_ alias: String) async {
+        // Manual action implies the user saw the account state; a later break may notify again.
+        needsLoginNotified.remove(alias)
         await store.setActive(alias)
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
@@ -805,6 +831,7 @@ public actor AppEngine {
 
     public func remove(_ alias: String) async {
         await store.remove(alias)
+        needsLoginNotified.remove(alias)
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
     }
@@ -980,7 +1007,7 @@ public actor AppEngine {
                     "proxy",
                     "rotated \(Self.oneLine(event.from ?? "unknown")) to \(Self.oneLine(event.to ?? "unknown")) limit \(Self.oneLine(event.limit ?? "codex"))"
                 )
-            case .refreshed, .tokensUpdated, .served:
+            case .refreshed, .tokensUpdated, .served, .usage:
                 break
             }
         }
@@ -1012,12 +1039,35 @@ public actor AppEngine {
                 emit(.exhausted(limit: event.limit ?? "codex"))
             }
         case .needsLogin:
-            emit(.needsLogin(alias: event.from ?? "?"))
+            // One notification per logged-out episode: the proxy emits an event per failing
+            // request, so without this gate the same login problem re-notifies every poll.
+            let alias = event.from ?? "?"
+            if !needsLoginNotified.contains(alias) {
+                needsLoginNotified.insert(alias)
+                emit(.needsLogin(alias: alias))
+            }
         case .refreshed:
+            needsLoginNotified.remove(event.from ?? "?")
             emit(.refreshed(alias: event.from ?? "?"))
         case .tokensUpdated:
+            needsLoginNotified.remove(event.from ?? "?")
             break
+        case .usage:
+            guard let alias = event.from, !alias.isEmpty, let sample = event.usage else { break }
+            await store.updateUsageStats(
+                alias,
+                model: sample.model,
+                inputTokens: sample.inputTokens,
+                cachedInputTokens: sample.cachedInputTokens,
+                outputTokens: sample.outputTokens
+            )
+            await store.markServed(alias)
+            needsLoginNotified.remove(alias)
         case .served:
+            if let alias = event.from, !alias.isEmpty {
+                await store.markServed(alias)
+                needsLoginNotified.remove(alias)
+            }
             if event.runID == nil {
                 await autoLog.write("proxy", "serving interactive traffic on \(Self.oneLine(event.from ?? "unknown"))")
             } else {
@@ -1710,7 +1760,10 @@ public actor AppEngine {
                 let settings = await self.settingsPoll()
                 await self.syncCodexBar()
                 await self.expireCooldownsAndNotify()
-                await self.pollUsage(activeOnly: true)
+                // Smart switching needs fresh readings for the whole pool: drain detection
+                // watches accounts CodexSwap itself is not serving, which active-only
+                // polling never sees.
+                await self.pollUsage(activeOnly: !settings.smartSwitchEnabled)
                 await self.pollRunningTaskUsage(settings: settings)
                 await self.automationTick()
                 if settings.automaticallyWarmAccounts,
@@ -1752,15 +1805,34 @@ public actor AppEngine {
     }
 
     private func pollUsage(activeOnly: Bool, aliases: Set<String>? = nil) async {
+        let settings = await settingsStore.get()
         let accounts = await store.all()
         let activeAlias = await store.activeAlias()
+        var draining: Set<String> = []
+        let now = Date()
         for acc in accounts where !acc.accessToken.isEmpty {
             if activeOnly && acc.alias != activeAlias { continue }
             if let aliases, !aliases.contains(acc.alias) { continue }
             guard !JWT.isStale(acc.accessToken) else { continue }
+            // A needs-login account rejects every usage call; polling it wastes a request
+            // per tick until the user signs in again.
+            guard !acc.needsLogin else { continue }
             if let windows = try? await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID) {
                 await store.updateUsage(acc.alias, windows: windows)
+                if settings.smartSwitchEnabled, let updated = await store.account(acc.alias),
+                   SmartSwitchPolicy.assess(
+                       account: updated,
+                       previousHistory: updated.usageHistory ?? [],
+                       now: now
+                   ).isDraining {
+                    draining.insert(acc.alias)
+                }
             }
+        }
+        if settings.smartSwitchEnabled {
+            await store.setDrainingAliases(draining)
+        } else if !(await store.currentDrainingAliases()).isEmpty {
+            await store.setDrainingAliases([])
         }
     }
 

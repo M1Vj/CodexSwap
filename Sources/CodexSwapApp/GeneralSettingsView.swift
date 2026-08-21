@@ -17,6 +17,17 @@ struct GeneralSettingsView: View {
                 }
             }
 
+            SettingsSection(title: "Account Rotation") {
+                Picker("Rotation order", selection: strategyBinding) {
+                    Text("Ranking (top rank first)").tag(RotationStrategy.priority)
+                    Text("Round-robin (spread evenly)").tag(RotationStrategy.roundRobin)
+                }
+                Toggle("Prefer accounts draining from other users", isOn: smartSwitchBinding)
+                Text("When enabled, CodexSwap polls every account each cycle and floats shared accounts whose quota is falling without your own traffic to the front of the rotation, ahead of their ranking position.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
             SettingsSection(title: "Startup") {
                 Toggle("Launch CodexSwap at Login", isOn: launchAtLoginBinding)
                 Text("Independent from routing. Enable this only if you want the local proxy ready automatically after signing in to your Mac.")
@@ -39,6 +50,20 @@ struct GeneralSettingsView: View {
         Binding(
             get: { model.settings.launchAtLogin },
             set: { value in model.actions.setLaunchAtLogin(value) }
+        )
+    }
+
+    private var strategyBinding: Binding<RotationStrategy> {
+        Binding(
+            get: { model.settings.rotationStrategy },
+            set: { model.actions.setStrategy($0) }
+        )
+    }
+
+    private var smartSwitchBinding: Binding<Bool> {
+        Binding(
+            get: { model.settings.smartSwitchEnabled },
+            set: { model.actions.setSmartSwitch($0) }
         )
     }
 

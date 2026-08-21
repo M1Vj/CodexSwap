@@ -34,6 +34,87 @@ public struct UsageWindow: Codable, Sendable, Equatable {
     }
 }
 
+/// Cumulative token consumption attributed to one model on an account.
+public struct ModelUsage: Codable, Sendable, Equatable {
+    public var model: String
+    public var requests: Int
+    public var inputTokens: Int
+    public var cachedInputTokens: Int
+    public var outputTokens: Int
+
+    public init(model: String, requests: Int = 0, inputTokens: Int = 0, cachedInputTokens: Int = 0, outputTokens: Int = 0) {
+        self.model = model
+        self.requests = requests
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.outputTokens = outputTokens
+    }
+}
+
+/// Lifetime token totals observed for an account through the proxy.
+public struct UsageStats: Codable, Sendable, Equatable {
+    public var totalRequests: Int
+    public var inputTokens: Int
+    public var cachedInputTokens: Int
+    public var outputTokens: Int
+    /// Sorted by `outputTokens` descending so the dominant model leads.
+    public var models: [ModelUsage]
+    public var updatedAt: Date?
+
+    public init(
+        totalRequests: Int = 0,
+        inputTokens: Int = 0,
+        cachedInputTokens: Int = 0,
+        outputTokens: Int = 0,
+        models: [ModelUsage] = [],
+        updatedAt: Date? = nil
+    ) {
+        self.totalRequests = totalRequests
+        self.inputTokens = inputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.outputTokens = outputTokens
+        self.models = models
+        self.updatedAt = updatedAt
+    }
+
+    /// Folds one completed response into the running totals and its per-model row.
+    public mutating func accumulate(model: String, inputTokens: Int, cachedInputTokens: Int, outputTokens: Int) {
+        totalRequests += 1
+        self.inputTokens += inputTokens
+        self.cachedInputTokens += cachedInputTokens
+        self.outputTokens += outputTokens
+        if let i = models.firstIndex(where: { $0.model == model }) {
+            models[i].requests += 1
+            models[i].inputTokens += inputTokens
+            models[i].cachedInputTokens += cachedInputTokens
+            models[i].outputTokens += outputTokens
+        } else {
+            models.append(ModelUsage(
+                model: model,
+                requests: 1,
+                inputTokens: inputTokens,
+                cachedInputTokens: cachedInputTokens,
+                outputTokens: outputTokens
+            ))
+        }
+        models.sort { $0.outputTokens > $1.outputTokens }
+        updatedAt = Date()
+    }
+}
+
+/// One point-in-time reading of a usage window, kept as a short ring for burn-rate analytics.
+public struct WindowSample: Codable, Sendable, Equatable {
+    public var capturedAt: Date
+    public var label: String
+    public var usedPercent: Int
+
+    public init(capturedAt: Date, label: String, usedPercent: Int) {
+        self.capturedAt = capturedAt
+        self.label = label
+        self.usedPercent = usedPercent
+    }
+}
+
 public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var alias: String
     public var email: String
@@ -50,6 +131,12 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     /// If set, this account's tokens are owned by CodexBar; read/write them at this managed CODEX_HOME.
     public var managedHomePath: String?
     public var routingEnabled: Bool
+    /// Lifetime token/cost telemetry observed through the proxy, if any.
+    public var usageStats: UsageStats?
+    /// Recent window readings ring (newest last), capped by the store for burn-rate analytics.
+    public var usageHistory: [WindowSample]?
+    /// Last time this account served a request routed by CodexSwap itself.
+    public var lastServedByUs: Date?
 
     public var id: String { accountID.isEmpty ? alias : accountID }
 
@@ -88,6 +175,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
         case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, routingEnabled
+        case usageStats, usageHistory, lastServedByUs
     }
 
     public init(from decoder: Decoder) throws {
@@ -106,6 +194,9 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         usage = try c.decodeIfPresent([UsageWindow].self, forKey: .usage) ?? []
         managedHomePath = try c.decodeIfPresent(String.self, forKey: .managedHomePath)
         routingEnabled = try c.decodeIfPresent(Bool.self, forKey: .routingEnabled) ?? true
+        usageStats = try c.decodeIfPresent(UsageStats.self, forKey: .usageStats)
+        usageHistory = try c.decodeIfPresent([WindowSample].self, forKey: .usageHistory)
+        lastServedByUs = try c.decodeIfPresent(Date.self, forKey: .lastServedByUs)
     }
 
     public var tokens: CodexTokens {

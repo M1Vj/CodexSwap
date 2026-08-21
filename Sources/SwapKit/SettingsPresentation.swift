@@ -66,10 +66,15 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let alias: String
     public let email: String
     public let priority: Int
+    /// 1-based position in the ranking (1 = top rank = first picked).
+    public let rank: Int
+    /// Total ranked accounts, for up/down control bounds.
+    public let rankCount: Int
     public let ownership: AccountOwnership
     public let isActive: Bool
     public let needsLogin: Bool
     public let routingEnabled: Bool
+    public let isDraining: Bool
     public let usageSummary: String
     public let resetCreditStatus: AccountResetCreditStatus
 
@@ -85,26 +90,29 @@ public struct SettingsPresentation: Sendable, Equatable {
         resetCreditStatuses: [String: AccountResetCreditStatus]? = nil
     ) {
         let resetCreditStatuses = resetCreditStatuses ?? snapshot.resetCreditStatuses
-        accounts = snapshot.accounts
+        let ranked = snapshot.accounts
             .sorted {
                 if $0.priority == $1.priority { return $0.alias.localizedCaseInsensitiveCompare($1.alias) == .orderedAscending }
                 return $0.priority > $1.priority
             }
-            .map { account in
-                AccountSettingsRow(
-                    alias: account.alias,
-                    email: account.email,
-                    priority: account.priority,
-                    ownership: AccountOwnership.classify(account: account),
-                    isActive: account.alias == snapshot.activeAlias,
-                    needsLogin: account.needsLogin,
-                    routingEnabled: account.routingEnabled,
-                    usageSummary: account.usage
-                        .map { "\($0.label) \($0.usedPercent)%" }
-                        .joined(separator: " · "),
-                    resetCreditStatus: resetCreditStatuses[account.alias] ?? .unavailable
-                )
-            }
+        accounts = ranked.enumerated().map { index, account in
+            AccountSettingsRow(
+                alias: account.alias,
+                email: account.email,
+                priority: account.priority,
+                rank: index + 1,
+                rankCount: ranked.count,
+                ownership: AccountOwnership.classify(account: account),
+                isActive: account.alias == snapshot.activeAlias,
+                needsLogin: account.needsLogin,
+                routingEnabled: account.routingEnabled,
+                isDraining: snapshot.drainingAliases.contains(account.alias),
+                usageSummary: account.usage
+                    .map { "\($0.label) \($0.usedPercent)%" }
+                    .joined(separator: " · "),
+                resetCreditStatus: resetCreditStatuses[account.alias] ?? .unavailable
+            )
+        }
 
         if let url = snapshot.proxyURL, let host = url.host, let port = url.port {
             proxyAddress = "\(host):\(port)"

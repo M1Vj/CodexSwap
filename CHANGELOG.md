@@ -6,6 +6,20 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ### Added
 
+- Usage Monitor window (menu bar → Usage Monitor…): pool overview (healthy/eligible accounts, total tokens, estimated cost, average usage), per-account cards with per-window meters, reset countdowns, burn rate, time-to-exhaustion (suppressed until a window is ≥3% consumed), pace-vs-reset status, health tiers, and a lifetime per-model token/cost breakdown.
+- Per-account usage telemetry: the proxy now observes `response.completed` SSE events and attributes input/cached/output tokens and model to the serving account; totals persist in `accounts.json` and roll up into pool summaries. Cost figures are estimates from published list pricing.
+- Smart Switch (opt-in, General → Account Rotation): polls the whole pool each cycle, detects shared accounts whose quota is draining without your own traffic, floats them to the front of rotation ahead of their ranking position, and badges them in the menu, Accounts settings, and Usage Monitor.
+- Account ranking: account rows are ranked #1..N (top rank picked first) with up/down reordering in Settings replacing the numeric priority stepper; rank display is consistent across the menu, Settings, CLI (`swapd list`), and Usage Monitor.
+- Menu bar redesign: rich account rows with per-window usage bars, health colors, reset countdowns, draining/sign-in/cooldown badges, estimated cost, a pool health line, and click-to-activate rows.
+- "When an account needs sign-in" notification toggle (Quota & Resets → Notifications).
+
+### Fixed
+
+- Repeated "Account needs sign-in" notifications every poll cycle: periodic CodexBar imports no longer clear the logged-out flag, sign-in reminders fire once per logged-out episode until the account recovers or is removed, and manual switching resets the reminder state.
+- Usage polling no longer spends a request per cycle on needs-login accounts.
+
+### Added
+
 - Kanban task board (To Do / In Queue / In Progress / Done) with drag-and-drop, per-task editor, and clipboard prompt export.
 - Quota-driven task automation: queued tasks run as sandboxed non-interactive `codex exec` sessions the moment quota returns on an enabled account, with plan-first documents (`.codexswap/tasks/<slug>/PLAN.md`) so unfinished work resumes on the next window.
 - Proxy task mode (`X-CodexSwap-Task-Accounts`) that rotates only within a task's allowed accounts and never changes the interactive active account.
