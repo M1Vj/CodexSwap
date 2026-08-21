@@ -11,6 +11,7 @@ struct SettingsActions {
     let switchAccount: (String) -> Void
     let setPriority: (String, Int) -> Void
     let reorderRank: (String, Int) -> Void
+    let applyRanking: ([String]) -> Void
     let setAccountRouting: (String, Bool) -> Void
     let setAutomaticResetProtection: (String, Bool) -> Void
     let useResetCredit: (String, Date?) -> Void
