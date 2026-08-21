@@ -30,7 +30,10 @@ expect_failure bash Scripts/version.sh "$TMP/prefixed-version"
 printf '1.2\n' > "$TMP/short-version"
 expect_failure bash Scripts/version.sh "$TMP/short-version"
 
-DIST_DIR="$TMP/dist" BUILD_NUMBER=42 Scripts/build-app.sh >/dev/null
+DIST_DIR="$TMP/dist" BUILD_NUMBER=42 Scripts/build-app.sh >/dev/null || {
+  echo "build-app.sh failed; retrying with full output:" >&2
+  DIST_DIR="$TMP/dist" BUILD_NUMBER=42 Scripts/build-app.sh
+}
 plist="$TMP/dist/CodexSwap.app/Contents/Info.plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" == "0.2.0" ]] || fail "bundle short version does not match VERSION"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "42" ]] || fail "bundle build number does not match BUILD_NUMBER"

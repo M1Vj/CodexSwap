@@ -91,3 +91,31 @@ Deleting `~/Library/Application Support/CodexSwap/` removes imported account sta
 ## Reporting a problem
 
 Use the repository's bug-report template and include the CodexSwap version, macOS version, Mac architecture, and sanitized reproduction steps. Report potential credential exposure or routing vulnerabilities through [GitHub private vulnerability reporting](https://github.com/M1Vj/CodexSwap/security/advisories/new), not a public issue.
+
+## Bridged (non-Codex) models
+
+**Codex says a model is "not supported when using Codex with a ChatGPT account."**
+The request reached OpenAI's backend instead of the bridge. For subagent roles
+(`~/.codex/agents/*.toml`), pin the provider explicitly so role application cannot
+lose the runtime base URL:
+
+```toml
+model_provider = "codexswap"
+
+[model_providers.codexswap]
+name = "CodexSwap"
+base_url = "http://127.0.0.1:58432/backend-api/codex"
+wire_api = "responses"
+```
+
+**A bridged model is not offered in Codex's model picker.**
+Add it to your `model_catalog_json` overlay (`~/.codex/model-catalogs/*.json`)
+with `visibility: "list"`, then restart Codex.
+
+**Bridged requests fail with `bad_bridged_base_url`.**
+The entry's Base URL in Settings → Advanced is empty or not a valid URL. It should
+end at the version segment, e.g. `https://opencode.ai/zen/v1`.
+
+**Tool calls never fire on a bridged model.**
+Check that the upstream gateway emits standard Chat Completions `tool_calls` deltas;
+the translator forwards them as Responses `function_call` items.

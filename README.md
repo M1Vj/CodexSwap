@@ -60,6 +60,7 @@ CodexSwap solves the problem at the routing layer:
 | ♾️ | **Evergreen tasks** | Run bounded improvement cycles continuously, with archived plans and resumable handoffs. |
 | 🛡️ | **Local safety boundaries** | Loopback-only proxy, reversible Codex configuration, no telemetry, and no approval bypass for task runs. |
 | 🔌 | **Flexible onboarding** | Import CodexBar-managed accounts or use standalone accounts created through `codex login`. |
+| 🌉 | **Bridged free models** | Serve non-Codex models (Chat Completions gateways) through the same proxy with full Responses-API translation — configurable in Advanced Settings, never touches account quota. |
 
 ## Quick start
 
@@ -124,6 +125,23 @@ This design has three important consequences:
 3. **Routing is reversible.** CodexSwap backs up displaced configuration and restores it when routing is disabled. If another tool changes the managed block, CodexSwap asks before repairing it.
 
 Earlier CodexSwap builds used a separate provider identity that could hide existing history. They did not delete it. Current builds migrate that configuration to the built-in-provider route automatically; restart Codex once after migration.
+
+## Bridged models (non-Codex lanes)
+
+Some gateway-hosted models only speak the OpenAI **Chat Completions** wire, while Codex only speaks the
+**Responses API**. CodexSwap's proxy translates between them, so you can point Codex at those models without
+any external tooling.
+
+- Configure entries under **Settings → Advanced → Free & Bridged Models**: model ID, display name, base URL
+  (ending at the version segment, e.g. `https://opencode.ai/zen/v1`), optional API key, and an enable toggle.
+- Requests naming an *enabled* model are translated and streamed back as native Responses events — including
+  tool calls, reasoning-effort clamping to the gateway's vocabulary, and token usage accounting.
+- Bridged requests bypass account selection entirely: they never consume Codex quota, trigger rotation,
+  or touch your credentials.
+- Disabled or unknown models fall through to normal account routing unchanged.
+
+The bundled default routes `x-preview-f-free` ("Ox Alpha Free") through `https://opencode.ai/zen/v1`,
+which currently serves that model anonymously.
 
 ## Task Board
 
