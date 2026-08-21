@@ -2,6 +2,15 @@ import AppKit
 import SwiftUI
 import SwapKit
 
+/// Compact token formatter shared by the monitor's sections.
+fileprivate func compactTokens(_ value: Int) -> String {
+    value >= 1_000_000
+        ? String(format: "%.2fM", Double(value) / 1_000_000)
+        : value >= 1_000
+            ? String(format: "%.1fK", Double(value) / 1_000)
+            : "\(value)"
+}
+
 @MainActor
 final class UsageMonitorWindowController: NSWindowController {
     private let viewModel: UsageMonitorViewModel
@@ -41,6 +50,7 @@ final class UsageMonitorViewModel: ObservableObject {
         summary: UsageAnalytics.PoolSummary(),
         smartSwitchEnabled: false
     )
+    @Published private(set) var localUsage = LocalUsageAttribution.empty
     @Published var sortMode: UsageSortMode = .rank
     @Published var isLoading = false
 
@@ -50,10 +60,25 @@ final class UsageMonitorViewModel: ObservableObject {
         self.engine = engine
     }
 
-    func refresh() async {
+    func refresh(forceLocalScan: Bool = false) async {
         isLoading = true
         overview = await engine.usageOverview()
+        // Engine-side TTL cache keeps the 5s tick cheap; the button forces a rescan.
+        localUsage = await engine.localUsageAttribution(forceRefresh: forceLocalScan)
         isLoading = false
+    }
+
+    func totals(for alias: String) -> LocalUsageTotals? {
+        localUsage.attributed[alias]
+    }
+
+    var unattributedTotals: LocalUsageTotals? { localUsage.unattributed }
+
+    var pooledLocalTotals: LocalUsageTotals {
+        var combined = LocalUsageTotals()
+        for totals in localUsage.attributed.values { combined += totals }
+        if let unattributed = localUsage.unattributed { combined += unattributed }
+        return combined
     }
 
     var sortedAccounts: [AccountUsageOverview] {
@@ -100,9 +125,21 @@ struct UsageMonitorView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
-                PoolSummaryCard(summary: model.overview.summary, smartSwitchEnabled: model.overview.smartSwitchEnabled)
+                PoolSummaryCard(
+                    summary: model.overview.summary,
+                    smartSwitchEnabled: model.overview.smartSwitchEnabled,
+                    localTotals: model.pooledLocalTotals
+                )
                 ForEach(model.sortedAccounts) { account in
-                    AccountUsageCard(account: account)
+                    AccountUsageCard(account: account, localTotals: model.totals(for: account.alias))
+                }
+                if let unattributed = model.unattributedTotals {
+                    Label(
+                        "Shared CODEX_HOME history (last 7d): \(unattributed.sessionCount) sessions · \(compactTokens(unattributed.totalTokens)) — cannot be split across standalone accounts.",
+                        systemImage: "questionmark.folder"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 if model.overview.accounts.isEmpty && !model.isLoading {
                     ContentUnavailableView(
@@ -145,11 +182,12 @@ struct UsageMonitorView: View {
             .pickerStyle(.menu)
             .frame(width: 150)
             Button {
-                Task { await model.refresh() }
+                Task { await model.refresh(forceLocalScan: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .disabled(model.isLoading)
+            .help("Refresh usage and rescan local session logs")
             .accessibilityLabel("Refresh usage")
         }
     }
@@ -171,6 +209,7 @@ struct UsageMonitorView: View {
 private struct PoolSummaryCard: View {
     let summary: UsageAnalytics.PoolSummary
     let smartSwitchEnabled: Bool
+    let localTotals: LocalUsageTotals
 
     var body: some View {
         GroupBox {
@@ -182,14 +221,27 @@ private struct PoolSummaryCard: View {
                     metric("\(summary.drainingCount)", label: "draining by others", color: .orange)
                 }
                 Divider()
-                metric(tokensLabel(summary.totalInputTokens + summary.totalOutputTokens), label: "tokens total")
-                metric(String(format: "~$%.2f", summary.estimatedCostTotal), label: "est. cost")
+                metric(compactTokens(summary.totalInputTokens + summary.totalOutputTokens), label: "proxy tokens")
+                metric(compactTokens(localTotals.totalTokens), label: "local tokens · 7d")
+                metric("\(localTotals.sessionCount)", label: "local sessions · 7d")
+                Divider()
+                metric(String(format: "~$%.2f", summary.estimatedCostTotal), label: "est. proxy cost")
+                metric(String(format: "~$%.2f", localEstimatedCost), label: "est. local cost · 7d")
                 metric("\(Int(summary.avgPrimaryUsedPercent.rounded()))%", label: "avg used")
             }
             .frame(maxWidth: .infinity)
         } label: {
             Text("Pool Overview").font(.headline)
         }
+    }
+
+    private var localEstimatedCost: Double {
+        UsageAnalytics.estimatedCost(
+            inputTokens: localTotals.inputTokens,
+            cachedInputTokens: localTotals.cachedInputTokens,
+            outputTokens: localTotals.outputTokens,
+            model: localTotals.models.first ?? "unknown"
+        )
     }
 
     private func metric(_ value: String, label: String, color: Color = .primary) -> some View {
@@ -204,15 +256,11 @@ private struct PoolSummaryCard: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func tokensLabel(_ tokens: Int) -> String {
-        tokens >= 1_000_000
-            ? String(format: "%.1fM", Double(tokens) / 1_000_000)
-            : String(format: "%.0fK", Double(tokens) / 1_000)
-    }
 }
 
 private struct AccountUsageCard: View {
     let account: AccountUsageOverview
+    let localTotals: LocalUsageTotals?
 
     var body: some View {
         GroupBox {
@@ -275,6 +323,10 @@ private struct AccountUsageCard: View {
 
                 if let stats = account.stats, stats.totalRequests > 0 {
                     ModelBreakdownTable(models: stats.models)
+                        .accessibilityLabel("Proxy-attributed per-model usage")
+                }
+                if let local = localTotals, local.sessionCount > 0 {
+                    LocalUsageSection(totals: local)
                 }
             }
             .padding(.vertical, 4)
@@ -382,6 +434,51 @@ private struct WindowMeter: View {
             parts.append(hoursLeft < 1 ? "runs out <1h" : String(format: "runs out in %.1fh", hoursLeft))
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+private struct LocalUsageSection: View {
+    let totals: LocalUsageTotals
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Label("Local sessions · 7d", systemImage: "doc.text.magnifyingglass")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            stat("in", tokens(totals.inputTokens))
+            stat("cached", tokens(totals.cachedInputTokens))
+            stat("out", tokens(totals.outputTokens))
+            stat("sessions", "\(totals.sessionCount)")
+            stat("est.", String(format: "~$%.4f", estimatedCost))
+            if let model = totals.models.first {
+                Text("via \(model)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var estimatedCost: Double {
+        UsageAnalytics.estimatedCost(
+            inputTokens: totals.inputTokens,
+            cachedInputTokens: totals.cachedInputTokens,
+            outputTokens: totals.outputTokens,
+            model: totals.models.first ?? "unknown"
+        )
+    }
+
+    private func stat(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 3) {
+            Text(value)
+                .font(.caption.monospacedDigit())
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func tokens(_ value: Int) -> String {
+        compactTokens(value)
     }
 }
 

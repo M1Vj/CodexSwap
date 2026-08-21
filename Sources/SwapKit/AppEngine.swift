@@ -123,6 +123,8 @@ public actor AppEngine {
     private var schedulingReasons: [String: String] = [:]
     /// Aliases whose logged-out episode already raised a notification; cleared on recovery.
     private var needsLoginNotified: Set<String> = []
+    /// Cached local session-log scan (dashboard input), refreshed at most every TTL.
+    private var localUsageCache: (generatedAt: Date, value: LocalUsageAttribution)?
 
     public init(
         store: AccountStore = AccountStore(),
@@ -382,6 +384,53 @@ public actor AppEngine {
             smartSwitchEnabled: settings.smartSwitchEnabled
         )
     }
+
+    /// Token usage recovered from each account's local codex session logs (last 7 days),
+    /// cached briefly so dashboard refreshes do not rescan the disk every tick.
+    public func localUsageAttribution(forceRefresh: Bool = false) async -> LocalUsageAttribution {
+        if !forceRefresh, let cache = localUsageCache,
+           Date().timeIntervalSince(cache.generatedAt) < Self.localUsageCacheTTL {
+            return cache.value
+        }
+        let accounts = await store.all()
+        // Managed homes attribute 1:1. Standalone accounts all share ~/.codex, so their
+        // history is only attributable when exactly one standalone account exists.
+        var byHome: [String: [String]] = [:]
+        for account in accounts where account.routingEnabled || account.needsLogin == false {
+            let home = account.managedHomePath ?? SessionUsageScanner.defaultHome().path
+            byHome[home, default: []].append(account.alias)
+        }
+        let scanStart = Date()
+        let homeKeys = Array(byHome.keys)
+        let scanned = await withTaskGroup(
+            of: (String, LocalUsageTotals).self,
+            returning: [String: LocalUsageTotals].self
+        ) { group in
+            for home in homeKeys {
+                group.addTask(priority: .utility) {
+                    (home, SessionUsageScanner.scan(home: URL(fileURLWithPath: home), days: 7, now: scanStart))
+                }
+            }
+            var out: [String: LocalUsageTotals] = [:]
+            for await (home, totals) in group { out[home] = totals }
+            return out
+        }
+        var attributed: [String: LocalUsageTotals] = [:]
+        var unattributed: LocalUsageTotals?
+        for (home, aliases) in byHome {
+            guard let totals = scanned[home] else { continue }
+            if aliases.count == 1, let alias = aliases.first {
+                attributed[alias] = totals
+            } else if totals.sessionCount > 0 {
+                unattributed = totals
+            }
+        }
+        let value = LocalUsageAttribution(attributed: attributed, unattributed: unattributed)
+        localUsageCache = (generatedAt: Date(), value: value)
+        return value
+    }
+
+    private static let localUsageCacheTTL: TimeInterval = 60
 
     /// Moves an account within the priority ranking; `toIndex` 0 is the top rank.
     public func reorderRank(_ alias: String, toIndex: Int) async {

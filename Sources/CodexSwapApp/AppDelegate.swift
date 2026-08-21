@@ -296,12 +296,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ? $0.alias.localizedCaseInsensitiveCompare($1.alias) == .orderedAscending
                 : $0.priority > $1.priority
         }
-        for (index, acc) in rankedAccounts.enumerated() {
+        // Routing-disabled accounts stay out of the rotation list; they get their own submenu.
+        let activeRoster = rankedAccounts.filter(\.routingEnabled)
+        let pausedRoster = rankedAccounts.filter { !$0.routingEnabled }
+        for (index, acc) in activeRoster.enumerated() {
             let row = MenuAccountRow(
                 rank: index + 1,
                 alias: acc.alias,
                 isActive: acc.alias == latest.activeAlias,
-                isEnabled: AccountRoutingPresentation.canMakeActive(routingEnabled: acc.routingEnabled),
+                isEnabled: true,
                 needsLogin: acc.needsLogin,
                 isDraining: latest.drainingAliases.contains(acc.alias),
                 cooldownUntil: acc.cooldownUntil(now: Date()),
@@ -310,11 +313,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
             let alias = acc.alias
-            let rowEnabled = AccountRoutingPresentation.canMakeActive(routingEnabled: acc.routingEnabled)
-            item.view = MenuRowContainer(row: row, width: 360, isEnabled: rowEnabled) { [weak self] in
+            item.view = MenuRowContainer(row: row, width: 360, isEnabled: true) { [weak self] in
                 self?.activateAccount(alias)
             }
             menu.addItem(item)
+        }
+
+        if !pausedRoster.isEmpty {
+            let submenu = NSMenu()
+            for acc in pausedRoster {
+                let entry = NSMenuItem(
+                    title: "Enable Routing — \(acc.alias)",
+                    action: #selector(enableRoutingFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                entry.target = self
+                entry.representedObject = acc.alias
+                entry.isEnabled = true
+                submenu.addItem(entry)
+            }
+            let pausedItem = NSMenuItem(
+                title: "Paused Accounts (\(pausedRoster.count))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            pausedItem.submenu = submenu
+            menu.addItem(pausedItem)
         }
 
         menu.addItem(.separator())
@@ -642,6 +666,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func activateAccount(_ alias: String) {
         Task { await engine.switchTo(alias); await refreshSnapshot() }
+    }
+
+    @objc private func enableRoutingFromMenu(_ sender: NSMenuItem) {
+        guard let alias = sender.representedObject as? String else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.engine.setAccountRouting(alias, enabled: true)
+            await self.refreshSnapshot()
+            self.presentMessage("\(alias) is back in the rotation.")
+        }
     }
 
     private func changePriority(_ alias: String, priority: Int) {

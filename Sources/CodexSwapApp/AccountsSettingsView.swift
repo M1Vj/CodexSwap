@@ -5,78 +5,64 @@ struct AccountsSettingsView: View {
     @ObservedObject var model: SettingsViewModel
 
     var body: some View {
-        GeometryReader { proxy in
-            ScrollView {
-                content(
-                    rowLayout: AccountSettingsLayoutPresentation.rowLayout(
-                        availableWidth: proxy.size.width
-                    )
-                )
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.trailing, 8)
-                .padding(.bottom, 4)
-            }
-        }
-    }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("CodexBar manages account credentials when available. CodexSwap imports its roster automatically.")
+                    .foregroundStyle(.secondary)
 
-    private func content(rowLayout: AccountSettingsRowLayout) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("CodexBar manages account credentials when available. CodexSwap imports its roster automatically.")
-                .foregroundStyle(.secondary)
-
-            SettingsSection(title: "Accounts") {
                 if model.presentation.accounts.isEmpty {
                     ContentUnavailableView(
                         "No Accounts",
                         systemImage: "person.crop.circle.badge.plus",
                         description: Text("Add an account through CodexBar or use the standalone fallback.")
                     )
+                    .padding(.top, 40)
                 } else {
                     ForEach(model.presentation.accounts) { account in
-                        AccountSettingsRowView(
-                            account: account,
-                            model: model,
-                            layout: rowLayout
-                        )
-                        if account.id != model.presentation.accounts.last?.id { Divider() }
+                        AccountCard(account: account, model: model)
                     }
                 }
-            }
 
-            HStack {
-                Button("Add in CodexBar…", action: model.actions.openCodexBar)
-                    .disabled(!model.codexBarInstalled)
-                    .accessibilityLabel("Open CodexBar to add an account")
-                Button("Add Standalone…", action: model.actions.addStandaloneAccount)
-                    .accessibilityLabel("Add a standalone Codex account")
-                Button("Rescan Accounts", action: model.actions.importAccounts)
-            }
+                HStack {
+                    Button("Add in CodexBar…", action: model.actions.openCodexBar)
+                        .disabled(!model.codexBarInstalled)
+                        .accessibilityLabel("Open CodexBar to add an account")
+                    Button("Add Standalone…", action: model.actions.addStandaloneAccount)
+                        .accessibilityLabel("Add a standalone Codex account")
+                    Button("Rescan Accounts", action: model.actions.importAccounts)
+                }
+                .padding(.top, 4)
 
-            if !model.codexBarInstalled {
-                Label("CodexBar is not installed. Standalone login remains available.", systemImage: "info.circle")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                if !model.codexBarInstalled {
+                    Label("CodexBar is not installed. Standalone login remains available.", systemImage: "info.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
+            .padding(.horizontal, 4)
+            .padding(.bottom, 8)
         }
     }
 }
 
-private struct AccountSettingsRowView: View {
+/// One account as a self-contained card: identity header, usage meters, then controls.
+private struct AccountCard: View {
     let account: AccountSettingsRow
     @ObservedObject var model: SettingsViewModel
-    let layout: AccountSettingsRowLayout
     @State private var resetConfirmationPresented = false
 
     var body: some View {
-        Group {
-            switch layout {
-            case .wide:
-                wideRow
-            case .compact:
-                compactRow
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                header
+                usageSection
+                statusLine
+                Divider()
+                controls
             }
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.vertical, 4)
         .confirmationDialog(
             resetConfirmationTitle,
             isPresented: $resetConfirmationPresented,
@@ -91,136 +77,103 @@ private struct AccountSettingsRowView: View {
         }
     }
 
-    private var wideRow: some View {
-        HStack(alignment: .top, spacing: 12) {
-            identity
-                .frame(minWidth: 280, maxWidth: .infinity, alignment: .leading)
-            priorityControl
-            activationControl
-            routingControl
-            secondaryActions
-        }
-    }
+    // MARK: Header
 
-    private var compactRow: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            identity
-
-            HStack(spacing: 12) {
-                priorityControl
-                Spacer()
-                activationControl
+    private var header: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: account.isActive ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(account.isActive ? Color.green : Color.secondary.opacity(0.5))
+                .font(.title3)
+                .accessibilityLabel(account.isActive ? "Active account" : "Inactive account")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(account.email.isEmpty ? account.alias : account.email)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-
-            HStack(spacing: 12) {
-                routingControl
-                secondaryActions
+            Spacer(minLength: 8)
+            chip(account.ownership == .codexBarManaged ? "CodexBar" : "Standalone", color: .secondary)
+            if account.isDraining {
+                chip("Draining by others", color: .orange)
+            }
+            if account.needsLogin {
+                chip("Needs sign-in", color: .red)
+            }
+            if account.isActive {
+                chip("Active", color: .green)
             }
         }
     }
 
-    private var identity: some View {
-        HStack(alignment: .top, spacing: 12) {
-            accountStatusImage
-            accountDetails
-        }
+    private var subtitle: String {
+        var parts = [account.alias]
+        if account.rank > 0 { parts.append("Rank #\(account.rank) of \(account.rankCount)") }
+        return parts.joined(separator: " · ")
     }
 
-    private var accountStatusImage: some View {
-        Image(systemName: account.isActive ? "checkmark.circle.fill" : "circle")
-            .foregroundStyle(account.isActive ? .green : .secondary)
-            .accessibilityLabel(account.isActive ? "Active account" : "Inactive account")
-    }
+    // MARK: Usage meters
 
-    private var accountDetails: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(account.email.isEmpty ? account.alias : account.email)
-                .fontWeight(.medium)
-                .lineLimit(layout == .compact ? 2 : 1)
-            Text(primaryMetadata)
+    @ViewBuilder
+    private var usageSection: some View {
+        if account.usageWindows.isEmpty {
+            Text("No quota readings yet — waiting for the next poll.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(layout == .compact ? 2 : 1)
-            if !warningMetadata.isEmpty {
-                Text(warningMetadata)
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .lineLimit(layout == .compact ? 2 : 1)
+                .foregroundStyle(.tertiary)
+        } else {
+            HStack(alignment: .top, spacing: 18) {
+                ForEach(account.usageWindows, id: \.label) { window in
+                    UsageBar(
+                        label: window.label,
+                        usedPercent: window.usedPercent,
+                        tier: UsageAnalytics.healthTier(usedPercent: window.usedPercent),
+                        caption: resetCaption(window)
+                    )
+                }
+                Spacer(minLength: 0)
             }
-            Text(resetCreditDescription)
-                .font(.callout)
+        }
+    }
+
+    private func resetCaption(_ window: UsageWindow) -> String? {
+        guard let resetAt = window.resetAt else { return nil }
+        let interval = resetAt.timeIntervalSinceNow
+        guard interval > 0 else { return "resetting…" }
+        let minutes = Int(interval / 60)
+        if minutes >= 60 { return "resets in \(minutes / 60)h \(minutes % 60)m" }
+        return "resets in \(minutes)m"
+    }
+
+    // MARK: Status line
+
+    private var statusLine: some View {
+        HStack(spacing: 14) {
+            Label(resetCreditDescription, systemImage: resetCreditIcon)
+                .font(.caption)
                 .foregroundStyle(resetCreditColor)
-                .lineLimit(layout == .compact ? 2 : 1)
+            if !account.routingEnabled {
+                Label("Routing disabled — hidden from the menu rotation", systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Spacer()
             Toggle("Protect from Automatic Reset", isOn: resetProtectionBinding)
                 .toggleStyle(.checkbox)
-                .help("Blocks automatic resets only. You can still use a reset manually after confirmation.")
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var priorityControl: some View {
-        HStack(spacing: 6) {
-            Text("Rank #\(account.rank)")
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(account.rank == 1 ? .primary : .secondary)
-                .accessibilityLabel("Rank \(account.rank) of \(account.rankCount)")
-            VStack(spacing: 2) {
-                Button {
-                    model.actions.reorderRank(account.alias, account.rank - 2)
-                } label: {
-                    Image(systemName: "chevron.up")
-                }
-                .disabled(account.rank <= 1)
-                .help("Move up in rotation ranking")
-                .accessibilityLabel("Move \(account.alias) up")
-                Button {
-                    model.actions.reorderRank(account.alias, account.rank)
-                } label: {
-                    Image(systemName: "chevron.down")
-                }
-                .disabled(account.rank >= account.rankCount)
-                .help("Move down in rotation ranking")
-                .accessibilityLabel("Move \(account.alias) down")
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-        }
-        .fixedSize()
-    }
-
-    @ViewBuilder
-    private var activationControl: some View {
-        if !AccountRoutingPresentation.canMakeActive(routingEnabled: account.routingEnabled) {
-            Button(AccountRoutingPresentation.action(routingEnabled: account.routingEnabled)) {
-                model.actions.setAccountRouting(account.alias, true)
-            }
-            .accessibilityLabel("Enable routing for \(account.alias)")
-            .fixedSize()
-        } else if !account.isActive {
-            Button("Make Active", action: { model.actions.switchAccount(account.alias) })
-                .accessibilityLabel("Make \(account.alias) active")
-                .fixedSize()
-        } else {
-            Label("Active", systemImage: "checkmark")
-                .foregroundStyle(.secondary)
-                .fixedSize()
+                .controlSize(.small)
+                .help("Blocks automatic resets only. Manual Use Reset… still works after confirmation.")
         }
     }
 
-    @ViewBuilder
-    private var routingControl: some View {
-        if account.routingEnabled {
-            Button(AccountRoutingPresentation.action(routingEnabled: account.routingEnabled)) {
-                model.actions.setAccountRouting(account.alias, false)
-            }
-            .accessibilityLabel("Disable routing for \(account.alias)")
-            .fixedSize()
-        }
-    }
+    // MARK: Controls
 
-    private var secondaryActions: some View {
+    private var controls: some View {
         HStack(spacing: 12) {
+            rankControl
+            Spacer()
+            activationControl
+            routingControl
             Button("Use Reset…") { resetConfirmationPresented = true }
                 .disabled(!resetAvailable)
                 .accessibilityLabel("Use reset credit for \(account.alias)")
@@ -229,38 +182,82 @@ private struct AccountSettingsRowView: View {
                     .help("Remove or reauthenticate this account in CodexBar")
                     .accessibilityLabel("Manage \(account.alias) in CodexBar")
             } else {
-                Button("Remove", role: .destructive, action: { model.actions.removeAccount(account.alias) })
+                Button("Remove", role: .destructive) { model.actions.removeAccount(account.alias) }
                     .accessibilityLabel("Remove \(account.alias)")
             }
         }
-        .fixedSize()
     }
 
-    private var primaryMetadata: String {
-        [
-            account.ownership == .codexBarManaged ? "CodexBar managed" : "Standalone",
-            account.isActive ? "Active" : "Inactive",
-            account.usageSummary,
-        ]
-        .filter { !$0.isEmpty }
-        .joined(separator: " · ")
+    private var rankControl: some View {
+        HStack(spacing: 6) {
+            Text("Rank #\(account.rank)")
+                .font(.callout.monospacedDigit().weight(.medium))
+                .accessibilityLabel("Rank \(account.rank) of \(account.rankCount)")
+            VStack(spacing: 1) {
+                Button {
+                    model.actions.reorderRank(account.alias, account.rank - 2)
+                } label: {
+                    Image(systemName: "chevron.up")
+                }
+                .disabled(account.rank <= 1)
+                .help("Move up — picked sooner")
+                .accessibilityLabel("Move \(account.alias) up in ranking")
+                Button {
+                    model.actions.reorderRank(account.alias, account.rank)
+                } label: {
+                    Image(systemName: "chevron.down")
+                }
+                .disabled(account.rank >= account.rankCount)
+                .help("Move down — picked later")
+                .accessibilityLabel("Move \(account.alias) down in ranking")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.mini)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.primary.opacity(0.05), in: Capsule())
     }
 
-    private var warningMetadata: String {
-        [
-            AccountRoutingPresentation.status(routingEnabled: account.routingEnabled),
-            account.needsLogin ? "Needs sign-in" : nil,
-            account.isDraining ? "Draining from other users" : nil,
-        ]
-        .compactMap { $0 }
-        .joined(separator: " · ")
+    @ViewBuilder
+    private var activationControl: some View {
+        if !AccountRoutingPresentation.canMakeActive(routingEnabled: account.routingEnabled) {
+            EmptyView()
+        } else if !account.isActive {
+            Button("Make Active") { model.actions.switchAccount(account.alias) }
+                .accessibilityLabel("Make \(account.alias) active")
+        } else {
+            Label("In use", systemImage: "checkmark")
+                .font(.callout)
+                .foregroundStyle(.green)
+        }
     }
 
-    private var priorityBinding: Binding<Int> {
-        Binding(
-            get: { account.priority },
-            set: { model.actions.setPriority(account.alias, $0) }
-        )
+    @ViewBuilder
+    private var routingControl: some View {
+        if account.routingEnabled {
+            Button(AccountRoutingPresentation.action(routingEnabled: true)) {
+                model.actions.setAccountRouting(account.alias, false)
+            }
+            .help("Hide from menu rotation and exclude from automatic switching")
+            .accessibilityLabel("Disable routing for \(account.alias)")
+        } else {
+            Button(AccountRoutingPresentation.action(routingEnabled: false)) {
+                model.actions.setAccountRouting(account.alias, true)
+            }
+            .accessibilityLabel("Enable routing for \(account.alias)")
+        }
+    }
+
+    // MARK: Helpers
+
+    private func chip(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12), in: Capsule())
+            .foregroundStyle(color)
     }
 
     private var resetProtectionBinding: Binding<Bool> {
@@ -292,8 +289,17 @@ private struct AccountSettingsRowView: View {
         }
     }
 
+    private var resetCreditIcon: String {
+        switch account.resetCreditStatus {
+        case .available(let count, _): count > 0 ? "bolt.badge.clock.fill" : "bolt.slash"
+        case .networkFailure: "wifi.exclamationmark"
+        default: "bolt"
+        }
+    }
+
     private var resetCreditColor: Color {
         switch account.resetCreditStatus {
+        case .available(let count, _) where count > 0: .primary
         case .networkFailure: .orange
         default: .secondary
         }

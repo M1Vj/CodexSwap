@@ -160,9 +160,14 @@ final class MenuRowContainer: NSView {
     init(row: MenuAccountRow, width: CGFloat, isEnabled: Bool, onSelect: @escaping () -> Void) {
         self.onSelect = onSelect
         self.rowIsEnabled = isEnabled
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 38))
-        wantsLayer = true
         let hosting = NSHostingView(rootView: row)
+        // Size from the content's ideal size so nothing clips vertically; clamp width so
+        // long aliases cannot stretch the menu absurdly wide.
+        let ideal = hosting.fittingSize
+        let height = max(40, ceil(ideal.height))
+        let finalWidth = max(width, min(ceil(ideal.width), 460))
+        super.init(frame: NSRect(x: 0, y: 0, width: finalWidth, height: height))
+        wantsLayer = true
         hosting.frame = bounds
         hosting.autoresizingMask = [.width, .height]
         addSubview(hosting)

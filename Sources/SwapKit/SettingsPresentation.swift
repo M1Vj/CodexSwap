@@ -49,19 +49,6 @@ public enum AccountRoutingPresentation {
     public static func canMakeActive(routingEnabled: Bool) -> Bool { routingEnabled }
 }
 
-public enum AccountSettingsRowLayout: Sendable, Equatable {
-    case wide
-    case compact
-}
-
-public enum AccountSettingsLayoutPresentation {
-    public static let wideRowMinimumWidth: CGFloat = 920
-
-    public static func rowLayout(availableWidth: CGFloat) -> AccountSettingsRowLayout {
-        availableWidth >= wideRowMinimumWidth ? .wide : .compact
-    }
-}
-
 public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let alias: String
     public let email: String
@@ -76,6 +63,8 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let routingEnabled: Bool
     public let isDraining: Bool
     public let usageSummary: String
+    /// Live window readings for usage meters in the accounts settings cards.
+    public let usageWindows: [UsageWindow]
     public let resetCreditStatus: AccountResetCreditStatus
 
     public var id: String { alias }
@@ -110,6 +99,7 @@ public struct SettingsPresentation: Sendable, Equatable {
                 usageSummary: account.usage
                     .map { "\($0.label) \($0.usedPercent)%" }
                     .joined(separator: " · "),
+                usageWindows: account.usage,
                 resetCreditStatus: resetCreditStatuses[account.alias] ?? .unavailable
             )
         }

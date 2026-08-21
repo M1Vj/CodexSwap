@@ -3228,10 +3228,22 @@ final class SettingsInformationArchitectureTests: XCTestCase {
         )
     }
 
-    func testAccountRowsUseCompactLayoutBelowWideControlRequirement() {
-        XCTAssertEqual(AccountSettingsLayoutPresentation.rowLayout(availableWidth: 919), .compact)
-        XCTAssertEqual(AccountSettingsLayoutPresentation.rowLayout(availableWidth: 920), .wide)
-        XCTAssertEqual(AccountSettingsLayoutPresentation.rowLayout(availableWidth: 1_200), .wide)
+    func testAccountRowsCarryRankAndLiveUsageWindows() {
+        var account = Account(alias: "a", accountID: "a", accessToken: "t", priority: 5)
+        account.usage = [UsageWindow(label: "5h", usedPercent: 40, windowSeconds: 18_000, resetAt: nil)]
+        let snapshot = EngineSnapshot(
+            accounts: [account],
+            activeAlias: nil,
+            proxyURL: nil,
+            strategy: .priority,
+            drainingAliases: ["a"]
+        )
+        let presentation = SettingsPresentation(snapshot: snapshot)
+        XCTAssertEqual(presentation.accounts.count, 1)
+        XCTAssertEqual(presentation.accounts[0].rank, 1)
+        XCTAssertEqual(presentation.accounts[0].rankCount, 1)
+        XCTAssertEqual(presentation.accounts[0].usageWindows, account.usage)
+        XCTAssertTrue(presentation.accounts[0].isDraining)
     }
 
     func testEachSettingBelongsToExactlyOneApprovedPane() {
