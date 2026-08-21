@@ -800,6 +800,22 @@ public actor ProxyServer {
             return
         }
 
+        // Free-model bridge: routed models translate Responses<->Chat against their own
+        // gateway and never touch account selection, tokens, or rotation.
+        if head.method == .POST, rawPath.hasSuffix("/responses"),
+           let alphaModel = AlphaBridge.routedModel(in: body) {
+            log("POST \(rawPath) -> alpha bridge model=\(alphaModel)")
+            let eventSink = self.sink
+            try await AlphaBridge.handle(
+                model: alphaModel,
+                body: body,
+                httpClient: self.httpClient,
+                outbound: outbound,
+                sink: eventSink
+            )
+            return
+        }
+
         let interactiveKey = mode == .normal && head.method == .POST && rawPath.hasSuffix("/responses")
             ? interactiveTurnKey(headers: head.headers, body: body)
             : nil
