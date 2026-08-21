@@ -313,7 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
             let alias = acc.alias
-            item.view = MenuRowContainer(row: row, width: 360, isEnabled: true) { [weak self] in
+            item.view = MenuRowContainer(row: row, width: 340, isEnabled: true) { [weak self] in
                 self?.activateAccount(alias)
             }
             menu.addItem(item)
@@ -402,6 +402,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     await self.engine.reorderRank(alias, toIndex: toIndex)
+                    await self.refreshSnapshot()
+                }
+            },
+            applyRanking: { [weak self] order in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.engine.applyRanking(order)
                     await self.refreshSnapshot()
                 }
             },

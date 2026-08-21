@@ -25,9 +25,10 @@ public actor AccountStore {
         var loaded = AccountStore.loadFrom(url) ?? StoreData()
         loaded.accounts = loaded.accounts.map { account in
             var normalized = account
-            normalized.priority = AccountPriority.normalize(account.priority)
+            normalized.priority = max(0, account.priority)
             return normalized
         }
+        Self.renumberRanks(&loaded)
         self.data = loaded
     }
 
@@ -301,23 +302,35 @@ public actor AccountStore {
 
     public func currentDrainingAliases() -> Set<String> { drainingAliases }
 
-    /// Moves an account within the priority-sorted ranking and reassigns the existing
-    /// priority values along the path so every other account keeps a distinct slot.
-    /// `toIndex` is a position in the current ranking where 0 is the top rank.
+    /// Applies a complete ranking (top first). Ignores orders that are not a permutation
+    /// of the current roster; surviving ranks are renumbered densely.
+    public func applyRanking(_ orderedAliases: [String]) {
+        guard orderedAliases.count == data.accounts.count,
+              Set(orderedAliases) == Set(data.accounts.map(\.alias)) else { return }
+        let count = orderedAliases.count
+        for (position, alias) in orderedAliases.enumerated() {
+            if let i = index(alias) {
+                data.accounts[i].priority = count - position
+            }
+        }
+        persist()
+    }
+
+    /// Moves an account within the priority-sorted ranking and renumbers every rank densely
+    /// so the change is always visible. `toIndex` is a position in the ranking where 0 is top.
     public func reorderAccount(_ alias: String, toIndex target: Int) {
         let ranked = data.accounts.sorted { Self.selectionOrder($0, $1, strategy: .priority) }
-        guard ranked.count > 1 else { return }
-        guard let from = ranked.firstIndex(where: { $0.alias == alias }) else { return }
+        guard ranked.count > 1, let from = ranked.firstIndex(where: { $0.alias == alias }) else { return }
         let to = min(max(target, 0), ranked.count - 1)
         guard from != to else { return }
         var reordered = ranked
         let moved = reordered.remove(at: from)
         reordered.insert(moved, at: to)
-        // Every slot keeps the priority value it held before the move, so accounts shifted
-        // along the path inherit their new rank's value.
+        // Write back dense ranks by alias so data.accounts ordering itself is untouched.
+        let count = reordered.count
         for (position, entry) in reordered.enumerated() {
             if let i = index(entry.alias) {
-                data.accounts[i].priority = AccountPriority.normalize(ranked[position].priority)
+                data.accounts[i].priority = count - position
             }
         }
         persist()
@@ -325,13 +338,36 @@ public actor AccountStore {
 
     public func setPriority(_ alias: String, priority: Int) {
         guard let i = index(alias) else { return }
-        data.accounts[i].priority = AccountPriority.normalize(priority)
+        // Legacy numeric setter: keep the value in a sane range, then renumber so the
+        // ranking stays dense and every rank change stays visible.
+        data.accounts[i].priority = max(0, priority)
+        renumberRanks()
         persist()
+    }
+
+    /// Rewrites priorities to dense ordinals (N…1) preserving relative order so no two
+    /// accounts can tie; ties would make rank reordering a silent no-op.
+    nonisolated private static func renumberRanks(_ data: inout StoreData) {
+        let ranked = data.accounts.sorted { selectionOrder($0, $1, strategy: .priority) }
+        let count = ranked.count
+        guard count > 0 else { return }
+        var newPriorities: [String: Int] = [:]
+        for (position, entry) in ranked.enumerated() {
+            newPriorities[entry.alias] = count - position
+        }
+        for i in data.accounts.indices {
+            data.accounts[i].priority = newPriorities[data.accounts[i].alias] ?? data.accounts[i].priority
+        }
+    }
+
+    private func renumberRanks() {
+        Self.renumberRanks(&data)
     }
 
     public func remove(_ alias: String) {
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
+        renumberRanks()
         persist()
     }
 
@@ -389,8 +425,17 @@ public actor AccountStore {
             return merged
         }
         data.accounts.append(account)
+        // Newcomers enter at the BOTTOM of the ranking: their raw priority comes from an
+        // incompatible scale (legacy 0–10, CodexBar rosters), so comparing it against the
+        // dense ranks would scramble ordering. Rank changes belong to the ranking editor.
+        let minimumRank = data.accounts.map(\.priority).min() ?? 2
+        if let i = index(account.alias) {
+            data.accounts[i].priority = minimumRank - 1
+        }
+        renumberRanks()
         persist()
-        return account
+        guard let stored = index(account.alias) else { return account }
+        return data.accounts[stored]
     }
 
     public func expireCooldowns(now: Date = Date()) -> [Account] {

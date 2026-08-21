@@ -98,12 +98,28 @@ final class UsageMonitorStoreTests: XCTestCase {
         let gammaPriority = await store.account("gamma")?.priority
         let alphaPriority = await store.account("alpha")?.priority
         let betaPriority = await store.account("beta")?.priority
-        XCTAssertEqual(gammaPriority, 10)
-        XCTAssertEqual(alphaPriority, 5)
+        XCTAssertEqual(gammaPriority, 3)
+        XCTAssertEqual(alphaPriority, 2)
         XCTAssertEqual(betaPriority, 1)
 
         let current = await store.current()
         XCTAssertEqual(current?.alias, "gamma")
+    }
+
+    func testReorderAccountBreaksTiesWithDistinctRanks() async {
+        let url = tempStoreURL()
+        let store = AccountStore(url: url)
+        // All imported with the same priority — ranks must still reorder visibly.
+        for alias in ["a", "b", "c"] {
+            await store.upsert(Account(alias: alias, accountID: alias, accessToken: "t"))
+        }
+        // Move the last-ranked account (alias tiebreak decides initial order) to the top.
+        await store.reorderAccount("c", toIndex: 0)
+
+        let ranked = await store.all()
+        let order = ranked.sorted { $0.priority > $1.priority }.map(\.alias)
+        XCTAssertEqual(order.first, "c")
+        XCTAssertEqual(Set(ranked.map(\.priority)).count, 3, "no two accounts may share a rank")
     }
 
     func testDrainingAliasesFloatEligibleOrderingWhenSet() async {

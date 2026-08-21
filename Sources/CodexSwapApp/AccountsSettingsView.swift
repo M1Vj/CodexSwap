@@ -3,6 +3,7 @@ import SwapKit
 
 struct AccountsSettingsView: View {
     @ObservedObject var model: SettingsViewModel
+    @State private var rankingSheetPresented = false
 
     var body: some View {
         ScrollView {
@@ -18,8 +19,24 @@ struct AccountsSettingsView: View {
                     )
                     .padding(.top, 40)
                 } else {
+                    HStack {
+                        Button {
+                            rankingSheetPresented = true
+                        } label: {
+                            Label("Reorder Ranking…", systemImage: "arrow.up.arrow.down")
+                        }
+                        .accessibilityLabel("Open the ranking reorder sheet")
+                        Text("Top rank is picked first.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+
                     ForEach(model.presentation.accounts) { account in
-                        AccountCard(account: account, model: model)
+                        AccountCard(
+                            account: account,
+                            model: model,
+                            openRankingSheet: { rankingSheetPresented = true }
+                        )
                     }
                 }
 
@@ -42,6 +59,86 @@ struct AccountsSettingsView: View {
             .padding(.horizontal, 4)
             .padding(.bottom, 8)
         }
+        .sheet(isPresented: $rankingSheetPresented) {
+            RankingSheet(model: model)
+        }
+    }
+}
+
+/// Drag-and-drop editor for the rotation ranking; saves one dense renumbering on apply.
+private struct RankingSheet: View {
+    @ObservedObject var model: SettingsViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var order: [AccountSettingsRow] = []
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Rotation Ranking")
+                    .font(.headline)
+                Text("Drag accounts to reorder. Rank #1 is picked first when routing.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+
+            Divider()
+
+            List {
+                ForEach(Array(order.enumerated()), id: \.element.id) { index, row in
+                    HStack(spacing: 10) {
+                        Image(systemName: "line.3.horizontal")
+                            .foregroundStyle(.tertiary)
+                            .help("Drag to reorder")
+                        Text("#\(index + 1)")
+                            .font(.callout.monospacedDigit().weight(.semibold))
+                            .frame(width: 34, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(row.email.isEmpty ? row.alias : row.email)
+                                .font(.body.weight(.medium))
+                                .lineLimit(1)
+                            if !row.usageWindows.isEmpty {
+                                Text(row.usageWindows.map { "\($0.label) \($0.usedPercent)%" }.joined(separator: " · "))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if row.isActive {
+                            Label("Active", systemImage: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                        }
+                        if !row.routingEnabled {
+                            Text("Paused")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .onMove { source, destination in
+                    order.move(fromOffsets: source, toOffset: destination)
+                }
+            }
+            .listStyle(.inset)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Apply Ranking") {
+                    model.actions.applyRanking(order.map(\.alias))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(12)
+        }
+        .frame(minWidth: 480, idealWidth: 520, minHeight: 420, idealHeight: 500)
+        .onAppear { order = model.presentation.accounts }
     }
 }
 
@@ -49,6 +146,7 @@ struct AccountsSettingsView: View {
 private struct AccountCard: View {
     let account: AccountSettingsRow
     @ObservedObject var model: SettingsViewModel
+    let openRankingSheet: () -> Void
     @State private var resetConfirmationPresented = false
 
     var body: some View {
@@ -139,11 +237,8 @@ private struct AccountCard: View {
 
     private func resetCaption(_ window: UsageWindow) -> String? {
         guard let resetAt = window.resetAt else { return nil }
-        let interval = resetAt.timeIntervalSinceNow
-        guard interval > 0 else { return "resetting…" }
-        let minutes = Int(interval / 60)
-        if minutes >= 60 { return "resets in \(minutes / 60)h \(minutes % 60)m" }
-        return "resets in \(minutes)m"
+        if resetAt <= Date() { return "resetting…" }
+        return "Resets " + resetAt.formatted(date: .abbreviated, time: .shortened)
     }
 
     // MARK: Status line
@@ -189,34 +284,17 @@ private struct AccountCard: View {
     }
 
     private var rankControl: some View {
-        HStack(spacing: 6) {
-            Text("Rank #\(account.rank)")
+        HStack(spacing: 8) {
+            Text("Rank #\(account.rank) of \(account.rankCount)")
                 .font(.callout.monospacedDigit().weight(.medium))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.primary.opacity(0.06), in: Capsule())
                 .accessibilityLabel("Rank \(account.rank) of \(account.rankCount)")
-            VStack(spacing: 1) {
-                Button {
-                    model.actions.reorderRank(account.alias, account.rank - 2)
-                } label: {
-                    Image(systemName: "chevron.up")
-                }
-                .disabled(account.rank <= 1)
-                .help("Move up — picked sooner")
-                .accessibilityLabel("Move \(account.alias) up in ranking")
-                Button {
-                    model.actions.reorderRank(account.alias, account.rank)
-                } label: {
-                    Image(systemName: "chevron.down")
-                }
-                .disabled(account.rank >= account.rankCount)
-                .help("Move down — picked later")
-                .accessibilityLabel("Move \(account.alias) down in ranking")
+            Button("Reorder…", action: openRankingSheet)
+                .controlSize(.small)
+                .help("Open the drag-and-drop ranking editor")
             }
-            .buttonStyle(.borderless)
-            .controlSize(.mini)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(Color.primary.opacity(0.05), in: Capsule())
     }
 
     @ViewBuilder

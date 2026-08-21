@@ -438,6 +438,12 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
+    /// Applies a full drag-and-drop ranking (top rank first) from the reorder sheet.
+    public func applyRanking(_ orderedAliases: [String]) async {
+        await store.applyRanking(orderedAliases)
+        emit(.snapshotChanged)
+    }
+
     public func refreshResetCreditStatuses(aliases: Set<String>? = nil) async {
         await refreshResetCreditsAndEmitSnapshot(aliases: aliases)
     }

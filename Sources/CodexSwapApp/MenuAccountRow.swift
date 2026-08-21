@@ -17,11 +17,11 @@ struct MenuAccountRow: View {
     let costEstimate: Double?
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .center, spacing: 8) {
             Text("#\(rank)")
                 .font(.caption.monospacedDigit().weight(.semibold))
                 .foregroundStyle(isActive ? Color.accentColor : .secondary)
-                .frame(width: 26, alignment: .leading)
+                .frame(width: 22, alignment: .leading)
                 .accessibilityLabel("Rank \(rank)")
             Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(isActive ? Color.green : Color.secondary.opacity(0.6))
@@ -40,32 +40,33 @@ struct MenuAccountRow: View {
                     if cooldownUntil != nil && !needsLogin {
                         badge("⏸", color: .orange, help: "Cooling down until limit reset")
                     }
-                    Spacer(minLength: 0)
+                    Spacer(minLength: 4)
                     if let costEstimate, costEstimate > 0 {
                         Text(String(format: "~$%.2f", costEstimate))
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
                 }
-                HStack(spacing: 8) {
-                    ForEach(windows, id: \.label) { window in
-                        UsageBar(
-                            label: window.label,
-                            usedPercent: window.usedPercent,
-                            tier: UsageAnalytics.healthTier(usedPercent: window.usedPercent),
-                            caption: resetCaption(window)
-                        )
-                    }
-                    if windows.isEmpty {
-                        Text("no usage data")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                if windows.isEmpty {
+                    Text("no usage data")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        ForEach(windows, id: \.label) { window in
+                            UsageBar(
+                                label: window.label,
+                                usedPercent: window.usedPercent,
+                                tier: UsageAnalytics.healthTier(usedPercent: window.usedPercent),
+                                caption: resetCaption(window)
+                            )
+                        }
                     }
                 }
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.vertical, 5)
         .contentShape(Rectangle())
         .opacity(isEnabled ? 1 : 0.45)
         .accessibilityElement(children: .combine)
@@ -82,13 +83,8 @@ struct MenuAccountRow: View {
 
     private func resetCaption(_ window: UsageWindow) -> String? {
         guard let resetAt = window.resetAt else { return nil }
-        let interval = resetAt.timeIntervalSinceNow
-        guard interval > 0 else { return "resetting…" }
-        let minutes = Int(interval / 60)
-        if minutes >= 60 {
-            return "resets in \(minutes / 60)h \(minutes % 60)m"
-        }
-        return "resets in \(minutes)m"
+        if resetAt <= Date() { return "resetting…" }
+        return "Resets " + resetAt.formatted(date: .abbreviated, time: .shortened)
     }
 
     private func badge(_ symbol: String, color: Color, help: String) -> some View {
@@ -100,6 +96,7 @@ struct MenuAccountRow: View {
 }
 
 /// Horizontal usage bar with a percent label; fill color follows the health tier.
+/// The track flexes to fill the row so wide menus never leave dead space.
 struct UsageBar: View {
     let label: String
     let usedPercent: Int
@@ -115,6 +112,10 @@ struct UsageBar: View {
                 Text("\(usedPercent)%")
                     .font(.caption2.monospacedDigit().weight(.medium))
                     .foregroundStyle(tier.color)
+                Text(caption ?? "")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
@@ -125,13 +126,9 @@ struct UsageBar: View {
                         .frame(width: max(2, proxy.size.width * CGFloat(usedPercent) / 100))
                 }
             }
-            .frame(width: 74, height: 4)
-            if let caption {
-                Text(caption)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-            }
+            .frame(height: 4)
         }
+        .frame(minWidth: 96, maxWidth: .infinity)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label): \(usedPercent)% used\(caption.map { ", \($0)" } ?? "")")
     }
@@ -161,11 +158,9 @@ final class MenuRowContainer: NSView {
         self.onSelect = onSelect
         self.rowIsEnabled = isEnabled
         let hosting = NSHostingView(rootView: row)
-        // Size from the content's ideal size so nothing clips vertically; clamp width so
-        // long aliases cannot stretch the menu absurdly wide.
-        let ideal = hosting.fittingSize
-        let height = max(40, ceil(ideal.height))
-        let finalWidth = max(width, min(ceil(ideal.width), 460))
+        // Rows flex to fill; pick a compact fixed width so the menu has no dead space.
+        let height = max(36, ceil(hosting.fittingSize.height))
+        let finalWidth = max(280, min(width, 400))
         super.init(frame: NSRect(x: 0, y: 0, width: finalWidth, height: height))
         wantsLayer = true
         hosting.frame = bounds

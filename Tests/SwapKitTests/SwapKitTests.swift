@@ -1786,6 +1786,8 @@ final class RotationTests: XCTestCase {
 
     func testPriorityPicksHighest() async {
         let store = await tempStore([acct("low", priority: 1), acct("high", priority: 10)])
+        // Raw construction values no longer decide order; the ranking does.
+        await store.applyRanking(["high", "low"])
         let current = await store.current()
         XCTAssertEqual(current?.alias, "high")
     }
@@ -1824,7 +1826,8 @@ final class RotationTests: XCTestCase {
         let reloaded = await AccountStore(url: url).account("paused")
         XCTAssertEqual(reloaded?.routingEnabled, false)
         XCTAssertEqual(reloaded?.tokens, original.tokens)
-        XCTAssertEqual(reloaded?.priority, 7)
+        // Ranks are dense after reload; the pause (not the numeric value) is the invariant here.
+        XCTAssertEqual(reloaded?.priority, 1)
         XCTAssertEqual(reloaded?.managedHomePath, "/managed")
     }
 
@@ -3260,7 +3263,7 @@ final class SettingsInformationArchitectureTests: XCTestCase {
 }
 
 final class AccountPriorityValidationTests: XCTestCase {
-    func testPriorityUpdatesClampToAllowedRange() async throws {
+    func testPriorityUpdatesStaySaneAndRankingStaysDense() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("priority-update-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }
         let store = AccountStore(url: url)
@@ -3268,13 +3271,13 @@ final class AccountPriorityValidationTests: XCTestCase {
 
         await store.setPriority("alpha", priority: -4)
         let lowPriority = await store.account("alpha")?.priority
-        XCTAssertEqual(lowPriority, 0)
+        XCTAssertEqual(lowPriority, 1)
         await store.setPriority("alpha", priority: 99)
         let highPriority = await store.account("alpha")?.priority
-        XCTAssertEqual(highPriority, 10)
+        XCTAssertEqual(highPriority, 1)
     }
 
-    func testImportedAndPersistedPrioritiesAreNormalized() async throws {
+    func testImportedAndPersistedPrioritiesRenumberToDenseRanks() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("priority-import-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }
         let persisted = #"{"schemaVersion":1,"accounts":[{"alias":"low","email":"","accountID":"low","accessToken":"token","refreshToken":"","idToken":"","priority":-3,"disabledUntil":{},"needsLogin":false,"usage":[]},{"alias":"high","email":"","accountID":"high","accessToken":"token","refreshToken":"","idToken":"","priority":40,"disabledUntil":{},"needsLogin":false,"usage":[]}]}"#
@@ -3283,11 +3286,15 @@ final class AccountPriorityValidationTests: XCTestCase {
         let store = AccountStore(url: url)
         let lowPriority = await store.account("low")?.priority
         let highPriority = await store.account("high")?.priority
-        XCTAssertEqual(lowPriority, 0)
-        XCTAssertEqual(highPriority, 10)
+        XCTAssertEqual(lowPriority, 1)
+        XCTAssertEqual(highPriority, 2)
 
         let imported = await store.upsert(Account(alias: "new", accountID: "new", accessToken: "token", priority: 80))
-        XCTAssertEqual(imported.priority, 10)
+        // Newcomers land at the bottom of the ranking regardless of raw value.
+        XCTAssertEqual(imported.priority, 1)
+        let all = await store.all()
+        XCTAssertTrue(all.allSatisfy { $0.priority >= 1 })
+        XCTAssertEqual(Set(all.map(\.priority)).count, all.count, "ranks must be unique")
     }
 }
 

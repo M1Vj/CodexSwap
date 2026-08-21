@@ -415,12 +415,8 @@ private struct WindowMeter: View {
 
     private var resetText: String {
         guard let resetAt = window.resetAt else { return "" }
-        let remaining = resetAt.timeIntervalSinceNow
-        guard remaining > 0 else { return "resetting…" }
-        let minutes = Int(remaining / 60)
-        if minutes >= 1440 { return "resets in \(minutes / 1440)d \(minutes % 1440 / 60)h" }
-        if minutes >= 60 { return "resets in \(minutes / 60)h \(minutes % 60)m" }
-        return "resets in \(minutes)m"
+        if resetAt <= Date() { return "resetting…" }
+        return "Resets " + resetAt.formatted(date: .abbreviated, time: .shortened)
     }
 
     /// Burn rate and time-to-exhaustion are suppressed until ≥3% is consumed so early-window
