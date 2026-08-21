@@ -119,7 +119,8 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         await fixture.engine.setPriority("alpha", priority: 7)
         XCTAssertEqual(events.value(), 1)
         let immediateSnapshot = await fixture.engine.snapshot()
-        XCTAssertEqual(immediateSnapshot.accounts.first?.priority, 7)
+        // Single-account roster renumbers to the dense top rank.
+        XCTAssertEqual(immediateSnapshot.accounts.first?.priority, 1)
 
         try await fixture.service.waitForFetchCount(2)
         await fixture.service.resumeSuspendedFetch()
