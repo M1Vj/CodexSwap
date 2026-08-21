@@ -9,12 +9,19 @@ final class AlphaBridgeTests: XCTestCase {
     // MARK: - Detection
 
     func testRoutedModelDetection() {
+        let catalog = [
+            BridgedModel(modelID: "x-preview-f-free", baseURL: "https://opencode.ai/zen/v1"),
+            BridgedModel(modelID: "disabled-model", baseURL: "https://example.invalid/v1", enabled: false),
+        ]
         let routed = #"{"model":"x-preview-f-free","stream":true,"input":"hi"}"#
-        XCTAssertEqual(AlphaBridge.routedModel(in: Data(routed.utf8)), "x-preview-f-free")
+        XCTAssertEqual(AlphaBridge.routedModel(in: Data(routed.utf8), catalog: catalog), "x-preview-f-free")
+
+        let disabled = #"{"model":"disabled-model","input":"hi"}"#
+        XCTAssertNil(AlphaBridge.routedModel(in: Data(disabled.utf8), catalog: catalog), "disabled entries must not match")
 
         let other = #"{"model":"gpt-5.6-sol","input":"hi"}"#
-        XCTAssertNil(AlphaBridge.routedModel(in: Data(other.utf8)))
-        XCTAssertNil(AlphaBridge.routedModel(in: Data("not json".utf8)))
+        XCTAssertNil(AlphaBridge.routedModel(in: Data(other.utf8), catalog: catalog))
+        XCTAssertNil(AlphaBridge.routedModel(in: Data("not json".utf8), catalog: catalog))
     }
 
     // MARK: - Request translation
@@ -187,10 +194,6 @@ final class AlphaBridgeTests: XCTestCase {
         let codexURL = try await codexUpstream.start()
         defer { Task { await codexUpstream.stop() } }
 
-        let originalBaseURL = AlphaBridge.upstreamBaseURL
-        AlphaBridge.upstreamBaseURL = chatURL
-        defer { AlphaBridge.upstreamBaseURL = originalBaseURL }
-
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("alpha-bridge-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -202,7 +205,12 @@ final class AlphaBridgeTests: XCTestCase {
         var config = ProxyServer.Config()
         config.port = 0
         config.upstream = codexURL
-        let server = ProxyServer(store: store, config: config, settingsProvider: { .default })
+        var settings = Settings.default
+        settings.bridgedModels = [
+            BridgedModel(modelID: "x-preview-f-free", displayName: "Ox Alpha Free", baseURL: chatURL.absoluteString)
+        ]
+        let fixedSettings = settings
+        let server = ProxyServer(store: store, config: config, settingsProvider: { fixedSettings })
         try await server.start()
         defer { Task { await server.stop() } }
 

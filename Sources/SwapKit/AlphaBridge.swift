@@ -12,20 +12,20 @@ import AsyncHTTPClient
 // models never touch account selection, tokens, or rotation.
 
 enum AlphaBridge {
-    /// Models served through the free-tier translation lane.
-    static let routedModels: Set<String> = ["x-preview-f-free"]
-    /// Test seams allow pointing the lane at a local fixture gateway.
-    nonisolated(unsafe) static var upstreamBaseURL = URL(string: "https://opencode.ai/zen/v1")!
     static let maxBodyBytes = 8 * 1024 * 1024
 
-    /// Returns the routed model name when `body` is a Responses request for a bridged model.
-    static func routedModel(in body: Data) -> String? {
+    /// Returns the enabled bridged-model entry matching `body`, if any.
+    static func matchedEntry(in body: Data, catalog: [BridgedModel]) -> BridgedModel? {
         guard body.count <= maxBodyBytes,
               body.count >= 2,
               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let model = object["model"] as? String,
-              routedModels.contains(model) else { return nil }
-        return model
+              let requested = object["model"] as? String else { return nil }
+        return catalog.first { $0.enabled && $0.modelID == requested }
+    }
+
+    /// Convenience for tests and tooling: is this body a request for an enabled entry?
+    static func routedModel(in body: Data, catalog: [BridgedModel]) -> String? {
+        matchedEntry(in: body, catalog: catalog)?.modelID
     }
 
     // MARK: Request translation
@@ -559,22 +559,29 @@ extension AlphaBridge {
     /// Serves one bridged request end-to-end. Called from ProxyServer once the
     /// request has been recognized as routed; never touches account state.
     static func handle(
-        model: String,
+        entry: BridgedModel,
         body: Data,
         httpClient: HTTPClient,
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         sink: ProxyEventSink
     ) async throws {
-        guard let payload = chatPayload(fromResponsesData: body, model: model),
+        guard let payload = chatPayload(fromResponsesData: body, model: entry.modelID),
               let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
             return
         }
         let wantsStream = (payload["stream"] as? Bool) ?? false
 
-        var request = HTTPClientRequest(url: upstreamBaseURL.appendingPathComponent("chat/completions").absoluteString)
+        guard let base = URL(string: entry.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            try await writeHTTPError(outbound, status: .internalServerError, code: "bad_bridged_base_url", message: "Bridged model has an invalid base URL")
+            return
+        }
+        var request = HTTPClientRequest(url: base.appendingPathComponent("chat/completions").absoluteString)
         request.method = .POST
         request.headers.add(name: "Content-Type", value: "application/json")
+        if !entry.apiKey.isEmpty {
+            request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
+        }
         request.body = .bytes(ByteBuffer(bytes: payloadData))
         let response: HTTPClientResponse
         do {
@@ -603,7 +610,7 @@ extension AlphaBridge {
             return
         }
 
-        var translator = AlphaSSETranslator(model: model)
+        var translator = AlphaSSETranslator(model: entry.modelID)
 
         if !wantsStream {
             var whole = ByteBuffer()
@@ -624,7 +631,7 @@ extension AlphaBridge {
             let responseObj = AlphaBridge.responseObject(
                 id: translator.responseID,
                 createdAt: translator.createdAt,
-                model: model,
+                model: entry.modelID,
                 status: "completed",
                 output: translator.orderedOutputItemsPublic(),
                 usage: translator.usage.map { AlphaBridge.usageDict(fromChatUsage: $0) }
@@ -637,7 +644,7 @@ extension AlphaBridge {
             try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: bodyBytes))))
             try await outbound.write(.end(nil))
             if let usage = translator.usage {
-                await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: AlphaBridge.usageSample(model: model, fromChatUsage: usage)))
+                await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)))
             }
             return
         }
@@ -660,7 +667,7 @@ extension AlphaBridge {
         try await outbound.write(.end(nil))
 
         if let usage = translator.usage {
-            await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: AlphaBridge.usageSample(model: model, fromChatUsage: usage)))
+            await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)))
         }
     }
 

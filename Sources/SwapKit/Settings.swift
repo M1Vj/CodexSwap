@@ -6,6 +6,34 @@ public enum QuotaExhaustionPolicy: String, Codable, Sendable, CaseIterable {
     case stopAndNotify
 }
 
+/// A non-Codex model served through the proxy's translation lane
+/// (Responses API on the client side, Chat Completions upstream).
+public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
+    public var modelID: String
+    public var displayName: String
+    /// Base URL ending at the version segment, e.g. https://opencode.ai/zen/v1
+    public var baseURL: String
+    /// Optional bearer credential; empty means anonymous (typical for free tiers).
+    public var apiKey: String
+    public var enabled: Bool
+
+    public init(
+        modelID: String,
+        displayName: String = "",
+        baseURL: String,
+        apiKey: String = "",
+        enabled: Bool = true
+    ) {
+        self.modelID = modelID
+        self.displayName = displayName.isEmpty ? modelID : displayName
+        self.baseURL = baseURL
+        self.apiKey = apiKey
+        self.enabled = enabled
+    }
+
+    public var id: String { modelID }
+}
+
 public struct Settings: Codable, Sendable, Equatable {
     public var rotationStrategy: RotationStrategy
     /// Pre-emptively rotate away from the active account when its primary (5h) window reaches this percent.
@@ -44,6 +72,8 @@ public struct Settings: Codable, Sendable, Equatable {
     /// Prefer accounts whose quota is draining from other users' activity when picking the next account.
     public var smartSwitchEnabled: Bool
     public var proxyPort: Int
+    /// Free/gateway models served through the Responses<->Chat bridge instead of Codex accounts.
+    public var bridgedModels: [BridgedModel]
 
     public static let defaultProxyPort = 58_432
 
@@ -74,7 +104,14 @@ public struct Settings: Codable, Sendable, Equatable {
         notifyOnTaskEvents: true,
         notifyOnNeedsLogin: true,
         smartSwitchEnabled: false,
-        proxyPort: defaultProxyPort
+        proxyPort: defaultProxyPort,
+        bridgedModels: [
+            BridgedModel(
+                modelID: "x-preview-f-free",
+                displayName: "Ox Alpha Free",
+                baseURL: "https://opencode.ai/zen/v1"
+            )
+        ]
     )
 
     public init(
@@ -104,7 +141,8 @@ public struct Settings: Codable, Sendable, Equatable {
         notifyOnTaskEvents: Bool,
         notifyOnNeedsLogin: Bool = true,
         smartSwitchEnabled: Bool = false,
-        proxyPort: Int
+        proxyPort: Int,
+        bridgedModels: [BridgedModel]? = nil
     ) {
         self.rotationStrategy = rotationStrategy
         self.primaryThresholdPercent = primaryThresholdPercent
@@ -133,6 +171,7 @@ public struct Settings: Codable, Sendable, Equatable {
         self.notifyOnNeedsLogin = notifyOnNeedsLogin
         self.smartSwitchEnabled = smartSwitchEnabled
         self.proxyPort = proxyPort
+        self.bridgedModels = bridgedModels ?? Settings.default.bridgedModels
     }
 
     /// Tolerant decoder: missing keys fall back to defaults so new fields never invalidate an old file.
@@ -171,6 +210,8 @@ public struct Settings: Codable, Sendable, Equatable {
         smartSwitchEnabled = try c.decodeIfPresent(Bool.self, forKey: .smartSwitchEnabled) ?? d.smartSwitchEnabled
         let decodedPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
         proxyPort = (1...65_535).contains(decodedPort) ? decodedPort : d.proxyPort
+        let decodedBridged = try c.decodeIfPresent([BridgedModel].self, forKey: .bridgedModels) ?? d.bridgedModels
+        bridgedModels = decodedBridged.filter { !$0.modelID.isEmpty && URL(string: $0.baseURL) != nil }
     }
 }
 
