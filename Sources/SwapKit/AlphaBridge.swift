@@ -341,15 +341,35 @@ struct AlphaSSETranslator {
                     return (callID: callID, itemID: itemID, name: name, arguments: "")
                 }()
                 if let function = call["function"] as? [String: Any] {
-                    if let name = function["name"] as? String, !name.isEmpty { entry.name += name }
+                    // Gateways differ: some stream incremental fragments, others resend
+                    // cumulative snapshots of name/arguments on every chunk. Blind
+                    // concatenation corrupts cumulative streams (e.g. doubled tool
+                    // names), so merge by prefix relationship and emit only new bytes.
+                    if let name = function["name"] as? String, !name.isEmpty {
+                        if entry.name.isEmpty || name.hasPrefix(entry.name) {
+                            entry.name = name
+                        } else if !entry.name.hasPrefix(name) {
+                            entry.name += name
+                        }
+                    }
                     if let arguments = function["arguments"] as? String, !arguments.isEmpty {
-                        entry.arguments += arguments
-                        ensureToolAdded(index: index, entry: entry)
-                        appendEvent(type: "response.function_call_arguments.delta", payload: [
-                            "item_id": entry.itemID,
-                            "output_index": outputIndexForTool(index: index),
-                            "delta": arguments,
-                        ])
+                        var freshFragment = arguments
+                        if !entry.arguments.isEmpty {
+                            if arguments.hasPrefix(entry.arguments) {
+                                freshFragment = String(arguments.dropFirst(entry.arguments.count))
+                            } else if entry.arguments.hasPrefix(arguments) {
+                                freshFragment = ""
+                            }
+                        }
+                        entry.arguments += freshFragment
+                        if !freshFragment.isEmpty {
+                            ensureToolAdded(index: index, entry: entry)
+                            appendEvent(type: "response.function_call_arguments.delta", payload: [
+                                "item_id": entry.itemID,
+                                "output_index": outputIndexForTool(index: index),
+                                "delta": freshFragment,
+                            ])
+                        }
                     }
                 }
                 toolCalls[index] = entry

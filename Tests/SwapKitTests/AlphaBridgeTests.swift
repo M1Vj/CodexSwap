@@ -178,6 +178,30 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual(calls.first?["arguments"] as? String, "{\"p\":1}")
     }
 
+    func testSSETranslatorCumulativeToolCallSnapshotsAreNotConcatenated() throws {
+        // Some gateways resend cumulative name/arguments snapshots per chunk.
+        let events = translatedEvents([
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ])
+
+        XCTAssertFalse(events.contains("exec_commandexec_command"), "name must never duplicate")
+        let doneItems = events.components(separatedBy: "\n")
+            .filter { $0.contains(#""type":"response.output_item.done""#) }
+            .compactMap { line -> [String: Any]? in
+                let json = line.replacingOccurrences(of: "data: ", with: "")
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else { return nil }
+                return obj["item"] as? [String: Any]
+            }
+        let calls = doneItems.filter { ($0["type"] as? String) == "function_call" }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?["name"] as? String, "exec_command")
+        XCTAssertEqual(calls.first?["arguments"] as? String, "{\"cmd\":\"pwd\"}")
+    }
+
     func testSSETranslatorFailureEvent() throws {
         var translator = AlphaSSETranslator(model: "x-preview-f-free")
         translator.fail(errorObject: ["code": "boom", "message": "bad"])
