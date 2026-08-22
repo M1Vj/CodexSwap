@@ -79,6 +79,20 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual((tools[0]["function"] as? [String: Any])?["name"] as? String, "read_file")
     }
 
+    func testZstdEncodedRequestBodiesAreDecodedForMatching() throws {
+        // Real zstd frame of {"model":"x-preview-f-free","input":"hi"} (codex sends zstd bodies).
+        let compressed = Data(base64Encoded: "KLUv/SQpSQEAeyJtb2RlbCI6IngtcHJldmlldy1mLWZyZWUiLCJpbnB1dCI6ImhpIn2LiZ2+")!
+        let catalog = [BridgedModel(modelID: "x-preview-f-free", baseURL: "https://opencode.ai/zen/v1")]
+
+        XCTAssertEqual(
+            AlphaBridge.routedModel(in: compressed, catalog: catalog, contentEncoding: "zstd"),
+            "x-preview-f-free",
+            "zstd bodies must be inflated before model matching"
+        )
+        XCTAssertNil(AlphaBridge.routedModel(in: compressed, catalog: catalog),
+                     "unflagged compressed bodies must not match raw bytes")
+    }
+
     func testEffortClamping() {
         XCTAssertEqual(AlphaBridge.clampedEffort("max"), "max")
         XCTAssertEqual(AlphaBridge.clampedEffort("xhigh"), "max")

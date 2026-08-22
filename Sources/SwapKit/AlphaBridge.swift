@@ -14,8 +14,28 @@ import AsyncHTTPClient
 enum AlphaBridge {
     static let maxBodyBytes = 8 * 1024 * 1024
 
+    /// Decodes a request body per its Content-Encoding so the model ID can be read.
+    /// Codex compresses large Responses bodies with zstd; Chat Completions gateways
+    /// receive plain JSON from this lane. Returns nil when decoding fails.
+    static func decodedRequestBody(_ data: Data, contentEncoding: String?) -> Data? {
+        switch contentEncoding?.lowercased() {
+        case "zstd", "zstandard":
+            return ZstdRuntime.decompress(data) ?? data
+        case nil, "", "identity":
+            return data
+        default:
+            // Unknown encodings are passed through; matching will simply miss.
+            return data
+        }
+    }
+
     /// Returns the enabled bridged-model entry matching `body`, if any.
-    static func matchedEntry(in body: Data, catalog: [BridgedModel]) -> BridgedModel? {
+    static func matchedEntry(
+        in rawBody: Data,
+        contentEncoding: String? = nil,
+        catalog: [BridgedModel]
+    ) -> BridgedModel? {
+        guard let body = decodedRequestBody(rawBody, contentEncoding: contentEncoding) else { return nil }
         guard body.count <= maxBodyBytes,
               body.count >= 2,
               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
@@ -24,8 +44,8 @@ enum AlphaBridge {
     }
 
     /// Convenience for tests and tooling: is this body a request for an enabled entry?
-    static func routedModel(in body: Data, catalog: [BridgedModel]) -> String? {
-        matchedEntry(in: body, catalog: catalog)?.modelID
+    static func routedModel(in body: Data, catalog: [BridgedModel], contentEncoding: String? = nil) -> String? {
+        matchedEntry(in: body, contentEncoding: contentEncoding, catalog: catalog)?.modelID
     }
 
     // MARK: Request translation
@@ -702,5 +722,91 @@ extension AlphaBridge {
         try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
         try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: data))))
         try await outbound.write(.end(nil))
+    }
+}
+
+
+// MARK: - zstd runtime binding
+
+/// Minimal runtime binding to libzstd for request-body inflation. Resolves the
+/// library through dlopen at first use (Homebrew or system paths) so the package
+/// carries no hard dependency; hosts without libzstd simply skip bridged-model
+/// detection for compressed bodies and fall through to account routing.
+enum ZstdRuntime {
+    private typealias DecompressFn = @convention(c) (UnsafeMutableRawPointer?, Int, UnsafePointer<UInt8>, Int) -> Int
+    private typealias FrameSizeFn = @convention(c) (UnsafePointer<UInt8>, Int) -> UInt64
+    private typealias IsErrorFn = @convention(c) (Int) -> UInt32
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var decompressFn: DecompressFn?
+    nonisolated(unsafe) private static var frameSizeFn: FrameSizeFn?
+    nonisolated(unsafe) private static var isErrorFn: IsErrorFn?
+    nonisolated(unsafe) private static var resolved = false
+
+    private static func resolve() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !resolved else { return }
+        resolved = true
+        let candidates = [
+            "/opt/homebrew/opt/zstd/lib/libzstd.1.dylib",
+            "/opt/homebrew/lib/libzstd.1.dylib",
+            "/usr/local/opt/zstd/lib/libzstd.1.dylib",
+            "libzstd.1.dylib",
+        ]
+        for path in candidates {
+            guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL) else { continue }
+            guard
+                let d = dlsym(handle, "ZSTD_decompress"),
+                let f = dlsym(handle, "ZSTD_getFrameContentSize"),
+                let e = dlsym(handle, "ZSTD_isError")
+            else {
+                dlclose(handle)
+                continue
+            }
+            decompressFn = unsafeBitCast(d, to: DecompressFn.self)
+            frameSizeFn = unsafeBitCast(f, to: FrameSizeFn.self)
+            isErrorFn = unsafeBitCast(e, to: IsErrorFn.self)
+            return
+        }
+    }
+
+    static func decompress(_ data: Data) -> Data? {
+        resolve()
+        guard let decompressFn, let frameSizeFn, let isErrorFn else { return nil }
+        guard data.count > 4, data.starts(with: [0x28, 0xB5, 0x2F, 0xFD]) else { return nil }
+
+        var declared = data.withUnsafeBytes { raw -> UInt64 in
+            guard let base = raw.baseAddress else { return 0 }
+            return frameSizeFn(base.assumingMemoryBound(to: UInt8.self), data.count)
+        }
+        if declared == UInt64.max || declared == 0xFFFFFFFFFFFFFFFF {
+            declared = UInt64(data.count) * 8
+        }
+        var capacity = Int(clamping: declared)
+        if capacity <= 0 || capacity > AlphaBridge.maxBodyBytes { capacity = AlphaBridge.maxBodyBytes }
+
+        while true {
+            var output = Data(count: capacity)
+            let written = output.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return data.withUnsafeBytes { src -> Int in
+                    guard let srcBase = src.baseAddress else { return 0 }
+                    return decompressFn(
+                        base,
+                        capacity,
+                        srcBase.assumingMemoryBound(to: UInt8.self),
+                        data.count
+                    )
+                }
+            }
+            if isErrorFn(written) == 0, written > 0 {
+                output.removeSubrange(written..<output.count)
+                return output
+            }
+            // ZSTD_error_dstSize_tooSmall -> grow once toward maxBodyBytes, then give up.
+            if capacity >= AlphaBridge.maxBodyBytes { return nil }
+            capacity = min(AlphaBridge.maxBodyBytes, capacity * 2)
+        }
     }
 }

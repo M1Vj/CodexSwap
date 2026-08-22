@@ -803,7 +803,10 @@ public actor ProxyServer {
         // Free-model bridge: routed models translate Responses<->Chat against their own
         // gateway and never touch account selection, tokens, or rotation.
         if head.method == .POST, rawPath.hasSuffix("/responses"),
-           let bridgedEntry = AlphaBridge.matchedEntry(in: body, catalog: settings.bridgedModels) {
+           let bridgedEntry = AlphaBridge.matchedEntry(
+               in: body,
+               contentEncoding: head.headers.first(name: "Content-Encoding"),
+               catalog: settings.bridgedModels) {
             log("POST \(rawPath) -> alpha bridge model=\(bridgedEntry.modelID)")
             let eventSink = self.sink
             try await AlphaBridge.handle(
