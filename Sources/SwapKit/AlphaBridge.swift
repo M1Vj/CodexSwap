@@ -719,7 +719,7 @@ extension AlphaBridge {
         // Free-tier gateways are a pool of backends with differing prompt limits:
         // a prompt-too-long rejection can be backend-specific. While nothing has
         // been streamed to the client yet, one fresh attempt may land elsewhere.
-        let maxUpstreamAttempts = 2
+        let maxUpstreamAttempts = 4
         var attempt = 0
 
         attemptLoop: while true {
@@ -732,7 +732,21 @@ extension AlphaBridge {
                     try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
                     return
                 }
-                guard response.status == .ok else { break }
+                if response.status != .ok {
+                    var detail = ByteBuffer()
+                    for try await chunk in response.body {
+                        detail.writeImmutableBuffer(chunk)
+                        if detail.readableBytes > 16 * 1024 { break }
+                    }
+                    let bodyText = String(buffer: detail)
+                    if response.status.code == 429 || response.status.code >= 500 || isPromptLengthFailure(code: String(response.status.code), message: bodyText) {
+                        if attempt < maxUpstreamAttempts {
+                            try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
+                            continue attemptLoop
+                        }
+                    }
+                    break
+                }
             }
 
             for try await chunk in response.body {
