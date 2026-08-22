@@ -273,6 +273,9 @@ struct AlphaSSETranslator {
     private(set) var pendingEvents: [Data] = []
     private(set) var finished = false
     private(set) var failed = false
+    private(set) var failureCode: String?
+    private(set) var failureMessage: String?
+    private(set) var emittedVisibleOutput = false
     private var usageDict: [String: Any]?
 
     var usage: [String: Any]? { usageDict }
@@ -327,6 +330,7 @@ struct AlphaSSETranslator {
         if let content = delta["content"] as? String, !content.isEmpty {
             startMessageIfNeeded()
             messageText += content
+            emittedVisibleOutput = true
             appendEvent(type: "response.output_text.delta", payload: [
                 "item_id": messageItemID,
                 "output_index": 0,
@@ -368,6 +372,7 @@ struct AlphaSSETranslator {
                         }
                         entry.arguments += freshFragment
                         if !freshFragment.isEmpty {
+                            emittedVisibleOutput = true
                             ensureToolAdded(index: index, entry: entry)
                             appendEvent(type: "response.function_call_arguments.delta", payload: [
                                 "item_id": entry.itemID,
@@ -582,6 +587,10 @@ struct AlphaSSETranslator {
         guard !finished else { return }
         finished = true
         failed = true
+        if let err = errorObject {
+            failureCode = err["code"] as? String ?? (err["type"] as? String)
+            failureMessage = err["message"] as? String
+        }
         emitCreatedIfNeeded()
         let response = AlphaBridge.responseObject(
             id: responseID,
@@ -629,7 +638,7 @@ extension AlphaBridge {
             request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
         }
         request.body = .bytes(ByteBuffer(bytes: payloadData))
-        let response: HTTPClientResponse
+        var response: HTTPClientResponse
         do {
             response = try await httpClient.execute(request, timeout: .seconds(600))
         } catch {
@@ -707,12 +716,41 @@ extension AlphaBridge {
         headers.add(name: "Cache-Control", value: "no-cache")
         try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)))
 
-        for try await chunk in response.body {
-            let events = translator.feed(chunk)
-            if !events.isEmpty {
-                try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(events)))))
+        // Free-tier gateways are a pool of backends with differing prompt limits:
+        // a prompt-too-long rejection can be backend-specific. While nothing has
+        // been streamed to the client yet, one fresh attempt may land elsewhere.
+        let maxUpstreamAttempts = 2
+        var attempt = 0
+
+        attemptLoop: while true {
+            attempt += 1
+            if attempt > 1 {
+                translator = AlphaSSETranslator(model: entry.modelID)
+                do {
+                    response = try await httpClient.execute(request, timeout: .seconds(600))
+                } catch {
+                    try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
+                    return
+                }
+                guard response.status == .ok else { break }
             }
+
+            for try await chunk in response.body {
+                let events = translator.feed(chunk)
+                if !events.isEmpty {
+                    try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(events)))))
+                }
+                if translator.failed, let code = translator.failureCode,
+                   isPromptLengthFailure(code: code, message: translator.failureMessage),
+                   !translator.emittedVisibleOutput, attempt < maxUpstreamAttempts {
+                    continue attemptLoop
+                }
+                if translator.failed { break }
+            }
+
+            break
         }
+
         var tail = translator.finishFeed()
         // Upstreams occasionally drop the connection mid-stream without an error
         // frame; surface that as response.failed so clients see a real diagnosis
@@ -726,6 +764,10 @@ extension AlphaBridge {
         } else if !translator.finished {
             translator.finish()
             tail += translator.finishFeed()
+        }
+        if translator.failed,
+           isPromptLengthFailure(code: translator.failureCode ?? "", message: translator.failureMessage) {
+            tail += Data("data: {\"error\":{\"code\":\"prompt_too_long\",\"message\":\"Bridged model rejected the prompt length; compact this session (e.g. /compact) or start a new one.\"}}\n\n".utf8)
         }
         if !tail.isEmpty {
             try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(tail)))))
@@ -742,6 +784,12 @@ extension AlphaBridge {
                 outputTokens: sample.outputTokens
             )
         }
+    }
+
+
+    static func isPromptLengthFailure(code: String, message: String?) -> Bool {
+        let haystack = (code + " " + (message ?? "")).lowercased()
+        return haystack.contains("1261") || haystack.contains("prompt exceeds max length") || haystack.contains("prompt is too long")
     }
 
     static func writeFailedEvent(
