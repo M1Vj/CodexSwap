@@ -188,6 +188,92 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertTrue(translator.finished && translator.failed)
     }
 
+    func testPassthroughRetriesFlakyGatewayThenStreams() async throws {
+        let flakyUpstream = MockUpstream(scripts: [
+            .init(.internalServerError, "text/plain", "overloaded"),
+            .init(.tooManyRequests, "text/plain", "slow down"),
+            .init(.ok, "text/event-stream",
+                  #"data: {"id":"c1","choices":[{"delta":{"content":"resumed"},"finish_reason":null}]}\n\ndata: [DONE]\n\n"#),
+        ])
+        let chatURL = try await flakyUpstream.start()
+        defer { Task { await flakyUpstream.stop() } }
+
+        let codexUpstream = MockUpstream(responseBody: "{}", contentType: "application/json")
+        let codexURL = try await codexUpstream.start()
+        defer { Task { await codexUpstream.stop() } }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("alpha-passthrough-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "probe", accountID: "acct", accessToken: "token"))
+
+        var config = ProxyServer.Config()
+        config.port = 0
+        config.upstream = codexURL
+        var settings = Settings.default
+        settings.bridgedModels = [
+            BridgedModel(modelID: "x-preview-f-free", displayName: "Ox Alpha Free", baseURL: chatURL.absoluteString)
+        ]
+        let fixedSettings = settings
+        let server = ProxyServer(store: store, config: config, settingsProvider: { fixedSettings })
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = Data(#"{"model":"x-preview-f-free","messages":[{"role":"user","content":"hi"}],"stream":true}"#.utf8)
+        let (body, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let text = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(text.contains("resumed"), text)
+
+        let hits = await flakyUpstream.requestCount()
+        XCTAssertEqual(hits, 3, "two retryable failures then success")
+
+        let codexHits = await codexUpstream.requestCount()
+        XCTAssertEqual(codexHits, 0, "passthrough lane must not touch accounts")
+    }
+
+    func testPassthroughDoesNotRetryClientErrors() async throws {
+        let upstream = MockUpstream(scripts: [.init(.badRequest, "application/json", "{\"error\":{\"message\":\"bad model params\"}}")])
+        let chatURL = try await upstream.start()
+        defer { Task { await upstream.stop() } }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("alpha-passthrough-fastfail-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+
+        var config = ProxyServer.Config()
+        config.port = 0
+        var settings = Settings.default
+        settings.bridgedModels = [BridgedModel(modelID: "x-preview-f-free", baseURL: chatURL.absoluteString)]
+        let fixedSettings = settings
+        let server = ProxyServer(store: store, config: config, settingsProvider: { fixedSettings })
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/chat/completions")!)
+        request.httpMethod = "POST"
+        request.httpBody = Data(#"{"model":"x-preview-f-free","messages":[]}"#.utf8)
+        let (body, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 502)
+        XCTAssertTrue(String(decoding: body, as: UTF8.self).contains("bad model params"))
+        let hits = await upstream.requestCount()
+        XCTAssertEqual(hits, 1, "client errors must fail fast without retries")
+    }
+
     // MARK: - End-to-end through ProxyServer
 
     func testProxyAlphaLaneBypassesAccountsAndTranslatesStreamingResponse() async throws {
@@ -264,17 +350,32 @@ final class AlphaBridgeTests: XCTestCase {
 
 // MARK: - Mock upstream
 
-/// Minimal HTTP server answering every request with one fixed raw response.
+/// Minimal HTTP server answering each request with the next scripted response
+/// (last script repeats). Scripts are (status, contentType, body) triples.
 private final class MockUpstream: @unchecked Sendable {
-    private let responseBody: String
-    private let contentType: String
+    struct Script {
+        let status: HTTPResponseStatus
+        let contentType: String
+        let body: String
+        init(_ status: HTTPResponseStatus = .ok, _ contentType: String, _ body: String) {
+            self.status = status
+            self.contentType = contentType
+            self.body = body
+        }
+    }
+
+    private let scripts: [Script]
     private var channel: Channel?
     private var serverGroup: MultiThreadedEventLoopGroup?
     private let counter = CounterBox()
+    private let indexBox = IndexBox()
 
-    init(responseBody: String, contentType: String) {
-        self.responseBody = responseBody
-        self.contentType = contentType
+    convenience init(responseBody: String, contentType: String) {
+        self.init(scripts: [MockUpstream.Script(.ok, contentType, responseBody)])
+    }
+
+    init(scripts: [Script]) {
+        self.scripts = scripts
     }
 
     func start() async throws -> URL {
@@ -283,14 +384,14 @@ private final class MockUpstream: @unchecked Sendable {
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
         let channel = try await bootstrap
-            .childChannelInitializer { [body = responseBody, type = contentType, counter] channel -> EventLoopFuture<Void> in
+            .childChannelInitializer { [scripts, counter, indexBox] channel -> EventLoopFuture<Void> in
                 do {
                     try channel.pipeline.syncOperations.configureHTTPServerPipeline()
                 } catch {
                     return channel.eventLoop.makeFailedFuture(error)
                 }
                 return channel.pipeline.addHandler(
-                    RawResponseHandler(body: body, contentType: type, counter: counter)
+                    ScriptedResponseHandler(scripts: scripts, counter: counter, indexBox: indexBox)
                 )
             }
             .bind(host: "127.0.0.1", port: 0).get()
@@ -309,6 +410,17 @@ private final class MockUpstream: @unchecked Sendable {
     }
 }
 
+private final class IndexBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func next() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let v = value
+        value += 1
+        return v
+    }
+}
+
 private final class CounterBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -321,24 +433,26 @@ private final class CounterBox: @unchecked Sendable {
     }
 }
 
-private final class RawResponseHandler: ChannelInboundHandler, @unchecked Sendable {
+private final class ScriptedResponseHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
-    private let body: String
-    private let contentType: String
+    private let scripts: [MockUpstream.Script]
     private let counter: CounterBox
+    private let indexBox: IndexBox
 
-    init(body: String, contentType: String, counter: CounterBox) {
-        self.body = body
-        self.contentType = contentType
+    init(scripts: [MockUpstream.Script], counter: CounterBox, indexBox: IndexBox) {
+        self.scripts = scripts
         self.counter = counter
+        self.indexBox = indexBox
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         if case .end = unwrapInboundIn(data) {
             counter.bump()
-            let payload = ByteBuffer(string: body)
-            let head = HTTPResponseHead(version: .http1_1, status: .ok, headers: [
-                "Content-Type": contentType,
+            let i = min(indexBox.next(), scripts.count - 1)
+            let script = scripts[i]
+            let payload = ByteBuffer(string: script.body)
+            let head = HTTPResponseHead(version: .http1_1, status: script.status, headers: [
+                "Content-Type": script.contentType,
                 "Content-Length": String(payload.readableBytes),
                 "Connection": "close",
             ])

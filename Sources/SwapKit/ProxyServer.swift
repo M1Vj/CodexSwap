@@ -800,6 +800,23 @@ public actor ProxyServer {
             return
         }
 
+        // Hardened Chat Completions passthrough for bridged models (opencode & friends):
+        // retries pre-stream gateway failures, then streams verbatim. No account state.
+        if head.method == .POST, rawPath.hasSuffix("/chat/completions"),
+           let passthroughEntry = AlphaPassthrough.matchedEntry(
+               in: body,
+               contentEncoding: head.headers.first(name: "Content-Encoding"),
+               catalog: settings.bridgedModels) {
+            log("POST \(rawPath) -> alpha passthrough model=\(passthroughEntry.modelID)")
+            try await AlphaPassthrough.handle(
+                entry: passthroughEntry,
+                body: body,
+                httpClient: self.httpClient,
+                outbound: outbound
+            )
+            return
+        }
+
         // Free-model bridge: routed models translate Responses<->Chat against their own
         // gateway and never touch account selection, tokens, or rotation.
         if head.method == .POST, rawPath.hasSuffix("/responses"),
