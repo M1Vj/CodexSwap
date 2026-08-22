@@ -59,6 +59,7 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual(payload["tool_choice"] as? String, "auto")
 
         let messages = try XCTUnwrap(payload["messages"] as? [[String: Any]])
+        // system(instructions), user, developer->system, assistant(merged call), tool, assistant(done)
         XCTAssertEqual(messages.count, 6)
         XCTAssertEqual(messages[0]["role"] as? String, "system")
         XCTAssertEqual(messages[0]["content"] as? String, "You are helpful.")
@@ -73,6 +74,13 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual(messages[4]["role"] as? String, "tool")
         XCTAssertEqual(messages[4]["tool_call_id"] as? String, "call_1")
         XCTAssertEqual(messages[4]["content"] as? String, "file body")
+
+        // max_output_tokens maps into the Chat budget with reasoning headroom.
+        let withBudget = try XCTUnwrap(AlphaBridge.chatPayload(
+            fromResponsesData: Data(#"{"model":"m","max_output_tokens":1000,"input":"hi"}"#.utf8),
+            model: "m"
+        ))
+        XCTAssertEqual(withBudget["max_tokens"] as? Int, 1000 + 16384)
 
         let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], "web_search must be dropped, function kept")
         XCTAssertEqual(tools.count, 1)
@@ -91,6 +99,35 @@ final class AlphaBridgeTests: XCTestCase {
         )
         XCTAssertNil(AlphaBridge.routedModel(in: compressed, catalog: catalog),
                      "unflagged compressed bodies must not match raw bytes")
+    }
+
+    func testConsecutiveFunctionCallsMergeIntoOneAssistantMessage() throws {
+        let json = "{\"model\":\"m\",\"input\":["
+            + "{\"type\":\"function_call\",\"call_id\":\"a\",\"name\":\"read\",\"arguments\":\"{}\"},"
+            + "{\"type\":\"function_call\",\"call_id\":\"b\",\"name\":\"write\",\"arguments\":\"{}\"},"
+            + "{\"type\":\"function_call_output\",\"call_id\":\"a\",\"output\":\"out-a\"},"
+            + "{\"type\":\"function_call_output\",\"call_id\":\"b\",\"output\":\"out-b\"}]}"
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(
+            fromResponsesData: Data(json.utf8), model: "m"))
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: Any]])
+        let assistants = messages.filter { ($0["tool_calls"] as? [[String: Any]]) != nil }
+        XCTAssertEqual(assistants.count, 1, "consecutive calls merge into one assistant message")
+        XCTAssertEqual((assistants[0]["tool_calls"] as? [[String: Any]])?.count, 2)
+        XCTAssertEqual(messages[1]["role"] as? String, "tool")
+        XCTAssertEqual(messages[2]["role"] as? String, "tool")
+    }
+
+    func testFreeformToolsAdaptToFunctionTools() throws {
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(
+            fromResponsesData: Data(#"{"model":"m","tools":[{"type":"custom","name":"apply_patch","description":"patch files"}],"input":"hi"}"#.utf8),
+            model: "m"))
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 1)
+        let function = try XCTUnwrap(tools[0]["function"] as? [String: Any])
+        XCTAssertEqual(function["name"] as? String, "apply_patch")
+        let params = try XCTUnwrap(function["parameters"] as? [String: Any])
+        let props = try XCTUnwrap(params["properties"] as? [String: Any])
+        XCTAssertNotNil(props["input"], "freeform tool gains an input string parameter")
     }
 
     func testEffortClamping() {

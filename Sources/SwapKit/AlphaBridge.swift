@@ -83,13 +83,21 @@ enum AlphaBridge {
     static func chatPayload(fromResponsesData data: Data, model: String) -> [String: Any]? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         var messages: [[String: Any]] = []
+        // Consecutive Responses `function_call` items merge into ONE assistant
+        // message carrying multiple tool_calls; many Chat backends reject stacked
+        // assistant messages. Tool outputs always immediately follow their calls.
+        var pendingToolCalls: [[String: Any]] = []
+
+        func flushPendingToolCalls() {
+            guard !pendingToolCalls.isEmpty else { return }
+            messages.append(["role": "assistant", "content": NSNull(), "tool_calls": pendingToolCalls])
+            pendingToolCalls.removeAll(keepingCapacity: true)
+        }
 
         if let instructions = root["instructions"] as? String, !instructions.isEmpty {
             messages.append(["role": "system", "content": instructions])
         }
 
-        var tools = root["tools"]
-        var sawToolCallByIndex = false
         switch root["input"] {
         case let text as String:
             if !text.isEmpty { messages.append(["role": "user", "content": text]) }
@@ -98,6 +106,7 @@ enum AlphaBridge {
                 let type = item["type"] as? String ?? "message"
                 switch type {
                 case "message":
+                    flushPendingToolCalls()
                     let role = chatRole(forResponsesRole: item["role"] as? String ?? "user")
                     let content: String
                     if let text = item["content"] as? String {
@@ -109,18 +118,17 @@ enum AlphaBridge {
                     }
                     messages.append(["role": role, "content": content])
                 case "function_call":
-                    sawToolCallByIndex = true
                     let callID = item["call_id"] as? String ?? item["id"] as? String ?? "call_\(UUID().uuidString)"
-                    let call: [String: Any] = [
+                    pendingToolCalls.append([
                         "id": callID,
                         "type": "function",
                         "function": [
                             "name": item["name"] as? String ?? "",
                             "arguments": item["arguments"] as? String ?? "",
                         ],
-                    ]
-                    messages.append(["role": "assistant", "content": NSNull(), "tool_calls": [call]])
+                    ])
                 case "function_call_output":
+                    flushPendingToolCalls()
                     let output: Any
                     if let text = item["output"] as? String {
                         output = text
@@ -137,13 +145,14 @@ enum AlphaBridge {
                     ])
                 default:
                     // Reasoning and other item types have no Chat Completions equivalent.
+                    flushPendingToolCalls()
                     continue
                 }
             }
+            flushPendingToolCalls()
         default:
             break
         }
-        _ = sawToolCallByIndex
 
         var payload: [String: Any] = [
             "model": model,
@@ -153,17 +162,42 @@ enum AlphaBridge {
         payload["reasoning_effort"] = clampedEffort((root["reasoning"] as? [String: Any])?["effort"] as? String)
 
         if let responseTools = root["tools"] as? [[String: Any]] {
+            var customToolNames: [String] = []
             let mapped = responseTools.compactMap { tool -> [String: Any]? in
-                guard (tool["type"] as? String) == "function", let name = tool["name"] as? String else { return nil }
-                var function: [String: Any] = ["name": name]
-                if let description = tool["description"] as? String { function["description"] = description }
-                if let parameters = tool["parameters"] { function["parameters"] = parameters }
-                return ["type": "function", "function": function]
+                switch tool["type"] as? String {
+                case "function":
+                    guard let name = tool["name"] as? String else { return nil }
+                    var function: [String: Any] = ["name": name]
+                    if let description = tool["description"] as? String { function["description"] = description }
+                    if let parameters = tool["parameters"] { function["parameters"] = parameters }
+                    return ["type": "function", "function": function]
+                case "custom", "freeform":
+                    // Codex freeform tools (e.g. apply_patch) carry raw-text calls;
+                    // adapt to a single-string-argument function so Chat backends
+                    // can drive them.
+                    guard let name = tool["name"] as? String else { return nil }
+                    customToolNames.append(name)
+                    var function: [String: Any] = [
+                        "name": name,
+                        "parameters": [
+                            "type": "object",
+                            "properties": ["input": ["type": "string"]],
+                            "required": ["input"],
+                        ],
+                    ]
+                    if let description = tool["description"] as? String { function["description"] = description }
+                    if let format = tool["format"] { function["x-freeform-format"] = format }
+                    return ["type": "function", "function": function]
+                default:
+                    // Hosted tools (web_search etc.) have no Chat equivalent here.
+                    return nil
+                }
             }
-            if !mapped.isEmpty { payload["tools"] = mapped; tools = nil }
+            if !mapped.isEmpty {
+                payload["tools"] = mapped
+                payload["x_custom_tool_names"] = customToolNames
+            }
         }
-        _ = tools
-
         switch root["tool_choice"] {
         case let name as String:
             payload["tool_choice"] = name
@@ -179,6 +213,11 @@ enum AlphaBridge {
         }
         if let parallel = root["parallel_tool_calls"] as? Bool {
             payload["parallel_tool_calls"] = parallel
+        }
+        // Responses max_output_tokens maps to the Chat budget; pad for reasoning
+        // tokens, which consume the same completion budget on thinking models.
+        if let maxOut = root["max_output_tokens"] as? Int, maxOut > 0 {
+            payload["max_tokens"] = min(maxOut + 16_384, 131_072)
         }
         return payload
     }
