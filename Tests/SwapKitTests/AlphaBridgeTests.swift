@@ -239,6 +239,30 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual(calls.first?["arguments"] as? String, "{\"cmd\":\"pwd\"}")
     }
 
+    func testCustomFreeformToolCallsEmitCustomToolCallItems() throws {
+        var translator = AlphaSSETranslator(
+            model: "x-preview-f-free",
+            customTools: ["exec"]
+        )
+        var collected = Data()
+        for chunk in [
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"input\":\"echo hi\"}"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            collected += translator.feed(ByteBuffer(string: chunk + "\n\n"))
+        }
+        collected += translator.finishFeed()
+        let events = String(decoding: collected, as: UTF8.self)
+
+        XCTAssertTrue(events.contains(#""type":"custom_tool_call""#), events)
+        XCTAssertFalse(events.contains(#""type":"function_call""#), events)
+        XCTAssertTrue(events.contains(#""input":"echo hi""#) || events.contains("\\\"input\\\""), events)
+        // raw input unwrapped from the {"input":...} wrapper
+        XCTAssertTrue(events.contains("echo hi"), events)
+    }
+
     func testSSETranslatorPrematureStreamEndEmitsFailedEvent() {
         var translator = AlphaSSETranslator(model: "x-preview-f-free")
         var collected = Data()

@@ -127,7 +127,7 @@ enum AlphaBridge {
                             "arguments": item["arguments"] as? String ?? "",
                         ],
                     ])
-                case "function_call_output":
+                case "function_call_output", "custom_tool_call_output":
                     flushPendingToolCalls()
                     let output: Any
                     if let text = item["output"] as? String {
@@ -330,8 +330,11 @@ struct AlphaSSETranslator {
         return copy.orderedOutputItems()
     }
 
-    init(model: String) {
+    let customTools: Set<String>
+
+    init(model: String, customTools: Set<String> = []) {
         self.model = model
+        self.customTools = customTools
         responseID = "resp_\(UUID().uuidString)"
         messageItemID = "msg_\(UUID().uuidString)"
         createdAt = Int(Date().timeIntervalSince1970)
@@ -410,7 +413,11 @@ struct AlphaSSETranslator {
                             }
                         }
                         entry.arguments += freshFragment
-                        if !freshFragment.isEmpty {
+                        let isCustomCall = customTools.contains(entry.name)
+                        if isCustomCall {
+                            ensureToolAdded(index: index, entry: entry)
+                        }
+                        if !freshFragment.isEmpty && !isCustomCall {
                             emittedVisibleOutput = true
                             ensureToolAdded(index: index, entry: entry)
                             appendEvent(type: "response.function_call_arguments.delta", payload: [
@@ -516,22 +523,20 @@ struct AlphaSSETranslator {
     }
 
     private mutating func ensureToolAdded(index: Int, entry: (callID: String, itemID: String, name: String, arguments: String)) {
-        // The added-event is emitted lazily right before the first argument delta;
-        // track emission by seeding a marker via toolOrder presence check.
-        if toolAddedAnnounced[index] != true {
-            toolAddedAnnounced[index] = true
-            appendEvent(type: "response.output_item.added", payload: [
-                "output_index": outputIndexForTool(index: index),
-                "item": [
-                    "id": entry.itemID,
-                    "type": "function_call",
-                    "call_id": entry.callID,
-                    "name": entry.name,
-                    "arguments": "",
-                    "status": "in_progress",
-                ],
-            ])
-        }
+        guard toolAddedAnnounced[index] != true else { return }
+        toolAddedAnnounced[index] = true
+        let itemType = customTools.contains(entry.name) ? "custom_tool_call" : "function_call"
+        appendEvent(type: "response.output_item.added", payload: [
+            "output_index": outputIndexForTool(index: index),
+            "item": [
+                "id": entry.itemID,
+                "type": itemType,
+                "call_id": entry.callID,
+                "name": entry.name,
+                "arguments": "",
+                "status": "in_progress",
+            ],
+        ])
     }
 
     private var toolAddedAnnounced: [Int: Bool] = [:]
@@ -551,7 +556,7 @@ struct AlphaSSETranslator {
             guard let entry = toolCalls[index] else { continue }
             items.append([
                 "id": entry.itemID,
-                "type": "function_call",
+                "type": customTools.contains(entry.name) ? "custom_tool_call" : "function_call",
                 "call_id": entry.callID,
                 "name": entry.name,
                 "arguments": entry.arguments,
@@ -586,24 +591,41 @@ struct AlphaSSETranslator {
             ])
         }
         for index in toolOrder {
-            guard let entry = toolCalls[index] else { continue }
+            guard var entry = toolCalls[index] else { continue }
             let outputIndex = outputIndexForTool(index: index)
+            let isCustom = customTools.contains(entry.name)
             if toolAddedAnnounced[index] != true {
                 ensureToolAdded(index: index, entry: entry)
             }
-            appendEvent(type: "response.function_call_arguments.done", payload: [
-                "item_id": entry.itemID,
-                "output_index": outputIndex,
-                "arguments": entry.arguments,
-            ])
+            var callArguments = entry.arguments
+            var itemType = "function_call"
+            if isCustom {
+                itemType = "custom_tool_call"
+                if let data = entry.arguments.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let inner = obj["input"] as? String {
+                    callArguments = inner
+                    entry.arguments = inner
+                }
+                appendEvent(type: "response.custom_tool_call_input.done", payload: [
+                    "item_id": entry.itemID,
+                    "input": callArguments,
+                ])
+            } else {
+                appendEvent(type: "response.function_call_arguments.done", payload: [
+                    "item_id": entry.itemID,
+                    "output_index": outputIndex,
+                    "arguments": entry.arguments,
+                ])
+            }
             appendEvent(type: "response.output_item.done", payload: [
                 "output_index": outputIndex,
                 "item": [
                     "id": entry.itemID,
-                    "type": "function_call",
+                    "type": itemType,
                     "call_id": entry.callID,
                     "name": entry.name,
-                    "arguments": entry.arguments,
+                    "arguments": callArguments,
                     "status": "completed",
                 ],
             ])
@@ -659,8 +681,8 @@ extension AlphaBridge {
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         sink: ProxyEventSink
     ) async throws {
-        guard let payload = chatPayload(fromResponsesData: body, model: entry.modelID),
-              let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
+        guard var payload = chatPayload(fromResponsesData: body, model: entry.modelID),
+              var payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
             return
         }
@@ -681,9 +703,30 @@ extension AlphaBridge {
         let wireLog: @Sendable (String) -> Void = { message in
             FileHandle.standardError.write("[alpha] \(message)\n".data(using: .utf8)!)
         }
+        var customToolNames: Set<String> = []
+        if let names = payload["x_custom_tool_names"] as? [String] {
+            customToolNames = Set(names)
+            payload.removeValue(forKey: "x_custom_tool_names")
+        }
+        // Raw upstream-side tool inventory before translation
+        if let rawRoot = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+            let rawTools = (rawRoot["tools"] as? [[String: Any]]) ?? []
+            let rawDesc = rawTools.map { t -> String in
+                let ty = (t["type"] as? String) ?? "?"
+                let nm = (t["name"] as? String) ?? ((t["function"] as? [String: Any])?["name"] as? String) ?? ""
+                return "\(ty):\(nm)"
+            }
+            wireLog("raw tools=\(rawTools.count) [\(rawDesc.joined(separator:", "))]")
+        }
+        if let toolsArray = payload["tools"] as? [[String: Any]] {
+            let names = toolsArray.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+            wireLog("request tools=\(toolsArray.count) names=\(names.prefix(12)) inputBytes=\(body.count)")
+        } else {
+            wireLog("request tools=NONE inputBytes=\(body.count)")
+        }
 
         let maxUpstreamAttempts = 4
-        var translator = AlphaSSETranslator(model: entry.modelID)
+        var translator = AlphaSSETranslator(model: entry.modelID, customTools: customToolNames)
         var headWritten = false
 
         attemptLoop: for attempt in 1...maxUpstreamAttempts {
