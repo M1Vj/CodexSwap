@@ -119,3 +119,9 @@ end at the version segment, e.g. `https://opencode.ai/zen/v1`.
 **Tool calls never fire on a bridged model.**
 Check that the upstream gateway emits standard Chat Completions `tool_calls` deltas;
 the translator forwards them as Responses `function_call` items.
+
+**Bridged model replies but never uses tools ("one message then stops").**
+Check the proxy verbose log for `request tools=NONE`. A catalog flag can suppress
+Codex's tool surface entirely — `use_responses_lite: true` on a custom catalog
+entry did exactly that. Remove the flag, restart Codex, and confirm the log shows
+`raw tools=N` with N > 0 and `request tools=<k>` names listed.
