@@ -125,3 +125,10 @@ Check the proxy verbose log for `request tools=NONE`. A catalog flag can suppres
 Codex's tool surface entirely — `use_responses_lite: true` on a custom catalog
 entry did exactly that. Remove the flag, restart Codex, and confirm the log shows
 `raw tools=N` with N > 0 and `request tools=<k>` names listed.
+
+**Every tool call aborts or reports "exec cell not found" on a bridged model.**
+`tool_mode: "code_mode_only"` in the catalog routes all tools through the JS
+runtime (`node_repl`). If that runtime is not running inside your host
+(IDE app-server, headless exec), every call dies regardless of translation
+correctness. Remove `tool_mode` from the catalog entry to fall back to
+classic shell function tools, which work through any Responses<->Chat bridge.
