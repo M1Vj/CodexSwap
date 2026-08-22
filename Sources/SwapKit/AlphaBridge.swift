@@ -637,11 +637,17 @@ extension AlphaBridge {
         if !entry.apiKey.isEmpty {
             request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
         }
+        let wireLog: @Sendable (String) -> Void = { message in
+            FileHandle.standardError.write("[alpha] \(message)\n".data(using: .utf8)!)
+        }
+
         request.body = .bytes(ByteBuffer(bytes: payloadData))
         var response: HTTPClientResponse
         do {
             response = try await httpClient.execute(request, timeout: .seconds(600))
+            wireLog("attempt 1 status \(response.status.code)")
         } catch {
+            wireLog("attempt 1 transport error: \(error)")
             if wantsStream {
                 try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
             } else {
@@ -721,9 +727,9 @@ extension AlphaBridge {
         // been streamed to the client yet, one fresh attempt may land elsewhere.
         let maxUpstreamAttempts = 4
         var attempt = 0
-
         attemptLoop: while true {
             attempt += 1
+            wireLog("attempt \(attempt)/\(maxUpstreamAttempts)")
             if attempt > 1 {
                 translator = AlphaSSETranslator(model: entry.modelID)
                 do {
@@ -732,6 +738,7 @@ extension AlphaBridge {
                     try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
                     return
                 }
+                wireLog("attempt \(attempt) status \(response.status.code)")
                 if response.status != .ok {
                     var detail = ByteBuffer()
                     for try await chunk in response.body {
@@ -753,6 +760,9 @@ extension AlphaBridge {
                 let events = translator.feed(chunk)
                 if !events.isEmpty {
                     try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(events)))))
+                }
+                if translator.failed, let code = translator.failureCode {
+                    wireLog("attempt \(attempt) stream failure code=\(code) msg=\(translator.failureMessage ?? "") visible=\(translator.emittedVisibleOutput)")
                 }
                 if translator.failed, let code = translator.failureCode,
                    isPromptLengthFailure(code: code, message: translator.failureMessage),
@@ -778,6 +788,9 @@ extension AlphaBridge {
         } else if !translator.finished {
             translator.finish()
             tail += translator.finishFeed()
+        }
+        if translator.failed {
+            wireLog("final: failed code=\(translator.failureCode ?? "?") msg=\(translator.failureMessage ?? "")")
         }
         if translator.failed,
            isPromptLengthFailure(code: translator.failureCode ?? "", message: translator.failureMessage) {
