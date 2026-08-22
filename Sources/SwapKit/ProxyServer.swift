@@ -809,9 +809,13 @@ public actor ProxyServer {
                catalog: settings.bridgedModels) {
             log("POST \(rawPath) -> alpha bridge model=\(bridgedEntry.modelID)")
             let eventSink = self.sink
+            let decodedBody = AlphaBridge.decodedRequestBody(
+                body,
+                contentEncoding: head.headers.first(name: "Content-Encoding")
+            ) ?? body
             try await AlphaBridge.handle(
                 entry: bridgedEntry,
-                body: body,
+                body: decodedBody,
                 httpClient: self.httpClient,
                 outbound: outbound,
                 sink: eventSink
