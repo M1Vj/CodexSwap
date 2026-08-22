@@ -316,6 +316,53 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual(hits, 1, "client errors must fail fast without retries")
     }
 
+    func testResponsesBridgeRetriesPromptLengthRejectionOnFreshBackend() async throws {
+        // Attempt 1: HTTP 400 carrying the Console prompt-length error.
+        // Attempt 2: success with a chat SSE completion.
+        let upstream = MockUpstream(scripts: [
+            .init(.badRequest, "application/json",
+                  "{\"error\":{\"type\":\"server_error\",\"message\":\"Error from provider (Console): Upstream request failed: [1261] Prompt exceeds max length\"}}"),
+            .init(.ok, "text/event-stream",
+                  #"data: {"id":"c9","choices":[{"delta":{"content":"landed elsewhere"}}]}"# + "\n\n" +
+                  #"data: {"id":"c9","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"# + "\n\n" +
+                  "data: [DONE]\n\n"),
+        ])
+        let chatURL = try await upstream.start()
+        defer { Task { await upstream.stop() } }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("alpha-retry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        var config = ProxyServer.Config()
+        config.port = 0
+        config.upstream = chatURL
+        var settings = Settings.default
+        settings.bridgedModels = [
+            BridgedModel(modelID: "x-preview-f-free", baseURL: chatURL.absoluteString)
+        ]
+        let fixedSettings = settings
+        let server = ProxyServer(store: store, config: config, settingsProvider: { fixedSettings })
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/backend-api/codex/responses")!)
+        request.httpMethod = "POST"
+        request.httpBody = Data(#"{"model":"x-preview-f-free","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"big session"}]}]}"#.utf8)
+        let (body, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+
+        let sse = String(decoding: body, as: UTF8.self)
+        XCTAssertTrue(sse.contains("landed elsewhere"), sse)
+        XCTAssertTrue(sse.contains(#""type":"response.completed""#), sse)
+        let hits = await upstream.requestCount()
+        XCTAssertEqual(hits, 2, "prompt-length rejection must trigger exactly one fresh-backend retry")
+    }
+
     // MARK: - End-to-end through ProxyServer
 
     func testProxyAlphaLaneBypassesAccountsAndTranslatesStreamingResponse() async throws {

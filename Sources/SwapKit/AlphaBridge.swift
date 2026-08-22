@@ -637,73 +637,152 @@ extension AlphaBridge {
         if !entry.apiKey.isEmpty {
             request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
         }
+        request.body = .bytes(ByteBuffer(bytes: payloadData))
+
         let wireLog: @Sendable (String) -> Void = { message in
             FileHandle.standardError.write("[alpha] \(message)\n".data(using: .utf8)!)
         }
 
-        request.body = .bytes(ByteBuffer(bytes: payloadData))
-        var response: HTTPClientResponse
-        do {
-            response = try await httpClient.execute(request, timeout: .seconds(600))
-            wireLog("attempt 1 status \(response.status.code)")
-        } catch {
-            wireLog("attempt 1 transport error: \(error)")
-            if wantsStream {
-                try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
-            } else {
-                try await writeHTTPError(outbound, status: .badGateway, code: "upstream_unreachable", message: "\(error)")
-            }
-            return
-        }
-
-        guard response.status == .ok else {
-            var collected = ByteBuffer()
-            for try await chunk in response.body {
-                collected.writeImmutableBuffer(chunk)
-                if collected.readableBytes > 64 * 1024 { break }
-            }
-            let detail = String(buffer: collected)
-            if wantsStream {
-                try await writeFailedEvent(outbound, code: "upstream_status_\(response.status.code)", message: detail.isEmpty ? "Upstream returned \(response.status.code)" : detail)
-            } else {
-                try await writeHTTPError(outbound, status: response.status, code: "upstream_status_\(response.status.code)", message: detail.isEmpty ? "Upstream returned \(response.status.code)" : detail)
-            }
-            return
-        }
-
+        let maxUpstreamAttempts = 4
         var translator = AlphaSSETranslator(model: entry.modelID)
+        var headWritten = false
 
-        if !wantsStream {
-            var whole = ByteBuffer()
-            for try await chunk in response.body {
-                whole.writeImmutableBuffer(chunk)
-                if whole.readableBytes > maxBodyBytes { break }
-            }
-            let text = String(buffer: whole)
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-            for raw in lines {
-                translator.process(Array(raw.utf8))
-            }
-            if !translator.finished { translator.finish() }
-            if translator.failed {
-                try await writeFailedEvent(outbound, code: "upstream_error", message: "Free-model upstream failed")
+        attemptLoop: for attempt in 1...maxUpstreamAttempts {
+            wireLog("attempt \(attempt)/\(maxUpstreamAttempts)")
+            let resp: HTTPClientResponse
+            do {
+                resp = try await httpClient.execute(request, timeout: .seconds(600))
+            } catch {
+                wireLog("attempt \(attempt) transport error: \(error)")
+                if attempt < maxUpstreamAttempts {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
+                    continue attemptLoop
+                }
+                if wantsStream {
+                    try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
+                } else {
+                    try await writeHTTPError(outbound, status: .badGateway, code: "upstream_unreachable", message: "\(error)")
+                }
                 return
             }
-            let responseObj = AlphaBridge.responseObject(
-                id: translator.responseID,
-                createdAt: translator.createdAt,
-                model: entry.modelID,
-                status: "completed",
-                output: translator.orderedOutputItemsPublic(),
-                usage: translator.usage.map { AlphaBridge.usageDict(fromChatUsage: $0) }
-            )
-            var headBuffer = HTTPHeaders()
-            headBuffer.add(name: "Content-Type", value: "application/json")
-            let bodyBytes = (try? JSONSerialization.data(withJSONObject: responseObj)) ?? Data("{}".utf8)
-            let respHead = HTTPResponseHead(version: .http1_1, status: .ok, headers: headBuffer)
-            try await outbound.write(.head(respHead))
-            try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: bodyBytes))))
+            wireLog("attempt \(attempt) status \(resp.status.code)")
+
+            if resp.status != .ok {
+                var collected = ByteBuffer()
+                for try await chunk in resp.body {
+                    collected.writeImmutableBuffer(chunk)
+                    if collected.readableBytes > 64 * 1024 { break }
+                }
+                let detail = String(buffer: collected)
+                wireLog("attempt \(attempt) error body: \(detail.prefix(200))")
+                let retryable = resp.status.code == 429 || resp.status.code >= 500
+                    || isPromptLengthFailure(code: String(resp.status.code), message: detail)
+                if retryable, attempt < maxUpstreamAttempts {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
+                    continue attemptLoop
+                }
+                if wantsStream {
+                    try await writeFailedEvent(outbound, code: "upstream_status_\(resp.status.code)", message: detail.isEmpty ? "Upstream returned \(resp.status.code)" : detail)
+                } else {
+                    try await writeHTTPError(outbound, status: resp.status, code: "upstream_status_\(resp.status.code)", message: detail.isEmpty ? "Upstream returned \(resp.status.code)" : detail)
+                }
+                return
+            }
+
+            if !wantsStream {
+                var whole = ByteBuffer()
+                for try await chunk in resp.body {
+                    whole.writeImmutableBuffer(chunk)
+                    if whole.readableBytes > maxBodyBytes { break }
+                }
+                let text = String(buffer: whole)
+                for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+                    translator.process(Array(raw.utf8))
+                }
+                if !translator.finished { translator.finish() }
+                if translator.failed {
+                    try await writeFailedEvent(outbound, code: "upstream_error", message: translator.failureMessage ?? "Free-model upstream failed")
+                    return
+                }
+                let responseObj = AlphaBridge.responseObject(
+                    id: translator.responseID,
+                    createdAt: translator.createdAt,
+                    model: entry.modelID,
+                    status: "completed",
+                    output: translator.orderedOutputItemsPublic(),
+                    usage: translator.usage.map { AlphaBridge.usageDict(fromChatUsage: $0) }
+                )
+                var jsonHeaders = HTTPHeaders()
+                jsonHeaders.add(name: "Content-Type", value: "application/json")
+                let bodyBytes = (try? JSONSerialization.data(withJSONObject: responseObj)) ?? Data("{}".utf8)
+                try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: jsonHeaders)))
+                try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: bodyBytes))))
+                try await outbound.write(.end(nil))
+                if let usage = translator.usage {
+                    let sample = AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)
+                    await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: sample))
+                    await BridgedUsageStore.shared.record(
+                        modelID: entry.modelID,
+                        inputTokens: sample.inputTokens,
+                        cachedInputTokens: sample.cachedInputTokens,
+                        outputTokens: sample.outputTokens
+                    )
+                }
+                return
+            }
+
+            if !headWritten {
+                headWritten = true
+                var headers = HTTPHeaders()
+                headers.add(name: "Content-Type", value: "text/event-stream; charset=utf-8")
+                headers.add(name: "Cache-Control", value: "no-cache")
+                try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)))
+            }
+            if attempt > 1 {
+                translator = AlphaSSETranslator(model: entry.modelID)
+            }
+
+            var tail = Data()
+            for try await chunk in resp.body {
+                tail += translator.feed(chunk)
+                if translator.failed {
+                    let promptTooLong = isPromptLengthFailure(
+                        code: translator.failureCode ?? "",
+                        message: translator.failureMessage
+                    )
+                    // A prompt-length rejection before any client-visible output is
+                    // backend-specific: a fresh connection may land elsewhere.
+                    if promptTooLong && !translator.emittedVisibleOutput && attempt < maxUpstreamAttempts {
+                        continue attemptLoop
+                    }
+                    break
+                }
+                if !tail.isEmpty {
+                    try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(tail)))))
+                    tail.removeAll(keepingCapacity: true)
+                }
+            }
+
+            tail += translator.finishFeed()
+            if !translator.finished && !translator.failed {
+                translator.fail(errorObject: [
+                    "code": "upstream_stream_ended",
+                    "message": "Free-model stream ended before completion",
+                ])
+                tail += translator.finishFeed()
+            } else if !translator.finished {
+                translator.finish()
+                tail += translator.finishFeed()
+            }
+            if translator.failed,
+               isPromptLengthFailure(code: translator.failureCode ?? "", message: translator.failureMessage) {
+                tail += Data("data: {\"error\":{\"code\":\"prompt_too_long\",\"message\":\"Bridged model rejected the prompt length; compact this session (e.g. /compact) or start a new one.\"}}\n\n".utf8)
+            }
+            if !tail.isEmpty {
+                try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(tail)))))
+            }
             try await outbound.write(.end(nil))
+
             if let usage = translator.usage {
                 let sample = AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)
                 await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: sample))
@@ -716,103 +795,7 @@ extension AlphaBridge {
             }
             return
         }
-
-        var headers = HTTPHeaders()
-        headers.add(name: "Content-Type", value: "text/event-stream; charset=utf-8")
-        headers.add(name: "Cache-Control", value: "no-cache")
-        try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)))
-
-        // Free-tier gateways are a pool of backends with differing prompt limits:
-        // a prompt-too-long rejection can be backend-specific. While nothing has
-        // been streamed to the client yet, one fresh attempt may land elsewhere.
-        let maxUpstreamAttempts = 4
-        var attempt = 0
-        attemptLoop: while true {
-            attempt += 1
-            wireLog("attempt \(attempt)/\(maxUpstreamAttempts)")
-            if attempt > 1 {
-                translator = AlphaSSETranslator(model: entry.modelID)
-                do {
-                    response = try await httpClient.execute(request, timeout: .seconds(600))
-                } catch {
-                    try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
-                    return
-                }
-                wireLog("attempt \(attempt) status \(response.status.code)")
-                if response.status != .ok {
-                    var detail = ByteBuffer()
-                    for try await chunk in response.body {
-                        detail.writeImmutableBuffer(chunk)
-                        if detail.readableBytes > 16 * 1024 { break }
-                    }
-                    let bodyText = String(buffer: detail)
-                    if response.status.code == 429 || response.status.code >= 500 || isPromptLengthFailure(code: String(response.status.code), message: bodyText) {
-                        if attempt < maxUpstreamAttempts {
-                            try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
-                            continue attemptLoop
-                        }
-                    }
-                    break
-                }
-            }
-
-            for try await chunk in response.body {
-                let events = translator.feed(chunk)
-                if !events.isEmpty {
-                    try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(events)))))
-                }
-                if translator.failed, let code = translator.failureCode {
-                    wireLog("attempt \(attempt) stream failure code=\(code) msg=\(translator.failureMessage ?? "") visible=\(translator.emittedVisibleOutput)")
-                }
-                if translator.failed, let code = translator.failureCode,
-                   isPromptLengthFailure(code: code, message: translator.failureMessage),
-                   !translator.emittedVisibleOutput, attempt < maxUpstreamAttempts {
-                    continue attemptLoop
-                }
-                if translator.failed { break }
-            }
-
-            break
-        }
-
-        var tail = translator.finishFeed()
-        // Upstreams occasionally drop the connection mid-stream without an error
-        // frame; surface that as response.failed so clients see a real diagnosis
-        // instead of a silently-truncated turn.
-        if !translator.finished && !translator.failed {
-            translator.fail(errorObject: [
-                "code": "upstream_stream_ended",
-                "message": "Free-model stream ended before completion",
-            ])
-            tail += translator.finishFeed()
-        } else if !translator.finished {
-            translator.finish()
-            tail += translator.finishFeed()
-        }
-        if translator.failed {
-            wireLog("final: failed code=\(translator.failureCode ?? "?") msg=\(translator.failureMessage ?? "")")
-        }
-        if translator.failed,
-           isPromptLengthFailure(code: translator.failureCode ?? "", message: translator.failureMessage) {
-            tail += Data("data: {\"error\":{\"code\":\"prompt_too_long\",\"message\":\"Bridged model rejected the prompt length; compact this session (e.g. /compact) or start a new one.\"}}\n\n".utf8)
-        }
-        if !tail.isEmpty {
-            try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(tail)))))
-        }
-        try await outbound.write(.end(nil))
-
-        if let usage = translator.usage {
-            let sample = AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)
-            await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: sample))
-            await BridgedUsageStore.shared.record(
-                modelID: entry.modelID,
-                inputTokens: sample.inputTokens,
-                cachedInputTokens: sample.cachedInputTokens,
-                outputTokens: sample.outputTokens
-            )
-        }
     }
-
 
     static func isPromptLengthFailure(code: String, message: String?) -> Bool {
         let haystack = (code + " " + (message ?? "")).lowercased()
