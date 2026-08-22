@@ -130,6 +130,19 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertNotNil(props["input"], "freeform tool gains an input string parameter")
     }
 
+    func testNamespaceCollaborationToolsFlattenToFunctions() throws {
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(
+            fromResponsesData: Data(#"{"model":"m","tools":[{"type":"namespace","name":"collaboration","description":"Tools for spawning and managing sub-agents.","tools":[{"name":"spawn_agent","description":"Spawn a sub-agent","parameters":{"type":"object","properties":{"message":{"type":"string"}}}},{"name":"wait_agent","description":"Wait","parameters":{"type":"object"}}]}],"input":"hi"}"#.utf8),
+            model: "m"))
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 2)
+        let names = Set(tools.compactMap { (($0["function"] as? [String: Any])?["name"] as? String) })
+        XCTAssertEqual(names, ["spawn_agent", "wait_agent"])
+        let spawn = tools.first { (($0["function"] as? [String: Any])?["name"] as? String) == "spawn_agent" }
+        let fn = try XCTUnwrap(spawn?["function"] as? [String: Any])
+        XCTAssertTrue((fn["description"] as? String)?.hasPrefix("[collaboration]") == true)
+    }
+
     func testEffortClamping() {
         XCTAssertEqual(AlphaBridge.clampedEffort("max"), "max")
         XCTAssertEqual(AlphaBridge.clampedEffort("xhigh"), "max")

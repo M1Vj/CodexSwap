@@ -163,19 +163,19 @@ enum AlphaBridge {
 
         if let responseTools = root["tools"] as? [[String: Any]] {
             var customToolNames: [String] = []
-            let mapped = responseTools.compactMap { tool -> [String: Any]? in
+            let mapped = responseTools.flatMap { tool -> [[String: Any]] in
                 switch tool["type"] as? String {
                 case "function":
-                    guard let name = tool["name"] as? String else { return nil }
+                    guard let name = tool["name"] as? String else { return [] }
                     var function: [String: Any] = ["name": name]
                     if let description = tool["description"] as? String { function["description"] = description }
                     if let parameters = tool["parameters"] { function["parameters"] = parameters }
-                    return ["type": "function", "function": function]
+                    return [["type": "function", "function": function]]
                 case "custom", "freeform":
                     // Codex freeform tools (e.g. apply_patch) carry raw-text calls;
                     // adapt to a single-string-argument function so Chat backends
                     // can drive them.
-                    guard let name = tool["name"] as? String else { return nil }
+                    guard let name = tool["name"] as? String else { return [] }
                     customToolNames.append(name)
                     var function: [String: Any] = [
                         "name": name,
@@ -187,10 +187,25 @@ enum AlphaBridge {
                     ]
                     if let description = tool["description"] as? String { function["description"] = description }
                     if let format = tool["format"] { function["x-freeform-format"] = format }
-                    return ["type": "function", "function": function]
+                    return [["type": "function", "function": function]]
+                case "namespace":
+                    // Multi-agent v2 ships collaboration tools inside a namespace;
+                    // flatten the inner function defs so the model can call them
+                    // directly (spawn_agent / wait_agent / send_input / ...).
+                    let nsName = (tool["name"] as? String) ?? ""
+                    guard let inner = tool["tools"] as? [[String: Any]] else { return [] }
+                    return inner.compactMap { f -> [String: Any]? in
+                        guard let fname = f["name"] as? String, !fname.isEmpty else { return nil }
+                        var function: [String: Any] = ["name": fname]
+                        if let description = f["description"] as? String {
+                            function["description"] = "[\(nsName)] \(description)"
+                        }
+                        if let parameters = f["parameters"] { function["parameters"] = parameters }
+                        return ["type": "function", "function": function]
+                    }
                 default:
                     // Hosted tools (web_search etc.) have no Chat equivalent here.
-                    return nil
+                    return []
                 }
             }
             if !mapped.isEmpty {
@@ -717,6 +732,12 @@ extension AlphaBridge {
                 return "\(ty):\(nm)"
             }
             wireLog("raw tools=\(rawTools.count) [\(rawDesc.joined(separator:", "))]")
+            for t in rawTools where (t["type"] as? String) != "function" {
+                if let data = try? JSONSerialization.data(withJSONObject: t),
+                   let line = String(data: data, encoding: .utf8) {
+                    wireLog("rawtool \(line.prefix(1500))")
+                }
+            }
         }
         if let toolsArray = payload["tools"] as? [[String: Any]] {
             let names = toolsArray.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
