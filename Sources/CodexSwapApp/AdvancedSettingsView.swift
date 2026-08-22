@@ -16,6 +16,8 @@ struct AdvancedSettingsView: View {
 
             BridgedModelsSection()
 
+            BridgedUsageSection()
+
             SettingsSection(title: "Terminal Shim") {
                 LabeledContent("Status", value: model.shimInstalled ? "Installed" : "Not Installed")
                 Text("The optional `codexswap` command launches Codex through the local proxy. It is generally unnecessary when automatic routing is enabled.")
@@ -163,5 +165,94 @@ private struct BridgedModelRow: View {
             }
             .padding(.vertical, 2)
         }
+    }
+}
+
+/// Live token usage for bridged models. These lanes consume no Codex quota;
+/// totals come from the proxy's own accounting, and estimated cost appears once
+/// a model's optional per-million pricing is filled in.
+private struct BridgedUsageSection: View {
+    @State private var snapshot: BridgedUsageStore.Snapshot?
+    @State private var prices: [String: (input: Double, output: Double)] = [:]
+
+    var body: some View {
+        SettingsSection(title: "Bridged Model Usage") {
+            if let snapshot, !(snapshot.todayRows.isEmpty && snapshot.allTimeRows.isEmpty) {
+                usageTable(snapshot)
+                HStack {
+                    Button("Reset Counters", role: .destructive) {
+                        Task {
+                            await BridgedUsageStore.shared.reset()
+                            await reload()
+                        }
+                    }
+                    Spacer()
+                }
+            } else {
+                Text("No bridged-model traffic recorded yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task { await reload() }
+    }
+
+    private func usageTable(_ snapshot: BridgedUsageStore.Snapshot) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !snapshot.todayRows.isEmpty {
+                Text("Today").font(.headline)
+                ForEach(snapshot.todayRows) { row in
+                    rowLine(row)
+                }
+            }
+            if !snapshot.allTimeRows.isEmpty {
+                Text("All Time").font(.headline).padding(.top, 4)
+                ForEach(snapshot.allTimeRows) { row in
+                    rowLine(row)
+                }
+            }
+        }
+    }
+
+    private func rowLine(_ row: BridgedUsageStore.Snapshot.Row) -> some View {
+        let e = row.entry
+        return HStack {
+            Text(row.modelID).font(.system(.callout, design: .monospaced))
+            Spacer()
+            Text("\(e.requests) req · in \(Self.grouped(e.inputTokens)) · out \(Self.grouped(e.outputTokens))")
+                .font(.callout)
+            if row.estimatedCost > 0 {
+                Text(String(format: "$%.4f", row.estimatedCost))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if isFree(modelID: row.modelID) {
+                Text("free")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+
+        static func grouped(_ value: Int) -> String {
+            let formatter = NumberFormatter()
+            formatter.numberStyle = .decimal
+            return formatter.string(from: NSNumber(value: value)) ?? String(value)
+        }
+
+    private func isFree(modelID: String) -> Bool {
+        guard let p = prices[modelID] else { return true }
+        return p.input == 0 && p.output == 0
+    }
+
+    private func reload() async {
+        let store = SettingsStore()
+        let settings = await store.get()
+        var priceMap: [String: (Double, Double)] = [:]
+        for m in settings.bridgedModels {
+            priceMap[m.modelID] = (m.inputPricePerMillion ?? 0, m.outputPricePerMillion ?? 0)
+        }
+        prices = priceMap
+        snapshot = await BridgedUsageStore.shared.snapshot(prices: priceMap)
     }
 }

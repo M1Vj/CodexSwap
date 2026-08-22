@@ -277,6 +277,11 @@ struct AlphaSSETranslator {
 
     var usage: [String: Any]? { usageDict }
 
+    /// Drains every pending event (test + error-path convenience).
+    mutating func drainAll() -> Data {
+        drain()
+    }
+
     /// Completed output items for building a full Responses object (non-streaming path).
     func orderedOutputItemsPublic() -> [[String: Any]] {
         var copy = self
@@ -397,13 +402,14 @@ struct AlphaSSETranslator {
         return drain()
     }
 
-    /// Flushes an unterminated tail line and returns any final events.
+    /// Flushes an unterminated tail line and returns any pending events.
+    /// Does NOT finalize: callers decide between normal completion ([DONE] or
+    /// finish_reason handled in process) and premature termination (fail()).
     mutating func finishFeed() -> Data {
         if !pendingLine.isEmpty {
             process(pendingLine)
             pendingLine.removeAll(keepingCapacity: true)
         }
-        if !finished { finish() }
         return drain()
     }
 
@@ -684,7 +690,14 @@ extension AlphaBridge {
             try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: bodyBytes))))
             try await outbound.write(.end(nil))
             if let usage = translator.usage {
-                await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)))
+                let sample = AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)
+                await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: sample))
+                await BridgedUsageStore.shared.record(
+                    modelID: entry.modelID,
+                    inputTokens: sample.inputTokens,
+                    cachedInputTokens: sample.cachedInputTokens,
+                    outputTokens: sample.outputTokens
+                )
             }
             return
         }
@@ -700,14 +713,34 @@ extension AlphaBridge {
                 try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(events)))))
             }
         }
-        let tail = translator.finishFeed()
+        var tail = translator.finishFeed()
+        // Upstreams occasionally drop the connection mid-stream without an error
+        // frame; surface that as response.failed so clients see a real diagnosis
+        // instead of a silently-truncated turn.
+        if !translator.finished && !translator.failed {
+            translator.fail(errorObject: [
+                "code": "upstream_stream_ended",
+                "message": "Free-model stream ended before completion",
+            ])
+            tail += translator.finishFeed()
+        } else if !translator.finished {
+            translator.finish()
+            tail += translator.finishFeed()
+        }
         if !tail.isEmpty {
             try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(tail)))))
         }
         try await outbound.write(.end(nil))
 
         if let usage = translator.usage {
-            await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)))
+            let sample = AlphaBridge.usageSample(model: entry.modelID, fromChatUsage: usage)
+            await sink.handle(ProxyEvent(kind: .usage, from: "alpha", to: nil, limit: nil, resetAt: nil, usage: sample))
+            await BridgedUsageStore.shared.record(
+                modelID: entry.modelID,
+                inputTokens: sample.inputTokens,
+                cachedInputTokens: sample.cachedInputTokens,
+                outputTokens: sample.outputTokens
+            )
         }
     }
 
@@ -721,7 +754,7 @@ extension AlphaBridge {
         try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)))
         var translator = AlphaSSETranslator(model: "unknown")
         translator.fail(errorObject: ["code": code, "message": message])
-        let events = translator.finishFeed()
+        let events = translator.drainAll()
         if !events.isEmpty {
             try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: Array(events)))))
         }

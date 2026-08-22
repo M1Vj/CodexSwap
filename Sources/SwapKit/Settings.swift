@@ -16,19 +16,27 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
     /// Optional bearer credential; empty means anonymous (typical for free tiers).
     public var apiKey: String
     public var enabled: Bool
+    /// Optional pricing in currency units per million input tokens (nil/0 = free tier).
+    public var inputPricePerMillion: Double?
+    /// Optional pricing in currency units per million output tokens.
+    public var outputPricePerMillion: Double?
 
     public init(
         modelID: String,
         displayName: String = "",
         baseURL: String,
         apiKey: String = "",
-        enabled: Bool = true
+        enabled: Bool = true,
+        inputPricePerMillion: Double? = nil,
+        outputPricePerMillion: Double? = nil
     ) {
         self.modelID = modelID
         self.displayName = displayName.isEmpty ? modelID : displayName
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.enabled = enabled
+        self.inputPricePerMillion = inputPricePerMillion
+        self.outputPricePerMillion = outputPricePerMillion
     }
 
     public var id: String { modelID }

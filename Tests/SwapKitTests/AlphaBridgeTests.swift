@@ -202,6 +202,24 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual(calls.first?["arguments"] as? String, "{\"cmd\":\"pwd\"}")
     }
 
+    func testSSETranslatorPrematureStreamEndEmitsFailedEvent() {
+        var translator = AlphaSSETranslator(model: "x-preview-f-free")
+        var collected = Data()
+        collected += translator.feed(ByteBuffer(string:
+            #"data: {"choices":[{"delta":{"content":"partial"}}]}"# + "\n\n"))
+        collected += translator.finishFeed()
+        // Simulate the handler's premature-end path (no finish_reason, no [DONE]).
+        if !translator.finished && !translator.failed {
+            translator.fail(errorObject: ["code": "upstream_stream_ended", "message": "ended"])
+            collected += translator.finishFeed()
+        }
+        let events = String(decoding: collected, as: UTF8.self)
+        XCTAssertTrue(events.contains(#""type":"response.failed""#), events)
+        XCTAssertTrue(events.contains("upstream_stream_ended"), events)
+        XCTAssertTrue(events.contains(#""delta":"partial""#), "prior deltas preserved")
+        XCTAssertFalse(events.contains(#""type":"response.completed""#), "truncated turns must not be marked complete")
+    }
+
     func testSSETranslatorFailureEvent() throws {
         var translator = AlphaSSETranslator(model: "x-preview-f-free")
         translator.fail(errorObject: ["code": "boom", "message": "bad"])
