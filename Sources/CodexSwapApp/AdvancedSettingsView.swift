@@ -14,6 +14,8 @@ struct AdvancedSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            SubagentModelsSection(model: model)
+
             BridgedModelsSection()
 
             BridgedUsageSection()
@@ -43,6 +45,8 @@ struct AdvancedSettingsView: View {
 private struct BridgedModelsSection: View {
     @State private var entries: [BridgedModel] = []
     @State private var loaded = false
+    @State private var persistenceMessage: String?
+    @State private var editGeneration = SettingsEditGeneration()
 
     var body: some View {
         SettingsSection(title: "Free & Bridged Models") {
@@ -51,7 +55,7 @@ private struct BridgedModelsSection: View {
                 .foregroundStyle(.secondary)
 
             ForEach($entries) { $entry in
-                BridgedModelRow(entry: $entry) { reload() }
+                BridgedModelRow(entry: $entry) { persist() }
             }
             .onDelete { offsets in
                 entries.remove(atOffsets: offsets)
@@ -68,6 +72,7 @@ private struct BridgedModelsSection: View {
                             enabled: false
                         )
                     )
+                    persist()
                 }
                 Spacer()
                 if !entries.isEmpty {
@@ -81,6 +86,12 @@ private struct BridgedModelsSection: View {
             Text(entriesValidationMessage)
                 .font(.callout)
                 .foregroundStyle(entriesValidationMessage.hasPrefix("⚠") ? Color.orange : .secondary)
+
+            if let persistenceMessage {
+                Text(persistenceMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
         .task { reload() }
     }
@@ -99,10 +110,11 @@ private struct BridgedModelsSection: View {
     }
 
     private func reload() {
-        let store = SettingsStore()
+        let token = editGeneration.generation
         Task {
-            let settings = await store.get()
+            let settings = await SettingsStoreBridge.bridgedModelsPersistence.current()
             await MainActor.run {
+                guard editGeneration.canApplyReload(token) else { return }
                 entries = settings.bridgedModels
                 loaded = true
             }
@@ -110,11 +122,17 @@ private struct BridgedModelsSection: View {
     }
 
     private func persist() {
+        let token = editGeneration.markEdited()
         let snapshot = entries
-        let store = SettingsStore()
-        Task {
-            _ = await store.update { settings in
-                settings.bridgedModels = snapshot
+        Task { @MainActor in
+            do {
+                let accepted = try await SettingsStoreBridge.bridgedModelsPersistence.persist(snapshot)
+                guard accepted else { return }
+                guard editGeneration.markPersisted(token) else { return }
+                persistenceMessage = nil
+            } catch {
+                guard editGeneration.generation == token else { return }
+                persistenceMessage = "Bridged model changes could not be saved. Your edits remain visible; try again."
             }
         }
     }
@@ -128,7 +146,13 @@ private struct BridgedModelRow: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Toggle(isOn: $entry.enabled) {
+                    Toggle(isOn: Binding(
+                        get: { entry.enabled },
+                        set: { enabled in
+                            entry.enabled = enabled
+                            onChange()
+                        }
+                    )) {
                         Text(entry.displayName.isEmpty ? "(unnamed)" : entry.displayName)
                             .font(.headline)
                     }
@@ -145,22 +169,22 @@ private struct BridgedModelRow: View {
                 LabeledContent("Model ID") {
                     TextField("gateway-model-id", text: $entry.modelID)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: entry.modelID) { _ in onChange() }
+                        .onChange(of: entry.modelID) { onChange() }
                 }
                 LabeledContent("Display Name") {
                     TextField("optional", text: $entry.displayName)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: entry.displayName) { _ in onChange() }
+                        .onChange(of: entry.displayName) { onChange() }
                 }
                 LabeledContent("Base URL") {
                     TextField("https://provider.example/v1", text: $entry.baseURL)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: entry.baseURL) { _ in onChange() }
+                        .onChange(of: entry.baseURL) { onChange() }
                 }
                 LabeledContent("API Key") {
                     SecureField("empty for free tiers", text: $entry.apiKey)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: entry.apiKey) { _ in onChange() }
+                        .onChange(of: entry.apiKey) { onChange() }
                 }
             }
             .padding(.vertical, 2)

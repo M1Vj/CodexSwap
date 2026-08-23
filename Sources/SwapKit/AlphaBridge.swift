@@ -14,6 +14,12 @@ import AsyncHTTPClient
 enum AlphaBridge {
     static let maxBodyBytes = 8 * 1024 * 1024
 
+    enum BridgedModelResolution: Equatable {
+        case none
+        case matched(BridgedModel)
+        case ambiguous(modelID: String)
+    }
+
     /// Decodes a request body per its Content-Encoding so the model ID can be read.
     /// Codex compresses large Responses bodies with zstd; Chat Completions gateways
     /// receive plain JSON from this lane. Returns nil when decoding fails.
@@ -35,12 +41,46 @@ enum AlphaBridge {
         contentEncoding: String? = nil,
         catalog: [BridgedModel]
     ) -> BridgedModel? {
-        guard let body = decodedRequestBody(rawBody, contentEncoding: contentEncoding) else { return nil }
+        guard case let .matched(entry) = resolveEntry(
+            in: rawBody,
+            contentEncoding: contentEncoding,
+            catalog: catalog
+        ) else { return nil }
+        return entry
+    }
+
+    static func resolveEntry(
+        in rawBody: Data,
+        contentEncoding: String? = nil,
+        catalog: [BridgedModel]
+    ) -> BridgedModelResolution {
+        guard let body = decodedRequestBody(rawBody, contentEncoding: contentEncoding) else { return .none }
         guard body.count <= maxBodyBytes,
               body.count >= 2,
               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let requested = object["model"] as? String else { return nil }
-        return catalog.first { $0.enabled && $0.modelID == requested }
+              let requested = object["model"] as? String,
+              !requested.isEmpty else { return .none }
+
+        let matches = catalog.filter { $0.enabled && $0.modelID == requested }
+        switch matches.count {
+        case 0:
+            return .none
+        case 1:
+            return .matched(matches[0])
+        default:
+            return .ambiguous(modelID: sanitizedModelID(requested))
+        }
+    }
+
+    private static func sanitizedModelID(_ raw: String) -> String {
+        let allowed = raw.unicodeScalars.filter { scalar in
+            scalar.value == 45 || scalar.value == 46 || scalar.value == 95
+                || (scalar.value >= 48 && scalar.value <= 57)
+                || (scalar.value >= 65 && scalar.value <= 90)
+                || (scalar.value >= 97 && scalar.value <= 122)
+        }
+        let value = String(String.UnicodeScalarView(allowed).prefix(64))
+        return value.isEmpty ? "redacted" : value
     }
 
     /// Convenience for tests and tooling: is this body a request for an enabled entry?
@@ -52,11 +92,13 @@ enum AlphaBridge {
 
     /// Maps a Responses reasoning effort onto the effort vocabulary the free
     /// gateway advertises (`low`, `high`, `max`).
-    static func clampedEffort(_ raw: String?) -> String {
+    static func validatedEffort(_ raw: String?) -> String? {
         switch (raw ?? "").lowercased() {
         case "low", "minimal": return "low"
-        case "max", "xhigh", "maximal": return "max"
-        default: return "high"
+        case "high", "medium": return "high"
+        case "max", "xhigh", "maximal", "ultra": return "max"
+        case "": return "high"
+        default: return nil
         }
     }
 
@@ -117,6 +159,19 @@ enum AlphaBridge {
                         content = ""
                     }
                     messages.append(["role": role, "content": content])
+                case "agent_message":
+                    flushPendingToolCalls()
+                    let content: String
+                    if let text = item["content"] as? String {
+                        content = text
+                    } else if let parts = item["content"] as? [[String: Any]] {
+                        content = joinedText(ofContentParts: parts)
+                    } else {
+                        content = ""
+                    }
+                    if !content.isEmpty {
+                        messages.append(["role": "user", "content": content])
+                    }
                 case "function_call":
                     let callID = item["call_id"] as? String ?? item["id"] as? String ?? "call_\(UUID().uuidString)"
                     pendingToolCalls.append([
@@ -159,14 +214,45 @@ enum AlphaBridge {
             "messages": messages,
             "stream": (root["stream"] as? Bool) ?? false,
         ]
-        payload["reasoning_effort"] = clampedEffort((root["reasoning"] as? [String: Any])?["effort"] as? String)
+        let rawEffort: String?
+        if let rawReasoning = root["reasoning"] {
+            guard let reasoning = rawReasoning as? [String: Any] else { return nil }
+            if let rawValue = reasoning["effort"] {
+                guard let effort = rawValue as? String else { return nil }
+                rawEffort = effort
+            } else {
+                rawEffort = nil
+            }
+        } else {
+            rawEffort = nil
+        }
+        guard let effort = validatedEffort(rawEffort) else {
+            return nil
+        }
+        payload["reasoning_effort"] = effort
 
         if let responseTools = root["tools"] as? [[String: Any]] {
             var customToolNames: [String] = []
+            var toolNamespaces: [String: String] = [:]
+            var seenToolNames = Set<String>()
+            var hasAmbiguousToolNames = false
+
+            func registerToolName(_ name: String, namespace: String? = nil) -> Bool {
+                guard seenToolNames.insert(name).inserted else {
+                    hasAmbiguousToolNames = true
+                    return false
+                }
+                if let namespace {
+                    toolNamespaces[name] = namespace
+                }
+                return true
+            }
+
             let mapped = responseTools.flatMap { tool -> [[String: Any]] in
                 switch tool["type"] as? String {
                 case "function":
-                    guard let name = tool["name"] as? String else { return [] }
+                    guard let name = tool["name"] as? String, !name.isEmpty,
+                          registerToolName(name) else { return [] }
                     var function: [String: Any] = ["name": name]
                     if let description = tool["description"] as? String { function["description"] = description }
                     if let parameters = tool["parameters"] { function["parameters"] = parameters }
@@ -175,7 +261,8 @@ enum AlphaBridge {
                     // Codex freeform tools (e.g. apply_patch) carry raw-text calls;
                     // adapt to a single-string-argument function so Chat backends
                     // can drive them.
-                    guard let name = tool["name"] as? String else { return [] }
+                    guard let name = tool["name"] as? String, !name.isEmpty,
+                          registerToolName(name) else { return [] }
                     customToolNames.append(name)
                     var function: [String: Any] = [
                         "name": name,
@@ -195,7 +282,8 @@ enum AlphaBridge {
                     let nsName = (tool["name"] as? String) ?? ""
                     guard let inner = tool["tools"] as? [[String: Any]] else { return [] }
                     return inner.compactMap { f -> [String: Any]? in
-                        guard let fname = f["name"] as? String, !fname.isEmpty else { return nil }
+                        guard let fname = f["name"] as? String, !fname.isEmpty,
+                              registerToolName(fname, namespace: nsName) else { return nil }
                         var function: [String: Any] = ["name": fname]
                         if let description = f["description"] as? String {
                             function["description"] = "[\(nsName)] \(description)"
@@ -208,9 +296,13 @@ enum AlphaBridge {
                     return []
                 }
             }
+            guard !hasAmbiguousToolNames else { return nil }
             if !mapped.isEmpty {
                 payload["tools"] = mapped
                 payload["x_custom_tool_names"] = customToolNames
+                if !toolNamespaces.isEmpty {
+                    payload["x_tool_namespaces"] = toolNamespaces
+                }
             }
         }
         switch root["tool_choice"] {
@@ -275,7 +367,7 @@ enum AlphaBridge {
         outputDetails["reasoning_tokens"] = (reasoning as? Int) ?? Int((reasoning as? Double)?.rounded() ?? 0)
         let input = intField("prompt_tokens")
         let outputTokens = intField("completion_tokens")
-        var dict: [String: Any] = [
+        let dict: [String: Any] = [
             "input_tokens": input,
             "input_tokens_details": inputDetails,
             "output_tokens": outputTokens,
@@ -317,6 +409,7 @@ struct AlphaSSETranslator {
 
     private(set) var responseID: String
     private let model: String
+    private let toolNamespaces: [String: String]
     let createdAt: Int
     private var createdEmitted = false
     private var messageStarted = false
@@ -341,15 +434,20 @@ struct AlphaSSETranslator {
 
     /// Completed output items for building a full Responses object (non-streaming path).
     func orderedOutputItemsPublic() -> [[String: Any]] {
-        var copy = self
+        let copy = self
         return copy.orderedOutputItems()
     }
 
     let customTools: Set<String>
 
-    init(model: String, customTools: Set<String> = []) {
+    init(
+        model: String,
+        customTools: Set<String> = [],
+        toolNamespaces: [String: String] = [:]
+    ) {
         self.model = model
         self.customTools = customTools
+        self.toolNamespaces = toolNamespaces
         responseID = "resp_\(UUID().uuidString)"
         messageItemID = "msg_\(UUID().uuidString)"
         createdAt = Int(Date().timeIntervalSince1970)
@@ -537,20 +635,34 @@ struct AlphaSSETranslator {
         1 + (toolOrder.firstIndex(of: index) ?? 0)
     }
 
+    private func decorateNamespacedToolItem(_ item: inout [String: Any], name: String) {
+        guard let namespace = toolNamespaces[name] else { return }
+        item["namespace"] = namespace
+        if namespace == "collaboration",
+           ["spawn_agent", "send_message", "followup_task"].contains(name) {
+            // Chat backends return plaintext JSON arguments. Mark the protected
+            // collaboration fields as intentionally plaintext so Codex forwards
+            // the task/message body as input_text instead of encrypted_content.
+            item["encrypted_function_args"] = [String]()
+        }
+    }
+
     private mutating func ensureToolAdded(index: Int, entry: (callID: String, itemID: String, name: String, arguments: String)) {
         guard toolAddedAnnounced[index] != true else { return }
         toolAddedAnnounced[index] = true
         let itemType = customTools.contains(entry.name) ? "custom_tool_call" : "function_call"
+        var item: [String: Any] = [
+            "id": entry.itemID,
+            "type": itemType,
+            "call_id": entry.callID,
+            "name": entry.name,
+            "arguments": "",
+            "status": "in_progress",
+        ]
+        decorateNamespacedToolItem(&item, name: entry.name)
         appendEvent(type: "response.output_item.added", payload: [
             "output_index": outputIndexForTool(index: index),
-            "item": [
-                "id": entry.itemID,
-                "type": itemType,
-                "call_id": entry.callID,
-                "name": entry.name,
-                "arguments": "",
-                "status": "in_progress",
-            ],
+            "item": item,
         ])
     }
 
@@ -569,14 +681,16 @@ struct AlphaSSETranslator {
         }
         for index in toolOrder {
             guard let entry = toolCalls[index] else { continue }
-            items.append([
+            var item: [String: Any] = [
                 "id": entry.itemID,
                 "type": customTools.contains(entry.name) ? "custom_tool_call" : "function_call",
                 "call_id": entry.callID,
                 "name": entry.name,
                 "arguments": entry.arguments,
                 "status": "completed",
-            ])
+            ]
+            decorateNamespacedToolItem(&item, name: entry.name)
+            items.append(item)
         }
         return items
     }
@@ -633,16 +747,18 @@ struct AlphaSSETranslator {
                     "arguments": entry.arguments,
                 ])
             }
+            var doneItem: [String: Any] = [
+                "id": entry.itemID,
+                "type": itemType,
+                "call_id": entry.callID,
+                "name": entry.name,
+                "arguments": callArguments,
+                "status": "completed",
+            ]
+            decorateNamespacedToolItem(&doneItem, name: entry.name)
             appendEvent(type: "response.output_item.done", payload: [
                 "output_index": outputIndex,
-                "item": [
-                    "id": entry.itemID,
-                    "type": itemType,
-                    "call_id": entry.callID,
-                    "name": entry.name,
-                    "arguments": callArguments,
-                    "status": "completed",
-                ],
+                "item": doneItem,
             ])
         }
 
@@ -696,8 +812,19 @@ extension AlphaBridge {
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         sink: ProxyEventSink
     ) async throws {
-        guard var payload = chatPayload(fromResponsesData: body, model: entry.modelID),
-              var payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
+        guard var payload = chatPayload(fromResponsesData: body, model: entry.modelID) else {
+            try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
+            return
+        }
+        var customToolNames: Set<String> = []
+        if let names = payload.removeValue(forKey: "x_custom_tool_names") as? [String] {
+            customToolNames = Set(names)
+        }
+        var toolNamespaces: [String: String] = [:]
+        if let namespaces = payload.removeValue(forKey: "x_tool_namespaces") as? [String: String] {
+            toolNamespaces = namespaces
+        }
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
             return
         }
@@ -717,11 +844,6 @@ extension AlphaBridge {
 
         let wireLog: @Sendable (String) -> Void = { message in
             FileHandle.standardError.write("[alpha] \(message)\n".data(using: .utf8)!)
-        }
-        var customToolNames: Set<String> = []
-        if let names = payload["x_custom_tool_names"] as? [String] {
-            customToolNames = Set(names)
-            payload.removeValue(forKey: "x_custom_tool_names")
         }
         // Raw upstream-side tool inventory before translation
         if let rawRoot = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
@@ -747,7 +869,11 @@ extension AlphaBridge {
         }
 
         let maxUpstreamAttempts = 4
-        var translator = AlphaSSETranslator(model: entry.modelID, customTools: customToolNames)
+        var translator = AlphaSSETranslator(
+            model: entry.modelID,
+            customTools: customToolNames,
+            toolNamespaces: toolNamespaces
+        )
         var headWritten = false
 
         attemptLoop: for attempt in 1...maxUpstreamAttempts {

@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public enum TaskRunnerError: LocalizedError, Sendable {
     case alreadyRunning
@@ -19,6 +24,14 @@ public enum TaskRunnerError: LocalizedError, Sendable {
 }
 
 public actor TaskRunner {
+    public typealias TaskHomeMaterializer = @Sendable (
+        AutomationTask,
+        URL,
+        URL,
+        [String],
+        UUID
+    ) async throws -> Void
+
     public struct RunExit: Sendable {
         public let exitCode: Int32
         public let quotaExhausted: Bool
@@ -47,9 +60,14 @@ public actor TaskRunner {
     private var running: [UUID: RunningTask] = [:]
     private var taskIDsByRunID: [UUID: UUID] = [:]
     private let logSink: (@Sendable (String, String) async -> Void)?
+    private let taskHomeMaterializer: TaskHomeMaterializer?
 
-    public init(logSink: (@Sendable (String, String) async -> Void)? = nil) {
+    public init(
+        logSink: (@Sendable (String, String) async -> Void)? = nil,
+        taskHomeMaterializer: TaskHomeMaterializer? = nil
+    ) {
         self.logSink = logSink
+        self.taskHomeMaterializer = taskHomeMaterializer
     }
 
     public static func launchArgs(
@@ -70,7 +88,14 @@ public actor TaskRunner {
             "--json",
             "-s", "workspace-write",
             "-c", "approval_policy=\"never\"",
+            // Keep the isolated Task Board home explicitly multi-agent capable
+            // even when the installed Codex default changes or config loading
+            // is layered by the launcher.
+            "-c", "features.multi_agent=true",
             "-m", task.model,
+            // Keep the Codex orchestration effort (including `ultra`) in the
+            // parent/role configuration. Provider-native clamping belongs only
+            // in the bridge that translates the request onto its wire API.
             "-c", "model_reasoning_effort=\"\(tomlEscape(task.reasoningEffort))\"",
             "-c", provider,
             "-c", "model_provider=\"codexswap-task\"",
@@ -126,18 +151,41 @@ public actor TaskRunner {
         let runNumber = explicitRunNumber ?? max(task.totalRuns, task.runs.count) + 1
         let logURL = taskDir.appendingPathComponent("run-\(runNumber).log")
         let finalMessageURL = taskDir.appendingPathComponent("run-\(runNumber).final.md")
+        try Self.validateTaskHomePaths(
+            supportDir: supportDir,
+            taskDir: taskDir,
+            codexHome: codexHome,
+            logURL: logURL,
+            finalMessageURL: finalMessageURL
+        )
+        let taskDirExisted = FileManager.default.fileExists(atPath: taskDir.path)
         try FileManager.default.createDirectory(
             at: taskDir,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: taskDir.path)
-        try FileManager.default.createDirectory(
-            at: codexHome,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: codexHome.path)
+        do {
+            if let taskHomeMaterializer {
+                try await taskHomeMaterializer(task, codexHome, proxyURL, allowedAliases, runID)
+            } else {
+                try FileManager.default.createDirectory(
+                    at: codexHome,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: codexHome.path)
+            }
+        } catch {
+            // A failed materialization must not strand an empty task-owned
+            // directory, while a pre-existing task home (including logs and
+            // continuation state) remains untouched for diagnosis/resume.
+            if !taskDirExisted {
+                Self.removeEmptyDirectory(at: codexHome)
+                Self.removeEmptyDirectory(at: taskDir)
+            }
+            throw error
+        }
         if !FileManager.default.fileExists(atPath: logURL.path) {
             guard FileManager.default.createFile(atPath: logURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
                 throw CocoaError(.fileWriteUnknown)
@@ -344,7 +392,7 @@ public actor TaskRunner {
     /// keep the newest `keepLogs` run logs and drop session artifacts older than a week.
     static func pruneArtifacts(taskDir: URL, codexHome: URL, keepLogs: Int, now: Date = Date()) {
         let fm = FileManager.default
-        if let names = try? fm.contentsOfDirectory(atPath: taskDir.path) {
+        if isSafeDirectory(taskDir), let names = try? fm.contentsOfDirectory(atPath: taskDir.path) {
             let runLogs = names
                 .compactMap { name -> (Int, String)? in
                     guard name.hasPrefix("run-"), name.hasSuffix(".log"),
@@ -353,52 +401,111 @@ public actor TaskRunner {
                 }
                 .sorted { $0.0 > $1.0 }
             for (_, name) in runLogs.dropFirst(keepLogs) {
-                try? fm.removeItem(at: taskDir.appendingPathComponent(name))
+                let file = taskDir.appendingPathComponent(name, isDirectory: false)
+                guard Self.isSafeRegularFile(file) else { continue }
+                try? fm.removeItem(at: file)
             }
             for name in names where name.hasPrefix("run-") && name.hasSuffix(".final.md") {
-                try? fm.removeItem(at: taskDir.appendingPathComponent(name))
+                let file = taskDir.appendingPathComponent(name, isDirectory: false)
+                guard Self.isSafeRegularFile(file) else { continue }
+                try? fm.removeItem(at: file)
             }
         }
         let sessions = codexHome.appendingPathComponent("sessions", isDirectory: true)
+        guard Self.isSafeDirectory(codexHome),
+              Self.isSafeDirectChild(sessions, of: codexHome),
+              Self.isSafeDirectory(sessions) else { return }
         let cutoff = now.addingTimeInterval(-7 * 86_400)
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey]
-        if let enumerator = fm.enumerator(
-            at: sessions,
-            includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles]
-        ) {
-            var directories: [URL] = []
-            while let item = enumerator.nextObject() as? URL {
-                let values = try? item.resourceValues(forKeys: keys)
-                if values?.isDirectory == true {
-                    directories.append(item)
-                } else if (values?.contentModificationDate ?? now) < cutoff {
-                    try? fm.removeItem(at: item)
-                }
-            }
-            for directory in directories.sorted(by: { $0.pathComponents.count > $1.pathComponents.count }) {
-                if (try? fm.contentsOfDirectory(atPath: directory.path).isEmpty) == true {
-                    try? fm.removeItem(at: directory)
-                }
-            }
-        }
+        Self.pruneSessionDirectory(sessions, cutoff: cutoff, now: now)
     }
 
     /// Codex expands plugin bundles under each task's private home while a run is active.
     /// They are disposable runtime cache and can dwarf all durable task artifacts, so remove
     /// them only after the process and outcome ingestion have finished.
     static func pruneTemporaryArtifacts(codexHome: URL) {
-        try? FileManager.default.removeItem(
-            at: codexHome.appendingPathComponent(".tmp", isDirectory: true)
-        )
+        let temporary = codexHome.appendingPathComponent(".tmp", isDirectory: true)
+        guard isSafeDirectory(codexHome),
+              isSafeDirectChild(temporary, of: codexHome),
+              isSafeDirectory(temporary),
+              isSafeOwnedTree(temporary) else { return }
+        try? FileManager.default.removeItem(at: temporary)
     }
 
-    private static func logTail(at url: URL, maximumBytes: Int) -> Data {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+    private static func pruneSessionDirectory(_ directory: URL, cutoff: Date, now: Date) {
+        guard isSafeDirectory(directory),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
+        let fileManager = FileManager.default
+        for name in names {
+            let item = directory.appendingPathComponent(name, isDirectory: false)
+            guard isSafeDirectChild(item, of: directory),
+                  let attributes = try? fileManager.attributesOfItem(atPath: item.path),
+                  let type = attributes[.type] as? FileAttributeType else { continue }
+            if type == .typeDirectory {
+                guard isSafeDirectory(item) else { continue }
+                pruneSessionDirectory(item, cutoff: cutoff, now: now)
+                if (try? fileManager.contentsOfDirectory(atPath: item.path).isEmpty) == true,
+                   isSafeDirectory(item) {
+                    try? fileManager.removeItem(at: item)
+                }
+            } else if type == .typeRegular,
+                      isSafeRegularFile(item),
+                      ((attributes[.modificationDate] as? Date) ?? now) < cutoff {
+                try? fileManager.removeItem(at: item)
+            }
+        }
+    }
+
+    private static func isSafeOwnedTree(_ directory: URL) -> Bool {
+        guard isSafeDirectory(directory),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return false }
+        for name in names {
+            let item = directory.appendingPathComponent(name, isDirectory: false)
+            guard isSafeDirectChild(item, of: directory),
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: item.path),
+                  let type = attributes[.type] as? FileAttributeType else { return false }
+            if type == .typeDirectory {
+                guard isSafeOwnedTree(item) else { return false }
+            } else if type == .typeRegular {
+                guard isSafeRegularFile(item) else { return false }
+            } else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func isSafeDirectory(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeDirectory else { return false }
+        return !url.resolvingSymlinksInPath().standardizedFileURL.path
+            .isEmpty && url.standardizedFileURL.path == url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func isSafeRegularFile(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular else { return false }
+        return url.standardizedFileURL.path == url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func isSafeDirectChild(_ child: URL, of parent: URL) -> Bool {
+        child.deletingLastPathComponent().standardizedFileURL == parent.standardizedFileURL
+    }
+
+    static func logTail(at url: URL, maximumBytes: Int) -> Data {
+        guard maximumBytes > 0 else { return Data() }
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { return Data() }
+        var descriptorStat = stat()
+        guard fstat(descriptor, &descriptorStat) == 0,
+              (descriptorStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            close(descriptor)
+            return Data()
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
         guard let length = try? handle.seekToEnd() else { return Data() }
         let byteCount = min(UInt64(maximumBytes), length)
-        try? handle.seek(toOffset: length - byteCount)
+        guard (try? handle.seek(toOffset: length - byteCount)) != nil else { return Data() }
         return (try? handle.read(upToCount: Int(byteCount))) ?? Data()
     }
 
@@ -410,6 +517,146 @@ public actor TaskRunner {
             .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\t", with: "\\t")
     }
+
+    private static func validateTaskHomePaths(
+        supportDir: URL,
+        taskDir: URL,
+        codexHome: URL,
+        logURL: URL,
+        finalMessageURL: URL
+    ) throws {
+        let support = supportDir.standardizedFileURL
+        let tasksRoot = support.appendingPathComponent("tasks", isDirectory: true)
+        let expectedTask = tasksRoot.appendingPathComponent(taskDir.lastPathComponent, isDirectory: true)
+        let expectedHome = expectedTask.appendingPathComponent("codex-home", isDirectory: true)
+        guard taskDir.standardizedFileURL == expectedTask.standardizedFileURL,
+              codexHome.standardizedFileURL == expectedHome.standardizedFileURL,
+              logURL.deletingLastPathComponent().standardizedFileURL == expectedTask.standardizedFileURL,
+              finalMessageURL.deletingLastPathComponent().standardizedFileURL == expectedTask.standardizedFileURL else {
+            throw TaskRunnerError.invalidRepository
+        }
+
+        try validateDirectoryChain(support)
+        for directory in [tasksRoot, expectedTask, expectedHome] {
+            try validateExistingDirectoryIfPresent(directory)
+        }
+        try validateExistingFileIfPresent(logURL)
+        try validateExistingFileIfPresent(finalMessageURL)
+    }
+
+    private static func validateDirectoryChain(_ url: URL) throws {
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix("/") else { throw TaskRunnerError.invalidRepository }
+        let components = URL(fileURLWithPath: path, isDirectory: true).pathComponents
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for component in components.dropFirst() {
+            current.appendPathComponent(component, isDirectory: true)
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: current.path)
+                let type = attributes[.type] as? FileAttributeType
+                let isSystemVarAlias = current.path == "/var" || current.path.hasPrefix("/var/")
+                guard type == .typeDirectory || (isSystemVarAlias && type == .typeSymbolicLink) else {
+                    throw TaskRunnerError.invalidRepository
+                }
+                try validateNoSymlink(current)
+            } catch let error as TaskRunnerError {
+                throw error
+            } catch {
+                let nsError = error as NSError
+                if Self.isMissingPathError(nsError) {
+                    break
+                }
+                throw TaskRunnerError.invalidRepository
+            }
+        }
+    }
+
+    private static func validateExistingDirectory(_ url: URL) throws {
+        try validateNoSymlink(url)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            throw TaskRunnerError.invalidRepository
+        }
+        let type = attributes[.type] as? FileAttributeType
+        let canonicalPath = url.standardizedFileURL.path
+        guard type == .typeDirectory
+            || ((canonicalPath == "/var" || canonicalPath.hasPrefix("/var/")) && type == .typeSymbolicLink) else {
+            throw TaskRunnerError.invalidRepository
+        }
+    }
+
+    private static func validateExistingDirectoryIfPresent(_ url: URL) throws {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let type = attributes[.type] as? FileAttributeType
+            let canonicalPath = url.standardizedFileURL.path
+            guard type == .typeDirectory
+                || ((canonicalPath == "/var" || canonicalPath.hasPrefix("/var/")) && type == .typeSymbolicLink) else {
+                throw TaskRunnerError.invalidRepository
+            }
+            try validateExistingDirectory(url)
+        } catch let error as TaskRunnerError {
+            throw error
+        } catch {
+            let nsError = error as NSError
+            guard Self.isMissingPathError(nsError) else {
+                throw TaskRunnerError.invalidRepository
+            }
+        }
+    }
+
+    private static func validateExistingFileIfPresent(_ url: URL) throws {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw TaskRunnerError.invalidRepository
+            }
+            try validateNoSymlink(url)
+        } catch let error as TaskRunnerError {
+            throw error
+        } catch {
+            let nsError = error as NSError
+            guard Self.isMissingPathError(nsError) else {
+                throw TaskRunnerError.invalidRepository
+            }
+        }
+    }
+
+    private static func validateNoSymlink(_ url: URL) throws {
+        let standardized = url.standardizedFileURL
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        guard canonicalSystemPath(standardized.path) == canonicalSystemPath(resolved.path) else {
+            throw TaskRunnerError.invalidRepository
+        }
+        let isSystemVarAlias = standardized.path == "/var" || standardized.path.hasPrefix("/var/")
+        if FileManager.default.fileExists(atPath: url.path),
+           let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+           attributes[.type] as? FileAttributeType == .typeSymbolicLink,
+           !isSystemVarAlias {
+            throw TaskRunnerError.invalidRepository
+        }
+    }
+
+    private static func canonicalSystemPath(_ path: String) -> String {
+        if path == "/var" { return "/private/var" }
+        if path.hasPrefix("/var/") { return "/private" + path }
+        return path
+    }
+
+    private static func isMissingPathError(_ error: NSError) -> Bool {
+        (error.domain == NSCocoaErrorDomain && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError))
+            || (error.domain == NSPOSIXErrorDomain && error.code == 2)
+    }
+
+    private static func removeEmptyDirectory(at url: URL) {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: url.path),
+              let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeDirectory,
+              let contents = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil),
+              contents.isEmpty else { return }
+        try? fileManager.removeItem(at: url)
+    }
+
 }
 
 protocol TaskRunning: Sendable {

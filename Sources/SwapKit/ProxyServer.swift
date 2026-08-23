@@ -788,6 +788,27 @@ public actor ProxyServer {
         }
 
         let settings = await settingsProvider()
+        let alphaResolution: AlphaBridge.BridgedModelResolution
+        if head.method == .POST,
+           (rawPath.hasSuffix("/chat/completions") || rawPath.hasSuffix("/responses")) {
+            alphaResolution = AlphaBridge.resolveEntry(
+                in: body,
+                contentEncoding: head.headers.first(name: "Content-Encoding"),
+                catalog: settings.bridgedModels
+            )
+        } else {
+            alphaResolution = .none
+        }
+        if case let .ambiguous(modelID) = alphaResolution {
+            try await AlphaBridge.writeHTTPError(
+                outbound,
+                status: .badRequest,
+                code: "invalid_request",
+                message: "Ambiguous bridged model configuration for \(modelID)"
+            )
+            return
+        }
+
         let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
         let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
 
@@ -803,10 +824,7 @@ public actor ProxyServer {
         // Hardened Chat Completions passthrough for bridged models (opencode & friends):
         // retries pre-stream gateway failures, then streams verbatim. No account state.
         if head.method == .POST, rawPath.hasSuffix("/chat/completions"),
-           let passthroughEntry = AlphaPassthrough.matchedEntry(
-               in: body,
-               contentEncoding: head.headers.first(name: "Content-Encoding"),
-               catalog: settings.bridgedModels) {
+           case let .matched(passthroughEntry) = alphaResolution {
             log("POST \(rawPath) -> alpha passthrough model=\(passthroughEntry.modelID)")
             try await AlphaPassthrough.handle(
                 entry: passthroughEntry,
@@ -820,10 +838,7 @@ public actor ProxyServer {
         // Free-model bridge: routed models translate Responses<->Chat against their own
         // gateway and never touch account selection, tokens, or rotation.
         if head.method == .POST, rawPath.hasSuffix("/responses"),
-           let bridgedEntry = AlphaBridge.matchedEntry(
-               in: body,
-               contentEncoding: head.headers.first(name: "Content-Encoding"),
-               catalog: settings.bridgedModels) {
+           case let .matched(bridgedEntry) = alphaResolution {
             log("POST \(rawPath) -> alpha bridge model=\(bridgedEntry.modelID)")
             let eventSink = self.sink
             let decodedBody = AlphaBridge.decodedRequestBody(

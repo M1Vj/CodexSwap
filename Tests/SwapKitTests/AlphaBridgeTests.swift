@@ -24,6 +24,39 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertNil(AlphaBridge.routedModel(in: Data("not json".utf8), catalog: catalog))
     }
 
+    func testDuplicateEnabledBridgedModelResolutionIsAmbiguous() {
+        let catalog = [
+            BridgedModel(modelID: "x-preview-f-free", baseURL: "https://one.example/v1"),
+            BridgedModel(modelID: "x-preview-f-free", baseURL: "https://two.example/v1"),
+        ]
+        let body = Data(#"{"model":"x-preview-f-free","input":"hi"}"#.utf8)
+
+        guard case let .ambiguous(modelID) = AlphaBridge.resolveEntry(in: body, catalog: catalog) else {
+            return XCTFail("duplicate enabled IDs must be distinguishable from no bridge")
+        }
+        XCTAssertEqual(modelID, "x-preview-f-free")
+        guard case let .ambiguous(passthroughModelID) = AlphaPassthrough.resolveEntry(in: body, catalog: catalog) else {
+            return XCTFail("passthrough resolution must preserve ambiguity")
+        }
+        XCTAssertEqual(passthroughModelID, "x-preview-f-free")
+    }
+
+    func testAmbiguousModelIdentifierIsSanitizedForInvalidRequestCopy() {
+        let requested = "model/with\ncontrol"
+        let catalog = [
+            BridgedModel(modelID: requested, baseURL: "https://one.example/v1"),
+            BridgedModel(modelID: requested, baseURL: "https://two.example/v1"),
+        ]
+        let body = Data(#"{"model":"model/with\ncontrol","input":"hi"}"#.utf8)
+
+        guard case let .ambiguous(modelID) = AlphaBridge.resolveEntry(in: body, catalog: catalog) else {
+            return XCTFail("duplicate enabled IDs must resolve as ambiguous")
+        }
+        XCTAssertEqual(modelID, "modelwithcontrol")
+        XCTAssertFalse(modelID.contains("/"))
+        XCTAssertFalse(modelID.contains("\n"))
+    }
+
     // MARK: - Request translation
 
     func testChatPayloadTranslation() throws {
@@ -87,6 +120,23 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertEqual((tools[0]["function"] as? [String: Any])?["name"] as? String, "read_file")
     }
 
+    func testAgentMessageInputBecomesUserChatMessage() throws {
+        let responsesRequest = #"{"model":"m","input":[{"type":"agent_message","author":"/root","recipient":"/root/probe","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\nReply exactly CHILD_OK."}]}]}"#
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(
+            fromResponsesData: Data(responsesRequest.utf8),
+            model: "m"
+        ))
+
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 1)
+        let message = try XCTUnwrap(messages.first)
+        XCTAssertEqual(message["role"] as? String, "user")
+        XCTAssertEqual(
+            message["content"] as? String,
+            "Message Type: NEW_TASK\nPayload:\nReply exactly CHILD_OK."
+        )
+    }
+
     func testZstdEncodedRequestBodiesAreDecodedForMatching() throws {
         // Real zstd frame of {"model":"x-preview-f-free","input":"hi"} (codex sends zstd bodies).
         let compressed = Data(base64Encoded: "KLUv/SQpSQEAeyJtb2RlbCI6IngtcHJldmlldy1mLWZyZWUiLCJpbnB1dCI6ImhpIn2LiZ2+")!
@@ -143,12 +193,62 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertTrue((fn["description"] as? String)?.hasPrefix("[collaboration]") == true)
     }
 
-    func testEffortClamping() {
-        XCTAssertEqual(AlphaBridge.clampedEffort("max"), "max")
-        XCTAssertEqual(AlphaBridge.clampedEffort("xhigh"), "max")
-        XCTAssertEqual(AlphaBridge.clampedEffort("medium"), "high")
-        XCTAssertEqual(AlphaBridge.clampedEffort("minimal"), "low")
-        XCTAssertEqual(AlphaBridge.clampedEffort(nil), "high")
+    func testChatPayloadRejectsDuplicateFlattenedNamesAcrossNamespaces() {
+        let request = #"{"model":"m","tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent"}]},{"type":"namespace","name":"other","tools":[{"name":"spawn_agent"}]}],"input":"hi"}"#
+
+        XCTAssertNil(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+    }
+
+    func testChatPayloadRejectsNamespaceAndOrdinaryFunctionNameCollision() {
+        let request = #"{"model":"m","tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent"}]},{"type":"function","name":"spawn_agent"}],"input":"hi"}"#
+
+        XCTAssertNil(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+    }
+
+    func testChatPayloadRejectsDuplicateNamesWithinOneNamespace() {
+        let request = #"{"model":"m","tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent"},{"name":"spawn_agent"}]}],"input":"hi"}"#
+
+        XCTAssertNil(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+    }
+
+    func testEffortValidation() {
+        XCTAssertEqual(AlphaBridge.validatedEffort("max"), "max")
+        XCTAssertEqual(AlphaBridge.validatedEffort("xhigh"), "max")
+        XCTAssertEqual(AlphaBridge.validatedEffort("maximal"), "max")
+        XCTAssertEqual(AlphaBridge.validatedEffort("ultra"), "max")
+        XCTAssertEqual(AlphaBridge.validatedEffort("high"), "high")
+        XCTAssertEqual(AlphaBridge.validatedEffort("medium"), "high")
+        XCTAssertEqual(AlphaBridge.validatedEffort("minimal"), "low")
+        XCTAssertEqual(AlphaBridge.validatedEffort(nil), "high")
+        XCTAssertEqual(AlphaBridge.validatedEffort(""), "high")
+        XCTAssertNil(AlphaBridge.validatedEffort("future-v9"))
+    }
+
+    func testChatPayloadRejectsUnknownFutureReasoningEffort() {
+        let request = #"{"model":"m","reasoning":{"effort":"future-v9"},"input":"hi"}"#
+
+        XCTAssertNil(
+            AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"),
+            "unknown reasoning efforts must fail closed instead of silently becoming high"
+        )
+    }
+
+    func testChatPayloadRejectsNumericReasoningEffort() {
+        let request = #"{"model":"m","reasoning":{"effort":2},"input":"hi"}"#
+
+        XCTAssertNil(
+            AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"),
+            "numeric reasoning efforts must not be treated as a missing effort"
+        )
+    }
+
+    func testChatPayloadRejectsNonObjectReasoning() {
+        let request = #"{"model":"m","reasoning":"high","input":"hi"}"#
+
+        XCTAssertNil(
+            AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"),
+            "non-object reasoning values must fail closed"
+        )
     }
 
     private func translatedEvents(_ chunks: [String]) -> String {
@@ -226,6 +326,44 @@ final class AlphaBridgeTests: XCTestCase {
         let calls = doneItems.filter { ($0["type"] as? String) == "function_call" }
         XCTAssertEqual(calls.count, 2, "both parallel tool calls get done items")
         XCTAssertEqual(calls.first?["arguments"] as? String, "{\"p\":1}")
+    }
+
+    func testSSETranslatorRestoresNamespaceForFlattenedToolCalls() throws {
+        var translator = AlphaSSETranslator(
+            model: "x-preview-f-free",
+            toolNamespaces: ["spawn_agent": "collaboration"]
+        )
+        var collected = Data()
+        for chunk in [
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_spawn","function":{"name":"spawn_agent","arguments":"{\"task_name\":\"probe\",\"message\":\"reply\"}"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            collected += translator.feed(ByteBuffer(string: chunk + "\n\n"))
+        }
+        collected += translator.finishFeed()
+        let events = String(decoding: collected, as: UTF8.self)
+
+        let doneItem = try XCTUnwrap(events.components(separatedBy: "\n")
+            .first { $0.contains(#""type":"response.output_item.done""#) }
+            .flatMap { line -> [String: Any]? in
+                let json = line.replacingOccurrences(of: "data: ", with: "")
+                guard let event = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else { return nil }
+                return event["item"] as? [String: Any]
+            })
+        XCTAssertEqual(doneItem["type"] as? String, "function_call")
+        XCTAssertEqual(doneItem["name"] as? String, "spawn_agent")
+        XCTAssertEqual(doneItem["namespace"] as? String, "collaboration")
+        XCTAssertEqual(doneItem["encrypted_function_args"] as? [String], [])
+
+        let completedLine = try XCTUnwrap(
+            events.split(separator: "\n").first { $0.contains(#""type":"response.completed""#) }
+        ).replacingOccurrences(of: "data: ", with: "")
+        let completed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(completedLine.utf8)) as? [String: Any])
+        let response = try XCTUnwrap(completed["response"] as? [String: Any])
+        let output = try XCTUnwrap(response["output"] as? [[String: Any]])
+        XCTAssertEqual(output.first?["namespace"] as? String, "collaboration")
+        XCTAssertEqual(output.first?["encrypted_function_args"] as? [String], [])
     }
 
     func testSSETranslatorCumulativeToolCallSnapshotsAreNotConcatenated() throws {
@@ -508,6 +646,67 @@ final class AlphaBridgeTests: XCTestCase {
 
         let hits = await codexUpstream.requestCount()
         XCTAssertEqual(hits, 0, "routed models must bypass Codex accounts entirely")
+    }
+
+    func testAmbiguousBridgedModelFailsClosedForChatAndResponsesBeforeAnyUpstream() async throws {
+        let chatUpstream = MockUpstream(responseBody: "{}", contentType: "application/json")
+        let chatURL = try await chatUpstream.start()
+        defer { Task { await chatUpstream.stop() } }
+
+        let bridgeUpstream = MockUpstream(responseBody: "{}", contentType: "application/json")
+        let bridgeURL = try await bridgeUpstream.start()
+        defer { Task { await bridgeUpstream.stop() } }
+
+        let codexUpstream = MockUpstream(responseBody: "{}", contentType: "application/json")
+        let codexURL = try await codexUpstream.start()
+        defer { Task { await codexUpstream.stop() } }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("alpha-ambiguous-model-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "probe", accountID: "acct", accessToken: "token"))
+
+        var config = ProxyServer.Config()
+        config.port = 0
+        config.upstream = codexURL
+        var settings = Settings.default
+        settings.bridgedModels = [
+            BridgedModel(modelID: "x-preview-f-free", baseURL: chatURL.absoluteString),
+            BridgedModel(modelID: "x-preview-f-free", baseURL: bridgeURL.absoluteString),
+        ]
+        let fixedSettings = settings
+        let server = ProxyServer(store: store, config: config, settingsProvider: { fixedSettings })
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        var chatRequest = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+        chatRequest.httpMethod = "POST"
+        chatRequest.httpBody = Data(#"{"model":"x-preview-f-free","messages":[]}"#.utf8)
+        let (chatBody, chatResponse) = try await URLSession.shared.data(for: chatRequest)
+        XCTAssertEqual((chatResponse as? HTTPURLResponse)?.statusCode, 400)
+        let chatText = String(decoding: chatBody, as: UTF8.self)
+        XCTAssertTrue(chatText.contains("invalid_request"), chatText)
+
+        var responsesRequest = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/backend-api/codex/responses")!)
+        responsesRequest.httpMethod = "POST"
+        responsesRequest.httpBody = Data(#"{"model":"x-preview-f-free","input":"hi"}"#.utf8)
+        let (responsesBody, responsesResponse) = try await URLSession.shared.data(for: responsesRequest)
+        XCTAssertEqual((responsesResponse as? HTTPURLResponse)?.statusCode, 400)
+        let responsesText = String(decoding: responsesBody, as: UTF8.self)
+        XCTAssertTrue(responsesText.contains("invalid_request"), responsesText)
+
+        let chatHits = await chatUpstream.requestCount()
+        let bridgeHits = await bridgeUpstream.requestCount()
+        let codexHits = await codexUpstream.requestCount()
+        XCTAssertEqual(chatHits, 0, "ambiguous passthrough must not call either bridge")
+        XCTAssertEqual(bridgeHits, 0, "ambiguous Responses routing must not call either bridge")
+        XCTAssertEqual(codexHits, 0, "ambiguous models must not fall back to account routing")
     }
 }
 

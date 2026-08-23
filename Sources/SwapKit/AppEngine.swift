@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public enum AppEngineError: LocalizedError, Sendable {
     case proxyNotRunning
@@ -156,9 +161,24 @@ public actor AppEngine {
         self.autoLog = autoLog
         self.supportDir = supportDir
         self.beforeTaskLaunch = nil
-        self.taskRunner = taskRunner ?? TaskRunner { [autoLog] category, message in
-            await autoLog.write(category, message)
-        }
+        self.taskRunner = taskRunner ?? TaskRunner(
+            logSink: { [autoLog] category, message in
+                await autoLog.write(category, message)
+            },
+            taskHomeMaterializer: { [settingsStore] task, codexHome, proxyURL, allowedAliases, runID in
+                let settings = await settingsStore.get()
+                let sourceHome = CodexAuth.codexHome()
+                try CodexTaskPolicyMaterializer(sourceCodexHome: sourceHome).materialize(
+                    policy: settings.subagentModelPolicy,
+                    targetCodexHome: codexHome,
+                    proxyURL: proxyURL,
+                    allowedAliases: allowedAliases,
+                    runID: runID,
+                    parentModelID: task.model,
+                    bridgedModels: settings.bridgedModels
+                )
+            }
+        )
     }
 
     init(
@@ -1615,7 +1635,7 @@ public actor AppEngine {
             task.runs[runIndex].headSHA = gitState?.headSHA
             task.runs[runIndex].actualBranch = gitState?.branch
         }
-        archiveExcessRuns(&task, taskDir: task.taskDirURL(supportDir: supportDir))
+        Self.archiveExcessRuns(&task, taskDir: task.taskDirURL(supportDir: supportDir))
         task.updatedAt = now
         await taskStore.update(task)
         switch transition.terminalEvent {
@@ -1708,9 +1728,9 @@ public actor AppEngine {
             task.runs[runIndex].planTotal = progress?.total
             task.runs[runIndex].headSHA = gitState?.headSHA
             task.runs[runIndex].actualBranch = gitState?.branch
-            ingestRunTelemetry(into: &task.runs[runIndex], taskDir: taskDir)
+            Self.ingestRunTelemetry(into: &task.runs[runIndex], taskDir: taskDir)
         }
-        archiveExcessRuns(&task, taskDir: taskDir)
+        Self.archiveExcessRuns(&task, taskDir: taskDir)
         task.updatedAt = now
         await taskStore.update(task)
         let progressText = "done \(progress?.done ?? 0) total \(progress?.total ?? 0) status \(progress?.status ?? "none")"
@@ -1751,16 +1771,31 @@ public actor AppEngine {
     }
 
 
-    private func ingestRunTelemetry(into run: inout TaskRunRecord, taskDir: URL) {
-        guard !run.logFileName.isEmpty else { return }
-        let telemetry = CodexEventDecoder.decode(logURL: taskDir.appendingPathComponent(run.logFileName))
+    static func ingestRunTelemetry(into run: inout TaskRunRecord, taskDir: URL) {
+        guard isSafeTaskDirectory(taskDir), isSafeRunFilename(run.logFileName) else { return }
+        let logURL = taskDir.appendingPathComponent(run.logFileName, isDirectory: false)
+        guard isSafeRegularDirectChild(logURL, parent: taskDir) else { return }
+        let telemetry = CodexEventDecoder.decode(logURL: logURL)
         run.sessionID = telemetry.sessionID
         run.inputTokens = telemetry.inputTokens
         run.cachedTokens = telemetry.cachedTokens
         run.outputTokens = telemetry.outputTokens
-        let finalURL = taskDir.appendingPathComponent(run.logFileName.replacingOccurrences(of: ".log", with: ".final.md"))
-        let finalText = try? String(contentsOf: finalURL, encoding: .utf8)
-        try? FileManager.default.removeItem(at: finalURL)
+        var finalText: String?
+        if run.logFileName.hasSuffix(".log") {
+            let stem = String(run.logFileName.dropLast(4))
+            let finalURL = taskDir.appendingPathComponent("\(stem).final.md", isDirectory: false)
+            if FileManager.default.fileExists(atPath: finalURL.path) {
+                // Never read or remove a pre-existing symlink/non-regular file.
+                guard isSafeRegularDirectChild(finalURL, parent: taskDir) else {
+                    run.summary = telemetry.finalMessage.map {
+                        String($0.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000))
+                    }
+                    return
+                }
+                finalText = try? String(contentsOf: finalURL, encoding: .utf8)
+                try? FileManager.default.removeItem(at: finalURL)
+            }
+        }
         let summary = (finalText?.isEmpty == false ? finalText : telemetry.finalMessage)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         run.summary = summary.map { String($0.prefix(2_000)) }
@@ -1771,9 +1806,10 @@ public actor AppEngine {
         return (Array(runs.suffix(limit)), Array(runs.prefix(runs.count - limit)))
     }
 
-    private func archiveExcessRuns(_ task: inout AutomationTask, taskDir: URL) {
+    static func archiveExcessRuns(_ task: inout AutomationTask, taskDir: URL) {
         let (kept, evicted) = Self.capRuns(task.runs, limit: 25)
         guard !evicted.isEmpty else { return }
+        guard isSafeTaskDirectory(taskDir) else { return }
         // History is only dropped from memory after every evicted record is durably
         // appended as single-line JSONL; any failure keeps the full in-memory history.
         let encoder = JSONEncoder()
@@ -1786,14 +1822,7 @@ public actor AppEngine {
             lines.append(Data("\n".utf8))
         }
         let archiveURL = taskDir.appendingPathComponent("runs-archive.jsonl")
-        if !FileManager.default.fileExists(atPath: archiveURL.path) {
-            guard FileManager.default.createFile(
-                atPath: archiveURL.path,
-                contents: nil,
-                attributes: [.posixPermissions: 0o600]
-            ) else { return }
-        }
-        guard let handle = try? FileHandle(forWritingTo: archiveURL) else { return }
+        guard let handle = openArchiveAppend(archiveURL, parent: taskDir) else { return }
         do {
             try handle.seekToEnd()
             try handle.write(contentsOf: lines)
@@ -1803,6 +1832,55 @@ public actor AppEngine {
             return
         }
         task.runs = kept
+    }
+
+    private static func isSafeTaskDirectory(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeDirectory else { return false }
+        return canonicalSystemPath(url.standardizedFileURL.path)
+            == canonicalSystemPath(url.resolvingSymlinksInPath().standardizedFileURL.path)
+    }
+
+    private static func isSafeRunFilename(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 255, value != ".", value != ".." else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            scalar.value >= 0x20 && scalar.value != 0x7F && scalar != "/" && scalar != "\\"
+        }
+    }
+
+    private static func isSafeRegularDirectChild(_ url: URL, parent: URL) -> Bool {
+        guard url.deletingLastPathComponent().standardizedFileURL == parent.standardizedFileURL,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular else { return false }
+        return canonicalSystemPath(url.standardizedFileURL.path)
+            == canonicalSystemPath(url.resolvingSymlinksInPath().standardizedFileURL.path)
+    }
+
+    private static func openArchiveAppend(_ url: URL, parent: URL) -> FileHandle? {
+        guard isSafeTaskDirectory(parent),
+              url.deletingLastPathComponent().standardizedFileURL == parent.standardizedFileURL else {
+            return nil
+        }
+        let descriptor = open(
+            url.path,
+            O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+            mode_t(0o600)
+        )
+        guard descriptor >= 0 else { return nil }
+        var descriptorStat = stat()
+        guard fstat(descriptor, &descriptorStat) == 0,
+              (descriptorStat.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              fchmod(descriptor, mode_t(0o600)) == 0 else {
+            close(descriptor)
+            return nil
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    private static func canonicalSystemPath(_ path: String) -> String {
+        if path == "/var" { return "/private/var" }
+        if path.hasPrefix("/var/") { return "/private" + path }
+        return path
     }
 
     // MARK: - Poller

@@ -81,12 +81,16 @@ enum AlphaPassthrough {
     }
 
     /// Matches a POST body against the enabled bridged catalog for this lane.
-    static func matchedEntry(
+    static func resolveEntry(
         in rawBody: Data,
         contentEncoding: String? = nil,
         catalog: [BridgedModel]
-    ) -> BridgedModel? {
-        AlphaBridge.matchedEntry(in: rawBody, contentEncoding: contentEncoding, catalog: catalog)
+    ) -> AlphaBridge.BridgedModelResolution {
+        AlphaBridge.resolveEntry(
+            in: rawBody,
+            contentEncoding: contentEncoding,
+            catalog: catalog
+        )
     }
 
     static func writePlainError(

@@ -82,6 +82,7 @@ public struct Settings: Codable, Sendable, Equatable {
     public var proxyPort: Int
     /// Free/gateway models served through the Responses<->Chat bridge instead of Codex accounts.
     public var bridgedModels: [BridgedModel]
+    public var subagentModelPolicy: SubagentModelPolicy
 
     public static let defaultProxyPort = 58_432
 
@@ -150,7 +151,8 @@ public struct Settings: Codable, Sendable, Equatable {
         notifyOnNeedsLogin: Bool = true,
         smartSwitchEnabled: Bool = false,
         proxyPort: Int,
-        bridgedModels: [BridgedModel]? = nil
+        bridgedModels: [BridgedModel]? = nil,
+        subagentModelPolicy: SubagentModelPolicy = .default
     ) {
         self.rotationStrategy = rotationStrategy
         self.primaryThresholdPercent = primaryThresholdPercent
@@ -180,6 +182,7 @@ public struct Settings: Codable, Sendable, Equatable {
         self.smartSwitchEnabled = smartSwitchEnabled
         self.proxyPort = proxyPort
         self.bridgedModels = bridgedModels ?? Settings.default.bridgedModels
+        self.subagentModelPolicy = subagentModelPolicy
     }
 
     /// Tolerant decoder: missing keys fall back to defaults so new fields never invalidate an old file.
@@ -220,6 +223,12 @@ public struct Settings: Codable, Sendable, Equatable {
         proxyPort = (1...65_535).contains(decodedPort) ? decodedPort : d.proxyPort
         let decodedBridged = try c.decodeIfPresent([BridgedModel].self, forKey: .bridgedModels) ?? d.bridgedModels
         bridgedModels = decodedBridged.filter { !$0.modelID.isEmpty && URL(string: $0.baseURL) != nil }
+        do {
+            subagentModelPolicy = try c.decodeIfPresent(SubagentModelPolicy.self, forKey: .subagentModelPolicy)
+                ?? d.subagentModelPolicy
+        } catch {
+            subagentModelPolicy = d.subagentModelPolicy
+        }
     }
 }
 

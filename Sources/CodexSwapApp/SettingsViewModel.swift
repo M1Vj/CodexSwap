@@ -35,6 +35,8 @@ struct SettingsActions {
     let setNotifyOnTaskEvents: (Bool) -> Void
     let setAutomationConsumeBankedWindow: (Bool) -> Void
     let setAutomationMaxConcurrent: (Int) -> Void
+    let refreshSubagentPolicy: () -> Void
+    let applySubagentPolicy: (SubagentModelPolicy) -> Void
     let installShim: () -> Void
     let uninstallShim: () -> Void
 }
@@ -44,15 +46,20 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var snapshot: EngineSnapshot
     @Published private(set) var settings: Settings
     @Published private(set) var shimInstalled: Bool
+    @Published private(set) var subagentPolicyPresentation: SubagentPolicyPresentationState
     @Published var message: String?
 
     let actions: SettingsActions
+    private var didBootstrapSubagentPolicy = false
+    private var hasUnsavedSubagentDraft = false
+    private var subagentPolicyOperationGate = SubagentPolicyOperationGate()
 
     init(snapshot: EngineSnapshot, settings: Settings, actions: SettingsActions) {
         self.snapshot = snapshot
         self.settings = settings
         self.actions = actions
         self.shimInstalled = ShimManager().isInstalled()
+        self.subagentPolicyPresentation = SubagentPolicyPresentationState(draft: .default)
     }
 
     var presentation: SettingsPresentation { SettingsPresentation(snapshot: snapshot) }
@@ -65,9 +72,169 @@ final class SettingsViewModel: ObservableObject {
         self.snapshot = snapshot
         self.settings = settings
         self.shimInstalled = ShimManager().isInstalled()
+        bootstrapSubagentPolicyIfNeeded(settings.subagentModelPolicy)
+    }
+
+    var subagentPolicyOperationGeneration: UInt {
+        subagentPolicyOperationGate.generation
+    }
+
+    func isCurrentSubagentPolicyOperation(_ token: UInt) -> Bool {
+        subagentPolicyOperationGate.isCurrent(token)
+    }
+
+    func bootstrapSubagentPolicyIfNeeded(_ persisted: SubagentModelPolicy) {
+        guard !didBootstrapSubagentPolicy else { return }
+        didBootstrapSubagentPolicy = true
+        guard !hasUnsavedSubagentDraft else { return }
+        var next = subagentPolicyPresentation
+        next.bootstrapPersistedDraft(persisted)
+        subagentPolicyPresentation = next
     }
 
     func showMessage(_ value: String) {
         message = value
+    }
+
+    func showSubagentPolicyMessage(_ value: String) {
+        var next = subagentPolicyPresentation
+        next.setMessage(value)
+        subagentPolicyPresentation = next
+    }
+
+    @discardableResult
+    func beginSubagentPolicyRefresh() -> Bool {
+        guard !subagentPolicyPresentation.isApplying else { return false }
+        var next = subagentPolicyPresentation
+        next.beginLoading()
+        subagentPolicyPresentation = next
+        _ = subagentPolicyOperationGate.begin()
+        return true
+    }
+
+    func loadSubagentPolicy(
+        catalog: [CodexModelDescriptor],
+        installedRoleIDs: [String],
+        parentProviderFamily: CodexModelProviderFamily? = nil,
+        actualAssignments: [SubagentRoleAssignment]? = nil
+    ) {
+        var next = subagentPolicyPresentation
+        next.load(
+            catalog: catalog,
+            installedRoleIDs: installedRoleIDs,
+            parentProviderFamily: parentProviderFamily,
+            actualAssignments: actualAssignments
+        )
+        subagentPolicyPresentation = next
+    }
+
+    func failSubagentCatalog(_ error: CodexModelCatalogError) {
+        var next = subagentPolicyPresentation
+        next.catalogFailed(error)
+        subagentPolicyPresentation = next
+    }
+
+    func failSubagentCatalog(message: String) {
+        var next = subagentPolicyPresentation
+        next.catalogFailed(message: message)
+        subagentPolicyPresentation = next
+    }
+
+    func updateSubagentDraft(_ draft: SubagentModelPolicy) {
+        guard !subagentPolicyPresentation.isApplying else { return }
+        markSubagentDraftEdited()
+        var next = subagentPolicyPresentation
+        next.updateDraft(draft)
+        subagentPolicyPresentation = next
+    }
+
+    func setSubagentEligibility(modelID: String, enabled: Bool) {
+        guard !subagentPolicyPresentation.isApplying else { return }
+        markSubagentDraftEdited()
+        var next = subagentPolicyPresentation
+        next.setEligibility(modelID: modelID, enabled: enabled)
+        subagentPolicyPresentation = next
+    }
+
+    func setSubagentAssignment(
+        roleID: String,
+        modelID: String? = nil,
+        reasoningEffort: CodexReasoningEffort? = nil
+    ) {
+        guard !subagentPolicyPresentation.isApplying else { return }
+        markSubagentDraftEdited()
+        var next = subagentPolicyPresentation
+        next.setAssignment(roleID: roleID, modelID: modelID, reasoningEffort: reasoningEffort)
+        subagentPolicyPresentation = next
+    }
+
+    func setSubagentAssignmentModel(roleID: String, modelID: String) {
+        guard !subagentPolicyPresentation.isApplying else { return }
+        markSubagentDraftEdited()
+        var next = subagentPolicyPresentation
+        next.setAssignmentModel(roleID: roleID, modelID: modelID)
+        subagentPolicyPresentation = next
+    }
+
+    func setSubagentAlphaUltra(enabled: Bool) {
+        guard !subagentPolicyPresentation.isApplying else { return }
+        markSubagentDraftEdited()
+        var next = subagentPolicyPresentation
+        next.setAlphaUltraEnabled(enabled)
+        subagentPolicyPresentation = next
+    }
+
+    func assignSubagentModelToAllRoles(modelID: String) {
+        guard !subagentPolicyPresentation.isApplying else { return }
+        markSubagentDraftEdited()
+        var next = subagentPolicyPresentation
+        next.assignModelToAllRoles(modelID: modelID)
+        subagentPolicyPresentation = next
+    }
+
+    @discardableResult
+    func beginSubagentPolicyApply(_ draft: SubagentModelPolicy) -> Bool {
+        var next = subagentPolicyPresentation
+        next.updateDraft(draft)
+        guard next.beginApplying() else { return false }
+        subagentPolicyPresentation = next
+        hasUnsavedSubagentDraft = true
+        _ = subagentPolicyOperationGate.begin()
+        return true
+    }
+
+    private func markSubagentDraftEdited() {
+        hasUnsavedSubagentDraft = true
+        _ = subagentPolicyOperationGate.begin()
+    }
+
+    func subagentPolicySucceeded(
+        catalog: [CodexModelDescriptor],
+        installedRoleIDs: [String],
+        parentProviderFamily: CodexModelProviderFamily? = nil,
+        actualAssignments: [SubagentRoleAssignment]? = nil,
+        verificationWarning: String? = nil
+    ) {
+        var next = subagentPolicyPresentation
+        next.applySucceeded(
+            catalog: catalog,
+            installedRoleIDs: installedRoleIDs,
+            parentProviderFamily: parentProviderFamily,
+            actualAssignments: actualAssignments,
+            verificationWarning: verificationWarning
+        )
+        subagentPolicyPresentation = next
+    }
+
+    func subagentPolicyFailed(_ error: CodexSubagentPolicyManagerError) {
+        var next = subagentPolicyPresentation
+        next.applyFailed(error)
+        subagentPolicyPresentation = next
+    }
+
+    func subagentPolicyFailed(message: String) {
+        var next = subagentPolicyPresentation
+        next.applyFailed(message: message)
+        subagentPolicyPresentation = next
     }
 }

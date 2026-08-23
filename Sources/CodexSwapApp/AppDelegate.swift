@@ -113,6 +113,217 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         publishSnapshot()
     }
 
+    // MARK: - Subagent policy
+
+    private func refreshSubagentPolicy() {
+        guard let viewModel = settingsViewModel else { return }
+        guard viewModel.beginSubagentPolicyRefresh() else { return }
+        let generation = viewModel.subagentPolicyOperationGeneration
+
+        Task { @MainActor [weak self] in
+            guard let self, let viewModel = self.settingsViewModel else { return }
+            do {
+                let currentSettings = await SettingsStoreBridge.current()
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.bootstrapSubagentPolicyIfNeeded(currentSettings.subagentModelPolicy)
+                let context = try CodexSubagentPolicyRuntimeResolver.resolve()
+                let catalog = try await CodexModelCatalogService(
+                    bridgedModels: currentSettings.bridgedModels,
+                    alphaUltraEnabled: currentSettings.subagentModelPolicy.alphaUltraEnabled
+                ).load()
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                let parentProviderFamily = try context.parentProviderFamily(catalog: catalog)
+                let actualAssignments = try CodexSubagentPolicyRuntimeResolver.readManagedAssignments(
+                    roleFiles: context.roleFiles
+                )
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.loadSubagentPolicy(
+                    catalog: catalog,
+                    installedRoleIDs: context.roleFiles.map(\.roleID),
+                    parentProviderFamily: parentProviderFamily,
+                    actualAssignments: actualAssignments
+                )
+            } catch let error as CodexModelCatalogError {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.failSubagentCatalog(error)
+            } catch let error as CodexSubagentPolicyRuntimeError {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.failSubagentCatalog(message: error.localizedDescription)
+            } catch {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.failSubagentCatalog(message: "The subagent catalog could not be loaded safely. Your draft is still here; try Refresh again.")
+            }
+        }
+    }
+
+    private func applySubagentPolicy(_ draft: SubagentModelPolicy) {
+        guard let viewModel = settingsViewModel,
+              viewModel.beginSubagentPolicyApply(draft) else { return }
+        let generation = viewModel.subagentPolicyOperationGeneration
+
+        Task { @MainActor [weak self] in
+            guard let self, let viewModel = self.settingsViewModel else { return }
+            do {
+                let currentSettings = await SettingsStoreBridge.current()
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                let context = try CodexSubagentPolicyRuntimeResolver.resolve()
+                let catalog = try await CodexModelCatalogService(
+                    bridgedModels: currentSettings.bridgedModels,
+                    alphaUltraEnabled: draft.alphaUltraEnabled
+                ).load()
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                let parentProviderFamily = try context.parentProviderFamily(catalog: catalog)
+
+                // The manager owns only exact role files and the declared
+                // catalog overlay. Parent model/routing fields are never
+                // passed or edited by this action.
+                try context.manager.apply(
+                    policy: draft,
+                    catalog: catalog,
+                    roleFiles: context.roleFiles,
+                    parentProviderFamily: parentProviderFamily
+                )
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+
+                // Read back the exact role files when possible. The manager
+                // already post-validates its staged bytes, so a readback
+                // failure must not turn a committed role transaction into a
+                // false rollback claim.
+                var actualAssignments: [SubagentRoleAssignment]?
+                var readbackWarning: String?
+                do {
+                    let readback = try CodexSubagentPolicyRuntimeResolver.readManagedAssignments(
+                        roleFiles: context.roleFiles
+                    )
+                    actualAssignments = readback
+                } catch let error as CodexSubagentPolicyRuntimeError {
+                    actualAssignments = nil
+                    readbackWarning = "The installed role values could not be verified after the transaction: \(error.localizedDescription)"
+                } catch {
+                    actualAssignments = nil
+                    readbackWarning = "The installed role values could not be verified after the transaction."
+                }
+                let reconciledDraft = actualAssignments.map {
+                    viewModel.subagentPolicyPresentation.policyReconciled(with: $0)
+                } ?? draft
+
+                // Persist preferences after the manager commits. A verified
+                // settings-write failure reports committed roles plus an
+                // unsaved-preferences warning rather than generic apply failure.
+                do {
+                    settings = try await SettingsStoreBridge.updatePersisting { settings in
+                        settings.subagentModelPolicy = reconciledDraft
+                    }
+                    guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                } catch let error as SettingsStoreError {
+                    guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                    viewModel.subagentPolicySucceeded(
+                        catalog: catalog,
+                        installedRoleIDs: context.roleFiles.map(\.roleID),
+                        parentProviderFamily: parentProviderFamily,
+                        actualAssignments: actualAssignments,
+                        verificationWarning: "Roles were applied, but preferences were not saved: \(error.localizedDescription)"
+                    )
+                    return
+                } catch {
+                    guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                    viewModel.subagentPolicySucceeded(
+                        catalog: catalog,
+                        installedRoleIDs: context.roleFiles.map(\.roleID),
+                        parentProviderFamily: parentProviderFamily,
+                        actualAssignments: actualAssignments,
+                        verificationWarning: "Roles were applied, but preferences were not saved."
+                    )
+                    return
+                }
+                latest = await engine.settingsSnapshot()
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                publishSnapshot()
+
+                // Re-read live catalog and role bindings so the UI shows what
+                // actually landed instead of assuming IDs alone describe it.
+                do {
+                    let freshSettings = await SettingsStoreBridge.current()
+                    let freshContext = try CodexSubagentPolicyRuntimeResolver.resolve()
+                    let freshCatalog = try await CodexModelCatalogService(
+                        bridgedModels: freshSettings.bridgedModels,
+                        alphaUltraEnabled: freshSettings.subagentModelPolicy.alphaUltraEnabled
+                    ).load()
+                    guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                    let freshParentProviderFamily = try freshContext.parentProviderFamily(catalog: freshCatalog)
+                    let freshAssignments = try CodexSubagentPolicyRuntimeResolver.readManagedAssignments(
+                        roleFiles: freshContext.roleFiles
+                    )
+                    var finalWarning = readbackWarning
+                    let freshDraft = viewModel.subagentPolicyPresentation.policyReconciled(with: freshAssignments)
+                    if freshDraft != reconciledDraft {
+                        do {
+                            settings = try await SettingsStoreBridge.updatePersisting { settings in
+                                settings.subagentModelPolicy = freshDraft
+                            }
+                        } catch let error as SettingsStoreError {
+                            finalWarning = [
+                                finalWarning,
+                                "Roles were applied, but preferences were not saved: \(error.localizedDescription)",
+                            ].compactMap { $0 }.joined(separator: " ")
+                        } catch {
+                            finalWarning = [
+                                finalWarning,
+                                "Roles were applied, but preferences were not saved.",
+                            ].compactMap { $0 }.joined(separator: " ")
+                        }
+                    }
+                    viewModel.subagentPolicySucceeded(
+                        catalog: freshCatalog,
+                        installedRoleIDs: freshContext.roleFiles.map(\.roleID),
+                        parentProviderFamily: freshParentProviderFamily,
+                        actualAssignments: freshAssignments,
+                        verificationWarning: finalWarning
+                    )
+                } catch let error as CodexModelCatalogError {
+                    guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                    let warning = [
+                        readbackWarning,
+                        "The catalog could not be refreshed: \(SubagentPolicyPresentationState.catalogFailureCopy(for: error))",
+                    ].compactMap { $0 }.joined(separator: " ")
+                    viewModel.subagentPolicySucceeded(
+                        catalog: catalog,
+                        installedRoleIDs: context.roleFiles.map(\.roleID),
+                        parentProviderFamily: parentProviderFamily,
+                        actualAssignments: actualAssignments,
+                        verificationWarning: warning
+                    )
+                } catch let error as CodexSubagentPolicyRuntimeError {
+                    guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                    let warning = [
+                        readbackWarning,
+                        "The installed role view could not be refreshed: \(error.localizedDescription)",
+                    ].compactMap { $0 }.joined(separator: " ")
+                    viewModel.subagentPolicySucceeded(
+                        catalog: catalog,
+                        installedRoleIDs: context.roleFiles.map(\.roleID),
+                        parentProviderFamily: parentProviderFamily,
+                        actualAssignments: actualAssignments,
+                        verificationWarning: warning
+                    )
+                }
+            } catch let error as CodexModelCatalogError {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.failSubagentCatalog(error)
+            } catch let error as CodexSubagentPolicyManagerError {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.subagentPolicyFailed(error)
+            } catch let error as CodexSubagentPolicyRuntimeError {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.subagentPolicyFailed(message: error.localizedDescription)
+            } catch {
+                guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
+                viewModel.subagentPolicyFailed(message: "The subagent policy could not be applied safely. Your draft is still here; no parent routing was changed.")
+            }
+        }
+    }
+
+
     private func publishSnapshot() {
         settingsViewModel?.update(snapshot: latest, settings: settings)
         taskBoardViewModel?.update(snapshot: latest, settings: settings)
@@ -460,6 +671,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setAutomationMaxConcurrent: { [weak self] value in
                 self?.updateSettings { $0.automationMaxConcurrent = max(1, min(4, value)) }
             },
+            refreshSubagentPolicy: { [weak self] in self?.refreshSubagentPolicy() },
+            applySubagentPolicy: { [weak self] draft in self?.applySubagentPolicy(draft) },
             installShim: { [weak self] in self?.setShimInstalled(true) },
             uninstallShim: { [weak self] in self?.setShimInstalled(false) }
         )
@@ -984,11 +1197,4 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
               let taskID = UUID(uuidString: rawTaskID) else { return }
         await handleTaskNotification(action: response.actionIdentifier, taskID: taskID)
     }
-}
-
-/// The SettingsStore is an actor; the menu needs its value synchronously-ish, so bridge through a shared instance.
-enum SettingsStoreBridge {
-    static let shared = SettingsStore()
-    static func current() async -> Settings { await shared.get() }
-    static func update(_ mutate: @escaping @Sendable (inout Settings) -> Void) async -> Settings { await shared.update(mutate) }
 }
