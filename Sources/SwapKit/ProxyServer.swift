@@ -215,6 +215,26 @@ func selectProxyAccount(
     }
 }
 
+/// Runs one routed attempt while holding an in-memory account lease. The lease
+/// spans the operation's complete response lifecycle, including body streaming,
+/// and is released on both success and failure so an archive tick can never race
+/// an in-flight upstream request or strand a failover alias.
+func withRoutingLease<T>(
+    store: AccountStore,
+    alias: String,
+    operation: @Sendable () async throws -> T
+) async rethrows -> T {
+    await store.acquireRoutingLease(alias)
+    do {
+        let result = try await operation()
+        await store.releaseRoutingLease(alias)
+        return result
+    } catch {
+        await store.releaseRoutingLease(alias)
+        throw error
+    }
+}
+
 func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHeaders {
     var headers = incoming
     headers.remove(name: "Host")
@@ -494,6 +514,11 @@ actor RefreshBurnGuard {
         suppressedUntil[alias] = (refreshToken, now.addingTimeInterval(window))
     }
     func clear(alias: String) { suppressedUntil[alias] = nil }
+}
+
+private enum ProxyAttemptResult: Sendable {
+    case completed
+    case retry(account: Account, tokenRefreshed: Bool, exhaustionHandled: Bool, finalReplay: Bool)
 }
 
 public actor ProxyServer {
@@ -973,27 +998,83 @@ public actor ProxyServer {
         // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
         while attempts < 8 {
             attempts += 1
+            let target = targetURL(for: rawPath, query: query)
+            let result = try await performAttempt(
+                head: head,
+                body: body,
+                outbound: outbound,
+                path: rawPath,
+                target: target,
+                account: account,
+                mode: mode,
+                settings: settings,
+                interactiveKey: interactiveKey,
+                tokenRefreshed: tokenRefreshed,
+                exhaustionHandled: exhaustionHandled,
+                finalReplay: finalReplay
+            )
+            switch result {
+            case .completed:
+                return
+            case let .retry(next, refreshed, handled, replay):
+                account = next
+                tokenRefreshed = refreshed
+                exhaustionHandled = handled
+                finalReplay = replay
+            }
+        }
+        try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
+    }
+
+    private func performAttempt(
+        head: HTTPRequestHead,
+        body: Data,
+        outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        path: String,
+        target: URL,
+        account initialAccount: Account,
+        mode: ProxyRequestMode,
+        settings: Settings,
+        interactiveKey: String?,
+        tokenRefreshed initialTokenRefreshed: Bool,
+        exhaustionHandled initialExhaustionHandled: Bool,
+        finalReplay initialFinalReplay: Bool
+    ) async throws -> ProxyAttemptResult {
+        // Capture the sendable collaborators before handing the attempt to the
+        // nonisolated lease wrapper. Actor methods below are called explicitly
+        // through `self` so the lease spans the complete upstream lifecycle
+        // without weakening Swift's concurrency checks.
+        let store = self.store
+        let burn = self.burn
+        let sink = self.sink
+        let exhaustionHandler = self.exhaustionHandler
+        let freshAlternative = self.freshAlternative
+        return try await withRoutingLease(store: store, alias: initialAccount.alias) { () async throws -> ProxyAttemptResult in
+            var account = initialAccount
+            var tokenRefreshed = initialTokenRefreshed
+            var exhaustionHandled = initialExhaustionHandled
+            var finalReplay = initialFinalReplay
+
             // Prefer CodexBar's fresher token for managed accounts before spending a refresh ourselves.
             if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
             if JWT.isStale(account.accessToken) {
-                if let refreshed = try? await refreshTokens(account) { account = refreshed }
+                if let refreshed = try? await self.refreshTokens(account) { account = refreshed }
             }
 
-            let target = targetURL(for: rawPath, query: query)
             let resp: HTTPClientResponse
             do {
-                resp = try await forward(head: head, body: body, account: account, target: target)
+                resp = try await self.forward(head: head, body: body, account: account, target: target)
             } catch {
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
-                return
+                return .completed
             }
 
             // A quota decision permits exactly one replay. Its response is final: do
             // not refresh, fail over, or make another exhaustion decision from it.
             if finalReplay {
-                recordActivity(account.alias)
-                try await streamResponse(outbound, response: resp, accountAlias: account.alias)
-                return
+                await self.recordActivity(account.alias)
+                try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
+                return .completed
             }
 
             // 401 -> refresh once, then retry
@@ -1001,39 +1082,57 @@ public actor ProxyServer {
                await !burn.suppressed(alias: account.alias, refreshToken: account.refreshToken, now: Date()) {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
                 do {
-                    account = try await refreshTokens(account)
+                    account = try await self.refreshTokens(account)
                     tokenRefreshed = true
-                    continue
+                    return .retry(
+                        account: account,
+                        tokenRefreshed: tokenRefreshed,
+                        exhaustionHandled: exhaustionHandled,
+                        finalReplay: finalReplay
+                    )
                 } catch RefreshError.sessionInvalidated {
                     if mode.isWarmup {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in")
-                        return
+                        return .completed
                     }
                     // A CodexBar-managed account may have lost the refresh race to CodexBar itself;
                     // adopt its rotated copy before condemning the account to needs-login.
                     if let hydrated = await store.hydrateFromManagedHome(account.alias),
                        hydrated.accessToken != account.accessToken, !JWT.isStale(hydrated.accessToken) {
                         account = hydrated
-                        continue
+                        return .retry(
+                            account: account,
+                            tokenRefreshed: tokenRefreshed,
+                            exhaustionHandled: exhaustionHandled,
+                            finalReplay: finalReplay
+                        )
                     }
                     if mode.isTask {
-                        if let next = try await taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
-                            account = next
-                            tokenRefreshed = false
-                            continue
+                        if let next = try await self.taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
+                            return .retry(
+                                account: next,
+                                tokenRefreshed: false,
+                                exhaustionHandled: exhaustionHandled,
+                                finalReplay: finalReplay
+                            )
                         }
-                        return
+                        return .completed
                     }
-                    account = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
-                    if account.needsLogin { return }
-                    await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
+                    account = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
+                    if account.needsLogin { return .completed }
+                    await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                     tokenRefreshed = false
-                    continue
+                    return .retry(
+                        account: account,
+                        tokenRefreshed: tokenRefreshed,
+                        exhaustionHandled: exhaustionHandled,
+                        finalReplay: finalReplay
+                    )
                 } catch {
                     try await writeError(outbound, status: .unauthorized, message: "token refresh failed: \(error)")
-                    return
+                    return .completed
                 }
             }
 
@@ -1047,32 +1146,45 @@ public actor ProxyServer {
                            hydrated.accessToken != account.accessToken, !JWT.isStale(hydrated.accessToken) {
                             account = hydrated
                             tokenRefreshed = false
-                            continue
+                            return .retry(
+                                account: account,
+                                tokenRefreshed: tokenRefreshed,
+                                exhaustionHandled: exhaustionHandled,
+                                finalReplay: finalReplay
+                            )
                         }
-                        if let next = try await taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
-                            account = next
-                            tokenRefreshed = false
-                            continue
+                        if let next = try await self.taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
+                            return .retry(
+                                account: next,
+                                tokenRefreshed: false,
+                                exhaustionHandled: exhaustionHandled,
+                                finalReplay: finalReplay
+                            )
                         }
-                        return
+                        return .completed
                     }
                     if mode.isWarmup {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                        return
+                        return .completed
                     }
-                    if let next = try await failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
+                    if let next = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
-                        await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
+                        await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                         tokenRefreshed = false
-                        continue
+                        return .retry(
+                            account: account,
+                            tokenRefreshed: tokenRefreshed,
+                            exhaustionHandled: exhaustionHandled,
+                            finalReplay: finalReplay
+                        )
                     }
-                    return
+                    return .completed
                 }
                 await burn.markUnhelpful(alias: account.alias, refreshToken: account.refreshToken, now: Date())
                 try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                return
+                return .completed
             }
 
             // 429 usage limit -> rotate
@@ -1082,11 +1194,11 @@ public actor ProxyServer {
                     let (limit, resetAt) = limitInfo(headers: resp.headers, body: classified.prefix)
                     if mode.isWarmup {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return
+                        return .completed
                     }
                     guard !exhaustionHandled else {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return
+                        return .completed
                     }
                     exhaustionHandled = true
                     await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
@@ -1106,22 +1218,32 @@ public actor ProxyServer {
                     case .retryCurrent:
                         tokenRefreshed = false
                         finalReplay = true
-                        continue
+                        return .retry(
+                            account: account,
+                            tokenRefreshed: tokenRefreshed,
+                            exhaustionHandled: exhaustionHandled,
+                            finalReplay: finalReplay
+                        )
                     case .switchTo:
                         guard let alternative = outcome.alternative else {
                             try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                            return
+                            return .completed
                         }
                         await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
                         account = alternative
-                        await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
+                        await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                         tokenRefreshed = false
                         finalReplay = true
-                        continue
+                        return .retry(
+                            account: account,
+                            tokenRefreshed: tokenRefreshed,
+                            exhaustionHandled: exhaustionHandled,
+                            finalReplay: finalReplay
+                        )
                     case .stopAndNotify:
                         await sink.handle(ProxyEvent.taskScoped(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt, mode: mode))
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return
+                        return .completed
                     }
                 }
                 try await streamClassifiedResponse(
@@ -1130,30 +1252,30 @@ public actor ProxyServer {
                     headers: resp.headers,
                     classified: classified
                 )
-                return
+                return .completed
             }
 
             // A 401 reaching here was suppressed by the burn guard; clearing would defeat it.
             if resp.status != .unauthorized {
                 await burn.clear(alias: account.alias)
             }
-            if mode == .normal, lastActivityAlias != account.alias {
+            let previousActivityAlias = await self.lastActivityAlias
+            if mode == .normal, previousActivityAlias != account.alias {
                 await sink.handle(ProxyEvent(kind: .served, from: account.alias, to: nil, limit: nil, resetAt: nil, runID: nil))
             }
-            recordActivity(account.alias)
-            log("\(head.method.rawValue) \(rawPath) account=\(account.alias) -> \(resp.status.code)")
-            await bindResponseTurnState(
+            await self.recordActivity(account.alias)
+            await self.log("\(head.method.rawValue) \(path) account=\(account.alias) -> \(resp.status.code)")
+            await self.bindResponseTurnState(
                 headers: resp.headers,
                 mode: mode,
                 method: head.method,
-                path: rawPath,
+                path: path,
                 alias: account.alias,
                 requestKey: interactiveKey
             )
-            try await streamResponse(outbound, response: resp, accountAlias: account.alias)
-            return
+            try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
+            return .completed
         }
-        try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
     }
 
     private func eligibleAlternative(mode: ProxyRequestMode, excluding alias: String, settings: Settings) async -> Account? {

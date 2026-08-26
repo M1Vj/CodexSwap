@@ -48,6 +48,31 @@ final class AutoArchiveLifecycleTests: XCTestCase {
         XCTAssertEqual(archived.map { $0.alias }, ["leased"])
     }
 
+    func testProxyLeaseWrapperDefersAtBoundaryThenReleasesForNextTick() async throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: temporaryStoreURL(), clock: { start })
+        await store.upsert(Account(alias: "proxy", accessToken: "token", routingEnabled: false))
+        let stored = await store.account("proxy")
+        let pause = try XCTUnwrap(stored?.routingPausedAt)
+        let due = pause.addingTimeInterval(AccountStore.automaticArchiveDelay)
+
+        let observedLeases = await withRoutingLease(store: store, alias: "proxy") {
+            let leases = await store.routingLeaseAliases()
+            XCTAssertTrue(leases.contains("proxy"))
+            let deferred = await store.archiveDueAccounts(now: due)
+            XCTAssertTrue(deferred.isEmpty)
+            let deferredAccount = await store.account("proxy")
+            XCTAssertNil(deferredAccount?.archivedAt)
+            return leases
+        }
+
+        XCTAssertEqual(observedLeases, ["proxy"])
+        let releasedLeases = await store.routingLeaseAliases()
+        XCTAssertTrue(releasedLeases.isEmpty)
+        let archived = await store.archiveDueAccounts(now: due)
+        XCTAssertEqual(archived.map(\.alias), ["proxy"])
+    }
+
     func testRoutingPauseTimestampStampsOnceClearsOnEnableAndLaterAttemptExtendsDeadline() async throws {
         let start = Date(timeIntervalSince1970: 1_800_000_000)
         let store = AccountStore(url: temporaryStoreURL(), clock: { start })
