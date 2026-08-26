@@ -39,7 +39,10 @@ final class UsageAnalyticsTests: XCTestCase {
 
         // CodexBar allocation: 80 cached reads, 20 writes from the remaining input,
         // and no double-billed input tokens. Rates are USD per million tokens.
-        let expected = (80.0 * 0.4 + 20.0 * 5.0 + 6.0 * 20.0) / 1_000_000
+        let cachedReadCost = 80.0 * 0.4
+        let cacheWriteCost = 20.0 * 5.0
+        let outputCost = 6.0 * 20.0
+        let expected = (cachedReadCost + cacheWriteCost + outputCost) / 1_000_000
         XCTAssertEqual(cost, expected, accuracy: 1e-12)
     }
 

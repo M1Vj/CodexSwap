@@ -30,7 +30,11 @@ final class BridgedUsageStoreTests: XCTestCase {
 
         XCTAssertEqual(row.entry.cacheWriteInputTokens, 20)
         XCTAssertTrue(row.pricingAvailable)
-        XCTAssertEqual(row.estimatedCost, (80.0 * 4.0 + 20.0 * 5.0 + 6.0 * 20.0) / 1_000_000, accuracy: 1e-12)
+        let cachedReadCost = 80.0 * 4.0
+        let cacheWriteCost = 20.0 * 5.0
+        let outputCost = 6.0 * 20.0
+        let expectedCost = (cachedReadCost + cacheWriteCost + outputCost) / 1_000_000
+        XCTAssertEqual(row.estimatedCost, expectedCost, accuracy: 1e-12)
 
         let reloaded = BridgedUsageStore(url: url, now: { Date(timeIntervalSince1970: 1_700_000_000) })
         let persisted = await reloaded.snapshot(prices: [String: BridgedUsageStore.Pricing]())
