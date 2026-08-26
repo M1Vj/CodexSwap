@@ -62,7 +62,11 @@ final class UsageAnalyticsTests: XCTestCase {
             price: price
         )
 
-        XCTAssertEqual(cost, (40.0 * 4.0 + 20.0 * 4.0 + 40.0 * 4.0) / 1_000_000, accuracy: 1e-12)
+        let cachedReadCost = 40.0 * 4.0
+        let cacheWriteCost = 20.0 * 4.0
+        let uncachedInputCost = 40.0 * 4.0
+        let expected = (cachedReadCost + cacheWriteCost + uncachedInputCost) / 1_000_000
+        XCTAssertEqual(cost, expected, accuracy: 1e-12)
     }
 
     func testAggregateEstimateDoesNotInventLongContextMultiplier() {
@@ -172,7 +176,9 @@ final class UsageAnalyticsTests: XCTestCase {
             cacheWriteInputPresence: .absent
         )
 
-        let expected = (100.0 * 4.0 + 6.0 * 20.0) / 1_000_000
+        let inputCost = 100.0 * 4.0
+        let outputCost = 6.0 * 20.0
+        let expected = (inputCost + outputCost) / 1_000_000
         XCTAssertEqual(UsageAnalytics.estimatedCost(stats), expected, accuracy: 1e-12)
     }
 

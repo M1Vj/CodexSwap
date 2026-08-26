@@ -94,7 +94,9 @@ final class BridgedUsageStoreTests: XCTestCase {
         ])
 
         let row = try XCTUnwrap(snapshot.allTimeRows.first)
-        XCTAssertEqual(row.estimatedCost, (100.0 * 4.0 + 3.0 * 20.0) / 1_000_000, accuracy: 1e-12)
+        let inputCost = 100.0 * 4.0
+        let outputCost = 3.0 * 20.0
+        XCTAssertEqual(row.estimatedCost, (inputCost + outputCost) / 1_000_000, accuracy: 1e-12)
     }
 
     func testLegacyNumericDatesStillReloadUsage() async throws {
