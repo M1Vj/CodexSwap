@@ -1,0 +1,289 @@
+import Foundation
+import XCTest
+@testable import SwapKit
+
+final class AccountStoreArchiveTests: XCTestCase {
+    private static let migrationDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+    private func temporaryStoreURL(_ name: String = "accounts") -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("account-archive-" + name + "-" + UUID().uuidString + ".json")
+    }
+
+    private func account(
+        _ alias: String,
+        priority: Int = 0,
+        routingEnabled: Bool = true
+    ) -> Account {
+        Account(
+            alias: alias,
+            email: alias + "@example.com",
+            accountID: "id-" + alias,
+            accessToken: "access-" + alias,
+            refreshToken: "refresh-" + alias,
+            idToken: "id-token-" + alias,
+            priority: priority,
+            routingEnabled: routingEnabled
+        )
+    }
+
+    private func legacyAccountJSON(
+        alias: String,
+        accountID: String,
+        accessToken: String,
+        routingEnabled: Bool,
+        lastUsedAt: Date? = nil,
+        lastServedByUs: Date? = nil
+    ) throws -> [String: Any] {
+        var result: [String: Any] = [
+            "alias": alias,
+            "email": alias + "@example.com",
+            "accountID": accountID,
+            "accessToken": accessToken,
+            "refreshToken": "refresh",
+            "idToken": "id-token",
+            "priority": 1,
+            "disabledUntil": [:],
+            "needsLogin": false,
+            "usage": [],
+            "routingEnabled": routingEnabled,
+        ]
+        let encoder = JSONEncoder.codex
+        if let lastUsedAt {
+            result["lastUsedAt"] = try JSONSerialization.jsonObject(
+                with: encoder.encode(lastUsedAt),
+                options: [.fragmentsAllowed]
+            )
+        }
+        if let lastServedByUs {
+            result["lastServedByUs"] = try JSONSerialization.jsonObject(
+                with: encoder.encode(lastServedByUs),
+                options: [.fragmentsAllowed]
+            )
+        }
+        return result
+    }
+
+    func testLegacyAccountDecodeUsesStableSentinelAndMissingTimestamps() throws {
+        let data = Data(#"{"alias":"legacy","accountID":"legacy","accessToken":"token","routingEnabled":false}"#.utf8)
+
+        let decoded = try JSONDecoder.codex.decode(Account.self, from: data)
+
+        XCTAssertNil(decoded.archivedAt)
+        XCTAssertNil(decoded.routingPausedAt)
+        XCTAssertEqual(decoded.telemetryID, UUID(uuidString: "00000000-0000-0000-0000-000000000000"))
+        XCTAssertFalse(decoded.routingEnabled)
+    }
+
+    func testStoreMigrationAssignsTelemetryOnceAndUsesMigrationClockForLegacyPause() async throws {
+        let url = temporaryStoreURL("migration")
+        let paused = try legacyAccountJSON(
+            alias: "paused",
+            accountID: "id-paused",
+            accessToken: "paused-token",
+            routingEnabled: false,
+            lastUsedAt: Self.migrationDate.addingTimeInterval(-86_400),
+            lastServedByUs: Self.migrationDate.addingTimeInterval(-172_800)
+        )
+        let enabled = try legacyAccountJSON(
+            alias: "enabled",
+            accountID: "id-enabled",
+            accessToken: "enabled-token",
+            routingEnabled: true,
+            lastUsedAt: Self.migrationDate.addingTimeInterval(-86_400),
+            lastServedByUs: Self.migrationDate.addingTimeInterval(-172_800)
+        )
+        let legacy: [String: Any] = ["schemaVersion": 1, "accounts": [paused, enabled]]
+        let raw = try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys])
+        try raw.write(to: url)
+
+        let store = AccountStore(url: url, clock: { AccountStoreArchiveTests.migrationDate })
+        let migratedPausedValue = await store.account("paused")
+        let migratedPaused = try XCTUnwrap(migratedPausedValue)
+        let migratedEnabledValue = await store.account("enabled")
+        let migratedEnabled = try XCTUnwrap(migratedEnabledValue)
+
+        XCTAssertEqual(migratedPaused.routingPausedAt, Self.migrationDate)
+        XCTAssertNil(migratedEnabled.routingPausedAt)
+        XCTAssertNotEqual(migratedPaused.telemetryID, UUID(uuidString: "00000000-0000-0000-0000-000000000000"))
+        XCTAssertNotEqual(migratedEnabled.telemetryID, UUID(uuidString: "00000000-0000-0000-0000-000000000000"))
+
+        let pausedID = migratedPaused.telemetryID
+        let enabledID = migratedEnabled.telemetryID
+        let persisted = try Data(contentsOf: url)
+        let persistedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: persisted) as? [String: Any])
+        XCTAssertEqual(persistedObject["schemaVersion"] as? Int, 2)
+
+        let reloaded = AccountStore(url: url, clock: { AccountStoreArchiveTests.migrationDate.addingTimeInterval(100) })
+        let reloadedPaused = await reloaded.account("paused")
+        let reloadedEnabled = await reloaded.account("enabled")
+        XCTAssertEqual(reloadedPaused?.telemetryID, pausedID)
+        XCTAssertEqual(reloadedEnabled?.telemetryID, enabledID)
+        XCTAssertEqual(reloadedPaused?.routingPausedAt, Self.migrationDate)
+    }
+
+    func testMigrationPreservesFuturePauseAndNeverBackdatesFromUsageDates() async throws {
+        let url = temporaryStoreURL("future")
+        let futurePause = Self.migrationDate.addingTimeInterval(604_800 * 2)
+        let record = try legacyAccountJSON(
+            alias: "paused",
+            accountID: "id-paused",
+            accessToken: "token",
+            routingEnabled: false,
+            lastUsedAt: Self.migrationDate.addingTimeInterval(-604_800 * 3),
+            lastServedByUs: Self.migrationDate.addingTimeInterval(-604_800 * 4)
+        )
+        var accountObject = record
+        accountObject["routingPausedAt"] = try JSONSerialization.jsonObject(
+            with: JSONEncoder.codex.encode(futurePause),
+            options: [.fragmentsAllowed]
+        )
+        let raw = try JSONSerialization.data(
+            withJSONObject: ["schemaVersion": 2, "accounts": [accountObject]],
+            options: [.sortedKeys]
+        )
+        try raw.write(to: url)
+
+        let store = AccountStore(url: url, clock: { AccountStoreArchiveTests.migrationDate })
+
+        let migratedValue = await store.account("paused")
+        let migrated = try XCTUnwrap(migratedValue)
+        XCTAssertEqual(migrated.routingPausedAt, futurePause)
+        XCTAssertLessThan(migrated.lastUsedAt!, migrated.routingPausedAt!)
+        XCTAssertLessThan(migrated.lastServedByUs!, migrated.routingPausedAt!)
+    }
+
+    func testArchiveIsIdempotentClearsActiveAndDrainStateAndRetainsHistory() async throws {
+        let url = temporaryStoreURL("archive")
+        let store = AccountStore(url: url, clock: { AccountStoreArchiveTests.migrationDate })
+        var archived = account("archived", priority: 3)
+        archived.managedHomePath = "/managed/archived"
+        archived.usage = [UsageWindow(label: "5h", usedPercent: 31, windowSeconds: 18_000, resetAt: Self.migrationDate.addingTimeInterval(3_600))]
+        archived.usageHistory = [WindowSample(capturedAt: Self.migrationDate, label: "5h", usedPercent: 31)]
+        archived.usageStats = UsageStats(totalRequests: 2, inputTokens: 10, outputTokens: 4)
+        await store.upsert(account("first", priority: 5))
+        await store.upsert(archived)
+        await store.upsert(account("last", priority: 1))
+        await store.applyRanking(["first", "archived", "last"])
+        _ = await store.setActive("archived", now: Self.migrationDate)
+        await store.setDrainingAliases(["archived"])
+
+        let archiveDate = Self.migrationDate.addingTimeInterval(60)
+        _ = await store.archive(alias: "archived", now: archiveDate)
+        let firstArchivedValue = await store.account("archived")
+        let firstArchived = try XCTUnwrap(firstArchivedValue)
+        XCTAssertTrue(firstArchived.isArchived)
+        XCTAssertEqual(firstArchived.archivedAt, archiveDate)
+        XCTAssertEqual(firstArchived.routingPausedAt, archiveDate)
+        XCTAssertFalse(firstArchived.routingEnabled)
+        let activeAlias = await store.activeAlias()
+        let activeAccounts = await store.activeAccounts()
+        let archivedAccounts = await store.archivedAccounts()
+        let activePriorities = Set(activeAccounts.map(\.priority))
+        let drainingAliases = await store.currentDrainingAliases()
+        XCTAssertNil(activeAlias)
+        XCTAssertEqual(activeAccounts.map(\.alias), ["first", "last"])
+        XCTAssertEqual(archivedAccounts.map(\.alias), ["archived"])
+        XCTAssertEqual(activePriorities, Set([1, 2]))
+        XCTAssertTrue(drainingAliases.isEmpty)
+        XCTAssertEqual(firstArchived.managedHomePath, archived.managedHomePath)
+        XCTAssertEqual(firstArchived.usage, archived.usage)
+        XCTAssertEqual(firstArchived.usageHistory, archived.usageHistory)
+        XCTAssertEqual(firstArchived.usageStats, archived.usageStats)
+        XCTAssertEqual(firstArchived.tokens, archived.tokens)
+
+        _ = await store.archive(alias: "archived", now: archiveDate.addingTimeInterval(300))
+        let repeatedValue = await store.account("archived")
+        let repeated = try XCTUnwrap(repeatedValue)
+        XCTAssertEqual(repeated.archivedAt, archiveDate)
+        XCTAssertEqual(repeated.routingPausedAt, archiveDate)
+        XCTAssertEqual(repeated.telemetryID, firstArchived.telemetryID)
+    }
+
+    func testRestoreIsIdempotentKeepsRoutingPausedAndAppendsToActiveBottom() async throws {
+        let url = temporaryStoreURL("restore")
+        let store = AccountStore(url: url, clock: { AccountStoreArchiveTests.migrationDate })
+        await store.upsert(account("first", priority: 2))
+        await store.upsert(account("archived", priority: 1))
+        await store.upsert(account("last", priority: 3))
+        await store.applyRanking(["first", "last", "archived"])
+        _ = await store.archive(alias: "archived", now: Self.migrationDate)
+        await store.setDrainingAliases(["archived"])
+
+        let restoreDate = Self.migrationDate.addingTimeInterval(120)
+        _ = await store.restore(alias: "archived", now: restoreDate)
+        let restoredValue = await store.account("archived")
+        let restored = try XCTUnwrap(restoredValue)
+        XCTAssertFalse(restored.isArchived)
+        XCTAssertFalse(restored.routingEnabled)
+        XCTAssertEqual(restored.routingPausedAt, restoreDate)
+        let activeAfterRestore = await store.activeAccounts()
+        let drainAfterRestore = await store.currentDrainingAliases()
+        XCTAssertEqual(activeAfterRestore.map(\.alias), ["first", "last", "archived"])
+        XCTAssertEqual(activeAfterRestore.map(\.priority), [3, 2, 1])
+        XCTAssertTrue(drainAfterRestore.isEmpty)
+
+        _ = await store.restore(alias: "archived", now: restoreDate.addingTimeInterval(60))
+        let repeatedValue = await store.account("archived")
+        let repeated = try XCTUnwrap(repeatedValue)
+        XCTAssertEqual(repeated.routingPausedAt, restoreDate)
+        let repeatedActive = await store.activeAccounts()
+        XCTAssertEqual(repeatedActive.map(\.alias), ["first", "last", "archived"])
+    }
+
+    func testPeriodicUpsertPreservesArchivePauseRankUsageAndTelemetry() async throws {
+        let url = temporaryStoreURL("upsert")
+        let store = AccountStore(url: url, clock: { AccountStoreArchiveTests.migrationDate })
+        var original = account("managed", priority: 7)
+        original.managedHomePath = "/managed/home"
+        original.usage = [UsageWindow(label: "5h", usedPercent: 12, windowSeconds: 18_000, resetAt: Self.migrationDate)]
+        original.usageHistory = [WindowSample(capturedAt: Self.migrationDate, label: "5h", usedPercent: 12)]
+        original.usageStats = UsageStats(totalRequests: 3, inputTokens: 42, outputTokens: 9)
+        await store.upsert(original)
+        _ = await store.archive(alias: "managed", now: Self.migrationDate)
+        let storedValue = await store.account("managed")
+        let stored = try XCTUnwrap(storedValue)
+
+        var imported = stored
+        imported.accessToken = "fresh-token"
+        imported.refreshToken = "fresh-refresh"
+        imported.idToken = "fresh-id"
+        imported.archivedAt = nil
+        imported.routingPausedAt = nil
+        imported.routingEnabled = true
+        imported.priority = 99
+        imported.usage = []
+        imported.usageHistory = nil
+        imported.usageStats = nil
+        imported.managedHomePath = nil
+        imported.telemetryID = UUID()
+
+        let merged = await store.upsert(imported)
+        XCTAssertTrue(merged.isArchived)
+        XCTAssertFalse(merged.routingEnabled)
+        XCTAssertEqual(merged.archivedAt, stored.archivedAt)
+        XCTAssertEqual(merged.routingPausedAt, stored.routingPausedAt)
+        XCTAssertEqual(merged.priority, stored.priority)
+        XCTAssertEqual(merged.telemetryID, stored.telemetryID)
+        XCTAssertEqual(merged.usage, stored.usage)
+        XCTAssertEqual(merged.usageHistory, stored.usageHistory)
+        XCTAssertEqual(merged.usageStats, stored.usageStats)
+        XCTAssertEqual(merged.managedHomePath, stored.managedHomePath)
+        XCTAssertEqual(merged.accessToken, "fresh-token")
+    }
+
+    func testManagedReconciliationReturnsRemovedTelemetryIDsWithoutChangingLegacyAliasAPI() async throws {
+        let url = temporaryStoreURL("reconcile")
+        let store = AccountStore(url: url)
+        await store.upsert(account("keep"))
+        await store.upsert(Account(alias: "gone", accountID: "id-gone", accessToken: "token", managedHomePath: "/managed/gone"))
+        let goneValue = await store.account("gone")
+        let expectedID = try XCTUnwrap(goneValue).telemetryID
+
+        let result = await store.reconcileManagedWithTelemetry(present: ["id-keep"])
+        XCTAssertEqual(result.removedAliases, ["gone"])
+        XCTAssertEqual(result.removedTelemetryIDs, [expectedID])
+        let secondResult = await store.reconcileManaged(present: ["id-keep"])
+        XCTAssertEqual(secondResult, [])
+    }
+}

@@ -1,9 +1,37 @@
 import Foundation
 
 struct StoreData: Codable {
-    var schemaVersion: Int = 1
+    var schemaVersion: Int = 2
     var activeAlias: String?
     var accounts: [Account] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, activeAlias, accounts
+    }
+
+    init(schemaVersion: Int = 2, activeAlias: String? = nil, accounts: [Account] = []) {
+        self.schemaVersion = schemaVersion
+        self.activeAlias = activeAlias
+        self.accounts = accounts
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // A missing version identifies the original account store format.
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        activeAlias = try c.decodeIfPresent(String.self, forKey: .activeAlias)
+        accounts = try c.decodeIfPresent([Account].self, forKey: .accounts) ?? []
+    }
+}
+
+public struct AccountRemovalResult: Sendable, Equatable {
+    public let removedAliases: [String]
+    public let removedTelemetryIDs: [UUID]
+
+    public init(removedAliases: [String] = [], removedTelemetryIDs: [UUID] = []) {
+        self.removedAliases = removedAliases
+        self.removedTelemetryIDs = removedTelemetryIDs
+    }
 }
 
 public struct RotationResult: Sendable {
@@ -13,23 +41,49 @@ public struct RotationResult: Sendable {
 
 public actor AccountStore {
     private let url: URL
+    private let clock: @Sendable () -> Date
     private var data: StoreData
     public private(set) var strategy: RotationStrategy
     /// Aliases currently assessed as draining from other users' activity (smart switch).
     private var drainingAliases: Set<String> = []
     private static let historyCap = 64
+    private static let currentSchemaVersion = 2
 
-    public init(url: URL = AppPaths.storeFile(), strategy: RotationStrategy = .priority) {
+    public init(
+        url: URL = AppPaths.storeFile(),
+        strategy: RotationStrategy = .priority,
+        clock: @escaping @Sendable () -> Date = { Date() }
+    ) {
         self.url = url
+        self.clock = clock
         self.strategy = strategy
         var loaded = AccountStore.loadFrom(url) ?? StoreData()
+        let migrationDate = clock()
+        var needsMigration = loaded.schemaVersion < Self.currentSchemaVersion
         loaded.accounts = loaded.accounts.map { account in
             var normalized = account
             normalized.priority = max(0, account.priority)
+            if normalized.telemetryID == Account.missingTelemetryID {
+                normalized.telemetryID = UUID()
+                needsMigration = true
+            }
+            if normalized.routingPausedAt == nil,
+               normalized.archivedAt == nil,
+               !normalized.routingEnabled {
+                // Legacy paused accounts receive a deterministic grace period;
+                // usage timestamps must never be used to backdate this value.
+                normalized.routingPausedAt = migrationDate
+                needsMigration = true
+            }
             return normalized
+        }
+        if loaded.schemaVersion < Self.currentSchemaVersion {
+            loaded.schemaVersion = Self.currentSchemaVersion
+            needsMigration = true
         }
         Self.renumberRanks(&loaded)
         self.data = loaded
+        if needsMigration { Self.persist(loaded, to: url) }
     }
 
     public func setStrategy(_ s: RotationStrategy) { strategy = s }
@@ -44,12 +98,34 @@ public actor AccountStore {
     private func persist() {
         let encoder = JSONEncoder.codex
         guard let raw = try? encoder.encode(data) else { return }
+        Self.persist(raw, to: url)
+    }
+
+    private static func persist(_ data: StoreData, to url: URL) {
+        let encoder = JSONEncoder.codex
+        guard let raw = try? encoder.encode(data) else { return }
+        persist(raw, to: url)
+    }
+
+    private static func persist(_ raw: Data, to url: URL) {
+        let fileManager = FileManager.default
         let dir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let tmp = url.appendingPathExtension("tmp")
-        guard FileManager.default.createFile(atPath: tmp.path, contents: raw, attributes: [.posixPermissions: 0o600]) else { return }
-        _ = try? FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let tmp = dir.appendingPathComponent(
+            "." + url.lastPathComponent + ".tmp-" + UUID().uuidString
+        )
+        do {
+            try raw.write(to: tmp, options: .atomic)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+            if fileManager.fileExists(atPath: url.path) {
+                _ = try fileManager.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try fileManager.moveItem(at: tmp, to: url)
+            }
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            try? fileManager.removeItem(at: tmp)
+        }
     }
 
     // MARK: - Reads
@@ -57,6 +133,34 @@ public actor AccountStore {
     public func all() -> [Account] { data.accounts }
     public func activeAlias() -> String? { data.activeAlias }
     public func account(_ alias: String) -> Account? { data.accounts.first { $0.alias == alias } }
+
+    /// Accounts in the operational roster, in their dense visible rank order.
+    /// Routing-paused accounts remain active until they are explicitly archived.
+    public func activeAccounts() -> [Account] {
+        rankedAccounts(data.accounts.filter { !$0.isArchived })
+    }
+
+    /// Accounts retained for history and ownership, excluded from all active
+    /// routing and quota consumers.
+    public func archivedAccounts() -> [Account] {
+        data.accounts
+            .filter(\.isArchived)
+            .sorted {
+                switch ($0.archivedAt, $1.archivedAt) {
+                case let (left?, right?) where left != right: return left > right
+                case (nil, _?): return false
+                case (_?, nil): return true
+                default: return $0.alias < $1.alias
+                }
+            }
+    }
+
+    private func rankedAccounts(_ accounts: [Account]) -> [Account] {
+        accounts.sorted {
+            if $0.priority != $1.priority { return $0.priority > $1.priority }
+            return Self.selectionOrder($0, $1, strategy: .priority)
+        }
+    }
 
     private func index(_ alias: String) -> Int? { data.accounts.firstIndex { $0.alias == alias } }
 
@@ -201,11 +305,71 @@ public actor AccountStore {
     /// Manual switch: clears the target's cooldowns and needs-login, then activates it.
     @discardableResult
     public func setActive(_ alias: String, now: Date = Date()) -> Account? {
-        guard let i = index(alias), data.accounts[i].routingEnabled else { return nil }
+        guard let i = index(alias), data.accounts[i].routingEnabled, !data.accounts[i].isArchived else { return nil }
         data.accounts[i].disabledUntil = [:]
         data.accounts[i].needsLogin = false
+        data.accounts[i].routingPausedAt = nil
         data.accounts[i].lastUsedAt = now
         data.activeAlias = alias
+        persist()
+        return data.accounts[i]
+    }
+
+    /// Archive an account locally while retaining its credentials, managed-home ownership,
+    /// usage history, and user preferences. Repeating the operation is a no-op.
+    @discardableResult
+    public func archive(alias: String, now: Date? = nil) -> Account? {
+        guard let i = index(alias) else { return nil }
+        var changed = false
+        if !data.accounts[i].isArchived {
+            let timestamp = now ?? clock()
+            data.accounts[i].archivedAt = timestamp
+            data.accounts[i].routingEnabled = false
+            if data.accounts[i].routingPausedAt == nil {
+                data.accounts[i].routingPausedAt = timestamp
+            }
+            changed = true
+        } else {
+            // Repair malformed/legacy archived rows without changing an existing
+            // archive timestamp, keeping repeated archive calls idempotent.
+            if data.accounts[i].routingEnabled {
+                data.accounts[i].routingEnabled = false
+                changed = true
+            }
+            if data.accounts[i].routingPausedAt == nil {
+                data.accounts[i].routingPausedAt = now ?? clock()
+                changed = true
+            }
+        }
+        if data.activeAlias == alias {
+            data.activeAlias = nil
+            changed = true
+        }
+        if drainingAliases.remove(alias) != nil { changed = true }
+        if changed {
+            renumberRanks()
+            persist()
+        }
+        return data.accounts[i]
+    }
+
+    /// Restore an archived account to the bottom of the active ranking. It remains paused
+    /// until the owner explicitly enables routing. Repeating restore is a no-op.
+    @discardableResult
+    public func restore(alias: String, now: Date? = nil) -> Account? {
+        guard let i = index(alias) else { return nil }
+        guard data.accounts[i].isArchived else { return data.accounts[i] }
+
+        let timestamp = now ?? clock()
+        data.accounts[i].archivedAt = nil
+        data.accounts[i].routingEnabled = false
+        data.accounts[i].routingPausedAt = timestamp
+        drainingAliases.remove(alias)
+
+        let activeOthers = data.accounts.filter { !$0.isArchived && $0.alias != alias }
+        let minimumRank = activeOthers.map(\.priority).min() ?? 1
+        data.accounts[i].priority = minimumRank - 1
+        renumberRanks()
         persist()
         return data.accounts[i]
     }
@@ -308,11 +472,12 @@ public actor AccountStore {
 
     public func currentDrainingAliases() -> Set<String> { drainingAliases }
 
-    /// Applies a complete ranking (top first). Ignores orders that are not a permutation
-    /// of the current roster; surviving ranks are renumbered densely.
+    /// Applies a complete ranking (top first) to the active roster. Archived accounts
+    /// are intentionally outside this visible rank sequence.
     public func applyRanking(_ orderedAliases: [String]) {
-        guard orderedAliases.count == data.accounts.count,
-              Set(orderedAliases) == Set(data.accounts.map(\.alias)) else { return }
+        let activeAliases = Set(data.accounts.filter { !$0.isArchived }.map(\.alias))
+        guard orderedAliases.count == activeAliases.count,
+              Set(orderedAliases) == activeAliases else { return }
         let count = orderedAliases.count
         for (position, alias) in orderedAliases.enumerated() {
             if let i = index(alias) {
@@ -322,10 +487,12 @@ public actor AccountStore {
         persist()
     }
 
-    /// Moves an account within the priority-sorted ranking and renumbers every rank densely
-    /// so the change is always visible. `toIndex` is a position in the ranking where 0 is top.
+    /// Moves an active account within the priority-sorted ranking and renumbers every rank
+    /// densely so the change is always visible. `toIndex` is a position where 0 is top.
     public func reorderAccount(_ alias: String, toIndex target: Int) {
-        let ranked = data.accounts.sorted { Self.selectionOrder($0, $1, strategy: .priority) }
+        let ranked = data.accounts
+            .filter { !$0.isArchived }
+            .sorted { Self.selectionOrder($0, $1, strategy: .priority) }
         guard ranked.count > 1, let from = ranked.firstIndex(where: { $0.alias == alias }) else { return }
         let to = min(max(target, 0), ranked.count - 1)
         guard from != to else { return }
@@ -351,17 +518,19 @@ public actor AccountStore {
         persist()
     }
 
-    /// Rewrites priorities to dense ordinals (N…1) preserving relative order so no two
-    /// accounts can tie; ties would make rank reordering a silent no-op.
+    /// Rewrites active priorities to dense ordinals (N…1), leaving archived records out of
+    /// the visible ranking sequence.
     nonisolated private static func renumberRanks(_ data: inout StoreData) {
-        let ranked = data.accounts.sorted { selectionOrder($0, $1, strategy: .priority) }
+        let ranked = data.accounts
+            .filter { !$0.isArchived }
+            .sorted { selectionOrder($0, $1, strategy: .priority) }
         let count = ranked.count
         guard count > 0 else { return }
         var newPriorities: [String: Int] = [:]
         for (position, entry) in ranked.enumerated() {
             newPriorities[entry.alias] = count - position
         }
-        for i in data.accounts.indices {
+        for i in data.accounts.indices where !data.accounts[i].isArchived {
             data.accounts[i].priority = newPriorities[data.accounts[i].alias] ?? data.accounts[i].priority
         }
     }
@@ -370,25 +539,53 @@ public actor AccountStore {
         Self.renumberRanks(&data)
     }
 
-    public func remove(_ alias: String) {
+    @discardableResult
+    public func remove(_ alias: String) -> UUID? {
+        let removedTelemetryID = data.accounts.first(where: { $0.alias == alias })?.telemetryID
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
+        drainingAliases.remove(alias)
         renumberRanks()
         persist()
+        return removedTelemetryID
+    }
+
+    /// Permanent removal result used by the later telemetry purge hook. The archive path
+    /// never calls this operation.
+    @discardableResult
+    public func removeWithTelemetry(_ alias: String) -> AccountRemovalResult {
+        guard let account = data.accounts.first(where: { $0.alias == alias }) else {
+            return AccountRemovalResult()
+        }
+        _ = remove(alias)
+        return AccountRemovalResult(removedAliases: [account.alias], removedTelemetryIDs: [account.telemetryID])
     }
 
     /// Drop CodexBar-managed accounts whose accountID is no longer in CodexBar's roster.
     /// Non-managed accounts (e.g. imported from live auth.json) are left untouched.
     @discardableResult
     public func reconcileManaged(present: Set<String>) -> [String] {
-        let removed = data.accounts
-            .filter { $0.managedHomePath != nil && !present.contains($0.accountID) }
-            .map { $0.alias }
-        guard !removed.isEmpty else { return [] }
+        reconcileManagedWithTelemetry(present: present).removedAliases
+    }
+
+    /// Reconcile CodexBar's managed roster while returning stable telemetry IDs for a
+    /// subsequent scoped purge. Non-managed accounts are intentionally left untouched.
+    @discardableResult
+    public func reconcileManagedWithTelemetry(present: Set<String>) -> AccountRemovalResult {
+        let removedAccounts = data.accounts.filter {
+            $0.managedHomePath != nil && !present.contains($0.accountID)
+        }
+        guard !removedAccounts.isEmpty else { return AccountRemovalResult() }
+        let removed = Set(removedAccounts.map(\.alias))
         data.accounts.removeAll { removed.contains($0.alias) }
         if let active = data.activeAlias, removed.contains(active) { data.activeAlias = nil }
+        drainingAliases.subtract(removed)
+        renumberRanks()
         persist()
-        return removed
+        return AccountRemovalResult(
+            removedAliases: removedAccounts.map(\.alias),
+            removedTelemetryIDs: removedAccounts.map(\.telemetryID)
+        )
     }
 
     /// Insert or update an account keyed by accountID (falling back to alias). Preserves priority on update.
@@ -404,6 +601,11 @@ public actor AccountStore {
             merged.disabledUntil = data.accounts[i].disabledUntil
             merged.routingEnabled = data.accounts[i].routingEnabled
             merged.lastUsedAt = data.accounts[i].lastUsedAt
+            merged.archivedAt = data.accounts[i].archivedAt
+            merged.routingPausedAt = data.accounts[i].routingPausedAt
+            merged.telemetryID = data.accounts[i].telemetryID == Account.missingTelemetryID
+                ? UUID()
+                : data.accounts[i].telemetryID
             merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
             // needsLogin is runtime overlay state, not import data: the periodic CodexBar
             // sync upserts every account, and imports always carry false, so copying the
@@ -427,14 +629,25 @@ public actor AccountStore {
                 merged.idToken = data.accounts[i].idToken
             }
             data.accounts[i] = merged
+            if data.accounts[i].routingPausedAt == nil,
+               data.accounts[i].archivedAt == nil,
+               !data.accounts[i].routingEnabled {
+                data.accounts[i].routingPausedAt = clock()
+            }
             persist()
-            return merged
+            return data.accounts[i]
+        }
+        if account.telemetryID == Account.missingTelemetryID {
+            account.telemetryID = UUID()
+        }
+        if account.routingPausedAt == nil, account.archivedAt == nil, !account.routingEnabled {
+            account.routingPausedAt = clock()
         }
         data.accounts.append(account)
         // Newcomers enter at the BOTTOM of the ranking: their raw priority comes from an
         // incompatible scale (legacy 0–10, CodexBar rosters), so comparing it against the
         // dense ranks would scramble ordering. Rank changes belong to the ranking editor.
-        let minimumRank = data.accounts.map(\.priority).min() ?? 2
+        let minimumRank = data.accounts.filter { !$0.isArchived }.map(\.priority).min() ?? 2
         if let i = index(account.alias) {
             data.accounts[i].priority = minimumRank - 1
         }
@@ -455,9 +668,18 @@ public actor AccountStore {
         return reset
     }
 
-    public func setRoutingEnabled(_ alias: String, enabled: Bool) {
+    public func setRoutingEnabled(_ alias: String, enabled: Bool, now: Date? = nil) {
         guard let i = index(alias) else { return }
+        if data.accounts[i].isArchived, enabled { return }
+        let wasEnabled = data.accounts[i].routingEnabled
         data.accounts[i].routingEnabled = enabled
+        if enabled {
+            data.accounts[i].routingPausedAt = nil
+        } else if wasEnabled {
+            data.accounts[i].routingPausedAt = now ?? clock()
+        } else if data.accounts[i].routingPausedAt == nil {
+            data.accounts[i].routingPausedAt = now ?? clock()
+        }
         if !enabled, data.activeAlias == alias { data.activeAlias = nil }
         persist()
     }

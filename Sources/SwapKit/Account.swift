@@ -220,6 +220,10 @@ public struct WindowSample: Codable, Sendable, Equatable {
 }
 
 public struct Account: Codable, Sendable, Identifiable, Equatable {
+    /// Stable decode-only marker for records written before telemetry IDs existed.
+    /// AccountStore replaces it with a random UUID during migration.
+    public static let missingTelemetryID = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+
     public var alias: String
     public var email: String
     public var accountID: String
@@ -241,6 +245,11 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var usageHistory: [WindowSample]?
     /// Last time this account served a request routed by CodexSwap itself.
     public var lastServedByUs: Date?
+    public var archivedAt: Date?
+    public var routingPausedAt: Date?
+    public var telemetryID: UUID
+
+    public var isArchived: Bool { archivedAt != nil }
 
     public var id: String { accountID.isEmpty ? alias : accountID }
 
@@ -258,7 +267,10 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         lastUsedAt: Date? = nil,
         usage: [UsageWindow] = [],
         managedHomePath: String? = nil,
-        routingEnabled: Bool = true
+        routingEnabled: Bool = true,
+        archivedAt: Date? = nil,
+        routingPausedAt: Date? = nil,
+        telemetryID: UUID = UUID()
     ) {
         self.alias = alias
         self.email = email
@@ -274,12 +286,15 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.usage = usage
         self.managedHomePath = managedHomePath
         self.routingEnabled = routingEnabled
+        self.archivedAt = archivedAt
+        self.routingPausedAt = routingPausedAt
+        self.telemetryID = telemetryID
     }
 
     private enum CodingKeys: String, CodingKey {
         case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
         case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, routingEnabled
-        case usageStats, usageHistory, lastServedByUs
+        case usageStats, usageHistory, lastServedByUs, archivedAt, routingPausedAt, telemetryID
     }
 
     public init(from decoder: Decoder) throws {
@@ -301,6 +316,9 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         usageStats = try c.decodeIfPresent(UsageStats.self, forKey: .usageStats)
         usageHistory = try c.decodeIfPresent([WindowSample].self, forKey: .usageHistory)
         lastServedByUs = try c.decodeIfPresent(Date.self, forKey: .lastServedByUs)
+        archivedAt = try c.decodeIfPresent(Date.self, forKey: .archivedAt)
+        routingPausedAt = try c.decodeIfPresent(Date.self, forKey: .routingPausedAt)
+        telemetryID = try c.decodeIfPresent(UUID.self, forKey: .telemetryID) ?? Self.missingTelemetryID
     }
 
     public var tokens: CodexTokens {
@@ -313,7 +331,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     }
 
     public func isEligible(now: Date) -> Bool {
-        routingEnabled && !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
+        !isArchived && routingEnabled && !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
     }
 
     /// Mirrors the proxy's pre-emptive rotation gate: a reported window at or past its

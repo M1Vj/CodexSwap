@@ -1,8 +1,15 @@
 import Foundation
 
 public enum AccountImporter {
-    /// Build an Account from a Codex token bundle, deriving identity from the access-token JWT.
-    public static func account(from tokens: CodexTokens, aliasHint: String? = nil, priority: Int = 0, managedHomePath: String? = nil) -> Account {
+    /// Build a fresh imported record, deriving identity from the access-token JWT. The store
+    /// owns preservation of archive/pause state when this record is periodically upserted.
+    public static func account(
+        from tokens: CodexTokens,
+        aliasHint: String? = nil,
+        priority: Int = 0,
+        managedHomePath: String? = nil,
+        telemetryID: UUID = UUID()
+    ) -> Account {
         let id = JWT.identity(fromAccessToken: tokens.accessToken)
         let email = id.email ?? ""
         let alias = aliasHint ?? Self.alias(fromEmail: email, accountId: tokens.accountId)
@@ -15,7 +22,8 @@ public enum AccountImporter {
             refreshToken: tokens.refreshToken,
             idToken: tokens.idToken,
             priority: priority,
-            managedHomePath: managedHomePath
+            managedHomePath: managedHomePath,
+            telemetryID: telemetryID
         )
     }
 
