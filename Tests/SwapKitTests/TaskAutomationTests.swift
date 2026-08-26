@@ -1754,7 +1754,7 @@ final class TaskAutomationTests: XCTestCase {
         let targetRole = fixture.targetHome.appendingPathComponent("agents/worker.toml")
         XCTAssertTrue((try Data(contentsOf: targetRole)).starts(with: [0xEF, 0xBB, 0xBF]))
         let rewritten = try String(contentsOf: targetRole, encoding: .utf8)
-        XCTAssertTrue(rewritten.hasPrefix("name = \"worker\""))
+        XCTAssertTrue(rewritten.drop(while: { $0 == "\u{FEFF}" }).hasPrefix("name = \"worker\""))
         XCTAssertTrue(rewritten.contains("description = \"Safe role\""))
         XCTAssertTrue(rewritten.contains("nickname_candidates = [\"reviewer\", \"safe\"]"))
         XCTAssertTrue(rewritten.contains("sandbox_mode = \"read-only\""))
@@ -3410,7 +3410,10 @@ final class TaskAutomationTests: XCTestCase {
                 message: "No eligible models"
             )
         ])
-        let runner = TaskRunner(taskHomeMaterializer: { _, _, _, _, _ in throw expected })
+        let runner = TaskRunner(
+            taskHomeMaterializer: { _, _, _, _, _ in throw expected },
+            codexBinaryResolver: { "/usr/bin/true" }
+        )
         let task = makeTask(repoPath: repository.path)
         do {
             try await runner.start(

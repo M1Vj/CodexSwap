@@ -24,6 +24,7 @@ public enum TaskRunnerError: LocalizedError, Sendable {
 }
 
 public actor TaskRunner {
+    public typealias CodexBinaryResolver = @Sendable () -> String?
     public typealias TaskHomeMaterializer = @Sendable (
         AutomationTask,
         URL,
@@ -61,13 +62,16 @@ public actor TaskRunner {
     private var taskIDsByRunID: [UUID: UUID] = [:]
     private let logSink: (@Sendable (String, String) async -> Void)?
     private let taskHomeMaterializer: TaskHomeMaterializer?
+    private let codexBinaryResolver: CodexBinaryResolver
 
     public init(
         logSink: (@Sendable (String, String) async -> Void)? = nil,
-        taskHomeMaterializer: TaskHomeMaterializer? = nil
+        taskHomeMaterializer: TaskHomeMaterializer? = nil,
+        codexBinaryResolver: @escaping CodexBinaryResolver = CodexLauncher.resolveWarmupBinary
     ) {
         self.logSink = logSink
         self.taskHomeMaterializer = taskHomeMaterializer
+        self.codexBinaryResolver = codexBinaryResolver
     }
 
     public static func launchArgs(
@@ -144,7 +148,7 @@ public actor TaskRunner {
         }
         // Warm-up's resolution order: prefer the real binary over any PATH shim — a write-jailing
         // shim would deny the isolated CODEX_HOME and fight the runner's own workspace-write sandbox.
-        guard let binary = CodexLauncher.resolveWarmupBinary() else { throw TaskRunnerError.binaryNotFound }
+        guard let binary = codexBinaryResolver() else { throw TaskRunnerError.binaryNotFound }
 
         let taskDir = task.taskDirURL(supportDir: supportDir)
         let codexHome = taskDir.appendingPathComponent("codex-home", isDirectory: true)
