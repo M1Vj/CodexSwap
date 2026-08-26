@@ -599,6 +599,197 @@ final class UsageAnalyticsTests: XCTestCase {
     }
 }
 
+/*
+final class UsageAnalyticsDerivedTests: XCTestCase {
+    private let accountID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+    private let otherAccountID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    private func event(
+        id: UUID = UUID(),
+        root: UUID = UUID(),
+        account: UUID,
+        minutesAgo: Double = 0,
+        attemptIndex: Int = 0,
+        outcome: UsageTelemetryAttemptOutcome = .success,
+        status: Int? = nil,
+        error: UsageTelemetryErrorClass? = nil,
+        input: Int? = 1_000,
+        cached: Int? = 400,
+        cacheWrite: Int? = 100,
+        output: Int? = 200,
+        reasoning: Int? = 80,
+        duration: Int? = 100,
+        model: String = "gpt-5.6-sol",
+        category: UsageTelemetryRequestCategory = .interactive
+    ) -> UsageTelemetryAttemptEvent {
+        let finished = now.addingTimeInterval(-minutesAgo * 60)
+        return UsageTelemetryAttemptEvent(
+            eventID: id,
+            rootRequestID: root,
+            attemptIndex: attemptIndex,
+            startedAt: finished.addingTimeInterval(-Double(duration ?? 0) / 1_000),
+            finishedAt: finished,
+            accountTelemetryID: account,
+            provider: .openAI,
+            model: model,
+            category: category,
+            outcome: outcome,
+            httpStatusCode: status,
+            errorClass: error,
+            durationMilliseconds: duration,
+            inputTokens: input,
+            cachedInputTokens: cached,
+            cacheWriteInputTokens: cacheWrite,
+            outputTokens: output,
+            reasoningTokens: reasoning,
+            estimatedCostUSD: nil
+        )
+    }
+
+    private func snapshot(
+        events: [UsageTelemetryAttemptEvent],
+        roots: [UsageTelemetryRootTerminal] = []
+    ) async -> UsageTelemetryRangeSnapshot {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexswap-derived-\(UUID().uuidString)", isDirectory: true)
+        let fixedNow = now
+        let store = UsageTelemetryStore(
+            url: root.appendingPathComponent("usage-telemetry-v1.json"),
+            enabled: true,
+            clock: { fixedNow },
+            timeZone: TimeZone(secondsFromGMT: 8 * 3_600)!
+        )
+        await store.recordAttempts(events)
+        for terminal in roots { await store.recordRootTerminal(terminal) }
+        return await store.snapshot(range: .thirtyDays)
+    }
+
+    func testDerivedCapacityForecastUsesHeadroomAndSuppressesResetDiscontinuity() {
+        let reset = now.addingTimeInterval(3_600)
+        var account = Account(alias: "active", accountID: "active")
+        account.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: reset)]
+        account.usageHistory = [
+            WindowSample(capturedAt: now.addingTimeInterval(-3_600), label: "5h", usedPercent: 20, resetAt: reset),
+            WindowSample(capturedAt: now.addingTimeInterval(-1_800), label: "5h", usedPercent: 35, resetAt: reset),
+        ]
+
+        let derived = UsageAnalytics.capacityMetrics(accounts: [account], scope: .active, now: now)
+        let metric = derived.windows.first { $0.label == "5h" }
+        XCTAssertEqual(metric?.headroomPercent, 50)
+        XCTAssertEqual(metric?.burnPercentPerHour ?? 0, 30, accuracy: 1e-9)
+        XCTAssertEqual(metric?.projectedUsageAtResetPercent ?? 0, 80, accuracy: 1e-9)
+        XCTAssertEqual(metric?.hoursUntilExhausted ?? 0, 50.0 / 30.0, accuracy: 1e-9)
+        XCTAssertEqual(metric?.forecastConfidence, .high)
+
+        account.usageHistory = [
+            WindowSample(capturedAt: now.addingTimeInterval(-3_600), label: "5h", usedPercent: 20, resetAt: reset.addingTimeInterval(-1)),
+            WindowSample(capturedAt: now.addingTimeInterval(-1_800), label: "5h", usedPercent: 35, resetAt: reset),
+        ]
+        let discontinuity = UsageAnalytics.capacityMetrics(accounts: [account], scope: .active, now: now)
+            .windows.first { $0.label == "5h" }
+        XCTAssertTrue(discontinuity?.hasDiscontinuity == true)
+        XCTAssertNil(discontinuity?.burnPercentPerHour)
+        XCTAssertNil(discontinuity?.projectedUsageAtResetPercent)
+    }
+
+    func testDerivedMetricsComputeEfficiencyReliabilityRetryWasteAndShares() async throws {
+        let root = UUID()
+        let events = [
+            event(root: root, account: accountID, attemptIndex: 0, outcome: .httpError, status: 429, error: .rateLimit, duration: 200),
+            event(root: root, account: otherAccountID, attemptIndex: 1, duration: 300),
+            event(root: UUID(), account: accountID, duration: 500, model: "gpt-5.6-luna"),
+        ]
+        let roots = [UsageTelemetryRootTerminal(
+            rootRequestID: root,
+            finishedAt: now,
+            category: .interactive,
+            outcome: .success,
+            attemptCount: 2,
+            accountFallbackCount: 1,
+            modelFallbackCount: 1
+        ), UsageTelemetryRootTerminal(
+            rootRequestID: events[2].rootRequestID,
+            finishedAt: now,
+            category: .interactive,
+            outcome: .success,
+            attemptCount: 1
+        )]
+        let snapshot = await snapshot(events: events, roots: roots)
+        let derived = UsageAnalytics.derive(snapshot: snapshot, scope: .all, now: now)
+
+        XCTAssertEqual(derived.efficiency.cachedInputTokens, 800)
+        XCTAssertEqual(derived.efficiency.cacheWriteInputTokens, 200)
+        XCTAssertEqual(derived.efficiency.freshInputTokens, 1_000)
+        XCTAssertEqual(derived.efficiency.cacheHitRate ?? 0, 0.4, accuracy: 1e-9)
+        XCTAssertEqual(derived.efficiency.cacheWriteRate ?? 0, 0.1, accuracy: 1e-9)
+        XCTAssertEqual(derived.efficiency.reasoningShare ?? 0, 0.08, accuracy: 1e-9)
+        XCTAssertEqual(derived.efficiency.tokensPerRootRequest ?? 0, 1_800, accuracy: 1e-9)
+        XCTAssertEqual(derived.reliability.attemptCount, 3)
+        XCTAssertEqual(derived.reliability.rateLimitedCount, 1)
+        XCTAssertEqual(derived.reliability.attemptErrorRate ?? 0, 1.0 / 3.0, accuracy: 1e-9)
+        XCTAssertEqual(derived.reliability.rateLimitedRate ?? 0, 1.0 / 3.0, accuracy: 1e-9)
+        XCTAssertEqual(derived.reliability.retryAmplification ?? 0, 1.5, accuracy: 1e-9)
+        XCTAssertEqual(derived.reliability.fallbackFrequency ?? 0, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(derived.reliability.rootSuccessRate ?? 0, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(derived.accountShares.count, 2)
+        XCTAssertEqual(derived.modelShares.map { $0.key }, ["gpt-5.6-luna", "gpt-5.6-sol"])
+        XCTAssertEqual(derived.latency.p50Milliseconds, 500)
+        XCTAssertNil(derived.latency.p95Milliseconds)
+    }
+
+    func testDerivedMetricsKeepUnknownAndPartialDenominatorsAndTaskBoardOutcomes() {
+        let completed = TaskRunRecord(startedAt: now.addingTimeInterval(-600), finishedAt: now, outcome: "completed", inputTokens: 100, outputTokens: 50)
+        let failed = TaskRunRecord(startedAt: now.addingTimeInterval(-300), finishedAt: now, outcome: "invalid-complete", inputTokens: nil, outputTokens: nil)
+        let stopped = TaskRunRecord(startedAt: now.addingTimeInterval(-100), finishedAt: now, outcome: "stopped")
+        let board = UsageAnalytics.taskBoardMetrics(runs: [completed, failed, stopped])
+        XCTAssertEqual(board.completedCount, 1)
+        XCTAssertEqual(board.failedCount, 1)
+        XCTAssertEqual(board.cancelledCount, 1)
+        XCTAssertEqual(board.completionRate ?? 0, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(board.tokensPerCompletedRun ?? 0, 150, accuracy: 1e-9)
+        XCTAssertEqual(board.completeness, .partial)
+
+        let unknown = UsageTelemetryAttemptEvent(
+            startedAt: now.addingTimeInterval(-1),
+            finishedAt: now,
+            accountTelemetryID: accountID,
+            inputTokens: nil,
+            cachedInputTokens: nil,
+            cacheWriteInputTokens: nil,
+            outputTokens: nil,
+            reasoningTokens: nil
+        )
+        let aggregate = UsageTelemetryAttemptAggregate(
+            accountTelemetryID: accountID,
+            provider: .openAI,
+            model: "gpt-5.6-sol",
+            category: .interactive
+        )
+        let derived = UsageAnalytics.derive(
+            snapshot: UsageTelemetryRangeSnapshot(
+                range: .lifetime,
+                rangeStart: nil,
+                rangeEnd: now,
+                events: [unknown],
+                dailyAttemptAggregates: [],
+                dailyRootAggregates: [],
+                lifetimeAttemptAggregates: [aggregate],
+                lifetimeRootAggregates: [],
+                detailCoverageStart: now,
+                detailTruncated: false
+            ),
+            scope: .all,
+            now: now
+        )
+        XCTAssertNil(derived.efficiency.cacheHitRate)
+        XCTAssertEqual(derived.efficiency.completeness, .unknown)
+        XCTAssertNil(derived.reliability.retryAmplification)
+        XCTAssertEqual(derived.reliability.completeness, .partial)
+    }
+}
+*/
+
 final class SmartSwitchPolicyTests: XCTestCase {
     private func account(alias: String, windows: [Int], servedAgo: TimeInterval? = nil, needsLogin: Bool = false) -> Account {
         var a = Account(alias: alias, accountID: alias, accessToken: "t", needsLogin: needsLogin)

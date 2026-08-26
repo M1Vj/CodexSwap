@@ -319,6 +319,10 @@ public struct UsageTelemetryRootTerminal: Codable, Sendable, Equatable {
     public let attemptCount: Int
     public let accountFallbackCount: Int
     public let modelFallbackCount: Int
+    /// Number of root requests that changed account or model. Older producers
+    /// only reported the two component counters, so the aggregate derives a
+    /// conservative lower-bound union when this remains nil.
+    public let fallbackRequestCount: Int?
 
     public init(
         rootRequestID: UUID,
@@ -327,7 +331,8 @@ public struct UsageTelemetryRootTerminal: Codable, Sendable, Equatable {
         outcome: UsageTelemetryRootOutcome,
         attemptCount: Int,
         accountFallbackCount: Int = 0,
-        modelFallbackCount: Int = 0
+        modelFallbackCount: Int = 0,
+        fallbackRequestCount: Int? = nil
     ) {
         self.rootRequestID = rootRequestID
         self.finishedAt = finishedAt
@@ -336,6 +341,7 @@ public struct UsageTelemetryRootTerminal: Codable, Sendable, Equatable {
         self.attemptCount = attemptCount
         self.accountFallbackCount = accountFallbackCount
         self.modelFallbackCount = modelFallbackCount
+        self.fallbackRequestCount = fallbackRequestCount
     }
 }
 
@@ -440,6 +446,21 @@ public struct UsageTelemetryAttemptAggregate: Codable, Sendable, Equatable {
     public var reasoningTokensCompleteness: TokenFieldCompleteness
     public var estimatedCostUSD: Double
     public var costCompleteness: CostAvailability
+    /// Optional fields added after schema v1. They let lifetime analytics keep
+    /// failed-attempt waste and success-only latency without retaining content.
+    /// `nil` preserves the distinction between an old aggregate and a measured
+    /// zero from a current store.
+    public var failedAttemptTokens: Int?
+    public var failedAttemptTokensCompleteness: TokenFieldCompleteness?
+    public var failedAttemptDurationMilliseconds: Int?
+    public var successDurationMilliseconds: Int?
+    public var successDurationSampleCount: Int?
+    public var successLatencyHistogram: [Int]?
+    public var successTimeToFirstChunkMilliseconds: Int?
+    public var successTimeToFirstChunkSampleCount: Int?
+    public var successTimeToFirstChunkHistogram: [Int]?
+    public var pricingSource: String?
+    public var pricingRevision: String?
 
     public init(
         accountTelemetryID: UUID,
@@ -470,7 +491,18 @@ public struct UsageTelemetryAttemptAggregate: Codable, Sendable, Equatable {
         reasoningTokens: Int = 0,
         reasoningTokensCompleteness: TokenFieldCompleteness = .unknown,
         estimatedCostUSD: Double = 0,
-        costCompleteness: CostAvailability = .unknown
+        costCompleteness: CostAvailability = .unknown,
+        failedAttemptTokens: Int? = nil,
+        failedAttemptTokensCompleteness: TokenFieldCompleteness? = nil,
+        failedAttemptDurationMilliseconds: Int? = nil,
+        successDurationMilliseconds: Int? = nil,
+        successDurationSampleCount: Int? = nil,
+        successLatencyHistogram: [Int]? = nil,
+        successTimeToFirstChunkMilliseconds: Int? = nil,
+        successTimeToFirstChunkSampleCount: Int? = nil,
+        successTimeToFirstChunkHistogram: [Int]? = nil,
+        pricingSource: String? = nil,
+        pricingRevision: String? = nil
     ) {
         self.accountTelemetryID = accountTelemetryID
         self.provider = provider
@@ -501,6 +533,17 @@ public struct UsageTelemetryAttemptAggregate: Codable, Sendable, Equatable {
         self.reasoningTokensCompleteness = reasoningTokensCompleteness
         self.estimatedCostUSD = estimatedCostUSD.isFinite && estimatedCostUSD >= 0 ? estimatedCostUSD : 0
         self.costCompleteness = costCompleteness
+        self.failedAttemptTokens = failedAttemptTokens.map { max(0, $0) }
+        self.failedAttemptTokensCompleteness = failedAttemptTokensCompleteness
+        self.failedAttemptDurationMilliseconds = failedAttemptDurationMilliseconds.map { max(0, $0) }
+        self.successDurationMilliseconds = successDurationMilliseconds.map { max(0, $0) }
+        self.successDurationSampleCount = successDurationSampleCount.map { max(0, $0) }
+        self.successLatencyHistogram = successLatencyHistogram.map { UsageTelemetryLatencyHistogram(buckets: $0).buckets }
+        self.successTimeToFirstChunkMilliseconds = successTimeToFirstChunkMilliseconds.map { max(0, $0) }
+        self.successTimeToFirstChunkSampleCount = successTimeToFirstChunkSampleCount.map { max(0, $0) }
+        self.successTimeToFirstChunkHistogram = successTimeToFirstChunkHistogram.map { UsageTelemetryLatencyHistogram(buckets: $0).buckets }
+        self.pricingSource = pricingSource
+        self.pricingRevision = pricingRevision
     }
 
     public mutating func ingest(_ event: UsageTelemetryAttemptEvent) {
@@ -545,6 +588,51 @@ public struct UsageTelemetryAttemptAggregate: Codable, Sendable, Equatable {
         }
         let nextCost = event.costCompleteness ?? (eventCost == nil ? .unknown : .complete)
         costCompleteness = combineCostCompleteness(costCompleteness, nextCost, hadExisting: hadAttempt)
+        if let source = event.pricingSource {
+            pricingSource = pricingSource == nil || pricingSource == source ? source : nil
+        }
+        if let revision = event.pricingRevision {
+            pricingRevision = pricingRevision == nil || pricingRevision == revision ? revision : nil
+        }
+
+        if event.outcome == .success {
+            let duration = event.derivedDurationMilliseconds
+            if let duration {
+                successDurationMilliseconds = UsageSafety.saturatingAdd(successDurationMilliseconds ?? 0, duration)
+                successDurationSampleCount = UsageSafety.saturatingIncrement(successDurationSampleCount ?? 0)
+                var histogram = UsageTelemetryLatencyHistogram(buckets: successLatencyHistogram ?? Array(repeating: 0, count: UsageTelemetryLatencyHistogram.bucketCount))
+                histogram.record(milliseconds: duration)
+                successLatencyHistogram = histogram.buckets
+            }
+            if let firstChunk = event.derivedTimeToFirstChunkMilliseconds {
+                successTimeToFirstChunkMilliseconds = UsageSafety.saturatingAdd(successTimeToFirstChunkMilliseconds ?? 0, firstChunk)
+                successTimeToFirstChunkSampleCount = UsageSafety.saturatingIncrement(successTimeToFirstChunkSampleCount ?? 0)
+                var histogram = UsageTelemetryLatencyHistogram(buckets: successTimeToFirstChunkHistogram ?? Array(repeating: 0, count: UsageTelemetryLatencyHistogram.bucketCount))
+                histogram.record(milliseconds: firstChunk)
+                successTimeToFirstChunkHistogram = histogram.buckets
+            }
+        } else if event.outcome == .httpError || event.outcome == .transportError {
+            let observedParts = [event.inputTokens, event.outputTokens].compactMap { $0 }
+            if !observedParts.isEmpty {
+                let total = observedParts.reduce(0, UsageSafety.saturatingAdd)
+                failedAttemptTokens = UsageSafety.saturatingAdd(failedAttemptTokens ?? 0, total)
+                let completeness: TokenFieldCompleteness = observedParts.count == 2 ? .complete : .partial
+                failedAttemptTokensCompleteness = UsageAnalytics.combineCompleteness(
+                    failedAttemptTokensCompleteness ?? .unknown,
+                    completeness,
+                    hasExistingContributor: failedAttemptTokens != nil
+                )
+            } else {
+                failedAttemptTokensCompleteness = UsageAnalytics.combineCompleteness(
+                    failedAttemptTokensCompleteness ?? .unknown,
+                    .unknown,
+                    hasExistingContributor: failedAttemptTokens != nil
+                )
+            }
+            if let duration = event.derivedDurationMilliseconds {
+                failedAttemptDurationMilliseconds = UsageSafety.saturatingAdd(failedAttemptDurationMilliseconds ?? 0, duration)
+            }
+        }
     }
 
     public func latencyPercentile(_ percentile: Double) -> Int? {
@@ -557,6 +645,20 @@ public struct UsageTelemetryAttemptAggregate: Codable, Sendable, Equatable {
         let minimumSamples = percentile <= 0.5 ? 3 : (percentile <= 0.95 ? 20 : 1)
         guard timeToFirstChunkSampleCount >= minimumSamples else { return nil }
         return UsageTelemetryLatencyHistogram(buckets: timeToFirstChunkHistogram).percentile(percentile)
+    }
+
+    public func successLatencyPercentile(_ percentile: Double) -> Int? {
+        let minimumSamples = percentile <= 0.5 ? 3 : (percentile <= 0.95 ? 20 : 1)
+        guard (successDurationSampleCount ?? 0) >= minimumSamples,
+              let successLatencyHistogram else { return nil }
+        return UsageTelemetryLatencyHistogram(buckets: successLatencyHistogram).percentile(percentile)
+    }
+
+    public func successFirstChunkPercentile(_ percentile: Double) -> Int? {
+        let minimumSamples = percentile <= 0.5 ? 3 : (percentile <= 0.95 ? 20 : 1)
+        guard (successTimeToFirstChunkSampleCount ?? 0) >= minimumSamples,
+              let successTimeToFirstChunkHistogram else { return nil }
+        return UsageTelemetryLatencyHistogram(buckets: successTimeToFirstChunkHistogram).percentile(percentile)
     }
 
     private func mergeToken(
@@ -611,6 +713,7 @@ public struct UsageTelemetryRootAggregate: Codable, Sendable, Equatable {
     public var retries: Int
     public var accountFallbacks: Int
     public var modelFallbacks: Int
+    public var fallbackRequests: Int?
 
     public init(
         category: UsageTelemetryRequestCategory,
@@ -620,7 +723,8 @@ public struct UsageTelemetryRootAggregate: Codable, Sendable, Equatable {
         cancelled: Int = 0,
         retries: Int = 0,
         accountFallbacks: Int = 0,
-        modelFallbacks: Int = 0
+        modelFallbacks: Int = 0,
+        fallbackRequests: Int? = nil
     ) {
         self.category = category
         self.requests = max(0, requests)
@@ -630,6 +734,7 @@ public struct UsageTelemetryRootAggregate: Codable, Sendable, Equatable {
         self.retries = max(0, retries)
         self.accountFallbacks = max(0, accountFallbacks)
         self.modelFallbacks = max(0, modelFallbacks)
+        self.fallbackRequests = fallbackRequests.map { max(0, $0) }
     }
 
     public mutating func ingest(_ terminal: UsageTelemetryRootTerminal) {
@@ -642,6 +747,11 @@ public struct UsageTelemetryRootAggregate: Codable, Sendable, Equatable {
         retries = UsageSafety.saturatingAdd(retries, max(0, terminal.attemptCount - 1))
         accountFallbacks = UsageSafety.saturatingAdd(accountFallbacks, max(0, terminal.accountFallbackCount))
         modelFallbacks = UsageSafety.saturatingAdd(modelFallbacks, max(0, terminal.modelFallbackCount))
+        let fallback = terminal.fallbackRequestCount ?? min(
+            1,
+            max(0, terminal.accountFallbackCount) + max(0, terminal.modelFallbackCount)
+        )
+        fallbackRequests = UsageSafety.saturatingAdd(fallbackRequests ?? 0, fallback)
     }
 }
 
@@ -1188,6 +1298,7 @@ public actor UsageTelemetryStore {
                 merged[index].retries = UsageSafety.saturatingAdd(merged[index].retries, value.retries)
                 merged[index].accountFallbacks = UsageSafety.saturatingAdd(merged[index].accountFallbacks, value.accountFallbacks)
                 merged[index].modelFallbacks = UsageSafety.saturatingAdd(merged[index].modelFallbacks, value.modelFallbacks)
+                merged[index].fallbackRequests = UsageSafety.saturatingAdd(merged[index].fallbackRequests ?? 0, value.fallbackRequests ?? 0)
             } else {
                 merged.append(value)
             }
@@ -1229,6 +1340,47 @@ public actor UsageTelemetryStore {
             target.estimatedCostUSD += source.estimatedCostUSD
         }
         if target.costCompleteness != source.costCompleteness { target.costCompleteness = .partial }
+        target.failedAttemptTokens = mergeOptionalCounter(target.failedAttemptTokens, source.failedAttemptTokens)
+        target.failedAttemptTokensCompleteness = mergeOptionalCompleteness(target.failedAttemptTokensCompleteness, source.failedAttemptTokensCompleteness)
+        target.failedAttemptDurationMilliseconds = mergeOptionalCounter(target.failedAttemptDurationMilliseconds, source.failedAttemptDurationMilliseconds)
+        target.successDurationMilliseconds = mergeOptionalCounter(target.successDurationMilliseconds, source.successDurationMilliseconds)
+        target.successDurationSampleCount = mergeOptionalCounter(target.successDurationSampleCount, source.successDurationSampleCount)
+        target.successTimeToFirstChunkMilliseconds = mergeOptionalCounter(target.successTimeToFirstChunkMilliseconds, source.successTimeToFirstChunkMilliseconds)
+        target.successTimeToFirstChunkSampleCount = mergeOptionalCounter(target.successTimeToFirstChunkSampleCount, source.successTimeToFirstChunkSampleCount)
+        if let sourceHistogram = source.successLatencyHistogram {
+            var histogram = UsageTelemetryLatencyHistogram(buckets: target.successLatencyHistogram ?? [])
+            histogram.merge(sourceHistogram)
+            target.successLatencyHistogram = histogram.buckets
+        }
+        if let sourceHistogram = source.successTimeToFirstChunkHistogram {
+            var histogram = UsageTelemetryLatencyHistogram(buckets: target.successTimeToFirstChunkHistogram ?? [])
+            histogram.merge(sourceHistogram)
+            target.successTimeToFirstChunkHistogram = histogram.buckets
+        }
+        if target.pricingSource != source.pricingSource { target.pricingSource = nil }
+        if target.pricingRevision != source.pricingRevision { target.pricingRevision = nil }
+    }
+
+    private static func mergeOptionalCounter(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        switch (lhs, rhs) {
+        case let (left?, right?): return UsageSafety.saturatingAdd(left, right)
+        case let (left?, nil): return left
+        case let (nil, right?): return right
+        case (nil, nil): return nil
+        }
+    }
+
+    private static func mergeOptionalCompleteness(
+        _ lhs: TokenFieldCompleteness?,
+        _ rhs: TokenFieldCompleteness?
+    ) -> TokenFieldCompleteness? {
+        switch (lhs, rhs) {
+        case (nil, nil): return nil
+        case let (left?, nil): return left
+        case let (nil, right?): return right
+        case let (left?, right?):
+            return UsageAnalytics.combineCompleteness(left, right, hasExistingContributor: true)
+        }
     }
 
     private static func merge(_ target: inout UsageTelemetryRootAggregate, _ source: UsageTelemetryRootAggregate) {
@@ -1239,6 +1391,7 @@ public actor UsageTelemetryStore {
         target.retries = UsageSafety.saturatingAdd(target.retries, source.retries)
         target.accountFallbacks = UsageSafety.saturatingAdd(target.accountFallbacks, source.accountFallbacks)
         target.modelFallbacks = UsageSafety.saturatingAdd(target.modelFallbacks, source.modelFallbacks)
+        target.fallbackRequests = UsageSafety.saturatingAdd(target.fallbackRequests ?? 0, source.fallbackRequests ?? 0)
     }
 }
 

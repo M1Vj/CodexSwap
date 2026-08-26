@@ -303,4 +303,24 @@ final class UsageTelemetryTests: XCTestCase {
         XCTAssertEqual((directoryAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
         XCTAssertEqual((fileAttributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
+
+    func testRangeSnapshotsPreserveStoredLocalDayKeyAndOffsetAcrossSevenThirtyAndLifetime() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let (store, _, cleanup) = makeStore(now: now)
+        defer { cleanup() }
+        let recent = event(id: UUID(), startedAt: now.addingTimeInterval(-2 * 86_400 - 1), finishedAt: now.addingTimeInterval(-2 * 86_400))
+        let older = event(id: UUID(), startedAt: now.addingTimeInterval(-8 * 86_400 - 1), finishedAt: now.addingTimeInterval(-8 * 86_400))
+        await store.recordAttempts([recent, older])
+
+        let seven = await store.snapshot(range: .sevenDays)
+        let thirty = await store.snapshot(range: .thirtyDays)
+        let lifetime = await store.snapshot(range: .lifetime)
+        XCTAssertEqual(seven.range, .sevenDays)
+        XCTAssertEqual(thirty.range, .thirtyDays)
+        XCTAssertNil(lifetime.rangeStart)
+        XCTAssertEqual(seven.events.count, 1)
+        XCTAssertEqual(thirty.events.count, 2)
+        XCTAssertTrue(thirty.dailyAttemptAggregates.allSatisfy { $0.utcOffsetSeconds == TimeZone.current.secondsFromGMT(for: $0.dayStart) || $0.utcOffsetSeconds == 0 })
+        XCTAssertEqual(lifetime.lifetimeAttemptAggregates.reduce(0) { $0 + $1.attempts }, 2)
+    }
 }
