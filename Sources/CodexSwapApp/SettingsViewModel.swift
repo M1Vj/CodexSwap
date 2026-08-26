@@ -9,6 +9,7 @@ struct SettingsActions {
     let setLaunchAtLogin: (Bool) -> Void
     let setStrategy: (RotationStrategy) -> Void
     let switchAccount: (String) -> Void
+    let restoreAccount: (String) -> Void
     let setPriority: (String, Int) -> Void
     let reorderRank: (String, Int) -> Void
     let applyRanking: ([String]) -> Void
@@ -30,6 +31,7 @@ struct SettingsActions {
     let setNotifyOnWindowReset: (Bool) -> Void
     let setNotifyOnNeedsLogin: (Bool) -> Void
     let setSmartSwitch: (Bool) -> Void
+    let setMetadataTelemetry: (Bool) -> Void
     let setAutomationEnabled: (Bool) -> Void
     let setAutomationAccounts: ([String]) -> Void
     let setNotifyOnTaskEvents: (Bool) -> Void

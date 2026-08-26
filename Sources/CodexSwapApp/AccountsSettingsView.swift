@@ -38,6 +38,25 @@ struct AccountsSettingsView: View {
                             openRankingSheet: { rankingSheetPresented = true }
                         )
                     }
+                    if !model.presentation.archivedAccounts.isEmpty {
+                        Text("Archived Accounts")
+                            .font(.headline)
+                            .padding(.top, 8)
+                        ForEach(model.presentation.archivedAccounts) { account in
+                            GroupBox {
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(account.email.isEmpty ? account.alias : account.email)
+                                        Text("Archived · historical usage only")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("Restore") { model.actions.restoreAccount(account.alias) }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 HStack {

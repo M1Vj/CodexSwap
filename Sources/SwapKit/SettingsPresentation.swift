@@ -72,6 +72,7 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
 
 public struct SettingsPresentation: Sendable, Equatable {
     public let accounts: [AccountSettingsRow]
+    public let archivedAccounts: [AccountSettingsRow]
     public let proxyAddress: String
 
     public init(
@@ -84,7 +85,7 @@ public struct SettingsPresentation: Sendable, Equatable {
                 if $0.priority == $1.priority { return $0.alias.localizedCaseInsensitiveCompare($1.alias) == .orderedAscending }
                 return $0.priority > $1.priority
             }
-        accounts = ranked.enumerated().map { index, account in
+        let rows = ranked.enumerated().map { index, account in
             AccountSettingsRow(
                 alias: account.alias,
                 email: account.email,
@@ -102,6 +103,12 @@ public struct SettingsPresentation: Sendable, Equatable {
                 usageWindows: account.usage,
                 resetCreditStatus: resetCreditStatuses[account.alias] ?? .unavailable
             )
+        }
+        accounts = rows.filter { row in
+            !(snapshot.accounts.first(where: { account in account.alias == row.alias })?.isArchived ?? false)
+        }
+        archivedAccounts = rows.filter { row in
+            snapshot.accounts.first(where: { account in account.alias == row.alias })?.isArchived == true
         }
 
         if let url = snapshot.proxyURL, let host = url.host, let port = url.port {

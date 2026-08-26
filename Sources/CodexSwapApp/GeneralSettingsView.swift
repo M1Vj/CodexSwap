@@ -35,6 +35,13 @@ struct GeneralSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            SettingsSection(title: "Privacy") {
+                Toggle("Collect local metadata telemetry", isOn: telemetryBinding)
+                Text("Optional, local-only metrics include bounded counts, timing, token totals, model/provider families, and retry outcomes. Prompts, responses, commands, paths, headers, OAuth data, and raw errors are never stored or uploaded. Request details are kept for 30 days; aggregates for 365 days and lifetime totals.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
         }
         .formStyle(.grouped)
     }
@@ -65,6 +72,10 @@ struct GeneralSettingsView: View {
             get: { model.settings.smartSwitchEnabled },
             set: { model.actions.setSmartSwitch($0) }
         )
+    }
+
+    private var telemetryBinding: Binding<Bool> {
+        Binding(get: { model.settings.metadataTelemetryEnabled }, set: { model.actions.setMetadataTelemetry($0) })
     }
 
     private var routingDescription: String {

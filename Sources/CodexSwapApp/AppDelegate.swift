@@ -686,6 +686,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setLaunchAtLogin: { [weak self] enabled in self?.setLaunchAtLogin(enabled) },
             setStrategy: { [weak self] strategy in self?.changeStrategy(strategy) },
             switchAccount: { [weak self] alias in self?.activateAccount(alias) },
+            restoreAccount: { [weak self] alias in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    _ = await self.engine.restoreAccount(alias: alias)
+                    await self.refreshSnapshot()
+                }
+            },
             setPriority: { [weak self] alias, priority in self?.changePriority(alias, priority: priority) },
             reorderRank: { [weak self] alias, toIndex in
                 Task { @MainActor [weak self] in
@@ -740,6 +747,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setNotifyOnWindowReset: { [weak self] enabled in self?.updateSettings { $0.notifyOnWindowReset = enabled } },
             setNotifyOnNeedsLogin: { [weak self] enabled in self?.updateSettings { $0.notifyOnNeedsLogin = enabled } },
             setSmartSwitch: { [weak self] enabled in self?.updateSettings { $0.smartSwitchEnabled = enabled } },
+            setMetadataTelemetry: { [weak self] enabled in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.engine.setMetadataTelemetryEnabled(enabled)
+                    await self.refreshSnapshot()
+                }
+            },
             setAutomationEnabled: { [weak self] enabled in self?.updateSettings { $0.automationEnabled = enabled } },
             setAutomationAccounts: { [weak self] aliases in self?.updateSettings { $0.automationAccounts = Array(Set(aliases)).sorted() } },
             setNotifyOnTaskEvents: { [weak self] enabled in self?.updateSettings { $0.notifyOnTaskEvents = enabled } },
