@@ -179,7 +179,26 @@ final class SSEUsageScannerTests: XCTestCase {
         feed(&scanner, #"event: response.completed"# + "\n\n")
         feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5.6-sol","usage":{"input_tokens":120,"cached_input_tokens":40,"output_tokens":55}}}"# + "\n\n")
 
-        XCTAssertEqual(scanner.consume(), ProxyUsageSample(model: "gpt-5.6-sol", inputTokens: 120, cachedInputTokens: 40, outputTokens: 55))
+        XCTAssertEqual(scanner.consume(), ProxyUsageSample(model: "gpt-5.6-sol", inputTokens: 120, cachedInputTokens: 40, outputTokens: 55, cacheWriteInputPresence: .absent))
+    }
+
+    func testAbsentCacheBucketsStayAbsentInProxySample() {
+        var scanner = SSEUsageScanner()
+        feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5.6-sol","usage":{"input_tokens":120,"output_tokens":55}}}"# + "\n")
+
+        let sample = scanner.consume()
+        XCTAssertEqual(sample?.cachedInputPresence, .absent)
+        XCTAssertEqual(sample?.cacheWriteInputPresence, .absent)
+    }
+
+    func testExplicitZeroCacheBucketsStayPresentInProxySample() {
+        var scanner = SSEUsageScanner()
+        feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5.6-sol","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":55}}}"# + "\n")
+
+        let sample = scanner.consume()
+        XCTAssertEqual(sample?.cachedInputTokens, 0)
+        XCTAssertEqual(sample?.cachedInputPresence, .present)
+        XCTAssertEqual(sample?.cacheWriteInputPresence, .present)
     }
 
     func testHandlesChunksSplitMidLineAndMidJSON() {
@@ -189,7 +208,7 @@ final class SSEUsageScannerTests: XCTestCase {
             feed(&scanner, String(UnicodeScalar(byte)))
         }
         // The stream ended without a trailing newline; the tail line must still flush.
-        XCTAssertEqual(scanner.finish(), ProxyUsageSample(model: "gpt-5", inputTokens: 7, cachedInputTokens: 0, outputTokens: 9))
+        XCTAssertEqual(scanner.finish(), ProxyUsageSample(model: "gpt-5", inputTokens: 7, cachedInputTokens: 0, outputTokens: 9, cacheWriteInputPresence: .absent))
     }
 
     func testIgnoresOtherEventTypesAndMalformedJSON() {
@@ -224,6 +243,49 @@ final class SSEUsageScannerTests: XCTestCase {
     func testDoubleEncodedUsageFieldsParse() {
         var scanner = SSEUsageScanner()
         feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5","usage":{"input_tokens":12.0,"cached_input_tokens":3.0,"output_tokens":6.0}}}"# + "\n")
-        XCTAssertEqual(scanner.consume(), ProxyUsageSample(model: "gpt-5", inputTokens: 12, cachedInputTokens: 3, outputTokens: 6))
+        XCTAssertEqual(scanner.consume(), ProxyUsageSample(model: "gpt-5", inputTokens: 12, cachedInputTokens: 3, outputTokens: 6, cacheWriteInputPresence: .absent))
+    }
+
+    func testNestedResponsesUsageParsesCacheReadAndWriteWithSubsetClamps() {
+        var scanner = SSEUsageScanner()
+        feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5.6-sol","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":50},"output_tokens":6}}}"# + "\n")
+
+        XCTAssertEqual(
+            scanner.consume(),
+            ProxyUsageSample(
+                model: "gpt-5.6-sol",
+                inputTokens: 100,
+                cachedInputTokens: 80,
+                cacheWriteInputTokens: 20,
+                outputTokens: 6
+            )
+        )
+    }
+
+    func testLegacyCacheAliasesRemainSupportedAlongsideCacheWrite() {
+        var scanner = SSEUsageScanner()
+        feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5","usage":{"input_tokens":12,"cached_input_tokens":3,"cache_creation_input_tokens":20,"output_tokens":6}}}"# + "\n")
+
+        XCTAssertEqual(
+            scanner.consume(),
+            ProxyUsageSample(model: "gpt-5", inputTokens: 12, cachedInputTokens: 3, cacheWriteInputTokens: 9, outputTokens: 6)
+        )
+    }
+
+    func testOfficialTopLevelCacheWriteInputTokensAliasIsSupported() {
+        var scanner = SSEUsageScanner()
+        feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5","usage":{"input_tokens":12,"cached_input_tokens":3,"cache_write_input_tokens":20,"output_tokens":6}}}"# + "\n")
+
+        XCTAssertEqual(
+            scanner.consume(),
+            ProxyUsageSample(model: "gpt-5", inputTokens: 12, cachedInputTokens: 3, cacheWriteInputTokens: 9, outputTokens: 6)
+        )
+    }
+
+    func testScannerIgnoresOutOfRangeUsageNumbers() {
+        var scanner = SSEUsageScanner()
+        feed(&scanner, #"data: {"type":"response.completed","response":{"model":"gpt-5","usage":{"input_tokens":1.7976931348623157e308,"output_tokens":1.7976931348623157e308}}}"# + "\n")
+
+        XCTAssertNil(scanner.consume())
     }
 }

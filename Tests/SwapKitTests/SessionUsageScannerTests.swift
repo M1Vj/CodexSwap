@@ -19,6 +19,12 @@ final class SessionUsageScannerTests: XCTestCase {
         try text.write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
     }
 
+    private func writeArchivedSession(_ text: String, home: URL, name: String) throws {
+        let dir = home.appendingPathComponent("archived_sessions")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try text.write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
     private func calendarDate(daysAgo: Int) -> (Int, Int, Int) {
         let calendar = Calendar(identifier: .gregorian)
         let date = calendar.date(byAdding: .day, value: -daysAgo, to: Date())!
@@ -29,8 +35,8 @@ final class SessionUsageScannerTests: XCTestCase {
     private let sampleSession = #"""
 {"timestamp":"2026-08-21T01:00:00Z","type":"response_item","payload":{"type":"message","role":"user"}}
 {"timestamp":"2026-08-21T01:00:05Z","type":"turn_context","payload":{"cwd":"/tmp","model":"gpt-5.6-sol","effort":"high"}}
-{"timestamp":"2026-08-21T01:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}}}}
-{"timestamp":"2026-08-21T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":50,"output_tokens":40},"last_token_usage":{"input_tokens":200,"cached_input_tokens":30,"output_tokens":30}}}}
+{"timestamp":"2026-08-21T01:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"cache_write_tokens":5,"output_tokens":10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}}}}
+{"timestamp":"2026-08-21T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"input_tokens_details":{"cached_tokens":50},"cache_write_tokens":20,"output_tokens":40},"last_token_usage":{"input_tokens":200,"cached_input_tokens":30,"output_tokens":30}}}}
 """#
     func testScanFoldsLastCumulativeTokenCountPerSession() throws {
         let home = makeHome()
@@ -43,8 +49,86 @@ final class SessionUsageScannerTests: XCTestCase {
         XCTAssertEqual(totals.sessionCount, 1)
         XCTAssertEqual(totals.inputTokens, 300)
         XCTAssertEqual(totals.cachedInputTokens, 50)
+        XCTAssertEqual(totals.cacheWriteInputTokens, 20)
         XCTAssertEqual(totals.outputTokens, 40)
         XCTAssertEqual(totals.models, ["gpt-5.6-sol"])
+    }
+
+    func testScanRetainsLegacyAliasesAndClampsCacheWriteSubset() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let text = #"{"type":"turn_context","payload":{"model":"gpt-5"}}"# + "\n" +
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"cached_input_tokens":3,"cache_creation_input_tokens":20,"output_tokens":6}}}}"# + "\n"
+        try writeSession(text, home: home, year: y, month: m, day: d, name: "legacy.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+
+        XCTAssertEqual(totals.cachedInputTokens, 3)
+        XCTAssertEqual(totals.cacheWriteInputTokens, 9)
+    }
+
+    func testScanParsesOfficialTopLevelCacheWriteInputTokens() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let text = #"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"# + "\n" +
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"cache_write_input_tokens":30,"output_tokens":5}}}}"# + "\n"
+        try writeSession(text, home: home, year: y, month: m, day: d, name: "official-write.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+
+        XCTAssertEqual(totals.inputTokens, 100)
+        XCTAssertEqual(totals.cachedInputTokens, 20)
+        XCTAssertEqual(totals.cacheWriteInputTokens, 30)
+        XCTAssertEqual(totals.outputTokens, 5)
+        XCTAssertEqual(totals.cachedInputCompleteness, .complete)
+        XCTAssertEqual(totals.cacheWriteInputCompleteness, .complete)
+    }
+
+    func testScanDistinguishesAbsentAndExplicitZeroCacheBucketsAcrossSessions() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let absent = #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}"# + "\n"
+        let zero = #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":2}}}}"# + "\n"
+        try writeSession(absent, home: home, year: y, month: m, day: d, name: "absent.jsonl")
+        try writeSession(zero, home: home, year: y, month: m, day: d, name: "zero.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+
+        XCTAssertEqual(totals.sessionCount, 2)
+        XCTAssertEqual(totals.cachedInputTokens, 0)
+        XCTAssertEqual(totals.cacheWriteInputTokens, 0)
+        XCTAssertEqual(totals.cachedInputCompleteness, .partial)
+        XCTAssertEqual(totals.cacheWriteInputCompleteness, .partial)
+    }
+
+    func testScanIgnoresOutOfRangeNumbers() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let text = #"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"# + "\n" +
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1.7976931348623157e308,"cache_write_input_tokens":1.7976931348623157e308,"output_tokens":1.7976931348623157e308}}}}"# + "\n"
+        try writeSession(text, home: home, year: y, month: m, day: d, name: "out-of-range.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+
+        XCTAssertEqual(totals.sessionCount, 0)
+        XCTAssertEqual(totals.inputTokens, 0)
+        XCTAssertEqual(totals.cacheWriteInputTokens, 0)
+    }
+
+    func testScanSaturatesTotalsAcrossSessions() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let max = Int.max
+        let event = #"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"# + "\n" +
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":9223372036854775807,"output_tokens":9223372036854775807}}}}"# + "\n"
+        try writeSession(event, home: home, year: y, month: m, day: d, name: "max-a.jsonl")
+        try writeSession(event, home: home, year: y, month: m, day: d, name: "max-b.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+
+        XCTAssertEqual(totals.inputTokens, max)
+        XCTAssertEqual(totals.outputTokens, max)
+        XCTAssertEqual(totals.sessionCount, 2)
     }
 
     func testScanAggregatesAcrossSessionsAndDays() throws {
@@ -73,6 +157,19 @@ final class SessionUsageScannerTests: XCTestCase {
 
         XCTAssertEqual(SessionUsageScanner.scan(home: home, days: 3).sessionCount, 0)
         XCTAssertEqual(SessionUsageScanner.scan(home: home, days: 7).sessionCount, 1)
+    }
+
+    func testScanCountsArchivedSessionsOnceWhenScanningMultipleDays() throws {
+        let home = makeHome()
+        let archived = #"{"type":"turn_context","payload":{"model":"gpt-5"}}"# + "\n" +
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":7,"output_tokens":3}}}}"# + "\n"
+        try writeArchivedSession(archived, home: home, name: "archived.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+
+        XCTAssertEqual(totals.sessionCount, 1)
+        XCTAssertEqual(totals.inputTokens, 7)
+        XCTAssertEqual(totals.outputTokens, 3)
     }
 
     func testScanIgnoresMalformedAndNonSessionFiles() throws {

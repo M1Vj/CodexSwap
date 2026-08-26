@@ -4,12 +4,12 @@
 
 CodexSwap stores one native subagent roster for each supported parent-provider family:
 
-- OpenAI parents use the owner's normal role-aware roster: GPT-5.6 Luna at max for ordinary roles and GPT-5.6 Sol at high for `sol_adversarial`, unless the owner customizes that OpenAI profile.
+- OpenAI parents use the owner's normal role-aware roster: GPT-5.6 Luna at max for ordinary roles and GPT-5.6 Sol at high for both `sol_adversarial` and `sol_escalation`, unless the owner customizes that OpenAI profile.
 - Bridged Alpha parents use 0x Alpha for every installed native subagent role, with the saved Alpha effort and Alpha Ultra preference.
 
 The profiles remain independent. Editing or applying the Alpha profile must not overwrite the OpenAI profile, and returning to an OpenAI parent must not require rebuilding the previous GPT roster by hand.
 
-Native Codex delegation stays provider-homogeneous. GPT-parent to Alpha-child `spawn_agent` remains blocked because the cross-provider encrypted task can be empty. The separately registered, attachment-only `codexswap_alpha_review` MCP remains the supported Sol-to-Alpha review path and is outside this profile switch.
+Native Codex delegation stays provider-homogeneous. GPT-parent to Alpha-child `spawn_agent` remains blocked because the cross-provider encrypted task can be empty or unreadable. The intended Codex workflow keeps Sol as the parent and orchestrator; another configured MCP client may invoke the separately registered, attachment-only Alpha review tool, but that invocation is not a native Sol child and remains outside this profile switch.
 
 ## Data model and migration
 
@@ -20,13 +20,15 @@ Native Codex delegation stays provider-homogeneous. GPT-parent to Alpha-child `s
 
 The container's decoder accepts both the new profile shape and the legacy single-policy shape. Legacy migration is deterministic:
 
-1. If every saved role assignment uses Alpha, preserve that roster as the bridged profile and seed the OpenAI profile from the normal Luna/Sol defaults.
+1. If the saved eligible IDs are exclusively Alpha, preserve that roster as the bridged profile and seed the OpenAI profile from the normal Luna/Sol defaults. When eligibility is omitted, an all-Alpha role roster remains the legacy fallback.
 2. Otherwise, preserve non-Alpha role assignments and eligible models as the OpenAI profile.
 3. Seed the bridged profile by assigning every saved role identity to Alpha. Use `ultra` when the legacy Alpha Ultra flag is enabled and `max` otherwise.
 4. Remove cross-provider eligible IDs from each migrated profile so the two profiles begin provider-homogeneous.
 5. Malformed, missing, or unknown profile data falls back to safe defaults. Unknown parent families never select a profile.
 
-Encoding writes only the new `{ openAI, bridged }` representation. No credentials, account identifiers, session data, or model-provider secrets enter this settings object.
+Migrated custom profiles preserve the eligible IDs and role assignments that the legacy policy actually saved. Migration does not invent missing legacy role assignments. The explicit `Restore compatible defaults` action can fill the complete current installed roster after the owner reviews the selected provider profile.
+
+Nested profiles are authoritative for current decoders. The encoder also dual-writes the normalized OpenAI profile to the legacy flat `eligibleModelIDs`, `roleAssignments`, and `alphaUltraEnabled` keys so an older build can read a rollback snapshot; current decoders prefer the nested profiles when both shapes are present. No credentials, account identifiers, session data, or model-provider secrets enter this settings object.
 
 ## Runtime selection
 

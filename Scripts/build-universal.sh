@@ -15,6 +15,7 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="${UNIVERSAL_SCRATCH_DIR:-$ROOT/.build/codexswap-universal}"
 PRODUCTS="$SCRATCH/products"
+RELEASE_PRODUCTS=(CodexSwapApp swapd codexswap-alpha-mcp)
 
 rm -rf "$PRODUCTS"
 mkdir -p "$PRODUCTS"
@@ -22,8 +23,9 @@ mkdir -p "$PRODUCTS"
 build_arch() {
   local arch="$1"
   local path="$SCRATCH/$arch"
-  swift build --package-path "$ROOT" --scratch-path "$path" -c release --arch "$arch" --product CodexSwapApp
-  swift build --package-path "$ROOT" --scratch-path "$path" -c release --arch "$arch" --product swapd
+  for product in "${RELEASE_PRODUCTS[@]}"; do
+    swift build --package-path "$ROOT" --scratch-path "$path" -c release --arch "$arch" --product "$product"
+  done
   swift build --package-path "$ROOT" --scratch-path "$path" -c release --arch "$arch" --show-bin-path
 }
 
@@ -32,7 +34,7 @@ ARM_BIN="$(build_arch arm64 | tail -n 1)"
 echo "› building x86_64 release products…"
 INTEL_BIN="$(build_arch x86_64 | tail -n 1)"
 
-for product in CodexSwapApp swapd; do
+for product in "${RELEASE_PRODUCTS[@]}"; do
   lipo -create "$ARM_BIN/$product" "$INTEL_BIN/$product" -output "$PRODUCTS/$product"
   chmod 755 "$PRODUCTS/$product"
   lipo "$PRODUCTS/$product" -verify_arch arm64 x86_64

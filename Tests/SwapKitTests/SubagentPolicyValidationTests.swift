@@ -196,7 +196,7 @@ final class SubagentPolicyValidationTests: XCTestCase {
         XCTAssertTrue(result.issues[0].message.localizedCaseInsensitiveContains("ultra"))
     }
 
-    func testHomogeneousGPTAndAlphaRostersAreAllowedWhenParentMatchesOrIsUnknown() {
+    func testHomogeneousGPTAndAlphaRostersAreAllowedWhenParentMatches() {
         let gptPolicy = SubagentModelPolicy(
             eligibleModelIDs: ["gpt-5.6-luna"],
             roleAssignments: [assignment(role: "worker")]
@@ -216,7 +216,44 @@ final class SubagentPolicyValidationTests: XCTestCase {
 
         XCTAssertTrue(validate(policy: gptPolicy, catalog: defaultCatalog, installedRoleIDs: ["worker"], parentProviderFamily: .openAI).canApply)
         XCTAssertTrue(validate(policy: alphaPolicy, catalog: alphaCatalog, installedRoleIDs: ["worker"], parentProviderFamily: .bridged).canApply)
-        XCTAssertTrue(validate(policy: alphaPolicy, catalog: alphaCatalog, installedRoleIDs: ["worker"], parentProviderFamily: .unknown).canApply)
+    }
+
+    func testDraftValidationKeepsUnknownParentEditableButApplyValidationBlocksIt() {
+        let policy = SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-5.6-luna"],
+            roleAssignments: [assignment(role: "worker")]
+        )
+
+        let draft = SubagentPolicyValidator.validateDraft(
+            policy: policy,
+            catalog: defaultCatalog,
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .unknown
+        )
+        let apply = SubagentPolicyValidator.validateForApply(
+            policy: policy,
+            catalog: defaultCatalog,
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .unknown
+        )
+
+        XCTAssertTrue(draft.canApply)
+        XCTAssertEqual(apply.issues.map(\.code), [.unknownParentProvider])
+        XCTAssertFalse(apply.canApply)
+    }
+
+    func testApplyValidationBlocksMissingParentFamily() {
+        let result = SubagentPolicyValidator.validateForApply(
+            policy: SubagentModelPolicy(
+                eligibleModelIDs: ["gpt-5.6-luna"],
+                roleAssignments: [assignment(role: "worker")]
+            ),
+            catalog: defaultCatalog,
+            installedRoleIDs: ["worker"]
+        )
+
+        XCTAssertEqual(result.issues.map(\.code), [.unknownParentProvider])
+        XCTAssertFalse(result.canApply)
     }
 
     func testKnownParentToDifferentProviderIsBlockedWithActionableMessage() {
@@ -521,7 +558,7 @@ final class SubagentPolicyValidationTests: XCTestCase {
     }
 
     private static let defaultInstalledRoles = [
-        "default", "worker", "explorer", "luna_clerk", "luna_researcher", "luna_reviewer", "sol_adversarial",
+        "default", "worker", "explorer", "luna_clerk", "luna_researcher", "luna_reviewer", "sol_adversarial", "sol_escalation",
     ]
 
     private var defaultCatalog: [CodexModelDescriptor] {
@@ -537,7 +574,7 @@ final class SubagentPolicyValidationTests: XCTestCase {
         installedRoleIDs: [String],
         parentProviderFamily: CodexModelProviderFamily? = nil
     ) -> SubagentPolicyValidationResult {
-        SubagentPolicyValidator.validate(
+        SubagentPolicyValidator.validateDraft(
             policy: policy,
             catalog: catalog,
             installedRoleIDs: installedRoleIDs,

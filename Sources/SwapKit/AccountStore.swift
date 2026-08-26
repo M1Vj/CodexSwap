@@ -275,7 +275,10 @@ public actor AccountStore {
         model: String,
         inputTokens: Int,
         cachedInputTokens: Int,
-        outputTokens: Int
+        cacheWriteInputTokens: Int = 0,
+        outputTokens: Int,
+        cachedInputPresence: TokenFieldPresence = .present,
+        cacheWriteInputPresence: TokenFieldPresence? = nil
     ) {
         guard let i = index(alias) else { return }
         var stats = data.accounts[i].usageStats ?? UsageStats()
@@ -283,7 +286,10 @@ public actor AccountStore {
             model: model,
             inputTokens: inputTokens,
             cachedInputTokens: cachedInputTokens,
-            outputTokens: outputTokens
+            cacheWriteInputTokens: cacheWriteInputTokens,
+            outputTokens: outputTokens,
+            cachedInputPresence: cachedInputPresence,
+            cacheWriteInputPresence: cacheWriteInputPresence
         )
         data.accounts[i].usageStats = stats
         persist()

@@ -221,12 +221,30 @@ private struct PoolSummaryCard: View {
                     metric("\(summary.drainingCount)", label: "draining by others", color: .orange)
                 }
                 Divider()
-                metric(compactTokens(summary.totalInputTokens + summary.totalOutputTokens), label: "proxy tokens")
+                metric(compactTokens(summary.totalProxyTokens), label: "proxy tokens")
+                metric(TokenMetricPresentation.text(
+                    value: summary.totalCachedInputTokens,
+                    completeness: summary.totalCachedInputCompleteness
+                ), label: "cached reads")
+                metric(TokenMetricPresentation.text(
+                    value: summary.totalCacheWriteInputTokens,
+                    completeness: summary.totalCacheWriteInputCompleteness
+                ), label: "cache writes")
                 metric(compactTokens(localTotals.totalTokens), label: "local tokens · 7d")
                 metric("\(localTotals.sessionCount)", label: "local sessions · 7d")
                 Divider()
-                metric(String(format: "~$%.2f", summary.estimatedCostTotal), label: "est. proxy cost")
-                metric(String(format: "~$%.2f", localEstimatedCost), label: "est. local cost · 7d")
+                metric(CostMetricPresentation.text(
+                    cost: summary.estimatedCostTotal,
+                    availability: summary.costAvailability,
+                    prefix: "~$",
+                    decimals: 2
+                ), label: "est. proxy cost")
+                metric(CostMetricPresentation.text(
+                    cost: localEstimatedCost,
+                    availability: UsageAnalytics.costAvailability(localTotals),
+                    prefix: "~$",
+                    decimals: 2
+                ), label: "est. local cost · 7d")
                 metric("\(Int(summary.avgPrimaryUsedPercent.rounded()))%", label: "avg used")
             }
             .frame(maxWidth: .infinity)
@@ -238,7 +256,8 @@ private struct PoolSummaryCard: View {
     private var localEstimatedCost: Double {
         UsageAnalytics.estimatedCost(
             inputTokens: localTotals.inputTokens,
-            cachedInputTokens: localTotals.cachedInputTokens,
+            cachedInputTokens: localTotals.cachedInputCompleteness == .unknown ? nil : localTotals.cachedInputTokens,
+            cacheWriteInputTokens: localTotals.cacheWriteInputCompleteness == .unknown ? nil : localTotals.cacheWriteInputTokens,
             outputTokens: localTotals.outputTokens,
             model: localTotals.models.first ?? "unknown"
         )
@@ -293,7 +312,12 @@ private struct AccountUsageCard: View {
                     }
                     Spacer()
                     if account.stats?.totalRequests ?? 0 > 0 {
-                        Text(String(format: "~$%.2f est.", account.estimatedCost))
+                        Text(CostMetricPresentation.text(
+                            cost: account.estimatedCost,
+                            availability: account.costAvailability,
+                            prefix: "~$",
+                            decimals: 2
+                        ) + " est.")
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
@@ -321,8 +345,10 @@ private struct AccountUsageCard: View {
                     }
                 }
 
-                if let stats = account.stats, stats.totalRequests > 0 {
-                    ModelBreakdownTable(models: stats.models)
+                if let stats = account.stats,
+                   stats.totalRequests > 0,
+                   stats.models.contains(where: { $0.requests > 0 }) {
+                    ModelBreakdownTable(models: stats.models.filter { $0.requests > 0 })
                         .accessibilityLabel("Proxy-attributed per-model usage")
                 }
                 if let local = localTotals, local.sessionCount > 0 {
@@ -433,6 +459,67 @@ private struct WindowMeter: View {
     }
 }
 
+enum LocalUsageCostProjection {
+    static func estimatedCost(for totals: LocalUsageTotals) -> Double {
+        UsageAnalytics.estimatedCost(
+            inputTokens: totals.inputTokens,
+            cachedInputTokens: totals.cachedInputCompleteness == .unknown ? nil : totals.cachedInputTokens,
+            cacheWriteInputTokens: totals.cacheWriteInputCompleteness == .unknown ? nil : totals.cacheWriteInputTokens,
+            outputTokens: totals.outputTokens,
+            model: totals.models.first ?? "unknown"
+        )
+    }
+
+    static func availability(for totals: LocalUsageTotals) -> CostAvailability {
+        UsageAnalytics.costAvailability(totals)
+    }
+
+    static func text(
+        for totals: LocalUsageTotals,
+        prefix: String = "~$",
+        decimals: Int = 4
+    ) -> String {
+        CostMetricPresentation.text(
+            cost: estimatedCost(for: totals),
+            availability: availability(for: totals),
+            prefix: prefix,
+            decimals: decimals
+        )
+    }
+}
+
+enum CostMetricPresentation {
+    static func text(
+        cost: Double,
+        availability: CostAvailability,
+        prefix: String = "$",
+        decimals: Int = 2
+    ) -> String {
+        switch availability {
+        case .unknown:
+            return "?"
+        case .unavailable, .partial:
+            return "unpriced"
+        case .complete:
+            let format = decimals == 4 ? "%@%.4f" : "%@%.2f"
+            return String(format: format, prefix, cost)
+        }
+    }
+}
+
+enum TokenMetricPresentation {
+    static func text(value: Int, completeness: TokenFieldCompleteness) -> String {
+        switch completeness {
+        case .unknown:
+            return "?"
+        case .partial:
+            return "partial \(compactTokens(value))"
+        case .complete:
+            return compactTokens(value)
+        }
+    }
+}
+
 private struct LocalUsageSection: View {
     let totals: LocalUsageTotals
 
@@ -442,25 +529,23 @@ private struct LocalUsageSection: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
             stat("in", tokens(totals.inputTokens))
-            stat("cached", tokens(totals.cachedInputTokens))
+            stat("cached", TokenMetricPresentation.text(
+                value: totals.cachedInputTokens,
+                completeness: totals.cachedInputCompleteness
+            ))
+            stat("write", TokenMetricPresentation.text(
+                value: totals.cacheWriteInputTokens,
+                completeness: totals.cacheWriteInputCompleteness
+            ))
             stat("out", tokens(totals.outputTokens))
             stat("sessions", "\(totals.sessionCount)")
-            stat("est.", String(format: "~$%.4f", estimatedCost))
+            stat("est.", LocalUsageCostProjection.text(for: totals))
             if let model = totals.models.first {
                 Text("via \(model)")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
         }
-    }
-
-    private var estimatedCost: Double {
-        UsageAnalytics.estimatedCost(
-            inputTokens: totals.inputTokens,
-            cachedInputTokens: totals.cachedInputTokens,
-            outputTokens: totals.outputTokens,
-            model: totals.models.first ?? "unknown"
-        )
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
@@ -492,6 +577,7 @@ private struct ModelBreakdownTable: View {
                     Text("Requests").font(.caption2).foregroundStyle(.tertiary)
                     Text("In").font(.caption2).foregroundStyle(.tertiary)
                     Text("Cached").font(.caption2).foregroundStyle(.tertiary)
+                    Text("Write").font(.caption2).foregroundStyle(.tertiary)
                     Text("Out").font(.caption2).foregroundStyle(.tertiary)
                     Text("Est. cost").font(.caption2).foregroundStyle(.tertiary)
                 }
@@ -500,14 +586,27 @@ private struct ModelBreakdownTable: View {
                         Text(row.model).font(.caption.monospacedDigit())
                         Text("\(row.requests)").font(.caption.monospacedDigit())
                         Text(tokens(row.inputTokens)).font(.caption.monospacedDigit())
-                        Text(tokens(row.cachedInputTokens)).font(.caption.monospacedDigit())
+                        Text(TokenMetricPresentation.text(
+                            value: row.cachedInputTokens,
+                            completeness: row.cachedInputCompleteness
+                        )).font(.caption.monospacedDigit())
+                        Text(TokenMetricPresentation.text(
+                            value: row.cacheWriteInputTokens,
+                            completeness: row.cacheWriteInputCompleteness
+                        )).font(.caption.monospacedDigit())
                         Text(tokens(row.outputTokens)).font(.caption.monospacedDigit())
-                        Text(String(format: "$%.4f", UsageAnalytics.estimatedCost(
+                        Text(CostMetricPresentation.text(
+                            cost: UsageAnalytics.estimatedCost(
                             inputTokens: row.inputTokens,
-                            cachedInputTokens: row.cachedInputTokens,
+                            cachedInputTokens: row.cachedInputCompleteness == .unknown ? nil : row.cachedInputTokens,
+                            cacheWriteInputTokens: row.cacheWriteInputCompleteness == .unknown ? nil : row.cacheWriteInputTokens,
                             outputTokens: row.outputTokens,
                             model: row.model
-                        ))).font(.caption.monospacedDigit())
+                            ),
+                            availability: UsageAnalytics.costAvailability(row),
+                            prefix: "$",
+                            decimals: 4
+                        )).font(.caption.monospacedDigit())
                     }
                 }
             }

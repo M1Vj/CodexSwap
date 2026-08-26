@@ -20,6 +20,10 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
     public var inputPricePerMillion: Double?
     /// Optional pricing in currency units per million output tokens.
     public var outputPricePerMillion: Double?
+    /// Optional cache-read pricing; nil falls back to input pricing for estimates.
+    public var cachedInputPricePerMillion: Double?
+    /// Optional cache-write pricing; nil falls back to input pricing for estimates.
+    public var cacheWriteInputPricePerMillion: Double?
 
     public init(
         modelID: String,
@@ -28,7 +32,9 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
         apiKey: String = "",
         enabled: Bool = true,
         inputPricePerMillion: Double? = nil,
-        outputPricePerMillion: Double? = nil
+        outputPricePerMillion: Double? = nil,
+        cachedInputPricePerMillion: Double? = nil,
+        cacheWriteInputPricePerMillion: Double? = nil
     ) {
         self.modelID = modelID
         self.displayName = displayName.isEmpty ? modelID : displayName
@@ -37,9 +43,50 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
         self.enabled = enabled
         self.inputPricePerMillion = inputPricePerMillion
         self.outputPricePerMillion = outputPricePerMillion
+        self.cachedInputPricePerMillion = cachedInputPricePerMillion
+        self.cacheWriteInputPricePerMillion = cacheWriteInputPricePerMillion
     }
 
     public var id: String { modelID }
+
+    /// Returns a bridged endpoint URL only when its transport is safe for use by
+    /// the proxy. Remote gateways must use HTTPS; plain HTTP is limited to
+    /// loopback addresses for local development.
+    public static func validatedBaseURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil else {
+            return nil
+        }
+
+        if scheme == "https" {
+            return url
+        }
+        guard scheme == "http", isLoopbackHost(host) else { return nil }
+        return url
+    }
+
+    private static func isLoopbackHost(_ host: String) -> Bool {
+        if host == "localhost" || host == "::1" {
+            return true
+        }
+
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4, octets[0] == "127" else { return false }
+        return octets.dropFirst().allSatisfy { octet in
+            let digits = octet.utf8
+            guard !digits.isEmpty,
+                  digits.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+                  let value = Int(octet) else {
+                return false
+            }
+            return value <= 255
+        }
+    }
 }
 
 public struct Settings: Codable, Sendable, Equatable {
@@ -82,7 +129,7 @@ public struct Settings: Codable, Sendable, Equatable {
     public var proxyPort: Int
     /// Free/gateway models served through the Responses<->Chat bridge instead of Codex accounts.
     public var bridgedModels: [BridgedModel]
-    public var subagentModelPolicy: SubagentModelPolicy
+    public var subagentModelPolicy: SubagentPolicyProfiles
 
     public static let defaultProxyPort = 58_432
 
@@ -152,7 +199,7 @@ public struct Settings: Codable, Sendable, Equatable {
         smartSwitchEnabled: Bool = false,
         proxyPort: Int,
         bridgedModels: [BridgedModel]? = nil,
-        subagentModelPolicy: SubagentModelPolicy = .default
+        subagentModelPolicy: SubagentPolicyProfiles = .default
     ) {
         self.rotationStrategy = rotationStrategy
         self.primaryThresholdPercent = primaryThresholdPercent
@@ -222,9 +269,11 @@ public struct Settings: Codable, Sendable, Equatable {
         let decodedPort = try c.decodeIfPresent(Int.self, forKey: .proxyPort) ?? d.proxyPort
         proxyPort = (1...65_535).contains(decodedPort) ? decodedPort : d.proxyPort
         let decodedBridged = try c.decodeIfPresent([BridgedModel].self, forKey: .bridgedModels) ?? d.bridgedModels
-        bridgedModels = decodedBridged.filter { !$0.modelID.isEmpty && URL(string: $0.baseURL) != nil }
+        bridgedModels = decodedBridged.filter {
+            !$0.modelID.isEmpty && BridgedModel.validatedBaseURL($0.baseURL) != nil
+        }
         do {
-            subagentModelPolicy = try c.decodeIfPresent(SubagentModelPolicy.self, forKey: .subagentModelPolicy)
+            subagentModelPolicy = try c.decodeIfPresent(SubagentPolicyProfiles.self, forKey: .subagentModelPolicy)
                 ?? d.subagentModelPolicy
         } catch {
             subagentModelPolicy = d.subagentModelPolicy

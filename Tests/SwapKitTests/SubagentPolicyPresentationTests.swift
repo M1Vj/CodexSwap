@@ -273,6 +273,404 @@ final class SubagentPolicyPresentationTests: XCTestCase {
         XCTAssertTrue(state.draft.roleAssignments.allSatisfy { $0.reasoningEffort == .ultra })
     }
 
+    func testParentCompatibilityBannerAggregatesMismatchesAndKeepsRowHelpConcise() {
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "explorer", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+            ]
+        ))
+        state.load(
+            catalog: [descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["worker", "explorer"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertEqual(state.parentCompatibilityAffectedRoleIDs, ["explorer", "worker"])
+        XCTAssertEqual(state.parentCompatibilityAffectedCount, 2)
+        XCTAssertTrue(state.parentCompatibilityBanner?.contains("OpenAI") == true)
+        XCTAssertTrue(state.parentCompatibilityBanner?.contains("Alpha") == true)
+        XCTAssertTrue(state.parentCompatibilityBanner?.contains("2 roles") == true)
+        XCTAssertTrue(state.roleCompatibilityHelp(for: "worker")?.contains("OpenAI") == true)
+        XCTAssertLessThan(state.roleCompatibilityHelp(for: "worker")?.count ?? .max, 180)
+    }
+
+    func testNativeCrossProviderCopyAppearsOnceWithoutRepeatingInIssueBanner() {
+        let copy = SubagentPolicyPresentationState.nativeCrossProviderCompatibilityCopy
+        XCTAssertEqual(
+            SubagentPolicyPresentationState.parentProviderCompatibilityCopy.components(separatedBy: copy).count - 1,
+            1
+        )
+
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+            ]
+        ))
+        state.load(
+            catalog: [descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertFalse(state.parentCompatibilityBanner?.contains(copy) == true)
+    }
+
+    func testUseForAllRolesIsDisabledOnlyForKnownParentProviderMismatch() {
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-5.6-luna", SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: "gpt-5.6-luna", reasoningEffort: .max),
+            ]
+        ))
+        state.load(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertTrue(state.canUseModelForAllRoles(modelID: "gpt-5.6-luna"))
+        XCTAssertFalse(state.canUseModelForAllRoles(modelID: SubagentPolicyValidator.alphaModelID))
+        XCTAssertTrue(state.useAllRolesHelp(for: SubagentPolicyValidator.alphaModelID).contains("OpenAI"))
+        XCTAssertTrue(state.useAllRolesHelp(for: SubagentPolicyValidator.alphaModelID).contains("Alpha"))
+    }
+
+    func testRestoreCompatibleDefaultsPreservesOpenAIRoleSpecificRoster() {
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-5.6-luna", "gpt-5.6-sol", SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "default", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "sol_adversarial", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "sol_escalation", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+            ]
+        ))
+        state.load(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: "gpt-5.6-sol", efforts: [.high, .max]), descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["default", "worker", "sol_adversarial", "sol_escalation"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertTrue(state.restoreCompatibleDefaults())
+        XCTAssertEqual(state.assignment(for: "default"), SubagentRoleAssignment(roleID: "default", modelID: "gpt-5.6-luna", reasoningEffort: .max))
+        XCTAssertEqual(state.assignment(for: "worker"), SubagentRoleAssignment(roleID: "worker", modelID: "gpt-5.6-luna", reasoningEffort: .max))
+        XCTAssertEqual(state.assignment(for: "sol_adversarial"), SubagentRoleAssignment(roleID: "sol_adversarial", modelID: "gpt-5.6-sol", reasoningEffort: .high))
+        XCTAssertEqual(state.assignment(for: "sol_escalation"), SubagentRoleAssignment(roleID: "sol_escalation", modelID: "gpt-5.6-sol", reasoningEffort: .high))
+    }
+
+    func testRestoreCompatibleDefaultsRecoversOpenAIFromAlphaOnlyEligibility() {
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "default", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "sol_adversarial", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "sol_escalation", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max),
+            ],
+            alphaUltraEnabled: true
+        ))
+        state.load(
+            catalog: [
+                descriptor(id: "gpt-5.6-luna"),
+                descriptor(id: "gpt-5.6-sol", efforts: [.high, .max]),
+                descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra]),
+            ],
+            installedRoleIDs: ["default", "worker", "sol_adversarial", "sol_escalation"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertTrue(state.canRestoreCompatibleDefaults)
+        XCTAssertTrue(state.restoreCompatibleDefaults())
+        XCTAssertEqual(state.draft.eligibleModelIDs, ["gpt-5.6-luna", "gpt-5.6-sol", SubagentPolicyValidator.alphaModelID])
+        XCTAssertEqual(state.assignment(for: "default"), SubagentRoleAssignment(roleID: "default", modelID: "gpt-5.6-luna", reasoningEffort: .max))
+        XCTAssertEqual(state.assignment(for: "worker"), SubagentRoleAssignment(roleID: "worker", modelID: "gpt-5.6-luna", reasoningEffort: .max))
+        XCTAssertEqual(state.assignment(for: "sol_adversarial"), SubagentRoleAssignment(roleID: "sol_adversarial", modelID: "gpt-5.6-sol", reasoningEffort: .high))
+        XCTAssertEqual(state.assignment(for: "sol_escalation"), SubagentRoleAssignment(roleID: "sol_escalation", modelID: "gpt-5.6-sol", reasoningEffort: .high))
+        XCTAssertEqual(state.parentProviderFamily, .openAI)
+        XCTAssertFalse(state.draft.alphaUltraEnabled)
+        XCTAssertTrue(state.canApply)
+    }
+
+    func testRestoreCompatibleDefaultsUsesAlphaMaxForBridgedParentWithoutEnablingUltra() {
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-5.6-luna", SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "default", modelID: "gpt-5.6-luna", reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "worker", modelID: "gpt-5.6-luna", reasoningEffort: .max),
+            ],
+            alphaUltraEnabled: true
+        ))
+        state.load(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["default", "worker"],
+            parentProviderFamily: .bridged
+        )
+
+        XCTAssertTrue(state.restoreCompatibleDefaults())
+        XCTAssertTrue(state.draft.roleAssignments.allSatisfy { $0.modelID == SubagentPolicyValidator.alphaModelID && $0.reasoningEffort == .max })
+        XCTAssertTrue(state.draft.alphaUltraEnabled)
+    }
+
+    func testRestoreCompatibleDefaultsUsesDeterministicSameFamilyFallbackWhenCanonicalModelsAreMissing() {
+        var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-fallback-a", "gpt-fallback-b"],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: "gpt-fallback-b", reasoningEffort: .max),
+                SubagentRoleAssignment(roleID: "sol_adversarial", modelID: "gpt-fallback-b", reasoningEffort: .max),
+            ]
+        ))
+        state.load(
+            catalog: [
+                descriptor(id: "gpt-fallback-b", efforts: [.max]),
+                descriptor(id: "gpt-fallback-a", efforts: [.high]),
+            ],
+            installedRoleIDs: ["worker", "sol_adversarial"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertTrue(state.restoreCompatibleDefaults())
+        XCTAssertEqual(state.assignment(for: "worker")?.modelID, "gpt-fallback-a")
+        XCTAssertEqual(state.assignment(for: "worker")?.reasoningEffort, .high)
+        XCTAssertEqual(state.assignment(for: "sol_adversarial")?.modelID, "gpt-fallback-a")
+        XCTAssertEqual(state.assignment(for: "sol_adversarial")?.reasoningEffort, .high)
+    }
+
+    func testUnknownParentFamilyIsBlockedAtApplyAndSectionCopyExplainsWhy() {
+        var state = validState()
+        state.load(
+            catalog: [descriptor(id: "gpt-5.6-luna")],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .unknown
+        )
+
+        XCTAssertFalse(state.canApply)
+        XCTAssertTrue(state.validation.issues.contains { $0.code == .unknownParentProvider })
+        XCTAssertTrue(state.statusText.localizedCaseInsensitiveContains("attention") || state.statusText.localizedCaseInsensitiveContains("blocked"))
+    }
+
+    func testAlphaUltraCopyStatesAlphaParentScopeProviderMaxAndNoGPTDelegation() {
+        let copy = SubagentPolicyPresentationState.alphaUltraExplanation
+
+        XCTAssertTrue(copy.localizedCaseInsensitiveContains("alpha-parent"))
+        XCTAssertTrue(copy.localizedCaseInsensitiveContains("max"))
+        XCTAssertTrue(copy.localizedCaseInsensitiveContains("does not enable gpt"))
+        XCTAssertTrue(copy.localizedCaseInsensitiveContains("delegation"))
+    }
+
+    func testProviderProfileLabelAndInteractiveBoundaryFollowParentFamily() {
+        var state = SubagentPolicyPresentationState()
+        state.load(
+            catalog: [descriptor(id: "gpt-5.6-luna")],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertEqual(state.providerProfileLabel, "Editing OpenAI parent profile")
+        XCTAssertTrue(SubagentPolicyPresentationState.interactiveSessionBoundary.contains("new Codex session"))
+
+        state.load(
+            catalog: [descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
+        )
+        XCTAssertEqual(state.providerProfileLabel, "Editing Alpha parent profile")
+    }
+
+    func testRefreshPreservesOpenAISavedDraftWhenInstalledRolesAreAlpha() {
+        let saved = SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-saved"],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: "gpt-saved", reasoningEffort: .max)
+            ]
+        )
+        var state = SubagentPolicyPresentationState(draft: saved)
+
+        state.load(
+            catalog: [descriptor(id: "gpt-saved"), descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI,
+            actualAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max)
+            ]
+        )
+
+        XCTAssertEqual(state.draft, saved)
+        XCTAssertEqual(state.providerProfileFamily, .openAI)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("different provider") == true)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("apply") == true)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("new codex session") == true)
+    }
+
+    func testRefreshPreservesAlphaSavedDraftWhenInstalledRolesAreOpenAI() {
+        let saved = SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .ultra)
+            ],
+            alphaUltraEnabled: true
+        )
+        var state = SubagentPolicyPresentationState(draft: saved)
+
+        state.load(
+            catalog: [descriptor(id: "gpt-saved"), descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra])],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged,
+            actualAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: "gpt-saved", reasoningEffort: .max)
+            ]
+        )
+
+        XCTAssertEqual(state.draft, saved)
+        XCTAssertEqual(state.providerProfileFamily, .bridged)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("different provider") == true)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("apply") == true)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("new codex session") == true)
+    }
+
+    func testAlphaUltraIsEditableOnlyForBridgedProfileAndOpenAIDraftNormalizesFalse() {
+        var openAI = SubagentPolicyPresentationState(draft: SubagentModelPolicy(alphaUltraEnabled: true))
+        openAI.load(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra])],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertFalse(openAI.isAlphaUltraEditable)
+        XCTAssertFalse(openAI.draft.alphaUltraEnabled)
+        openAI.setAlphaUltraEnabled(true)
+        XCTAssertFalse(openAI.draft.alphaUltraEnabled)
+
+        var bridged = SubagentPolicyPresentationState(draft: .alphaDefault)
+        bridged.load(
+            catalog: [descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra])],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
+        )
+
+        XCTAssertTrue(bridged.isAlphaUltraEditable)
+        bridged.setAlphaUltraEnabled(true)
+        XCTAssertTrue(bridged.draft.alphaUltraEnabled)
+    }
+
+    func testFreshParentFamilyChangeSkipsCrossFamilyPersistence() {
+        let decision = SubagentPolicyPresentationState.persistenceDecision(
+            originalFamily: .openAI,
+            freshFamily: .bridged
+        )
+
+        XCTAssertFalse(decision.shouldPersist)
+        XCTAssertTrue(decision.warning?.localizedCaseInsensitiveContains("changed") == true)
+        XCTAssertTrue(decision.warning?.localizedCaseInsensitiveContains("refresh") == true)
+        XCTAssertTrue(decision.warning?.localizedCaseInsensitiveContains("new codex session") == true)
+
+        let stable = SubagentPolicyPresentationState.persistenceDecision(
+            originalFamily: .openAI,
+            freshFamily: .openAI
+        )
+        XCTAssertTrue(stable.shouldPersist)
+        XCTAssertNil(stable.warning)
+    }
+
+    func testApplySuccessSwitchesToFreshSavedProfileAfterFamilyRace() {
+        var state = validState()
+        XCTAssertTrue(state.beginApplying())
+        let freshSaved = SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .ultra)
+            ],
+            alphaUltraEnabled: true
+        )
+
+        state.applySucceeded(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra])],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged,
+            actualAssignments: nil,
+            verificationWarning: "The configured parent provider changed.",
+            persistedDraft: freshSaved,
+            persistedProfileFamily: .bridged
+        )
+
+        XCTAssertEqual(state.draft, freshSaved)
+        XCTAssertEqual(state.providerProfileFamily, .bridged)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("changed") == true)
+        XCTAssertTrue(state.restartGuidance?.localizedCaseInsensitiveContains("new codex session") == true)
+    }
+
+    func testApplySuccessPreservesOpenAISavedDraftWhenReadbackIsAlpha() {
+        var state = validState()
+        let saved = state.draft
+        XCTAssertTrue(state.beginApplying())
+
+        state.applySucceeded(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID)],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI,
+            actualAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .max)
+            ]
+        )
+
+        XCTAssertEqual(state.draft, saved)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("different provider") == true)
+        XCTAssertEqual(state.providerProfileFamily, .openAI)
+    }
+
+    func testApplySuccessPreservesAlphaSavedDraftWhenReadbackIsOpenAI() {
+        let saved = SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .ultra)
+            ],
+            alphaUltraEnabled: true
+        )
+        var state = SubagentPolicyPresentationState(draft: saved)
+        state.load(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra])],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
+        )
+        XCTAssertTrue(state.beginApplying())
+
+        state.applySucceeded(
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: SubagentPolicyValidator.alphaModelID, efforts: [.max, .ultra])],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged,
+            actualAssignments: [
+                SubagentRoleAssignment(roleID: "worker", modelID: "gpt-5.6-luna", reasoningEffort: .max)
+            ]
+        )
+
+        XCTAssertEqual(state.draft, saved)
+        XCTAssertTrue(state.message?.localizedCaseInsensitiveContains("different provider") == true)
+        XCTAssertEqual(state.providerProfileFamily, .bridged)
+    }
+
+    func testProfileScopedBootstrapLoadsOnlySelectedFamilyDraft() {
+        let openAI = SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-custom"],
+            roleAssignments: [SubagentRoleAssignment(roleID: "worker", modelID: "gpt-custom", reasoningEffort: .medium)]
+        )
+        let bridged = SubagentModelPolicy(
+            eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+            roleAssignments: [SubagentRoleAssignment(roleID: "worker", modelID: SubagentPolicyValidator.alphaModelID, reasoningEffort: .ultra)],
+            alphaUltraEnabled: true
+        )
+        let profiles = SubagentPolicyProfiles(openAI: openAI, bridged: bridged)
+        var state = SubagentPolicyPresentationState()
+
+        state.bootstrapPersistedDraft(bridged, providerProfileFamily: .bridged)
+        XCTAssertEqual(state.draft, profiles.bridged)
+        XCTAssertEqual(state.providerProfileLabel, "Editing Alpha parent profile")
+
+        state.bootstrapPersistedDraft(openAI, providerProfileFamily: .openAI)
+        XCTAssertEqual(state.draft, profiles.openAI)
+        XCTAssertEqual(state.providerProfileLabel, "Editing OpenAI parent profile")
+    }
+
     func testRolePickerKeepsOnlyEligibleModelsPlusCurrentStaleChoiceAndRepairsEffort() {
         var state = SubagentPolicyPresentationState(draft: SubagentModelPolicy(
             eligibleModelIDs: ["gpt-5.6-luna"],
@@ -407,7 +805,7 @@ final class SubagentPolicyPresentationTests: XCTestCase {
         var state = validState()
         XCTAssertTrue(state.beginApplying())
         state.applySucceeded(
-            catalog: [descriptor(id: "gpt-5.6-luna")],
+            catalog: [descriptor(id: "gpt-5.6-luna"), descriptor(id: "gpt-5.6-sol", efforts: [.high])],
             installedRoleIDs: ["worker"],
             parentProviderFamily: .openAI,
             actualAssignments: [

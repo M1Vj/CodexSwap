@@ -37,6 +37,8 @@ struct SettingsActions {
     let setAutomationMaxConcurrent: (Int) -> Void
     let refreshSubagentPolicy: () -> Void
     let applySubagentPolicy: (SubagentModelPolicy) -> Void
+    let refreshAlphaDelegationMCP: () -> Void
+    let copyAlphaDelegationMCPSetup: () -> Void
     let installShim: () -> Void
     let uninstallShim: () -> Void
 }
@@ -47,10 +49,11 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var settings: Settings
     @Published private(set) var shimInstalled: Bool
     @Published private(set) var subagentPolicyPresentation: SubagentPolicyPresentationState
+    @Published private(set) var alphaDelegationMCPPresentation: AlphaDelegationMCPPresentationState
     @Published var message: String?
 
     let actions: SettingsActions
-    private var didBootstrapSubagentPolicy = false
+    private var bootstrappedSubagentPolicyFamily: CodexModelProviderFamily?
     private var hasUnsavedSubagentDraft = false
     private var subagentPolicyOperationGate = SubagentPolicyOperationGate()
 
@@ -60,6 +63,7 @@ final class SettingsViewModel: ObservableObject {
         self.actions = actions
         self.shimInstalled = ShimManager().isInstalled()
         self.subagentPolicyPresentation = SubagentPolicyPresentationState(draft: .default)
+        self.alphaDelegationMCPPresentation = AlphaDelegationMCPPresentationState()
     }
 
     var presentation: SettingsPresentation { SettingsPresentation(snapshot: snapshot) }
@@ -72,7 +76,9 @@ final class SettingsViewModel: ObservableObject {
         self.snapshot = snapshot
         self.settings = settings
         self.shimInstalled = ShimManager().isInstalled()
-        bootstrapSubagentPolicyIfNeeded(settings.subagentModelPolicy)
+        if let family = subagentPolicyPresentation.parentProviderFamily {
+            bootstrapSubagentPolicyIfNeeded(settings.subagentModelPolicy, family: family)
+        }
     }
 
     var subagentPolicyOperationGeneration: UInt {
@@ -83,13 +89,20 @@ final class SettingsViewModel: ObservableObject {
         subagentPolicyOperationGate.isCurrent(token)
     }
 
-    func bootstrapSubagentPolicyIfNeeded(_ persisted: SubagentModelPolicy) {
-        guard !didBootstrapSubagentPolicy else { return }
-        didBootstrapSubagentPolicy = true
+    func bootstrapSubagentPolicyIfNeeded(
+        _ profiles: SubagentPolicyProfiles,
+        family: CodexModelProviderFamily? = nil
+    ) {
+        guard let family,
+              family != .unknown,
+              let persisted = profiles.policy(for: family) else { return }
         guard !hasUnsavedSubagentDraft else { return }
+        guard bootstrappedSubagentPolicyFamily != family
+                || subagentPolicyPresentation.providerProfileFamily != family else { return }
         var next = subagentPolicyPresentation
-        next.bootstrapPersistedDraft(persisted)
+        next.bootstrapPersistedDraft(persisted, providerProfileFamily: family)
         subagentPolicyPresentation = next
+        bootstrappedSubagentPolicyFamily = family
     }
 
     func showMessage(_ value: String) {
@@ -213,7 +226,10 @@ final class SettingsViewModel: ObservableObject {
         installedRoleIDs: [String],
         parentProviderFamily: CodexModelProviderFamily? = nil,
         actualAssignments: [SubagentRoleAssignment]? = nil,
-        verificationWarning: String? = nil
+        verificationWarning: String? = nil,
+        persistedDraft: SubagentModelPolicy? = nil,
+        persistedProfileFamily: CodexModelProviderFamily? = nil,
+        preferencesPersisted: Bool = true
     ) {
         var next = subagentPolicyPresentation
         next.applySucceeded(
@@ -221,9 +237,12 @@ final class SettingsViewModel: ObservableObject {
             installedRoleIDs: installedRoleIDs,
             parentProviderFamily: parentProviderFamily,
             actualAssignments: actualAssignments,
-            verificationWarning: verificationWarning
+            verificationWarning: verificationWarning,
+            persistedDraft: persistedDraft,
+            persistedProfileFamily: persistedProfileFamily
         )
         subagentPolicyPresentation = next
+        hasUnsavedSubagentDraft = !preferencesPersisted
     }
 
     func subagentPolicyFailed(_ error: CodexSubagentPolicyManagerError) {
@@ -237,4 +256,26 @@ final class SettingsViewModel: ObservableObject {
         next.applyFailed(message: message)
         subagentPolicyPresentation = next
     }
+
+    // MARK: - Alpha review delegation
+
+    @discardableResult
+    func beginAlphaDelegationMCPRefresh() -> UInt? {
+        var next = alphaDelegationMCPPresentation
+        let generation = next.beginRefresh()
+        alphaDelegationMCPPresentation = next
+        return generation
+    }
+
+    @discardableResult
+    func applyAlphaDelegationMCPStatus(
+        _ status: AlphaDelegationMCPStatus,
+        generation: UInt
+    ) -> Bool {
+        var next = alphaDelegationMCPPresentation
+        guard next.apply(status: status, generation: generation) else { return false }
+        alphaDelegationMCPPresentation = next
+        return true
+    }
+
 }

@@ -23,10 +23,11 @@ if [[ -z "${BUILD_PRODUCTS_DIR:-}" ]]; then
   echo "› building release binaries…"
   swift build -c release --product CodexSwapApp
   swift build -c release --product swapd
+  swift build -c release --product codexswap-alpha-mcp
   BUILD_PRODUCTS_DIR="$ROOT/.build/release"
 fi
 
-for product in CodexSwapApp swapd; do
+for product in CodexSwapApp swapd codexswap-alpha-mcp; do
   [[ -x "$BUILD_PRODUCTS_DIR/$product" ]] || {
     echo "missing release product: $BUILD_PRODUCTS_DIR/$product" >&2
     exit 1
@@ -38,7 +39,8 @@ rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$BUILD_PRODUCTS_DIR/CodexSwapApp" "$CONTENTS/MacOS/$APP_NAME"
 cp "$BUILD_PRODUCTS_DIR/swapd" "$CONTENTS/MacOS/swapd"
-chmod 755 "$CONTENTS/MacOS/$APP_NAME" "$CONTENTS/MacOS/swapd"
+cp "$BUILD_PRODUCTS_DIR/codexswap-alpha-mcp" "$CONTENTS/MacOS/codexswap-alpha-mcp"
+chmod 755 "$CONTENTS/MacOS/$APP_NAME" "$CONTENTS/MacOS/swapd" "$CONTENTS/MacOS/codexswap-alpha-mcp"
 
 [[ -f "$ROOT/Assets/AppIcon.icns" ]] || {
   echo "missing app icon: $ROOT/Assets/AppIcon.icns" >&2
@@ -80,8 +82,12 @@ else
 fi
 
 codesign "${SIGN_ARGS[@]}" "$CONTENTS/MacOS/swapd"
+codesign "${SIGN_ARGS[@]}" "$CONTENTS/MacOS/codexswap-alpha-mcp"
 codesign "${SIGN_ARGS[@]}" "$CONTENTS/MacOS/$APP_NAME"
 codesign "${SIGN_ARGS[@]}" --identifier "$BUNDLE_ID" "$APP"
+for binary in "$APP_NAME" swapd codexswap-alpha-mcp; do
+  codesign --verify --strict "$CONTENTS/MacOS/$binary"
+done
 codesign --verify --deep --strict "$APP"
 
 echo "✓ built $APP"

@@ -34,6 +34,11 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
     public var sessionID: String?
     public var inputTokens: Int?
     public var cachedTokens: Int?
+    public var cachedTokensCompleteness: TokenFieldCompleteness
+    /// Cache-write input tokens recorded by Codex. Older run records did not
+    /// persist this field, so decoding keeps it unknown (`nil`).
+    public var cacheWriteTokens: Int?
+    public var cacheWriteTokensCompleteness: TokenFieldCompleteness
     public var outputTokens: Int?
     public var summary: String?
 
@@ -53,8 +58,11 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         sessionID: String? = nil,
         inputTokens: Int? = nil,
         cachedTokens: Int? = nil,
+        cacheWriteTokens: Int? = nil,
         outputTokens: Int? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        cachedTokensCompleteness: TokenFieldCompleteness? = nil,
+        cacheWriteTokensCompleteness: TokenFieldCompleteness? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -71,6 +79,11 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         self.sessionID = sessionID
         self.inputTokens = inputTokens
         self.cachedTokens = cachedTokens
+        self.cachedTokensCompleteness = cachedTokensCompleteness
+            ?? (cachedTokens == nil ? .unknown : .complete)
+        self.cacheWriteTokens = cacheWriteTokens
+        self.cacheWriteTokensCompleteness = cacheWriteTokensCompleteness
+            ?? (cacheWriteTokens == nil ? .unknown : .complete)
         self.outputTokens = outputTokens
         self.summary = summary
     }
@@ -92,8 +105,23 @@ public struct TaskRunRecord: Codable, Sendable, Equatable, Identifiable {
         sessionID = (try? c.decodeIfPresent(String.self, forKey: .sessionID)) ?? nil
         inputTokens = (try? c.decodeIfPresent(Int.self, forKey: .inputTokens)) ?? nil
         cachedTokens = (try? c.decodeIfPresent(Int.self, forKey: .cachedTokens)) ?? nil
+        // Historical records carried counts but no presence/completeness marker;
+        // retain those values while refusing to call them measured.
+        cachedTokensCompleteness = (try? c.decodeIfPresent(TokenFieldCompleteness.self, forKey: .cachedTokensCompleteness)) ?? .unknown
+        cacheWriteTokens = (try? c.decodeIfPresent(Int.self, forKey: .cacheWriteTokens)) ?? nil
+        cacheWriteTokensCompleteness = (try? c.decodeIfPresent(TokenFieldCompleteness.self, forKey: .cacheWriteTokensCompleteness)) ?? .unknown
         outputTokens = (try? c.decodeIfPresent(Int.self, forKey: .outputTokens)) ?? nil
         summary = (try? c.decodeIfPresent(String.self, forKey: .summary)) ?? nil
+    }
+
+    public var cachedInputCompleteness: TokenFieldCompleteness {
+        get { cachedTokensCompleteness }
+        set { cachedTokensCompleteness = newValue }
+    }
+
+    public var cacheWriteInputCompleteness: TokenFieldCompleteness {
+        get { cacheWriteTokensCompleteness }
+        set { cacheWriteTokensCompleteness = newValue }
     }
 }
 

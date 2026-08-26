@@ -211,10 +211,28 @@ public enum TaskRunSummaryExtractor {
 
     public static func tokenLine(for run: TaskRunRecord) -> String? {
         var pieces: [String] = []
+        let hasTokenTelemetry = run.inputTokens != nil
+            || run.cachedTokens != nil
+            || run.cacheWriteTokens != nil
+            || run.outputTokens != nil
+        guard hasTokenTelemetry else { return nil }
         if let input = run.inputTokens { pieces.append("in \(compact(input))") }
-        if let cached = run.cachedTokens { pieces.append("cached \(compact(cached))") }
+        pieces.append("cached \(cacheText(value: run.cachedTokens, completeness: run.cachedTokensCompleteness))")
+        pieces.append("write \(cacheText(value: run.cacheWriteTokens, completeness: run.cacheWriteTokensCompleteness))")
         if let output = run.outputTokens { pieces.append("out \(compact(output))") }
         return pieces.isEmpty ? nil : pieces.joined(separator: " · ")
+    }
+
+    private static func cacheText(value: Int?, completeness: TokenFieldCompleteness) -> String {
+        switch completeness {
+        case .unknown:
+            return "?"
+        case .partial:
+            return "partial \(compact(value ?? 0))"
+        case .complete:
+            guard let value else { return "?" }
+            return compact(value)
+        }
     }
 
     private static func compact(_ value: Int) -> String {

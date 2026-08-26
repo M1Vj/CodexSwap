@@ -4,12 +4,25 @@ public struct RunTelemetry: Sendable, Equatable {
     public var sessionID: String?
     public var inputTokens: Int?
     public var cachedTokens: Int?
+    public var cachedTokensCompleteness: TokenFieldCompleteness = .unknown
+    public var cacheWriteTokens: Int?
+    public var cacheWriteTokensCompleteness: TokenFieldCompleteness = .unknown
     public var outputTokens: Int?
     public var finalMessage: String?
     public var lastError: String?
 
+    public var cachedInputCompleteness: TokenFieldCompleteness {
+        get { cachedTokensCompleteness }
+        set { cachedTokensCompleteness = newValue }
+    }
+
+    public var cacheWriteInputCompleteness: TokenFieldCompleteness {
+        get { cacheWriteTokensCompleteness }
+        set { cacheWriteTokensCompleteness = newValue }
+    }
+
     public var isEmpty: Bool {
-        sessionID == nil && inputTokens == nil && cachedTokens == nil
+        sessionID == nil && inputTokens == nil && cachedTokens == nil && cacheWriteTokens == nil
             && outputTokens == nil && finalMessage == nil && lastError == nil
     }
 }
@@ -32,11 +45,18 @@ public enum CodexEventDecoder {
     private struct TokenTotals {
         var input: Int?
         var cached: Int?
+        var cacheWrite: Int?
         var output: Int?
+        var contributorCount = 0
+        var cachedCompleteness: TokenFieldCompleteness = .unknown
+        var cacheWriteCompleteness: TokenFieldCompleteness = .unknown
 
         func apply(to telemetry: inout RunTelemetry) {
             telemetry.inputTokens = input
             telemetry.cachedTokens = cached
+            telemetry.cachedTokensCompleteness = cachedCompleteness
+            telemetry.cacheWriteTokens = cacheWrite
+            telemetry.cacheWriteTokensCompleteness = cacheWriteCompleteness
             telemetry.outputTokens = output
         }
     }
@@ -54,9 +74,36 @@ public enum CodexEventDecoder {
             }
         case "turn.completed":
             if let usage = object["usage"] as? [String: Any] {
-                if let value = intValue(usage["input_tokens"]) { totals.input = (totals.input ?? 0) + value }
-                if let value = intValue(usage["cached_input_tokens"]) { totals.cached = (totals.cached ?? 0) + value }
-                if let value = intValue(usage["output_tokens"]) { totals.output = (totals.output ?? 0) + value }
+                let input = intValue(usage["input_tokens"])
+                if let value = input { totals.input = UsageSafety.saturatingAdd(totals.input ?? 0, value) }
+                let details = usage["input_tokens_details"] as? [String: Any] ?? [:]
+                let requestedCached = intValue(details["cached_tokens"])
+                    ?? intValue(usage["cached_input_tokens"])
+                    ?? intValue(usage["cache_read_tokens"])
+                let requestedCacheWrite = intValue(details["cache_write_tokens"])
+                    ?? intValue(usage["cache_write_input_tokens"])
+                    ?? intValue(usage["cache_write_tokens"])
+                    ?? intValue(usage["cache_creation_input_tokens"])
+                    ?? intValue(usage["cache_creation_tokens"])
+                if let input {
+                    let hadExistingContributor = totals.contributorCount > 0
+                    let cached = min(requestedCached ?? 0, input)
+                    let cacheWrite = min(requestedCacheWrite ?? 0, input - cached)
+                    if requestedCached != nil { totals.cached = UsageSafety.saturatingAdd(totals.cached ?? 0, cached) }
+                    if requestedCacheWrite != nil { totals.cacheWrite = UsageSafety.saturatingAdd(totals.cacheWrite ?? 0, cacheWrite) }
+                    totals.cachedCompleteness = UsageAnalytics.combineCompleteness(
+                        totals.cachedCompleteness,
+                        requestedCached == nil ? .unknown : .complete,
+                        hasExistingContributor: hadExistingContributor
+                    )
+                    totals.cacheWriteCompleteness = UsageAnalytics.combineCompleteness(
+                        totals.cacheWriteCompleteness,
+                        requestedCacheWrite == nil ? .unknown : .complete,
+                        hasExistingContributor: hadExistingContributor
+                    )
+                    totals.contributorCount = UsageSafety.saturatingIncrement(totals.contributorCount)
+                }
+                if let value = intValue(usage["output_tokens"]) { totals.output = UsageSafety.saturatingAdd(totals.output ?? 0, value) }
             }
         case "turn.failed":
             if let error = object["error"] as? [String: Any], let message = error["message"] as? String {
@@ -103,8 +150,6 @@ public enum CodexEventDecoder {
     }
 
     private static func intValue(_ value: Any?) -> Int? {
-        if let int = value as? Int { return int }
-        if let double = value as? Double { return Int(double) }
-        return nil
+        UsageSafety.nonNegativeInteger(value)
     }
 }

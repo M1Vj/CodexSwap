@@ -169,7 +169,7 @@ public actor AppEngine {
                 let settings = await settingsStore.get()
                 let sourceHome = CodexAuth.codexHome()
                 try CodexTaskPolicyMaterializer(sourceCodexHome: sourceHome).materialize(
-                    policy: settings.subagentModelPolicy,
+                    policyProfiles: settings.subagentModelPolicy,
                     targetCodexHome: codexHome,
                     proxyURL: proxyURL,
                     allowedAliases: allowedAliases,
@@ -1134,7 +1134,10 @@ public actor AppEngine {
                 model: sample.model,
                 inputTokens: sample.inputTokens,
                 cachedInputTokens: sample.cachedInputTokens,
-                outputTokens: sample.outputTokens
+                cacheWriteInputTokens: sample.cacheWriteInputTokens,
+                outputTokens: sample.outputTokens,
+                cachedInputPresence: sample.cachedInputPresence,
+                cacheWriteInputPresence: sample.cacheWriteInputPresence
             )
             await store.markServed(alias)
             needsLoginNotified.remove(alias)
@@ -1779,6 +1782,9 @@ public actor AppEngine {
         run.sessionID = telemetry.sessionID
         run.inputTokens = telemetry.inputTokens
         run.cachedTokens = telemetry.cachedTokens
+        run.cachedTokensCompleteness = telemetry.cachedTokensCompleteness
+        run.cacheWriteTokens = telemetry.cacheWriteTokens
+        run.cacheWriteTokensCompleteness = telemetry.cacheWriteTokensCompleteness
         run.outputTokens = telemetry.outputTokens
         var finalText: String?
         if run.logFileName.hasSuffix(".log") {

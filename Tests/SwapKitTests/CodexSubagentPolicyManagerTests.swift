@@ -124,7 +124,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try manager.apply(
             policy: policy(role: "worker", model: "gpt-5.6-luna", effort: .max),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let rewritten = try String(contentsOf: fixture.agents.appendingPathComponent("worker.toml"), encoding: .utf8)
@@ -157,7 +158,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", model: "gpt-5.6-luna", effort: .max),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let rewritten = try String(contentsOf: fixture.agents.appendingPathComponent("worker.toml"), encoding: .utf8)
         let modelOffset = try XCTUnwrap(rewritten.range(of: "model = \"gpt-5.6-luna\""))
@@ -195,7 +197,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
                     providerFamily: .openAI
                 )
             ],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let rewritten = try String(contentsOf: fixture.agents.appendingPathComponent("worker.toml"), encoding: .utf8)
@@ -224,7 +227,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let rewritten = try String(contentsOf: fixture.agents.appendingPathComponent("worker.toml"), encoding: .utf8)
@@ -247,7 +251,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: roleID),
             catalog: [gptDescriptor],
-            roleFiles: [binding]
+            roleFiles: [binding],
+            parentProviderFamily: .openAI
         )
 
         XCTAssertEqual(
@@ -280,7 +285,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try CodexSubagentPolicyManager(codexHome: aliasHome, catalogOverlayURL: aliasOverlay).apply(
             policy: policy(role: "luna_clerk"),
             catalog: [gptDescriptor],
-            roleFiles: [binding]
+            roleFiles: [binding],
+            parentProviderFamily: .openAI
         )
 
         XCTAssertTrue(try String(contentsOf: roleURL, encoding: .utf8).contains("gpt-5.6-luna"))
@@ -300,7 +306,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try manager.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -320,7 +327,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let rewritten = try Data(contentsOf: fixture.agents.appendingPathComponent("worker.toml"))
         let expected = "model = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\n[permissions.\"nested#key\"] # comment ]\nmodel = \"nested\"\n"
@@ -337,7 +345,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker", alphaUltra: false),
                 catalog: [gptDescriptor, alphaDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             ))
             XCTAssertTrue(recorder.targets.isEmpty)
             XCTAssertEqual(try Data(contentsOf: fixture.overlay), Data(overlay.utf8))
@@ -368,7 +377,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .writeFailed(.overlay) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected overlay atomic replacement failure, got \(error)")
@@ -388,7 +398,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         ))
         XCTAssertEqual(try Data(contentsOf: fixture.agents.appendingPathComponent("worker.toml")), Data(validRole.utf8))
         XCTAssertEqual(try Data(contentsOf: fixture.overlay), Data(alphaOverlay(efforts: ["max"]).utf8))
@@ -473,7 +484,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try manager.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                roleFiles: bindings
+                roleFiles: bindings,
+                parentProviderFamily: .openAI
             ), "Expected (testCase.name) to fail")
             XCTAssertTrue(recorder.targets.isEmpty, "(testCase.name) performed a write")
         }
@@ -495,7 +507,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            roleFiles: [binding]
+            roleFiles: [binding],
+            parentProviderFamily: .openAI
         ))
         XCTAssertTrue(recorder.targets.isEmpty)
 
@@ -506,7 +519,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            roleFiles: [CodexSubagentRoleFile(roleID: "worker", fileURL: binding.fileURL)]
+            roleFiles: [CodexSubagentRoleFile(roleID: "worker", fileURL: binding.fileURL)],
+            parentProviderFamily: .openAI
         ))
         XCTAssertTrue(recorder.targets.isEmpty)
     }
@@ -526,7 +540,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            roleFiles: [binding]
+            roleFiles: [binding],
+            parentProviderFamily: .openAI
         ))
         XCTAssertTrue(recorder.targets.isEmpty)
 
@@ -558,7 +573,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try specialManager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         ))
         XCTAssertTrue(specialRecorder.targets.isEmpty)
     }
@@ -571,7 +587,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         XCTAssertEqual(
@@ -592,7 +609,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             ))
             XCTAssertTrue(recorder.targets.isEmpty, "invalid token (value) performed a write")
         }
@@ -605,7 +623,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let rewritten = try String(contentsOf: fixture.agents.appendingPathComponent("worker.toml"), encoding: .utf8)
         XCTAssertTrue(rewritten.contains("[permissions] # ]\nmodel = \"nested\""))
@@ -620,7 +639,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let expected = "model = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\ncustom_basic = \"'''\"\ncustom_literal = '\"\"\"'\n"
@@ -643,7 +663,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -672,7 +693,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -703,7 +725,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -725,7 +748,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let expected = "custom.foo = \"nested\"\nmodel = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\n"
@@ -751,7 +775,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -779,7 +804,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -801,7 +827,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let expected = "\"custom\" = \"value\"\n\"custom\".foo = \"nested\"\nmodel = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\n[\"custom\"]\nmodel = \"nested\"\n"
@@ -826,7 +853,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role, got \(error)")
@@ -848,7 +876,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
 
         let expected = "custom # comment\n\"custom\" # quoted comment\nmodel = \"gpt-5.6-luna\"\nmodel_reasoning_effort = \"max\"\n"
@@ -869,7 +898,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected malformed role, got \(error)")
@@ -902,7 +932,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         ))
         XCTAssertEqual(try Data(contentsOf: fixture.agents.appendingPathComponent("worker.toml")), Data(validRole.utf8))
     }
@@ -914,7 +945,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try makeManager(missingMax) { recorder.record($0) }.apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .overlay(.missingNativeMax) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected missing native max, got \(error)")
@@ -928,7 +960,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", alphaUltra: false),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let object = try overlayObject(fixture)
         let levels = try XCTUnwrap((object["models"] as? [[String: Any]])?.first?["supported_reasoning_levels"] as? [[String: Any]])
@@ -945,7 +978,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try makeManager(fixture) { recorder.record($0) }.apply(
             policy: policy(role: "worker", alphaUltra: false),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .overlay(.invalidSyntheticMarker) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected invalid synthetic marker, got \(error)")
@@ -967,7 +1001,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             try? manager.apply(
                 policy: policy(role: "worker", effort: index == 0 ? .max : .high),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )
         }
         XCTAssertEqual(probe.maxActive, 1)
@@ -985,7 +1020,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .duplicateManagedKey(let roleID, let key) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Unexpected error: \(error)")
@@ -1019,7 +1055,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try manager.apply(
                 policy: policy(role: "worker"),
                 catalog: [gptDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .malformedRole("worker") = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed role for value \(value), got \(error)")
@@ -1037,7 +1074,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         XCTAssertEqual(
             try String(contentsOf: fixture.agents.appendingPathComponent("worker.toml")),
@@ -1054,7 +1092,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try manager.apply(
                 policy: policy(role: unsafe),
                 catalog: [gptDescriptor],
-                installedRoleIDs: [unsafe]
+                installedRoleIDs: [unsafe],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .unsafeRoleID(unsafe) = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected unsafe ID for '\(unsafe)', got \(error)")
@@ -1065,7 +1104,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "missing"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["missing"]
+            installedRoleIDs: ["missing"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .missingRole("missing") = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected missing role, got \(error)")
@@ -1081,7 +1121,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .symlinkRole("worker") = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected symlink role, got \(error)")
@@ -1100,7 +1141,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try makeManager(fixture).apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .symlinkAgentsDirectory = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected symlinked agents directory, got \(error)")
@@ -1120,7 +1162,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try makeManager(fixture).apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .overlay(.symlink) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected symlinked overlay, got \(error)")
@@ -1147,7 +1190,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .overlay(.symlink) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected symlinked overlay parent, got \(error)")
@@ -1172,7 +1216,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .symlinkAgentsDirectory = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected swapped agents directory rejection, got (error)")
@@ -1206,7 +1251,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .overlay(.symlink) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected swapped overlay parent rejection, got (error)")
@@ -1243,7 +1289,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: SubagentModelPolicy(eligibleModelIDs: [], roleAssignments: []),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .validationFailed(let issues) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Unexpected error: \(error)")
@@ -1273,7 +1320,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", model: "gpt-5.6-luna", effort: .max, alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixture.overlay)) as? [String: Any])
         let unknownKeep = ((object["unknown_root"] as? [String: Any])?["keep"] as? [Any]) ?? []
@@ -1327,7 +1375,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", model: "future-bridge", effort: .high),
             catalog: [future],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
         )
 
         let object = try overlayObject(fixture)
@@ -1365,7 +1414,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", model: "future-bridge", effort: .high),
             catalog: [future],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
         )
 
         let models = try XCTUnwrap(try overlayObject(fixture)["models"] as? [[String: Any]])
@@ -1395,7 +1445,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", model: SubagentPolicyValidator.alphaModelID, effort: .ultra, alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
         )
 
         let models = try XCTUnwrap(try overlayObject(fixture)["models"] as? [[String: Any]])
@@ -1424,7 +1475,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try makeManager(emptyFixture) { emptyRecorder.record($0) }.apply(
             policy: policy(role: "worker", model: "future-bridge", effort: .high),
             catalog: [future],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .bridged
         )) { error in
             guard case .overlay(.missingAlphaModel) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected missing template failure, got \(error)")
@@ -1450,13 +1502,54 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertTrue(mismatchRecorder.targets.isEmpty)
     }
 
+    func testUnknownParentFamilyBlocksApplyBeforeAnyWrite() throws {
+        let fixture = try Fixture(roleFiles: ["worker": validRole], overlay: alphaOverlay(efforts: ["max"]))
+        defer { fixture.cleanup() }
+        let recorder = WriteRecorder()
+        let manager = makeManager(fixture) { recorder.record($0) }
+        let roleURL = fixture.agents.appendingPathComponent("worker.toml")
+        let beforeRole = try Data(contentsOf: roleURL)
+        let beforeOverlay = try Data(contentsOf: fixture.overlay)
+
+        XCTAssertThrowsError(try manager.apply(
+            policy: policy(role: "worker"),
+            catalog: [gptDescriptor],
+            installedRoleIDs: ["worker"]
+        )) { error in
+            guard case .validationFailed(let issues) = error as? CodexSubagentPolicyManagerError else {
+                return XCTFail("Expected unknown-parent validation failure, got \(error)")
+            }
+            XCTAssertEqual(issues.map(\.code), [.unknownParentProvider])
+        }
+
+        XCTAssertTrue(recorder.targets.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: roleURL), beforeRole)
+        XCTAssertEqual(try Data(contentsOf: fixture.overlay), beforeOverlay)
+
+        XCTAssertThrowsError(try manager.apply(
+            policy: policy(role: "worker"),
+            catalog: [gptDescriptor],
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .unknown
+        )) { error in
+            guard case .validationFailed(let issues) = error as? CodexSubagentPolicyManagerError else {
+                return XCTFail("Expected explicit unknown-parent validation failure, got \(error)")
+            }
+            XCTAssertEqual(issues.map(\.code), [.unknownParentProvider])
+        }
+        XCTAssertTrue(recorder.targets.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: roleURL), beforeRole)
+        XCTAssertEqual(try Data(contentsOf: fixture.overlay), beforeOverlay)
+    }
+
     func testNativeAndSyntheticUltraEnableDisableAreSafeAndIdempotent() throws {
         let nativeFixture = try Fixture(roleFiles: ["worker": validRole], overlay: alphaOverlay(efforts: ["max", "ultra"]))
         defer { nativeFixture.cleanup() }
         try makeManager(nativeFixture).apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let native = try overlayObject(nativeFixture)
         let nativeAlpha = try XCTUnwrap((native["models"] as? [[String: Any]])?.first)
@@ -1468,15 +1561,16 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         let recorder = WriteRecorder()
         let syntheticManager = makeManager(syntheticFixture) { recorder.record($0) }
         let syntheticPolicy = policy(role: "worker", alphaUltra: true)
-        try syntheticManager.apply(policy: syntheticPolicy, catalog: [gptDescriptor, alphaDescriptor], installedRoleIDs: ["worker"])
+        try syntheticManager.apply(policy: syntheticPolicy, catalog: [gptDescriptor, alphaDescriptor], installedRoleIDs: ["worker"], parentProviderFamily: .openAI)
         let firstWriteCount = recorder.targets.count
-        try syntheticManager.apply(policy: syntheticPolicy, catalog: [gptDescriptor, alphaDescriptor], installedRoleIDs: ["worker"])
+        try syntheticManager.apply(policy: syntheticPolicy, catalog: [gptDescriptor, alphaDescriptor], installedRoleIDs: ["worker"], parentProviderFamily: .openAI)
         XCTAssertEqual(recorder.targets.count, firstWriteCount, "An already synthetic overlay must be idempotent")
 
         try makeManager(syntheticFixture).apply(
             policy: policy(role: "worker", alphaUltra: false),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         let disabled = try overlayObject(syntheticFixture)
         let disabledAlpha = try XCTUnwrap((disabled["models"] as? [[String: Any]])?.first)
@@ -1501,7 +1595,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             try manager.apply(
                 policy: policy(role: "worker", alphaUltra: alphaUltraEnabled),
                 catalog: [gptDescriptor, alphaDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )
             XCTAssertEqual(try Data(contentsOf: fixture.overlay), originalOverlay)
             XCTAssertTrue(recorder.targets.isEmpty)
@@ -1523,7 +1618,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try manager.apply(
                 policy: policy(role: "worker", alphaUltra: true),
                 catalog: [gptDescriptor, alphaDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .overlay(let actual) = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Unexpected error: \(error)")
@@ -1551,7 +1647,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             XCTAssertThrowsError(try manager.apply(
                 policy: policy(role: "worker", alphaUltra: true),
                 catalog: [gptDescriptor, alphaDescriptor],
-                installedRoleIDs: ["worker"]
+                installedRoleIDs: ["worker"],
+                parentProviderFamily: .openAI
             )) { error in
                 guard case .overlay(.malformed) = error as? CodexSubagentPolicyManagerError else {
                     return XCTFail("Expected malformed overlay for \(overlay), got \(error)")
@@ -1570,7 +1667,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", alphaUltra: false),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         XCTAssertEqual(try Data(contentsOf: fixture.overlay), Data(originalOverlay.utf8))
     }
@@ -1590,7 +1688,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         XCTAssertThrowsError(try manager.apply(
             policy: policy(role: "worker"),
             catalog: [gptDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )) { error in
             guard case .externalEdit(.role("worker")) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected external edit, got \(error)")
@@ -1610,7 +1709,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
         try makeManager(fixture).apply(
             policy: policy(role: "worker", alphaUltra: true),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["worker"]
+            installedRoleIDs: ["worker"],
+            parentProviderFamily: .openAI
         )
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: roleURL.path)[.posixPermissions] as? NSNumber)?.intValue, 0o640)
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: fixture.overlay.path)[.posixPermissions] as? NSNumber)?.intValue, 0o644)
@@ -1634,7 +1734,7 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             ]
         )
 
-        XCTAssertThrowsError(try manager.apply(policy: policy, catalog: [gptDescriptor], installedRoleIDs: ["b", "a"])) { error in
+        XCTAssertThrowsError(try manager.apply(policy: policy, catalog: [gptDescriptor], installedRoleIDs: ["b", "a"], parentProviderFamily: .openAI)) { error in
             guard case .writeFailed(.role("b")) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected typed write failure, got \(error)")
             }
@@ -1666,7 +1766,7 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
             ]
         )
 
-        XCTAssertThrowsError(try manager.apply(policy: policy, catalog: [gptDescriptor], installedRoleIDs: ["a", "b"])) { error in
+        XCTAssertThrowsError(try manager.apply(policy: policy, catalog: [gptDescriptor], installedRoleIDs: ["a", "b"], parentProviderFamily: .openAI)) { error in
             guard case .transactionRecoveryFailed(.role(let target)) = error as? CodexSubagentPolicyManagerError else {
                 return XCTFail("Expected recovery error naming only role kind, got \(error)")
             }
@@ -1691,7 +1791,8 @@ final class CodexSubagentPolicyManagerTests: XCTestCase {
                 alphaUltraEnabled: true
             ),
             catalog: [gptDescriptor, alphaDescriptor],
-            installedRoleIDs: ["z", "a"]
+            installedRoleIDs: ["z", "a"],
+            parentProviderFamily: .openAI
         )
         XCTAssertEqual(recorder.targets, [.role("a"), .role("z"), .overlay])
     }

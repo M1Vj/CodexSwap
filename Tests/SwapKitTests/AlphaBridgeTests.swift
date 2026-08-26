@@ -3,6 +3,7 @@ import Foundation
 import NIOCore
 import NIOPosix
 import NIOHTTP1
+import AsyncHTTPClient
 @testable import SwapKit
 
 final class AlphaBridgeTests: XCTestCase {
@@ -22,6 +23,174 @@ final class AlphaBridgeTests: XCTestCase {
         let other = #"{"model":"gpt-5.6-sol","input":"hi"}"#
         XCTAssertNil(AlphaBridge.routedModel(in: Data(other.utf8), catalog: catalog))
         XCTAssertNil(AlphaBridge.routedModel(in: Data("not json".utf8), catalog: catalog))
+    }
+
+    func testBridgedBaseURLTransportValidationRejectsRemoteHTTP() {
+        XCTAssertNil(
+            BridgedModel.validatedBaseURL("http://provider.example/v1"),
+            "remote bridged endpoints must use HTTPS"
+        )
+    }
+
+    func testBridgedBaseURLTransportValidationAllowsLoopbackHTTP() {
+        XCTAssertNotNil(BridgedModel.validatedBaseURL("http://localhost:1234/v1"))
+        XCTAssertNotNil(BridgedModel.validatedBaseURL("http://127.0.0.1:1234/v1"))
+        XCTAssertNotNil(BridgedModel.validatedBaseURL("http://[::1]:1234/v1"))
+    }
+
+    func testBridgedBaseURLTransportValidationAllowsHTTPS() {
+        XCTAssertEqual(
+            BridgedModel.validatedBaseURL("https://opencode.ai/zen/v1")?.absoluteString,
+            "https://opencode.ai/zen/v1"
+        )
+    }
+
+    func testBridgeDiagnosticsNeverIncludeRawToolsOrUpstreamErrorBody() async throws {
+        let upstream = MockUpstream(
+            scripts: [
+                .init(
+                    .badRequest,
+                    "application/json",
+                    "{\"error\":{\"message\":\"UPSTREAM_SENTINEL_BODY\"}}"
+                )
+            ]
+        )
+        let upstreamURL = try await upstream.start()
+        defer { Task { await upstream.stop() } }
+
+        let (writer, output) = NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>.makeTestingWriter()
+        let logs = LogRecorder()
+        let body = Data(
+            #"{"model":"x-preview-f-free","stream":false,"tools":[{"type":"custom","name":"RAW_TOOL_SENTINEL","description":"RAW_DESCRIPTION_SENTINEL","format":{"type":"text"}}],"input":"RAW_INPUT_SENTINEL"}"#.utf8
+        )
+        let entry = BridgedModel(modelID: "x-preview-f-free", baseURL: upstreamURL.absoluteString)
+        let client = HTTPClient.shared
+
+        try await AlphaBridge.handle(
+            entry: entry,
+            body: body,
+            httpClient: client,
+            outbound: writer,
+            sink: NullEventSink(),
+            log: logs.record
+        )
+
+        let joined = logs.values().joined(separator: "\n")
+        XCTAssertFalse(joined.contains("RAW_TOOL_SENTINEL"), joined)
+        XCTAssertFalse(joined.contains("RAW_DESCRIPTION_SENTINEL"), joined)
+        XCTAssertFalse(joined.contains("RAW_INPUT_SENTINEL"), joined)
+        XCTAssertFalse(joined.contains("UPSTREAM_SENTINEL_BODY"), joined)
+        XCTAssertFalse(joined.localizedCaseInsensitiveContains("error body"), joined)
+        _ = output
+    }
+
+    func testChatUsageCarriesNestedCacheReadAndWriteBuckets() {
+        let sample = AlphaBridge.usageSample(model: "x-preview-f-free", fromChatUsage: [
+            "prompt_tokens": 100,
+            "completion_tokens": 6,
+            "prompt_tokens_details": [
+                "cached_tokens": 80,
+                "cache_write_tokens": 50,
+            ],
+        ])
+
+        XCTAssertEqual(sample.inputTokens, 100)
+        XCTAssertEqual(sample.cachedInputTokens, 80)
+        XCTAssertEqual(sample.cacheWriteInputTokens, 20)
+        XCTAssertEqual(sample.outputTokens, 6)
+
+        let responseUsage = AlphaBridge.usageDict(fromChatUsage: [
+            "prompt_tokens": 100,
+            "completion_tokens": 6,
+            "prompt_tokens_details": ["cached_tokens": 80, "cache_write_tokens": 50],
+        ])
+        let details = responseUsage["input_tokens_details"] as? [String: Any]
+        XCTAssertEqual(details?["cached_tokens"] as? Int, 80)
+        XCTAssertEqual(details?["cache_write_tokens"] as? Int, 20)
+    }
+
+    func testChatUsageCarriesOfficialTopLevelCacheWriteInputTokensAlias() {
+        let sample = AlphaBridge.usageSample(model: "x-preview-f-free", fromChatUsage: [
+            "prompt_tokens": 100,
+            "completion_tokens": 6,
+            "prompt_tokens_details": ["cached_tokens": 80],
+            "cache_write_input_tokens": 50,
+        ])
+
+        XCTAssertEqual(sample.cachedInputTokens, 80)
+        XCTAssertEqual(sample.cacheWriteInputTokens, 20)
+    }
+
+    func testChatUsageOmitsAbsentCacheBucketsInsteadOfInjectingZero() {
+        let responseUsage = AlphaBridge.usageDict(fromChatUsage: [
+            "prompt_tokens": 100,
+            "completion_tokens": 6,
+        ])
+
+        let details = responseUsage["input_tokens_details"] as? [String: Any]
+        XCTAssertNil(details?["cached_tokens"])
+        XCTAssertNil(details?["cache_write_tokens"])
+        XCTAssertNil(responseUsage["cache_write_tokens"])
+
+        let sample = AlphaBridge.usageSample(model: "x-preview-f-free", fromChatUsage: [
+            "prompt_tokens": 100,
+            "completion_tokens": 6,
+        ])
+        XCTAssertEqual(sample.cachedInputPresence, .absent)
+        XCTAssertEqual(sample.cacheWriteInputPresence, .absent)
+    }
+
+    func testChatUsageRejectsNegativeAndFractionalTokenCounts() {
+        let sample = AlphaBridge.usageSample(model: "x-preview-f-free", fromChatUsage: [
+            "prompt_tokens": 10.5,
+            "completion_tokens": -4,
+            "prompt_tokens_details": [
+                "cached_tokens": 3.25,
+                "cache_write_tokens": -2,
+            ],
+        ])
+
+        XCTAssertEqual(sample.inputTokens, 0)
+        XCTAssertEqual(sample.cachedInputTokens, 0)
+        XCTAssertEqual(sample.cacheWriteInputTokens, 0)
+        XCTAssertEqual(sample.outputTokens, 0)
+
+        let responseUsage = AlphaBridge.usageDict(fromChatUsage: [
+            "prompt_tokens": 10,
+            "completion_tokens": -4,
+            "prompt_tokens_details": [
+                "cached_tokens": 2,
+                "cache_write_tokens": 1,
+            ],
+        ])
+        XCTAssertEqual(responseUsage["input_tokens"] as? Int, 10)
+        XCTAssertEqual(responseUsage["output_tokens"] as? Int, 0)
+    }
+
+    func testChatUsageIgnoresOutOfRangeTokenNumbers() {
+        let outOfRange = Double(Int.max)
+        let sample = AlphaBridge.usageSample(model: "x-preview-f-free", fromChatUsage: [
+            "prompt_tokens": outOfRange,
+            "completion_tokens": outOfRange,
+            "prompt_tokens_details": [
+                "cached_tokens": outOfRange,
+                "cache_write_tokens": outOfRange,
+            ],
+        ])
+
+        XCTAssertEqual(sample.inputTokens, 0)
+        XCTAssertEqual(sample.cachedInputTokens, 0)
+        XCTAssertEqual(sample.cacheWriteInputTokens, 0)
+        XCTAssertEqual(sample.outputTokens, 0)
+    }
+
+    func testChatUsageSaturatesTotalTokenFallback() {
+        let responseUsage = AlphaBridge.usageDict(fromChatUsage: [
+            "prompt_tokens": Int.max,
+            "completion_tokens": 1,
+        ])
+
+        XCTAssertEqual(responseUsage["total_tokens"] as? Int, Int.max)
     }
 
     func testDuplicateEnabledBridgedModelResolutionIsAmbiguous() {
@@ -769,6 +938,23 @@ private final class MockUpstream: @unchecked Sendable {
 
     func requestCount() async -> Int {
         counter.load()
+    }
+}
+
+private final class LogRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+
+    func record(_ message: String) {
+        lock.lock()
+        entries.append(message)
+        lock.unlock()
+    }
+
+    func values() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
     }
 }
 

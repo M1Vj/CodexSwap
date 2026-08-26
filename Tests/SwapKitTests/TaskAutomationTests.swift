@@ -424,6 +424,25 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertTrue(prompt.contains("must not end"))
     }
 
+    func testTaskBoardRunPresentationIncludesMeasuredCacheWrites() {
+        var task = makeTask()
+        task.runs = [TaskRunRecord(
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_001),
+            outcome: "completed",
+            logFileName: "run-1.log",
+            inputTokens: 100,
+            cachedTokens: 40,
+            cacheWriteTokens: 20,
+            outputTokens: 6
+        )]
+
+        XCTAssertEqual(
+            TaskRunTimelineRow.rows(for: task).first?.telemetrySummary,
+            "in 100 · cached 40 · write 20 · out 6"
+        )
+    }
+
     func testAutomationTaskMinimalJSONDecodesWithDefaults() throws {
         let id = UUID()
         let json = """
@@ -1173,6 +1192,19 @@ final class TaskAutomationTests: XCTestCase {
         return "{\"models\":[{\"slug\":\"x-preview-f-free\",\"display_name\":\"Alpha\",\"supported_reasoning_levels\":[\(levels)],\"fixture_unknown\":\"keep\"}]}"
     }
 
+    private func providerLinkedOverlay(duplicateGPT: Bool = false) -> String {
+        let duplicateModel = duplicateGPT
+            ? ", {\"slug\":\"gpt-5.6-sol\",\"display_name\":\"Duplicate GPT\",\"supported_reasoning_levels\":[{\"effort\":\"high\"},{\"effort\":\"max\"}]}"
+            : ""
+        return """
+        {"models":[
+          {"slug":"gpt-5.6-luna","display_name":"Luna","supported_reasoning_levels":[{"effort":"max"}]},
+          {"slug":"gpt-5.6-sol","display_name":"Sol","supported_reasoning_levels":[{"effort":"high"},{"effort":"max"}]}\(duplicateModel),
+          {"slug":"x-preview-f-free","display_name":"Alpha","supported_reasoning_levels":[{"effort":"max"}]}
+        ]}
+        """
+    }
+
     private func roleAssignment(
         role: String,
         model: String = "gpt-5.6-sol",
@@ -1199,6 +1231,290 @@ final class TaskAutomationTests: XCTestCase {
         try Data("continuation\n".utf8).write(
             to: fixture.targetHome.appendingPathComponent("sessions/keep.jsonl")
         )
+    }
+
+    func testTaskPolicyMaterializerDefaultProfilesCoverBothSolRolesForEachParentFamily() throws {
+        let roleFiles = [
+            "worker.toml": policyRole(name: "worker"),
+            "sol_adversarial.toml": policyRole(name: "sol_adversarial"),
+            "sol_escalation.toml": policyRole(name: "sol_escalation"),
+        ]
+        let profiles = SubagentPolicyProfiles.default
+        let alpha = BridgedModel(
+            modelID: SubagentPolicyValidator.alphaModelID,
+            baseURL: "https://bridge.invalid/v1"
+        )
+
+        let alphaFixture = try PolicyMaterializerFixture(
+            roleFiles: roleFiles,
+            overlay: providerLinkedOverlay()
+        )
+        defer { alphaFixture.cleanup() }
+        try CodexTaskPolicyMaterializer(sourceCodexHome: alphaFixture.sourceHome).materialize(
+            policyProfiles: profiles,
+            targetCodexHome: alphaFixture.targetHome,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: [],
+            runID: UUID(),
+            parentModelID: SubagentPolicyValidator.alphaModelID,
+            bridgedModels: [alpha]
+        )
+        for roleID in ["worker", "sol_adversarial", "sol_escalation"] {
+            let contents = try String(
+                contentsOf: alphaFixture.targetHome.appendingPathComponent("agents/\(roleID).toml"),
+                encoding: .utf8
+            )
+            XCTAssertTrue(contents.contains("model = \"\(SubagentPolicyValidator.alphaModelID)\""))
+            XCTAssertTrue(contents.contains("model_reasoning_effort = \"max\""))
+        }
+
+        let openAIFixture = try PolicyMaterializerFixture(
+            roleFiles: roleFiles,
+            overlay: providerLinkedOverlay()
+        )
+        defer { openAIFixture.cleanup() }
+        try CodexTaskPolicyMaterializer(sourceCodexHome: openAIFixture.sourceHome).materialize(
+            policyProfiles: profiles,
+            targetCodexHome: openAIFixture.targetHome,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: [],
+            runID: UUID(),
+            parentModelID: "gpt-5.6-sol"
+        )
+        let expectedOpenAI: [String: (model: String, effort: String)] = [
+            "worker": ("gpt-5.6-luna", "max"),
+            "sol_adversarial": ("gpt-5.6-sol", "high"),
+            "sol_escalation": ("gpt-5.6-sol", "high"),
+        ]
+        for (roleID, expected) in expectedOpenAI {
+            let contents = try String(
+                contentsOf: openAIFixture.targetHome.appendingPathComponent("agents/\(roleID).toml"),
+                encoding: .utf8
+            )
+            XCTAssertTrue(contents.contains("model = \"\(expected.model)\""))
+            XCTAssertTrue(contents.contains("model_reasoning_effort = \"\(expected.effort)\""))
+        }
+    }
+
+    func testTaskPolicyMaterializerSelectsBridgedProfileForAlphaParentWithoutChangingOpenAIProfile() throws {
+        let fixture = try PolicyMaterializerFixture(
+            roleFiles: [
+                "worker.toml": policyRole(name: "worker"),
+                "sol_adversarial.toml": policyRole(name: "sol_adversarial")
+            ],
+            overlay: providerLinkedOverlay()
+        )
+        defer { fixture.cleanup() }
+
+        let profiles = SubagentPolicyProfiles(
+            openAI: SubagentModelPolicy(
+                eligibleModelIDs: ["gpt-5.6-luna", "gpt-5.6-sol"],
+                roleAssignments: [
+                    roleAssignment(role: "worker", model: "gpt-5.6-luna", effort: .max),
+                    roleAssignment(role: "sol_adversarial", model: "gpt-5.6-sol", effort: .high),
+                ]
+            ),
+            bridged: SubagentModelPolicy(
+                eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+                roleAssignments: [
+                    roleAssignment(role: "worker", model: SubagentPolicyValidator.alphaModelID, effort: .ultra),
+                    roleAssignment(role: "sol_adversarial", model: SubagentPolicyValidator.alphaModelID, effort: .ultra),
+                ],
+                alphaUltraEnabled: true
+            )
+        )
+
+        try CodexTaskPolicyMaterializer(sourceCodexHome: fixture.sourceHome).materialize(
+            policyProfiles: profiles,
+            targetCodexHome: fixture.targetHome,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: [],
+            runID: UUID(),
+            parentModelID: SubagentPolicyValidator.alphaModelID,
+            bridgedModels: [BridgedModel(
+                modelID: SubagentPolicyValidator.alphaModelID,
+                baseURL: "https://bridge.invalid/v1"
+            )]
+        )
+
+        let worker = try String(
+            contentsOf: fixture.targetHome.appendingPathComponent("agents/worker.toml"),
+            encoding: .utf8
+        )
+        let adversarial = try String(
+            contentsOf: fixture.targetHome.appendingPathComponent("agents/sol_adversarial.toml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(worker.contains("model = \"\(SubagentPolicyValidator.alphaModelID)\""))
+        XCTAssertTrue(worker.contains("model_reasoning_effort = \"ultra\""))
+        XCTAssertTrue(adversarial.contains("model = \"\(SubagentPolicyValidator.alphaModelID)\""))
+        XCTAssertTrue(adversarial.contains("model_reasoning_effort = \"ultra\""))
+        XCTAssertEqual(profiles.openAI.roleAssignments.first?.modelID, "gpt-5.6-luna")
+    }
+
+    func testTaskPolicyMaterializerSelectsOpenAIProfileAfterAlphaRun() throws {
+        let fixture = try PolicyMaterializerFixture(
+            roleFiles: [
+                "worker.toml": policyRole(name: "worker"),
+                "sol_adversarial.toml": policyRole(name: "sol_adversarial")
+            ],
+            overlay: providerLinkedOverlay()
+        )
+        defer { fixture.cleanup() }
+
+        let profiles = SubagentPolicyProfiles(
+            openAI: SubagentModelPolicy(
+                eligibleModelIDs: ["gpt-5.6-luna", "gpt-5.6-sol"],
+                roleAssignments: [
+                    roleAssignment(role: "worker", model: "gpt-5.6-luna", effort: .max),
+                    roleAssignment(role: "sol_adversarial", model: "gpt-5.6-sol", effort: .high),
+                ]
+            ),
+            bridged: SubagentModelPolicy(
+                eligibleModelIDs: [SubagentPolicyValidator.alphaModelID],
+                roleAssignments: [
+                    roleAssignment(role: "worker", model: SubagentPolicyValidator.alphaModelID, effort: .max),
+                    roleAssignment(role: "sol_adversarial", model: SubagentPolicyValidator.alphaModelID, effort: .max),
+                ]
+            )
+        )
+        let materializer = CodexTaskPolicyMaterializer(sourceCodexHome: fixture.sourceHome)
+        let alpha = BridgedModel(
+            modelID: SubagentPolicyValidator.alphaModelID,
+            baseURL: "https://bridge.invalid/v1"
+        )
+
+        try materializer.materialize(
+            policyProfiles: profiles,
+            targetCodexHome: fixture.targetHome,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: [],
+            runID: UUID(),
+            parentModelID: SubagentPolicyValidator.alphaModelID,
+            bridgedModels: [alpha]
+        )
+        try materializer.materialize(
+            policyProfiles: profiles,
+            targetCodexHome: fixture.targetHome,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: [],
+            runID: UUID(),
+            parentModelID: "gpt-5.6-sol",
+            bridgedModels: [alpha]
+        )
+
+        let worker = try String(
+            contentsOf: fixture.targetHome.appendingPathComponent("agents/worker.toml"),
+            encoding: .utf8
+        )
+        let adversarial = try String(
+            contentsOf: fixture.targetHome.appendingPathComponent("agents/sol_adversarial.toml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(worker.contains("model = \"gpt-5.6-luna\""))
+        XCTAssertTrue(worker.contains("model_reasoning_effort = \"max\""))
+        XCTAssertTrue(adversarial.contains("model = \"gpt-5.6-sol\""))
+        XCTAssertTrue(adversarial.contains("model_reasoning_effort = \"high\""))
+        XCTAssertFalse(worker.contains(SubagentPolicyValidator.alphaModelID))
+    }
+
+    func testTaskPolicyMaterializerUnknownMissingAndDuplicateParentsLeaveTargetUntouched() throws {
+        let cases: [(overlay: String, parent: String)] = [
+            (providerLinkedOverlay(), "missing-parent"),
+            (providerLinkedOverlay(duplicateGPT: true), "gpt-5.6-sol"),
+        ]
+
+        for (overlay, parent) in cases {
+            let fixture = try PolicyMaterializerFixture(
+                roleFiles: ["worker.toml": policyRole(name: "worker")],
+                overlay: overlay
+            )
+            defer { fixture.cleanup() }
+            try seedExistingTaskHome(fixture)
+            let beforeAgents = try Data(contentsOf: fixture.targetHome.appendingPathComponent("agents/worker.toml"))
+            let beforeConfig = try Data(contentsOf: fixture.targetHome.appendingPathComponent("config.toml"))
+            let profiles = SubagentPolicyProfiles.default
+
+            XCTAssertThrowsError(
+                try CodexTaskPolicyMaterializer(sourceCodexHome: fixture.sourceHome).materialize(
+                    policyProfiles: profiles,
+                    targetCodexHome: fixture.targetHome,
+                    proxyURL: URL(string: "http://127.0.0.1:58432")!,
+                    allowedAliases: [],
+                    runID: UUID(),
+                    parentModelID: parent,
+                    bridgedModels: [BridgedModel(
+                        modelID: SubagentPolicyValidator.alphaModelID,
+                        baseURL: "https://bridge.invalid/v1"
+                    )]
+                )
+            )
+            XCTAssertEqual(try Data(contentsOf: fixture.targetHome.appendingPathComponent("agents/worker.toml")), beforeAgents)
+            XCTAssertEqual(try Data(contentsOf: fixture.targetHome.appendingPathComponent("config.toml")), beforeConfig)
+        }
+
+        let missingParentFixture = try PolicyMaterializerFixture(
+            roleFiles: ["worker.toml": policyRole(name: "worker")],
+            overlay: providerLinkedOverlay()
+        )
+        defer { missingParentFixture.cleanup() }
+        let profiles = SubagentPolicyProfiles.default
+        XCTAssertThrowsError(
+            try CodexTaskPolicyMaterializer(sourceCodexHome: missingParentFixture.sourceHome).materialize(
+                policyProfiles: profiles,
+                targetCodexHome: missingParentFixture.targetHome,
+                proxyURL: URL(string: "http://127.0.0.1:58432")!,
+                allowedAliases: [],
+                runID: UUID(),
+                parentModelID: nil,
+                bridgedModels: [BridgedModel(
+                    modelID: SubagentPolicyValidator.alphaModelID,
+                    baseURL: "https://bridge.invalid/v1"
+                )]
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missingParentFixture.targetHome.path))
+    }
+
+    func testLegacyMaterializerUsesExplicitParentWhileProfilesKeepMissingParentFailClosed() throws {
+        let explicitFixture = try PolicyMaterializerFixture(
+            roleFiles: ["worker.toml": policyRole(name: "worker")],
+            overlay: gptOverlay()
+        )
+        defer { explicitFixture.cleanup() }
+        let policy = SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-5.6-sol"],
+            roleAssignments: [roleAssignment(role: "worker")]
+        )
+
+        try CodexTaskPolicyMaterializer(sourceCodexHome: explicitFixture.sourceHome).materialize(
+            policy: policy,
+            targetCodexHome: explicitFixture.targetHome,
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            allowedAliases: [],
+            runID: UUID(),
+            parentModelID: "gpt-5.6-sol"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: explicitFixture.targetHome.appendingPathComponent("agents/worker.toml").path
+        ))
+
+        let missingParentFixture = try PolicyMaterializerFixture(
+            roleFiles: ["worker.toml": policyRole(name: "worker")],
+            overlay: gptOverlay()
+        )
+        defer { missingParentFixture.cleanup() }
+        XCTAssertThrowsError(
+            try CodexTaskPolicyMaterializer(sourceCodexHome: missingParentFixture.sourceHome).materialize(
+                policyProfiles: SubagentPolicyProfiles.default,
+                targetCodexHome: missingParentFixture.targetHome,
+                proxyURL: URL(string: "http://127.0.0.1:58432")!,
+                allowedAliases: [],
+                runID: UUID(),
+                parentModelID: nil
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missingParentFixture.targetHome.path))
     }
 
     func testTaskPolicyMaterializerStagesOnlySelectedRolesAndTaskProvider() throws {
@@ -1579,7 +1895,7 @@ final class TaskAutomationTests: XCTestCase {
 
         XCTAssertThrowsError(
             try CodexTaskPolicyMaterializer(sourceCodexHome: fixture.sourceHome).materialize(
-                policy: policy,
+                policyProfiles: SubagentPolicyProfiles(openAI: policy, bridged: policy),
                 targetCodexHome: fixture.targetHome,
                 proxyURL: URL(string: "http://127.0.0.1:58432")!,
                 allowedAliases: [],

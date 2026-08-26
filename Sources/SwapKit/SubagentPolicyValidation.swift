@@ -59,6 +59,7 @@ public enum SubagentPolicyIssueCode: String, Codable, Sendable, Equatable, Hasha
     case mixedProviderFamilies = "mixed_provider_families"
     case unknownProviderFamily = "unknown_provider_family"
     case parentProviderMismatch = "parent_provider_mismatch"
+    case unknownParentProvider = "unknown_parent_provider"
 }
 
 /// One actionable validation finding for a saved subagent policy draft.
@@ -162,11 +163,71 @@ public struct SubagentPolicyValidator: Sendable {
 
     private init() {}
 
+    /// Validates a policy for the role editor. An explicitly unknown parent is
+    /// reported as an apply blocker, while callers that need a draft-only
+    /// preview can use `validateDraft` to keep editing before parent discovery
+    /// completes.
     public static func validate(
         policy: SubagentModelPolicy,
         catalog: [CodexModelDescriptor],
         installedRoleIDs: [String],
         parentProviderFamily: CodexModelProviderFamily? = nil
+    ) -> SubagentPolicyValidationResult {
+        validateInternal(
+            policy: policy,
+            catalog: catalog,
+            installedRoleIDs: installedRoleIDs,
+            parentProviderFamily: parentProviderFamily,
+            requireKnownParent: false,
+            blockExplicitUnknownParent: true
+        )
+    }
+
+    /// Draft-only validation intentionally omits parent authorization. It is
+    /// useful while the editor is loading or when the runtime has not yet
+    /// resolved the configured parent family; it must never authorize apply.
+    public static func validateDraft(
+        policy: SubagentModelPolicy,
+        catalog: [CodexModelDescriptor],
+        installedRoleIDs: [String],
+        parentProviderFamily: CodexModelProviderFamily? = nil
+    ) -> SubagentPolicyValidationResult {
+        validateInternal(
+            policy: policy,
+            catalog: catalog,
+            installedRoleIDs: installedRoleIDs,
+            parentProviderFamily: parentProviderFamily,
+            requireKnownParent: false,
+            blockExplicitUnknownParent: false
+        )
+    }
+
+    /// Apply authorization requires a known parent provider. Native Codex
+    /// task encryption cannot be safely authorized on a missing or unknown
+    /// parent family, even when the draft itself is otherwise valid.
+    public static func validateForApply(
+        policy: SubagentModelPolicy,
+        catalog: [CodexModelDescriptor],
+        installedRoleIDs: [String],
+        parentProviderFamily: CodexModelProviderFamily? = nil
+    ) -> SubagentPolicyValidationResult {
+        validateInternal(
+            policy: policy,
+            catalog: catalog,
+            installedRoleIDs: installedRoleIDs,
+            parentProviderFamily: parentProviderFamily,
+            requireKnownParent: true,
+            blockExplicitUnknownParent: true
+        )
+    }
+
+    private static func validateInternal(
+        policy: SubagentModelPolicy,
+        catalog: [CodexModelDescriptor],
+        installedRoleIDs: [String],
+        parentProviderFamily: CodexModelProviderFamily?,
+        requireKnownParent: Bool,
+        blockExplicitUnknownParent: Bool
     ) -> SubagentPolicyValidationResult {
         var issues = Set<SubagentPolicyIssue>()
 
@@ -205,6 +266,15 @@ public struct SubagentPolicyValidator: Sendable {
         // Directory discovery may report one role more than once; validation is file-identity based.
         let installedSet = Set(installedRoleIDs)
         let installedRoles = installedSet.sorted()
+
+        let parentIsUnknown = parentProviderFamily == nil || parentProviderFamily == .unknown
+        if (requireKnownParent || blockExplicitUnknownParent && parentProviderFamily == .unknown) && parentIsUnknown {
+            add(
+                .error,
+                .unknownParentProvider,
+                "Codex's configured parent provider is unknown. Refresh Codex and verify the parent family before applying a native subagent policy."
+            )
+        }
 
         if eligibleModelIDs.isEmpty {
             add(

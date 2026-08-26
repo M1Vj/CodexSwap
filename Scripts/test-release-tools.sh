@@ -38,6 +38,15 @@ plist="$TMP/dist/CodexSwap.app/Contents/Info.plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" == "0.2.0" ]] || fail "bundle short version does not match VERSION"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" == "42" ]] || fail "bundle build number does not match BUILD_NUMBER"
 
+for binary in CodexSwap swapd codexswap-alpha-mcp; do
+  [[ -x "$TMP/dist/CodexSwap.app/Contents/MacOS/$binary" ]] \
+    || fail "bundle is missing executable product: $binary"
+done
+
+bash Scripts/verify-release.sh --mcp-smoke \
+  "$TMP/dist/CodexSwap.app/Contents/MacOS/codexswap-alpha-mcp" >/dev/null \
+  || fail "packaged Alpha MCP protocol smoke failed"
+
 for script in build-universal.sh package-release.sh notarize-release.sh verify-release.sh render-cask.sh verify-cask.sh; do
   bash "Scripts/$script" --help >/dev/null || fail "$script --help failed"
 done
@@ -46,6 +55,18 @@ grep -Fq 'lipo "$PRODUCTS/$product" -verify_arch arm64 x86_64' Scripts/build-uni
   || fail "build-universal.sh must pass the universal binary before lipo -verify_arch"
 grep -Fq 'lipo "$binary" -verify_arch arm64 x86_64' Scripts/verify-release.sh \
   || fail "verify-release.sh must pass the universal binary before lipo -verify_arch"
+for product in CodexSwapApp swapd codexswap-alpha-mcp; do
+  grep -Fq "$product" Scripts/build-universal.sh \
+    || fail "build-universal.sh must include product: $product"
+done
+for binary in CodexSwap swapd codexswap-alpha-mcp; do
+  grep -Fq "$binary" Scripts/verify-release.sh \
+    || fail "verify-release.sh must include executable: $binary"
+done
+grep -Fq 'run_alpha_mcp_smoke "$APP/Contents/MacOS/codexswap-alpha-mcp"' Scripts/verify-release.sh \
+  || fail "verify-release.sh must smoke the packaged Alpha MCP helper"
+grep -Fq 'alarm $seconds' Scripts/verify-release.sh \
+  || fail "verify-release.sh Alpha MCP smoke must have a bounded timeout"
 
 expect_failure env RELEASE_TAG=v9.9.9 bash Scripts/package-release.sh --dry-run
 expect_failure env -u APPLE_API_KEY_ID -u APPLE_API_ISSUER_ID -u APPLE_API_KEY_PATH bash Scripts/notarize-release.sh "$TMP/missing.zip"

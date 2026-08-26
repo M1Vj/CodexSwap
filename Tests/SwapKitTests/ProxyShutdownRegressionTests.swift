@@ -9,6 +9,108 @@ import NIOHTTP1
 @testable import SwapKit
 
 final class ProxyShutdownRegressionTests: XCTestCase {
+    func testCandidateRequestBodyLimitRejectsDeclaredLengthBeforeAggregation() {
+        let head = HTTPRequestHead(
+            version: .http1_1,
+            method: .POST,
+            uri: "/backend-api/codex/responses",
+            headers: [
+                "Content-Length": String(ProxyServer.maxCandidateRequestBodyBytes + 1),
+            ]
+        )
+
+        XCTAssertTrue(proxyRequestBodyExceedsAggregationLimit(head))
+        XCTAssertEqual(
+            proxyRequestBodyAggregationLimit(method: .POST, path: "/backend-api/codex/responses"),
+            ProxyServer.maxCandidateRequestBodyBytes
+        )
+        XCTAssertNil(proxyRequestBodyAggregationLimit(method: .GET, path: "/backend-api/codex/responses"))
+        XCTAssertNil(proxyRequestBodyAggregationLimit(method: .POST, path: "/v1/models"))
+    }
+
+    func testProxyHandlerReturns413ForOversizedDeclaredCandidateBodyBeforeUpstream() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var config = ProxyServer.Config()
+        config.port = 0
+        config.upstream = URL(string: "http://127.0.0.1:1")!
+        let server = makeServer(root: root, config: config)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        var headers = HTTPHeaders()
+        headers.add(name: "Host", value: "127.0.0.1")
+        headers.add(name: "Content-Length", value: String(ProxyServer.maxCandidateRequestBodyBytes + 1))
+        let head = HTTPRequestHead(
+            version: .http1_1,
+            method: .POST,
+            uri: "/backend-api/codex/responses",
+            headers: headers
+        )
+
+        let status = try await sendRawProxyRequest(port: port, head: head, chunks: [])
+        XCTAssertEqual(status, .payloadTooLarge)
+        await server.stop()
+    }
+
+    func testProxyHandlerReturns413WhenChunkedCandidateBodyCrossesCap() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var config = ProxyServer.Config()
+        config.port = 0
+        config.upstream = URL(string: "http://127.0.0.1:1")!
+        let server = makeServer(root: root, config: config)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        var headers = HTTPHeaders()
+        headers.add(name: "Host", value: "127.0.0.1")
+        headers.add(name: "Transfer-Encoding", value: "chunked")
+        let head = HTTPRequestHead(
+            version: .http1_1,
+            method: .POST,
+            uri: "/v1/chat/completions",
+            headers: headers
+        )
+
+        let status = try await sendRawProxyRequest(
+            port: port,
+            head: head,
+            chunks: [
+                ByteBuffer(repeating: 0x61, count: ProxyServer.maxCandidateRequestBodyBytes),
+                ByteBuffer(string: "x"),
+            ]
+        )
+        XCTAssertEqual(status, .payloadTooLarge)
+        await server.stop()
+    }
+
+    func testCandidateRequestBodyLimitRejectsChunkCrossingWithoutAppendingPastCap() {
+        var accumulator = ProxyRequestBodyAccumulator(limit: 8)
+
+        XCTAssertTrue(accumulator.append(ByteBuffer(string: "12345")))
+        XCTAssertFalse(accumulator.append(ByteBuffer(string: "6789")))
+        XCTAssertEqual(accumulator.bytes, Data("12345".utf8))
+    }
+
+    func testAlphaResolutionRetainsItsExistingEightMiBCap() {
+        let catalog = [
+            BridgedModel(
+                modelID: "x-preview-f-free",
+                displayName: "Alpha",
+                baseURL: "http://127.0.0.1:1"
+            ),
+        ]
+        let oversized = Data(repeating: 0x20, count: AlphaBridge.maxBodyBytes + 1)
+
+        XCTAssertEqual(AlphaBridge.maxBodyBytes, 8 * 1024 * 1024)
+        XCTAssertEqual(AlphaBridge.resolveEntry(in: oversized, catalog: catalog), .none)
+    }
+
     func testCountingBarrierWaitTimesOutInsteadOfHanging() async {
         let barrier = CountingLifecycleBarrier(target: 1)
 
@@ -492,5 +594,50 @@ private actor HangingHeaderUpstream {
                 }
             }
         }
+    }
+}
+
+private func sendRawProxyRequest(
+    port: Int,
+    head: HTTPRequestHead,
+    chunks: [ByteBuffer]
+) async throws -> HTTPResponseStatus {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    do {
+        let channel = try await ClientBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHTTPClientHandlers()
+                }
+            }
+            .connect(host: "127.0.0.1", port: port)
+            .get()
+        let asyncChannel = try await channel.eventLoop.submit {
+            try NIOAsyncChannel<HTTPClientResponsePart, HTTPClientRequestPart>(
+                wrappingChannelSynchronously: channel
+            )
+        }.get()
+        let status = try await asyncChannel.executeThenClose { inbound, outbound in
+            try await outbound.write(.head(head))
+            for chunk in chunks {
+                try await outbound.write(.body(.byteBuffer(chunk)))
+            }
+            try await outbound.write(.end(nil))
+
+            var responseStatus: HTTPResponseStatus?
+            for try await part in inbound {
+                switch part {
+                case .head(let responseHead): responseStatus = responseHead.status
+                case .end: return try XCTUnwrap(responseStatus)
+                case .body: break
+                }
+            }
+            return try XCTUnwrap(responseStatus)
+        }
+        try await group.shutdownGracefully()
+        return status
+    } catch {
+        try? await group.shutdownGracefully()
+        throw error
     }
 }

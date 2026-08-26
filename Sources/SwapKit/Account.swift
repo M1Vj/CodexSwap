@@ -40,14 +40,48 @@ public struct ModelUsage: Codable, Sendable, Equatable {
     public var requests: Int
     public var inputTokens: Int
     public var cachedInputTokens: Int
+    public var cacheWriteInputTokens: Int
+    public var cachedInputCompleteness: TokenFieldCompleteness
+    public var cacheWriteInputCompleteness: TokenFieldCompleteness
     public var outputTokens: Int
 
-    public init(model: String, requests: Int = 0, inputTokens: Int = 0, cachedInputTokens: Int = 0, outputTokens: Int = 0) {
+    public init(
+        model: String,
+        requests: Int = 0,
+        inputTokens: Int = 0,
+        cachedInputTokens: Int = 0,
+        cacheWriteInputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cachedInputCompleteness: TokenFieldCompleteness? = nil,
+        cacheWriteInputCompleteness: TokenFieldCompleteness? = nil
+    ) {
         self.model = model
         self.requests = requests
         self.inputTokens = inputTokens
         self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.cachedInputCompleteness = cachedInputCompleteness
+            ?? (requests > 0 ? .complete : .unknown)
+        self.cacheWriteInputCompleteness = cacheWriteInputCompleteness
+            ?? (requests > 0 ? .complete : .unknown)
         self.outputTokens = outputTokens
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case model, requests, inputTokens, cachedInputTokens, cacheWriteInputTokens
+        case cachedInputCompleteness, cacheWriteInputCompleteness, outputTokens
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
+        requests = try c.decodeIfPresent(Int.self, forKey: .requests) ?? 0
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        cachedInputTokens = try c.decodeIfPresent(Int.self, forKey: .cachedInputTokens) ?? 0
+        cacheWriteInputTokens = try c.decodeIfPresent(Int.self, forKey: .cacheWriteInputTokens) ?? 0
+        cachedInputCompleteness = try c.decodeIfPresent(TokenFieldCompleteness.self, forKey: .cachedInputCompleteness) ?? .unknown
+        cacheWriteInputCompleteness = try c.decodeIfPresent(TokenFieldCompleteness.self, forKey: .cacheWriteInputCompleteness) ?? .unknown
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens) ?? 0
     }
 }
 
@@ -56,6 +90,9 @@ public struct UsageStats: Codable, Sendable, Equatable {
     public var totalRequests: Int
     public var inputTokens: Int
     public var cachedInputTokens: Int
+    public var cacheWriteInputTokens: Int
+    public var cachedInputCompleteness: TokenFieldCompleteness
+    public var cacheWriteInputCompleteness: TokenFieldCompleteness
     public var outputTokens: Int
     /// Sorted by `outputTokens` descending so the dominant model leads.
     public var models: [ModelUsage]
@@ -65,36 +102,103 @@ public struct UsageStats: Codable, Sendable, Equatable {
         totalRequests: Int = 0,
         inputTokens: Int = 0,
         cachedInputTokens: Int = 0,
+        cacheWriteInputTokens: Int = 0,
         outputTokens: Int = 0,
         models: [ModelUsage] = [],
-        updatedAt: Date? = nil
+        updatedAt: Date? = nil,
+        cachedInputCompleteness: TokenFieldCompleteness? = nil,
+        cacheWriteInputCompleteness: TokenFieldCompleteness? = nil
     ) {
         self.totalRequests = totalRequests
         self.inputTokens = inputTokens
         self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.cachedInputCompleteness = cachedInputCompleteness
+            ?? (totalRequests > 0 ? .complete : .unknown)
+        self.cacheWriteInputCompleteness = cacheWriteInputCompleteness
+            ?? (totalRequests > 0 ? .complete : .unknown)
         self.outputTokens = outputTokens
         self.models = models
         self.updatedAt = updatedAt
     }
 
     /// Folds one completed response into the running totals and its per-model row.
-    public mutating func accumulate(model: String, inputTokens: Int, cachedInputTokens: Int, outputTokens: Int) {
-        totalRequests += 1
-        self.inputTokens += inputTokens
-        self.cachedInputTokens += cachedInputTokens
-        self.outputTokens += outputTokens
+    private enum CodingKeys: String, CodingKey {
+        case totalRequests, inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, models, updatedAt
+        case cachedInputCompleteness, cacheWriteInputCompleteness
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        totalRequests = try c.decodeIfPresent(Int.self, forKey: .totalRequests) ?? 0
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        cachedInputTokens = try c.decodeIfPresent(Int.self, forKey: .cachedInputTokens) ?? 0
+        cacheWriteInputTokens = try c.decodeIfPresent(Int.self, forKey: .cacheWriteInputTokens) ?? 0
+        cachedInputCompleteness = try c.decodeIfPresent(TokenFieldCompleteness.self, forKey: .cachedInputCompleteness) ?? .unknown
+        cacheWriteInputCompleteness = try c.decodeIfPresent(TokenFieldCompleteness.self, forKey: .cacheWriteInputCompleteness) ?? .unknown
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens) ?? 0
+        models = try c.decodeIfPresent([ModelUsage].self, forKey: .models) ?? []
+        updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt)
+    }
+
+    public mutating func accumulate(
+        model: String,
+        inputTokens: Int,
+        cachedInputTokens: Int,
+        cacheWriteInputTokens: Int = 0,
+        outputTokens: Int,
+        cachedInputPresence: TokenFieldPresence = .present,
+        cacheWriteInputPresence: TokenFieldPresence? = nil
+    ) {
+        let inputTokens = max(0, inputTokens)
+        let cachedInputTokens = min(max(0, cachedInputTokens), inputTokens)
+        let cacheWriteInputTokens = min(max(0, cacheWriteInputTokens), inputTokens - cachedInputTokens)
+        let outputTokens = max(0, outputTokens)
+        let hadExistingRequest = totalRequests > 0
+        totalRequests = UsageSafety.saturatingIncrement(totalRequests)
+        self.inputTokens = UsageSafety.saturatingAdd(self.inputTokens, inputTokens)
+        self.cachedInputTokens = UsageSafety.saturatingAdd(self.cachedInputTokens, cachedInputTokens)
+        self.cacheWriteInputTokens = UsageSafety.saturatingAdd(self.cacheWriteInputTokens, cacheWriteInputTokens)
+        cachedInputCompleteness = UsageAnalytics.advanceCompleteness(
+            cachedInputCompleteness,
+            presence: cachedInputPresence,
+            hasExistingRequest: hadExistingRequest
+        )
+        let writePresence = cacheWriteInputPresence
+            ?? (cacheWriteInputTokens > 0 ? .present : .absent)
+        cacheWriteInputCompleteness = UsageAnalytics.advanceCompleteness(
+            cacheWriteInputCompleteness,
+            presence: writePresence,
+            hasExistingRequest: hadExistingRequest
+        )
+        self.outputTokens = UsageSafety.saturatingAdd(self.outputTokens, outputTokens)
         if let i = models.firstIndex(where: { $0.model == model }) {
-            models[i].requests += 1
-            models[i].inputTokens += inputTokens
-            models[i].cachedInputTokens += cachedInputTokens
-            models[i].outputTokens += outputTokens
+            let hadExistingModelRequest = models[i].requests > 0
+            models[i].requests = UsageSafety.saturatingIncrement(models[i].requests)
+            models[i].inputTokens = UsageSafety.saturatingAdd(models[i].inputTokens, inputTokens)
+            models[i].cachedInputTokens = UsageSafety.saturatingAdd(models[i].cachedInputTokens, cachedInputTokens)
+            models[i].cacheWriteInputTokens = UsageSafety.saturatingAdd(models[i].cacheWriteInputTokens, cacheWriteInputTokens)
+            models[i].cachedInputCompleteness = UsageAnalytics.advanceCompleteness(
+                models[i].cachedInputCompleteness,
+                presence: cachedInputPresence,
+                hasExistingRequest: hadExistingModelRequest
+            )
+            models[i].cacheWriteInputCompleteness = UsageAnalytics.advanceCompleteness(
+                models[i].cacheWriteInputCompleteness,
+                presence: writePresence,
+                hasExistingRequest: hadExistingModelRequest
+            )
+            models[i].outputTokens = UsageSafety.saturatingAdd(models[i].outputTokens, outputTokens)
         } else {
             models.append(ModelUsage(
                 model: model,
                 requests: 1,
                 inputTokens: inputTokens,
                 cachedInputTokens: cachedInputTokens,
-                outputTokens: outputTokens
+                cacheWriteInputTokens: cacheWriteInputTokens,
+                outputTokens: outputTokens,
+                cachedInputCompleteness: cachedInputPresence == .present ? .complete : .unknown,
+                cacheWriteInputCompleteness: writePresence == .present ? .complete : .unknown
             ))
         }
         models.sort { $0.outputTokens > $1.outputTokens }

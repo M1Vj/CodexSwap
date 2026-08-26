@@ -324,7 +324,7 @@ enum AlphaBridge {
         // Responses max_output_tokens maps to the Chat budget; pad for reasoning
         // tokens, which consume the same completion budget on thinking models.
         if let maxOut = root["max_output_tokens"] as? Int, maxOut > 0 {
-            payload["max_tokens"] = min(maxOut + 16_384, 131_072)
+            payload["max_tokens"] = min(UsageSafety.saturatingAdd(maxOut, 16_384), 131_072)
         }
         return payload
     }
@@ -355,42 +355,86 @@ enum AlphaBridge {
 
     static func usageDict(fromChatUsage usage: [String: Any]) -> [String: Any] {
         func intField(_ name: String) -> Int {
-            if let n = usage[name] as? Int { return n }
-            if let d = usage[name] as? Double { return Int(d.rounded()) }
-            return 0
+            UsageSafety.nonNegativeInteger(usage[name]) ?? 0
         }
-        let cached = (usage["prompt_tokens_details"] as? [String: Any])?["cached_tokens"]
+        func integralField(_ value: Any?) -> Int {
+            UsageSafety.nonNegativeInteger(value) ?? 0
+        }
+        let promptDetails = usage["prompt_tokens_details"] as? [String: Any] ?? [:]
+        let cached = promptDetails["cached_tokens"]
+            ?? usage["cached_input_tokens"]
+            ?? usage["cache_read_tokens"]
+        let cacheWrite = promptDetails["cache_write_tokens"]
+            ?? usage["cache_write_input_tokens"]
+            ?? usage["cache_write_tokens"]
+            ?? usage["cache_creation_input_tokens"]
+            ?? usage["cache_creation_tokens"]
+        let cachedValue = UsageSafety.nonNegativeInteger(cached)
+        let cacheWriteValue = UsageSafety.nonNegativeInteger(cacheWrite)
         let reasoning = (usage["completion_tokens_details"] as? [String: Any])?["reasoning_tokens"]
         var inputDetails: [String: Any] = [:]
-        inputDetails["cached_tokens"] = (cached as? Int) ?? Int((cached as? Double)?.rounded() ?? 0)
+        if let cachedValue {
+            inputDetails["cached_tokens"] = cachedValue
+        }
+        if let cacheWriteValue {
+            inputDetails["cache_write_tokens"] = cacheWriteValue
+        }
         var outputDetails: [String: Any] = [:]
-        outputDetails["reasoning_tokens"] = (reasoning as? Int) ?? Int((reasoning as? Double)?.rounded() ?? 0)
+        outputDetails["reasoning_tokens"] = integralField(reasoning)
         let input = intField("prompt_tokens")
         let outputTokens = intField("completion_tokens")
-        let dict: [String: Any] = [
+        let cachedSubset = min(max(0, inputDetails["cached_tokens"] as? Int ?? 0), max(0, input))
+        let cacheWriteSubset = min(
+            max(0, inputDetails["cache_write_tokens"] as? Int ?? 0),
+            max(0, input) - cachedSubset
+        )
+        if cachedValue != nil { inputDetails["cached_tokens"] = cachedSubset }
+        if cacheWriteValue != nil { inputDetails["cache_write_tokens"] = cacheWriteSubset }
+        var dict: [String: Any] = [
             "input_tokens": input,
-            "input_tokens_details": inputDetails,
             "output_tokens": outputTokens,
             "output_tokens_details": outputDetails,
-            "total_tokens": intField("total_tokens") == 0 ? input + outputTokens : intField("total_tokens"),
+            "total_tokens": intField("total_tokens") == 0
+                ? UsageSafety.saturatingAdd(input, outputTokens)
+                : intField("total_tokens"),
         ]
+        if !inputDetails.isEmpty { dict["input_tokens_details"] = inputDetails }
+        if cacheWriteValue != nil { dict["cache_write_tokens"] = cacheWriteSubset }
         _ = dict.keys.contains("total_tokens")
         return dict
     }
 
     static func usageSample(model: String, fromChatUsage usage: [String: Any]) -> ProxyUsageSample {
         func intField(_ name: String) -> Int {
-            if let n = usage[name] as? Int { return n }
-            if let d = usage[name] as? Double { return Int(d.rounded()) }
-            return 0
+            UsageSafety.nonNegativeInteger(usage[name]) ?? 0
         }
-        let cached = (usage["prompt_tokens_details"] as? [String: Any])?["cached_tokens"]
-        let cachedInt = (cached as? Int) ?? Int((cached as? Double)?.rounded() ?? 0)
+        func integralField(_ value: Any?) -> Int {
+            UsageSafety.nonNegativeInteger(value) ?? 0
+        }
+        let promptDetails = usage["prompt_tokens_details"] as? [String: Any] ?? [:]
+        let cached = promptDetails["cached_tokens"]
+            ?? usage["cached_input_tokens"]
+            ?? usage["cache_read_tokens"]
+        let cacheWrite = promptDetails["cache_write_tokens"]
+            ?? usage["cache_write_input_tokens"]
+            ?? usage["cache_write_tokens"]
+            ?? usage["cache_creation_input_tokens"]
+            ?? usage["cache_creation_tokens"]
+        let cachedValue = UsageSafety.nonNegativeInteger(cached)
+        let cacheWriteValue = UsageSafety.nonNegativeInteger(cacheWrite)
+        let cachedInt = cachedValue ?? 0
+        let cacheWriteInt = cacheWriteValue ?? 0
+        let input = intField("prompt_tokens")
+        let cachedSubset = min(max(0, cachedInt), max(0, input))
+        let cacheWriteSubset = min(max(0, cacheWriteInt), max(0, input) - cachedSubset)
         return ProxyUsageSample(
             model: model,
-            inputTokens: intField("prompt_tokens"),
-            cachedInputTokens: cachedInt,
-            outputTokens: intField("completion_tokens")
+            inputTokens: max(0, input),
+            cachedInputTokens: cachedSubset,
+            cacheWriteInputTokens: cacheWriteSubset,
+            outputTokens: intField("completion_tokens"),
+            cachedInputPresence: cachedValue == nil ? .absent : .present,
+            cacheWriteInputPresence: cacheWriteValue == nil ? .absent : .present
         )
     }
 }
@@ -496,7 +540,7 @@ struct AlphaSSETranslator {
 
         if let calls = delta["tool_calls"] as? [[String: Any]] {
             for call in calls {
-                let index = (call["index"] as? Int) ?? ((call["index"] as? Double).map(Int.init(_:)) ?? 0)
+                let index = UsageSafety.nonNegativeInteger(call["index"]) ?? 0
                 var entry = toolCalls[index] ?? {
                     toolOrder.append(index)
                     let callID = (call["id"] as? String) ?? "call_\(UUID().uuidString)"
@@ -810,7 +854,8 @@ extension AlphaBridge {
         body: Data,
         httpClient: HTTPClient,
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
-        sink: ProxyEventSink
+        sink: ProxyEventSink,
+        log: (@Sendable (String) -> Void)? = nil
     ) async throws {
         guard var payload = chatPayload(fromResponsesData: body, model: entry.modelID) else {
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
@@ -830,7 +875,7 @@ extension AlphaBridge {
         }
         let wantsStream = (payload["stream"] as? Bool) ?? false
 
-        guard let base = URL(string: entry.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        guard let base = BridgedModel.validatedBaseURL(entry.baseURL) else {
             try await writeHTTPError(outbound, status: .internalServerError, code: "bad_bridged_base_url", message: "Bridged model has an invalid base URL")
             return
         }
@@ -842,31 +887,7 @@ extension AlphaBridge {
         }
         request.body = .bytes(ByteBuffer(bytes: payloadData))
 
-        let wireLog: @Sendable (String) -> Void = { message in
-            FileHandle.standardError.write("[alpha] \(message)\n".data(using: .utf8)!)
-        }
-        // Raw upstream-side tool inventory before translation
-        if let rawRoot = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
-            let rawTools = (rawRoot["tools"] as? [[String: Any]]) ?? []
-            let rawDesc = rawTools.map { t -> String in
-                let ty = (t["type"] as? String) ?? "?"
-                let nm = (t["name"] as? String) ?? ((t["function"] as? [String: Any])?["name"] as? String) ?? ""
-                return "\(ty):\(nm)"
-            }
-            wireLog("raw tools=\(rawTools.count) [\(rawDesc.joined(separator:", "))]")
-            for t in rawTools where (t["type"] as? String) != "function" {
-                if let data = try? JSONSerialization.data(withJSONObject: t),
-                   let line = String(data: data, encoding: .utf8) {
-                    wireLog("rawtool \(line.prefix(1500))")
-                }
-            }
-        }
-        if let toolsArray = payload["tools"] as? [[String: Any]] {
-            let names = toolsArray.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
-            wireLog("request tools=\(toolsArray.count) names=\(names.prefix(12)) inputBytes=\(body.count)")
-        } else {
-            wireLog("request tools=NONE inputBytes=\(body.count)")
-        }
+        let wireLog: @Sendable (String) -> Void = { message in log?(message) }
 
         let maxUpstreamAttempts = 4
         var translator = AlphaSSETranslator(
@@ -882,7 +903,7 @@ extension AlphaBridge {
             do {
                 resp = try await httpClient.execute(request, timeout: .seconds(600))
             } catch {
-                wireLog("attempt \(attempt) transport error: \(error)")
+                wireLog("attempt \(attempt) transport failure")
                 if attempt < maxUpstreamAttempts {
                     try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
                     continue attemptLoop
@@ -903,7 +924,7 @@ extension AlphaBridge {
                     if collected.readableBytes > 64 * 1024 { break }
                 }
                 let detail = String(buffer: collected)
-                wireLog("attempt \(attempt) error body: \(detail.prefix(200))")
+                wireLog("attempt \(attempt) upstream status \(resp.status.code)")
                 let retryable = resp.status.code == 429 || resp.status.code >= 500
                     || isPromptLengthFailure(code: String(resp.status.code), message: detail)
                 if retryable, attempt < maxUpstreamAttempts {
@@ -954,7 +975,10 @@ extension AlphaBridge {
                         modelID: entry.modelID,
                         inputTokens: sample.inputTokens,
                         cachedInputTokens: sample.cachedInputTokens,
-                        outputTokens: sample.outputTokens
+                        cacheWriteInputTokens: sample.cacheWriteInputTokens,
+                        outputTokens: sample.outputTokens,
+                        cachedInputPresence: sample.cachedInputPresence,
+                        cacheWriteInputPresence: sample.cacheWriteInputPresence
                     )
                 }
                 return
@@ -1019,7 +1043,10 @@ extension AlphaBridge {
                     modelID: entry.modelID,
                     inputTokens: sample.inputTokens,
                     cachedInputTokens: sample.cachedInputTokens,
-                    outputTokens: sample.outputTokens
+                    cacheWriteInputTokens: sample.cacheWriteInputTokens,
+                    outputTokens: sample.outputTokens,
+                    cachedInputPresence: sample.cachedInputPresence,
+                    cacheWriteInputPresence: sample.cacheWriteInputPresence
                 )
             }
             return

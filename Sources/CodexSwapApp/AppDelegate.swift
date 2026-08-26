@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private let engine = AppEngine(settingsStore: SettingsStoreBridge.shared)
+    private let alphaDelegationMCPManager = AlphaDelegationMCPManager()
     private var hasBundle: Bool { Bundle.main.bundleIdentifier != nil }
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
@@ -125,14 +126,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let currentSettings = await SettingsStoreBridge.current()
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
-                viewModel.bootstrapSubagentPolicyIfNeeded(currentSettings.subagentModelPolicy)
                 let context = try CodexSubagentPolicyRuntimeResolver.resolve()
                 let catalog = try await CodexModelCatalogService(
                     bridgedModels: currentSettings.bridgedModels,
-                    alphaUltraEnabled: currentSettings.subagentModelPolicy.alphaUltraEnabled
+                    alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
                 ).load()
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 let parentProviderFamily = try context.parentProviderFamily(catalog: catalog)
+                viewModel.bootstrapSubagentPolicyIfNeeded(
+                    currentSettings.subagentModelPolicy,
+                    family: parentProviderFamily
+                )
                 let actualAssignments = try CodexSubagentPolicyRuntimeResolver.readManagedAssignments(
                     roleFiles: context.roleFiles
                 )
@@ -169,7 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let context = try CodexSubagentPolicyRuntimeResolver.resolve()
                 let catalog = try await CodexModelCatalogService(
                     bridgedModels: currentSettings.bridgedModels,
-                    alphaUltraEnabled: draft.alphaUltraEnabled
+                    alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
+                        || (viewModel.subagentPolicyPresentation.providerProfileFamily == .bridged && draft.alphaUltraEnabled)
                 ).load()
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 let parentProviderFamily = try context.parentProviderFamily(catalog: catalog)
@@ -177,8 +182,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // The manager owns only exact role files and the declared
                 // catalog overlay. Parent model/routing fields are never
                 // passed or edited by this action.
+                let normalizedDraft = draft.normalized(for: parentProviderFamily)
                 try context.manager.apply(
-                    policy: draft,
+                    policy: normalizedDraft,
                     catalog: catalog,
                     roleFiles: context.roleFiles,
                     parentProviderFamily: parentProviderFamily
@@ -190,12 +196,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // failure must not turn a committed role transaction into a
                 // false rollback claim.
                 var actualAssignments: [SubagentRoleAssignment]?
+                var compatibleActualAssignments: [SubagentRoleAssignment]?
                 var readbackWarning: String?
                 do {
                     let readback = try CodexSubagentPolicyRuntimeResolver.readManagedAssignments(
                         roleFiles: context.roleFiles
                     )
                     actualAssignments = readback
+                    if viewModel.subagentPolicyPresentation.actualAssignmentsAreCompatible(
+                        readback,
+                        with: parentProviderFamily
+                    ) {
+                        compatibleActualAssignments = readback
+                    } else {
+                        readbackWarning = SubagentPolicyPresentationState.providerMismatchWarning(for: parentProviderFamily)
+                    }
                 } catch let error as CodexSubagentPolicyRuntimeError {
                     actualAssignments = nil
                     readbackWarning = "The installed role values could not be verified after the transaction: \(error.localizedDescription)"
@@ -203,16 +218,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     actualAssignments = nil
                     readbackWarning = "The installed role values could not be verified after the transaction."
                 }
-                let reconciledDraft = actualAssignments.map {
+                let reconciledDraft = compatibleActualAssignments.map {
                     viewModel.subagentPolicyPresentation.policyReconciled(with: $0)
-                } ?? draft
+                } ?? normalizedDraft
 
                 // Persist preferences after the manager commits. A verified
                 // settings-write failure reports committed roles plus an
                 // unsaved-preferences warning rather than generic apply failure.
                 do {
                     settings = try await SettingsStoreBridge.updatePersisting { settings in
-                        settings.subagentModelPolicy = reconciledDraft
+                        settings.subagentModelPolicy.update(reconciledDraft, for: parentProviderFamily)
                     }
                     guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 } catch let error as SettingsStoreError {
@@ -221,8 +236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         catalog: catalog,
                         installedRoleIDs: context.roleFiles.map(\.roleID),
                         parentProviderFamily: parentProviderFamily,
-                        actualAssignments: actualAssignments,
-                        verificationWarning: "Roles were applied, but preferences were not saved: \(error.localizedDescription)"
+                        actualAssignments: compatibleActualAssignments,
+                        verificationWarning: "Roles were applied, but preferences were not saved: \(error.localizedDescription)",
+                        preferencesPersisted: false
                     )
                     return
                 } catch {
@@ -231,8 +247,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         catalog: catalog,
                         installedRoleIDs: context.roleFiles.map(\.roleID),
                         parentProviderFamily: parentProviderFamily,
-                        actualAssignments: actualAssignments,
-                        verificationWarning: "Roles were applied, but preferences were not saved."
+                        actualAssignments: compatibleActualAssignments,
+                        verificationWarning: "Roles were applied, but preferences were not saved.",
+                        preferencesPersisted: false
                     )
                     return
                 }
@@ -247,7 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let freshContext = try CodexSubagentPolicyRuntimeResolver.resolve()
                     let freshCatalog = try await CodexModelCatalogService(
                         bridgedModels: freshSettings.bridgedModels,
-                        alphaUltraEnabled: freshSettings.subagentModelPolicy.alphaUltraEnabled
+                        alphaUltraEnabled: freshSettings.subagentModelPolicy.bridged.alphaUltraEnabled
                     ).load()
                     guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                     let freshParentProviderFamily = try freshContext.parentProviderFamily(catalog: freshCatalog)
@@ -255,18 +272,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         roleFiles: freshContext.roleFiles
                     )
                     var finalWarning = readbackWarning
-                    let freshDraft = viewModel.subagentPolicyPresentation.policyReconciled(with: freshAssignments)
-                    if freshDraft != reconciledDraft {
+                    let persistenceDecision = SubagentPolicyPresentationState.persistenceDecision(
+                        originalFamily: parentProviderFamily,
+                        freshFamily: freshParentProviderFamily
+                    )
+                    if let warning = persistenceDecision.warning {
+                        finalWarning = [finalWarning, warning].compactMap { $0 }.joined(separator: " ")
+                    }
+                    let freshCompatibleAssignments: [SubagentRoleAssignment]?
+                    if persistenceDecision.shouldPersist,
+                       viewModel.subagentPolicyPresentation.actualAssignmentsAreCompatible(
+                           freshAssignments,
+                           with: freshParentProviderFamily
+                       ) {
+                        freshCompatibleAssignments = freshAssignments
+                    } else {
+                        freshCompatibleAssignments = nil
+                        if persistenceDecision.shouldPersist {
+                            let warning = SubagentPolicyPresentationState.providerMismatchWarning(for: freshParentProviderFamily)
+                            finalWarning = [finalWarning, warning].compactMap { $0 }.joined(separator: " ")
+                        }
+                    }
+                    let freshDraft = freshCompatibleAssignments.map {
+                        viewModel.subagentPolicyPresentation.policyReconciled(with: $0)
+                    }
+                    var preferencesPersisted = true
+                    if let freshDraft, freshDraft != reconciledDraft {
                         do {
                             settings = try await SettingsStoreBridge.updatePersisting { settings in
-                                settings.subagentModelPolicy = freshDraft
+                                settings.subagentModelPolicy.update(freshDraft, for: parentProviderFamily)
                             }
                         } catch let error as SettingsStoreError {
+                            preferencesPersisted = false
                             finalWarning = [
                                 finalWarning,
                                 "Roles were applied, but preferences were not saved: \(error.localizedDescription)",
                             ].compactMap { $0 }.joined(separator: " ")
                         } catch {
+                            preferencesPersisted = false
                             finalWarning = [
                                 finalWarning,
                                 "Roles were applied, but preferences were not saved.",
@@ -277,8 +320,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         catalog: freshCatalog,
                         installedRoleIDs: freshContext.roleFiles.map(\.roleID),
                         parentProviderFamily: freshParentProviderFamily,
-                        actualAssignments: freshAssignments,
-                        verificationWarning: finalWarning
+                        actualAssignments: freshCompatibleAssignments,
+                        verificationWarning: finalWarning,
+                        persistedDraft: persistenceDecision.shouldPersist
+                            ? nil
+                            : freshSettings.subagentModelPolicy.policy(for: freshParentProviderFamily),
+                        persistedProfileFamily: persistenceDecision.shouldPersist ? nil : freshParentProviderFamily,
+                        preferencesPersisted: preferencesPersisted,
                     )
                 } catch let error as CodexModelCatalogError {
                     guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
@@ -396,6 +444,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
         Task { @MainActor in await self.refreshSnapshot() }
+    }
+
+    // MARK: - Alpha review delegation
+
+    private func refreshAlphaDelegationMCP() {
+        guard let viewModel = settingsViewModel,
+              let generation = viewModel.beginAlphaDelegationMCPRefresh() else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self, let viewModel = self.settingsViewModel else { return }
+            let status = await self.alphaDelegationMCPManager.status()
+            _ = viewModel.applyAlphaDelegationMCPStatus(status, generation: generation)
+        }
+    }
+
+    private func copyAlphaDelegationMCPSetup() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let guidance = await self.alphaDelegationMCPManager.installGuidance() else {
+                presentMessage("Setup guidance was not copied because the Alpha registration status changed. Refresh and verify the reserved name first.")
+                return
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(guidance, forType: .string)
+            presentMessage("Manual Alpha review setup guidance copied. Verify codexswap_alpha is unused before running the command.")
+        }
     }
 
     // MARK: - Menu
@@ -673,6 +747,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             refreshSubagentPolicy: { [weak self] in self?.refreshSubagentPolicy() },
             applySubagentPolicy: { [weak self] draft in self?.applySubagentPolicy(draft) },
+            refreshAlphaDelegationMCP: { [weak self] in self?.refreshAlphaDelegationMCP() },
+            copyAlphaDelegationMCPSetup: { [weak self] in self?.copyAlphaDelegationMCPSetup() },
             installShim: { [weak self] in self?.setShimInstalled(true) },
             uninstallShim: { [weak self] in self?.setShimInstalled(false) }
         )

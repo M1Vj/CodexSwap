@@ -3,6 +3,7 @@ import SwapKit
 
 struct AdvancedSettingsView: View {
     @ObservedObject var model: SettingsViewModel
+    @State private var bridgedUsageRefresh = BridgedUsageRefreshState()
 
     var body: some View {
         Form {
@@ -16,9 +17,11 @@ struct AdvancedSettingsView: View {
 
             SubagentModelsSection(model: model)
 
-            BridgedModelsSection()
+            BridgedModelsSection { persisted in
+                _ = bridgedUsageRefresh.applyPersistenceResult(persisted)
+            }
 
-            BridgedUsageSection()
+            BridgedUsageSection(pricingRevision: bridgedUsageRefresh.revision)
 
             SettingsSection(title: "Terminal Shim") {
                 LabeledContent("Status", value: model.shimInstalled ? "Installed" : "Not Installed")
@@ -43,10 +46,15 @@ struct AdvancedSettingsView: View {
 /// naming an enabled model here bypass Codex accounts entirely and are translated
 /// to the entry's OpenAI-compatible Chat Completions endpoint.
 private struct BridgedModelsSection: View {
+    let onPersistenceResult: (Bool) -> Void
     @State private var entries: [BridgedModel] = []
     @State private var loaded = false
     @State private var persistenceMessage: String?
     @State private var editGeneration = SettingsEditGeneration()
+
+    init(onPersistenceResult: @escaping (Bool) -> Void) {
+        self.onPersistenceResult = onPersistenceResult
+    }
 
     var body: some View {
         SettingsSection(title: "Free & Bridged Models") {
@@ -102,7 +110,9 @@ private struct BridgedModelsSection: View {
         if !duplicateIDs.isEmpty {
             return "⚠ Duplicate model IDs: \(duplicateIDs.keys.sorted().joined(separator: ", "))"
         }
-        let missingBase = entries.filter { !$0.modelID.isEmpty && URL(string: $0.baseURL) == nil }
+        let missingBase = entries.filter {
+            !$0.modelID.isEmpty && BridgedModel.validatedBaseURL($0.baseURL) == nil
+        }
         if !missingBase.isEmpty {
             return "⚠ Invalid base URL for: \(missingBase.map(\.modelID).joined(separator: ", "))"
         }
@@ -127,12 +137,20 @@ private struct BridgedModelsSection: View {
         Task { @MainActor in
             do {
                 let accepted = try await SettingsStoreBridge.bridgedModelsPersistence.persist(snapshot)
-                guard accepted else { return }
-                guard editGeneration.markPersisted(token) else { return }
+                guard accepted else {
+                    onPersistenceResult(false)
+                    return
+                }
+                guard editGeneration.markPersisted(token) else {
+                    onPersistenceResult(false)
+                    return
+                }
                 persistenceMessage = nil
+                onPersistenceResult(true)
             } catch {
                 guard editGeneration.generation == token else { return }
                 persistenceMessage = "Bridged model changes could not be saved. Your edits remain visible; try again."
+                onPersistenceResult(false)
             }
         }
     }
@@ -186,8 +204,33 @@ private struct BridgedModelRow: View {
                         .textFieldStyle(.roundedBorder)
                         .onChange(of: entry.apiKey) { onChange() }
                 }
+                priceField("Input $/1M", keyPath: \.inputPricePerMillion)
+                priceField("Cached input $/1M", keyPath: \.cachedInputPricePerMillion)
+                priceField("Cache write $/1M", keyPath: \.cacheWriteInputPricePerMillion)
+                priceField("Output $/1M", keyPath: \.outputPricePerMillion)
             }
             .padding(.vertical, 2)
+        }
+    }
+
+    private func priceField(
+        _ title: String,
+        keyPath: WritableKeyPath<BridgedModel, Double?>
+    ) -> some View {
+        LabeledContent(title) {
+            TextField("optional", text: Binding(
+                get: { entry[keyPath: keyPath].map { String($0) } ?? "" },
+                set: { raw in
+                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty {
+                        entry[keyPath: keyPath] = nil
+                    } else if let value = Double(trimmed), value.isFinite, value >= 0 {
+                        entry[keyPath: keyPath] = value
+                    }
+                    onChange()
+                }
+            ))
+            .textFieldStyle(.roundedBorder)
         }
     }
 }
@@ -195,9 +238,57 @@ private struct BridgedModelRow: View {
 /// Live token usage for bridged models. These lanes consume no Codex quota;
 /// totals come from the proxy's own accounting, and estimated cost appears once
 /// a model's optional per-million pricing is filled in.
+enum BridgedUsagePresentation {
+    static func pricing(for settings: SwapKit.Settings) -> [String: BridgedUsageStore.Pricing] {
+        settings.bridgedModels.reduce(into: [:]) { prices, model in
+            prices[model.modelID] = BridgedUsageStore.Pricing(
+                inputPerMillion: model.inputPricePerMillion,
+                cachedInputPerMillion: model.cachedInputPricePerMillion,
+                cacheWriteInputPerMillion: model.cacheWriteInputPricePerMillion,
+                outputPerMillion: model.outputPricePerMillion
+            )
+        }
+    }
+
+    static func cacheText(for entry: BridgedUsageStore.Entry) -> String {
+        let cached = TokenMetricPresentation.text(
+            value: entry.cachedInputTokens,
+            completeness: entry.cachedInputCompleteness
+        )
+        let writes = TokenMetricPresentation.text(
+            value: entry.cacheWriteInputTokens,
+            completeness: entry.cacheWriteInputCompleteness
+        )
+        return "cached \(cached) · write \(writes)"
+    }
+}
+
+struct BridgedUsageRefreshState: Sendable, Equatable {
+    private(set) var revision: UInt = 0
+    private(set) var loadGeneration: UInt = 0
+
+    @discardableResult
+    mutating func applyPersistenceResult(_ persisted: Bool) -> UInt {
+        guard persisted else { return revision }
+        revision &+= 1
+        return revision
+    }
+
+    @discardableResult
+    mutating func beginLoad() -> UInt {
+        loadGeneration &+= 1
+        return loadGeneration
+    }
+
+    func acceptsLoad(_ token: UInt) -> Bool {
+        loadGeneration == token
+    }
+}
+
 private struct BridgedUsageSection: View {
+    let pricingRevision: UInt
     @State private var snapshot: BridgedUsageStore.Snapshot?
-    @State private var prices: [String: (input: Double, output: Double)] = [:]
+    @State private var refresh = BridgedUsageRefreshState()
 
     var body: some View {
         SettingsSection(title: "Bridged Model Usage") {
@@ -219,6 +310,9 @@ private struct BridgedUsageSection: View {
             }
         }
         .task { await reload() }
+        .onChange(of: pricingRevision) { _, _ in
+            Task { await reload() }
+        }
     }
 
     private func usageTable(_ snapshot: BridgedUsageStore.Snapshot) -> some View {
@@ -243,14 +337,18 @@ private struct BridgedUsageSection: View {
         return HStack {
             Text(row.modelID).font(.system(.callout, design: .monospaced))
             Spacer()
-            Text("\(e.requests) req · in \(Self.grouped(e.inputTokens)) · out \(Self.grouped(e.outputTokens))")
+            Text("\(e.requests) req · in \(Self.grouped(e.inputTokens)) · \(BridgedUsagePresentation.cacheText(for: e)) · out \(Self.grouped(e.outputTokens))")
                 .font(.callout)
             if row.estimatedCost > 0 {
                 Text(String(format: "$%.4f", row.estimatedCost))
                     .font(.callout)
                     .foregroundStyle(.secondary)
-            } else if isFree(modelID: row.modelID) {
+            } else if row.pricingAvailable {
                 Text("free")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("unpriced")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -264,19 +362,12 @@ private struct BridgedUsageSection: View {
             return formatter.string(from: NSNumber(value: value)) ?? String(value)
         }
 
-    private func isFree(modelID: String) -> Bool {
-        guard let p = prices[modelID] else { return true }
-        return p.input == 0 && p.output == 0
-    }
-
     private func reload() async {
-        let store = SettingsStore()
-        let settings = await store.get()
-        var priceMap: [String: (Double, Double)] = [:]
-        for m in settings.bridgedModels {
-            priceMap[m.modelID] = (m.inputPricePerMillion ?? 0, m.outputPricePerMillion ?? 0)
-        }
-        prices = priceMap
-        snapshot = await BridgedUsageStore.shared.snapshot(prices: priceMap)
+        let token = refresh.beginLoad()
+        let settings = await SettingsStoreBridge.bridgedModelsPersistence.current()
+        let priceMap = BridgedUsagePresentation.pricing(for: settings)
+        let nextSnapshot = await BridgedUsageStore.shared.snapshot(prices: priceMap)
+        guard refresh.acceptsLoad(token) else { return }
+        snapshot = nextSnapshot
     }
 }

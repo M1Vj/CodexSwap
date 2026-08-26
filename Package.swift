@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "SwapKit", targets: ["SwapKit"]),
         .executable(name: "swapd", targets: ["swapd"]),
         .executable(name: "CodexSwapApp", targets: ["CodexSwapApp"]),
+        .executable(name: "codexswap-alpha-mcp", targets: ["codexswap-alpha-mcp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -32,9 +33,17 @@ let package = Package(
             name: "CodexSwapApp",
             dependencies: ["SwapKit"]
         ),
+        .executableTarget(
+            name: "codexswap-alpha-mcp",
+            dependencies: ["SwapKit"]
+        ),
         .testTarget(
             name: "SwapKitTests",
             dependencies: ["SwapKit"]
+        ),
+        .testTarget(
+            name: "CodexSwapAppTests",
+            dependencies: ["CodexSwapApp"]
         ),
     ]
 )

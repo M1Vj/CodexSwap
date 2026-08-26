@@ -20,7 +20,7 @@ enum AlphaPassthrough {
         httpClient: HTTPClient,
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
     ) async throws {
-        guard let base = URL(string: entry.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        guard let base = BridgedModel.validatedBaseURL(entry.baseURL) else {
             return try await writePlainError(outbound, status: .internalServerError, message: "Bridged model has an invalid base URL")
         }
         var request = HTTPClientRequest(url: base.appendingPathComponent("chat/completions").absoluteString)

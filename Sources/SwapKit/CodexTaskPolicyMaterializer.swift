@@ -137,7 +137,7 @@ public struct CodexTaskPolicyMaterializer: Sendable {
     }
 
     public func materialize(
-        policy: SubagentModelPolicy,
+        policyProfiles: SubagentPolicyProfiles,
         targetCodexHome: URL,
         proxyURL: URL,
         allowedAliases: [String],
@@ -154,7 +154,7 @@ public struct CodexTaskPolicyMaterializer: Sendable {
         let overlayData = try readOverlay(sourceOverlay)
         let (rewrittenOverlay, parsedCatalog) = try rewriteOverlay(
             overlayData,
-            alphaUltraEnabled: policy.alphaUltraEnabled,
+            alphaUltraEnabled: policyProfiles.bridged.alphaUltraEnabled,
             bridgedModels: bridgedModels
         )
         // Validate only against the exact catalog that will be staged. An
@@ -162,14 +162,14 @@ public struct CodexTaskPolicyMaterializer: Sendable {
         // provenance remains authoritative for configured bridge identities.
         let resolvedCatalog = parsedCatalog
 
-        let assignments = try validatedAssignments(policy.roleAssignments)
+        // Assignments are validated after the parent family selects its profile.
         // Discover the logical roles that are actually installed before
         // validating the saved policy. Persisted assignments for a role that
         // is not installed are intentionally retained as non-blocking
         // warnings; only assignments for installed roles are staged.
         let discoveredSources = try discoverRoleSources(sourceAgents: sourceAgents)
         let installedRoleIDs = discoveredSources.keys.sorted()
-        let parentFamily: CodexModelProviderFamily?
+        let parentFamily: CodexModelProviderFamily
         guard let parentID = parentModelID,
               !parentID.isEmpty,
               !Self.hasDisallowedControl(parentID) else {
@@ -198,8 +198,19 @@ public struct CodexTaskPolicyMaterializer: Sendable {
             ])
         }
         parentFamily = family
-        let validation = SubagentPolicyValidator.validate(
-            policy: policy,
+        guard let selectedPolicy = policyProfiles.policy(for: parentFamily)?.normalized(for: parentFamily) else {
+            throw CodexTaskPolicyMaterializerError.validationFailed([
+                SubagentPolicyIssue(
+                    severity: .error,
+                    code: .unknownProviderFamily,
+                    modelID: Self.safeIdentifier(parentID),
+                    message: "The configured parent provider is unsupported; no Task Board policy was staged."
+                )
+            ])
+        }
+        let assignments = try validatedAssignments(selectedPolicy.roleAssignments)
+        let validation = SubagentPolicyValidator.validateForApply(
+            policy: selectedPolicy,
             catalog: resolvedCatalog,
             installedRoleIDs: installedRoleIDs,
             parentProviderFamily: parentFamily
@@ -238,6 +249,31 @@ public struct CodexTaskPolicyMaterializer: Sendable {
             config: Data(config.utf8),
             targetOverlay: targetOverlay,
             targetConfig: targetConfig
+        )
+    }
+
+    /// Compatibility entry point for callers that still hold one legacy policy.
+    /// New callers should pass both provider-linked profiles so parent selection
+    /// cannot accidentally replace the other family's saved roster.
+    /// The legacy path requires an already-resolved parent model ID; callers
+    /// that need missing-parent fail-closed validation must use the profiles API.
+    public func materialize(
+        policy: SubagentModelPolicy,
+        targetCodexHome: URL,
+        proxyURL: URL,
+        allowedAliases: [String],
+        runID: UUID,
+        parentModelID: String,
+        bridgedModels: [BridgedModel] = []
+    ) throws {
+        try materialize(
+            policyProfiles: SubagentPolicyProfiles(openAI: policy, bridged: policy),
+            targetCodexHome: targetCodexHome,
+            proxyURL: proxyURL,
+            allowedAliases: allowedAliases,
+            runID: runID,
+            parentModelID: parentModelID,
+            bridgedModels: bridgedModels
         )
     }
 

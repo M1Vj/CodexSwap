@@ -13,10 +13,10 @@ final class RunTelemetryTests: XCTestCase {
     {"type":"item.completed","item":{"id":"item_0","item_type":"command_execution","command":"ls"}}
     {"type":"item.completed","item":{"id":"item_1","item_type":"agent_message","text":"Interim note."}}
     not json at all
-    {"type":"turn.completed","usage":{"input_tokens":24837,"cached_input_tokens":18001,"output_tokens":1542}}
+    {"type":"turn.completed","usage":{"input_tokens":24837,"input_tokens_details":{"cached_tokens":18001},"cache_write_tokens":500,"output_tokens":1542}}
     {"type":"turn.started"}
     {"type":"item.completed","item":{"id":"item_2","item_type":"agent_message","text":"All done: shipped the fix."}}
-    {"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":58}}
+    {"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"cache_creation_input_tokens":250,"output_tokens":58}}
     {"type":"unknown.event","payload":{"x":1}}
     tokens used
     38,353
@@ -28,9 +28,72 @@ final class RunTelemetryTests: XCTestCase {
         XCTAssertEqual(telemetry.sessionID, "0199aaaa-bbbb-cccc-dddd-eeeeffff0001")
         XCTAssertEqual(telemetry.inputTokens, 25_837)
         XCTAssertEqual(telemetry.cachedTokens, 18_901)
+        XCTAssertEqual(telemetry.cacheWriteTokens, 600)
         XCTAssertEqual(telemetry.outputTokens, 1_600)
         XCTAssertEqual(telemetry.finalMessage, "All done: shipped the fix.")
         XCTAssertNil(telemetry.lastError)
+    }
+
+    func testDecoderParsesOfficialTopLevelCacheWriteInputTokens() {
+        let telemetry = CodexEventDecoder.decode(logText: #"{"type":"turn.completed","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"cache_write_input_tokens":30,"output_tokens":5}}"#)
+
+        XCTAssertEqual(telemetry.inputTokens, 100)
+        XCTAssertEqual(telemetry.cachedTokens, 20)
+        XCTAssertEqual(telemetry.cacheWriteTokens, 30)
+        XCTAssertEqual(telemetry.outputTokens, 5)
+    }
+
+    func testDecoderMarksMixedCachePresencePartialRegardlessOfTurnOrder() {
+        let absent = #"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}"#
+        let explicitZero = #"{"type":"turn.completed","usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":2}}"#
+
+        for log in [absent + "\n" + explicitZero, explicitZero + "\n" + absent] {
+            let telemetry = CodexEventDecoder.decode(logText: log)
+            XCTAssertEqual(telemetry.cachedTokens, 0)
+            XCTAssertEqual(telemetry.cacheWriteTokens, 0)
+            XCTAssertEqual(telemetry.cachedTokensCompleteness, .partial)
+            XCTAssertEqual(telemetry.cacheWriteTokensCompleteness, .partial)
+        }
+    }
+
+    func testDecoderMarksAllPresentZeroBucketsComplete() {
+        let log = #"{"type":"turn.completed","usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":2}}"#
+        let telemetry = CodexEventDecoder.decode(logText: log)
+
+        XCTAssertEqual(telemetry.cachedTokens, 0)
+        XCTAssertEqual(telemetry.cacheWriteTokens, 0)
+        XCTAssertEqual(telemetry.cachedTokensCompleteness, .complete)
+        XCTAssertEqual(telemetry.cacheWriteTokensCompleteness, .complete)
+    }
+
+    func testDecoderMarksAllAbsentCacheBucketsUnknown() {
+        let log = #"{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":2}}"#
+        let telemetry = CodexEventDecoder.decode(logText: log)
+
+        XCTAssertNil(telemetry.cachedTokens)
+        XCTAssertNil(telemetry.cacheWriteTokens)
+        XCTAssertEqual(telemetry.cachedTokensCompleteness, .unknown)
+        XCTAssertEqual(telemetry.cacheWriteTokensCompleteness, .unknown)
+    }
+
+    func testDecoderIgnoresOutOfRangeNumbersAndSaturatesTotals() {
+        let max = Int.max
+        let perEvent = 5_000_000_000_000_000_000
+        let outOfRange = "1.7976931348623157e308"
+        let text = """
+        {"type":"turn.completed","usage":{"input_tokens":\(outOfRange),"output_tokens":\(outOfRange),"cache_write_input_tokens":\(outOfRange)}}
+        {"type":"turn.completed","usage":{"input_tokens":\(perEvent),"input_tokens_details":{"cached_tokens":\(perEvent)},"cache_write_input_tokens":\(perEvent),"output_tokens":\(perEvent)}}
+        {"type":"turn.completed","usage":{"input_tokens":\(perEvent),"input_tokens_details":{"cached_tokens":\(perEvent)},"cache_write_input_tokens":\(perEvent),"output_tokens":\(perEvent)}}
+        {"type":"turn.completed","usage":{"input_tokens":\(perEvent),"input_tokens_details":{"cached_tokens":0},"cache_write_input_tokens":\(perEvent),"output_tokens":\(perEvent)}}
+        {"type":"turn.completed","usage":{"input_tokens":\(perEvent),"input_tokens_details":{"cached_tokens":0},"cache_write_input_tokens":\(perEvent),"output_tokens":\(perEvent)}}
+        """
+
+        let telemetry = CodexEventDecoder.decode(logText: text)
+
+        XCTAssertEqual(telemetry.inputTokens, max)
+        XCTAssertEqual(telemetry.cachedTokens, max)
+        XCTAssertEqual(telemetry.cacheWriteTokens, max)
+        XCTAssertEqual(telemetry.outputTokens, max)
     }
 
     func testDecoderCapturesErrorsAndToleratesAlternateItemShape() {
@@ -45,6 +108,29 @@ final class RunTelemetryTests: XCTestCase {
         XCTAssertEqual(telemetry.sessionID, "alt-session")
         XCTAssertEqual(telemetry.finalMessage, "Alt shape.")
         XCTAssertEqual(telemetry.lastError, "usage_limit_reached")
+    }
+
+    func testLegacyTelemetryRunRecordLeavesCacheWritesUnknown() throws {
+        let legacy = try JSONDecoder().decode(TaskRunRecord.self, from: Data("{}".utf8))
+        XCTAssertNil(legacy.cacheWriteTokens)
+
+        let withCache = try JSONDecoder().decode(
+            TaskRunRecord.self,
+            from: Data(#"{"cacheWriteTokens":12}"#.utf8)
+        )
+        XCTAssertEqual(withCache.cacheWriteTokens, 12)
+    }
+
+    func testLegacyRunRecordWithCacheValuesStillDecodesCompletenessAsUnknown() throws {
+        let legacy = try JSONDecoder().decode(
+            TaskRunRecord.self,
+            from: Data(#"{"inputTokens":100,"cachedTokens":0,"cacheWriteTokens":0,"outputTokens":2}"#.utf8)
+        )
+
+        XCTAssertEqual(legacy.cachedTokens, 0)
+        XCTAssertEqual(legacy.cacheWriteTokens, 0)
+        XCTAssertEqual(legacy.cachedTokensCompleteness, .unknown)
+        XCTAssertEqual(legacy.cacheWriteTokensCompleteness, .unknown)
     }
 
     func testDecoderReturnsEmptyForPlainTextLog() {
@@ -159,9 +245,55 @@ final class RunTelemetryTests: XCTestCase {
     }
 
     func testSummaryExtractorComposesTokensAndSummary() {
-        let run = TaskRunRecord(inputTokens: 25_837, cachedTokens: 18_901, outputTokens: 1_600, summary: "Shipped.")
-        XCTAssertEqual(TaskRunSummaryExtractor.summary(from: run), "in 25k · cached 18k · out 1600 — Shipped.")
+        let run = TaskRunRecord(inputTokens: 25_837, cachedTokens: 18_901, cacheWriteTokens: 4_000, outputTokens: 1_600, summary: "Shipped.")
+        XCTAssertEqual(TaskRunSummaryExtractor.summary(from: run), "in 25k · cached 18k · write 4000 · out 1600 — Shipped.")
         XCTAssertNil(TaskRunSummaryExtractor.summary(from: TaskRunRecord()))
+    }
+
+    func testSummaryExtractorRendersUnknownCacheBucketsWithoutInventingZero() {
+        let run = TaskRunRecord(inputTokens: 100, outputTokens: 5)
+
+        XCTAssertEqual(
+            TaskRunSummaryExtractor.tokenLine(for: run),
+            "in 100 · cached ? · write ? · out 5"
+        )
+    }
+
+    func testSummaryExtractorRendersPartialCacheBucketsWithCounts() {
+        let run = TaskRunRecord(
+            inputTokens: 100,
+            cachedTokens: 7,
+            cacheWriteTokens: 3,
+            outputTokens: 5,
+            cachedTokensCompleteness: .partial,
+            cacheWriteTokensCompleteness: .partial
+        )
+
+        XCTAssertEqual(
+            TaskRunSummaryExtractor.tokenLine(for: run),
+            "in 100 · cached partial 7 · write partial 3 · out 5"
+        )
+    }
+
+    func testPartialCacheCompletenessRoundTripsWithCounts() throws {
+        let record = TaskRunRecord(
+            inputTokens: 100,
+            cachedTokens: 7,
+            cacheWriteTokens: 3,
+            outputTokens: 5,
+            cachedTokensCompleteness: .partial,
+            cacheWriteTokensCompleteness: .partial
+        )
+
+        let decoded = try JSONDecoder().decode(
+            TaskRunRecord.self,
+            from: JSONEncoder().encode(record)
+        )
+
+        XCTAssertEqual(decoded.cachedTokens, 7)
+        XCTAssertEqual(decoded.cacheWriteTokens, 3)
+        XCTAssertEqual(decoded.cachedTokensCompleteness, .partial)
+        XCTAssertEqual(decoded.cacheWriteTokensCompleteness, .partial)
     }
 
     func testDecoderChunkedFileReadMatchesTextDecode() throws {

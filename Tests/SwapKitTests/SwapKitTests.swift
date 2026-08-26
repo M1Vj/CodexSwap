@@ -89,6 +89,27 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(zero.proxyPort, Settings.defaultProxyPort)
         XCTAssertEqual(tooHigh.proxyPort, Settings.defaultProxyPort)
     }
+
+    func testPersistedBridgedModelsRejectRemoteHTTPButKeepLoopbackHTTPAndHTTPS() throws {
+        var settings = Settings.default
+        settings.bridgedModels = [
+            BridgedModel(modelID: "remote-http", baseURL: "http://provider.example/v1"),
+            BridgedModel(modelID: "loopback-http", baseURL: "http://127.0.0.1:1234/v1"),
+            BridgedModel(modelID: "secure-https", baseURL: "https://provider.example/v1"),
+        ]
+
+        let decoded = try JSONDecoder().decode(Settings.self, from: JSONEncoder().encode(settings))
+
+        XCTAssertEqual(
+            decoded.bridgedModels.map(\.modelID),
+            ["loopback-http", "secure-https"],
+            "persisted settings must use the shared bridged endpoint transport rule"
+        )
+    }
+
+    func testDefaultBridgedEndpointRemainsOpenCodeHTTPS() {
+        XCTAssertEqual(Settings.default.bridgedModels.first?.baseURL, "https://opencode.ai/zen/v1")
+    }
 }
 
 final class CodexConfigManagerTests: XCTestCase {

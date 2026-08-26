@@ -382,7 +382,7 @@ public struct CodexSubagentPolicyManager: Sendable {
         parentProviderFamily: CodexModelProviderFamily?,
         requireLogicalName: Bool
     ) throws {
-        let validation = SubagentPolicyValidator.validate(
+        let validation = SubagentPolicyValidator.validateForApply(
             policy: policy,
             catalog: catalog,
             installedRoleIDs: roleFiles.map(\.roleID),

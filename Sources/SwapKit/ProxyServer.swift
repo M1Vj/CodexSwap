@@ -119,6 +119,49 @@ func proxyRequestMode(headers: HTTPHeaders, method: HTTPMethod, path: String, lo
     return ProxyRequestMode(headers: headers)
 }
 
+/// Bounds request-body aggregation for the two JSON endpoints that can carry
+/// large Responses or Chat Completions payloads. AlphaBridge has a separate,
+/// smaller model-resolution cap; this ceiling protects ordinary OpenAI models
+/// without changing their existing request contract.
+func proxyRequestBodyAggregationLimit(method: HTTPMethod, path: String) -> Int? {
+    guard method == .POST else { return nil }
+    let rawPath = splitPathQuery(path).0
+    guard rawPath.hasSuffix("/responses") || rawPath.hasSuffix("/chat/completions") else {
+        return nil
+    }
+    return ProxyServer.maxCandidateRequestBodyBytes
+}
+
+func proxyRequestBodyExceedsAggregationLimit(_ head: HTTPRequestHead) -> Bool {
+    guard let limit = proxyRequestBodyAggregationLimit(method: head.method, path: head.uri),
+          let rawLength = head.headers.first(name: "Content-Length") else {
+        return false
+    }
+    let value = rawLength.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty, value.allSatisfy({ $0.isNumber }) else { return false }
+    guard let declared = Int64(value) else { return true }
+    return declared > Int64(limit)
+}
+
+/// Incrementally collects one request body without ever appending a chunk that
+/// would exceed the configured limit.
+struct ProxyRequestBodyAccumulator {
+    private let limit: Int
+    private var buffer = ByteBuffer()
+
+    init(limit: Int) {
+        self.limit = max(0, limit)
+    }
+
+    var bytes: Data { Data(buffer.readableBytesView) }
+
+    mutating func append(_ chunk: ByteBuffer) -> Bool {
+        guard chunk.readableBytes <= limit - buffer.readableBytes else { return false }
+        buffer.writeImmutableBuffer(chunk)
+        return true
+    }
+}
+
 func selectProxyAccount(
     store: AccountStore,
     mode: ProxyRequestMode,
@@ -194,14 +237,32 @@ public struct ProxyUsageSample: Sendable, Equatable {
     public let model: String
     public let inputTokens: Int
     public let cachedInputTokens: Int
+    public let cacheWriteInputTokens: Int
+    public let cachedInputPresence: TokenFieldPresence
+    public let cacheWriteInputPresence: TokenFieldPresence
     public let outputTokens: Int
 
-    public init(model: String, inputTokens: Int, cachedInputTokens: Int, outputTokens: Int) {
+    public init(
+        model: String,
+        inputTokens: Int,
+        cachedInputTokens: Int,
+        cacheWriteInputTokens: Int = 0,
+        outputTokens: Int,
+        cachedInputPresence: TokenFieldPresence = .present,
+        cacheWriteInputPresence: TokenFieldPresence? = nil
+    ) {
         self.model = model
         self.inputTokens = inputTokens
         self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteInputTokens = cacheWriteInputTokens
+        self.cachedInputPresence = cachedInputPresence
+        self.cacheWriteInputPresence = cacheWriteInputPresence
+            ?? (cacheWriteInputTokens > 0 ? .present : .absent)
         self.outputTokens = outputTokens
     }
+
+    public var cacheReadPresence: TokenFieldPresence { cachedInputPresence }
+    public var cacheWritePresence: TokenFieldPresence { cacheWriteInputPresence }
 }
 
 public struct ProxyEvent: Sendable {
@@ -453,6 +514,11 @@ public actor ProxyServer {
         public var apiUpstream: URL = URL(string: "https://api.openai.com")!
         public init() {}
     }
+
+    /// Global aggregation ceiling for candidate JSON endpoints. This is
+    /// intentionally distinct from `AlphaBridge.maxBodyBytes`, which applies
+    /// only after a bridged model has been resolved.
+    static let maxCandidateRequestBodyBytes = 64 * 1024 * 1024
 
     private let store: AccountStore
     private let refresher: TokenRefresher
@@ -746,15 +812,36 @@ public actor ProxyServer {
             var iterator = inbound.makeAsyncIterator()
             while let first = try await iterator.next() {
                 guard case .head(let head) = first else { continue }
-                var body = ByteBuffer()
+                if proxyRequestBodyExceedsAggregationLimit(head) {
+                    try await self.writeError(
+                        outbound,
+                        status: .payloadTooLarge,
+                        message: "request body exceeds the proxy limit"
+                    )
+                    return
+                }
+
+                let aggregationLimit = proxyRequestBodyAggregationLimit(
+                    method: head.method,
+                    path: head.uri
+                ) ?? Int.max
+                var body = ProxyRequestBodyAccumulator(limit: aggregationLimit)
                 readBody: while let part = try await iterator.next() {
                     switch part {
-                    case .body(let chunk): body.writeImmutableBuffer(chunk)
+                    case .body(let chunk):
+                        guard body.append(chunk) else {
+                            try await self.writeError(
+                                outbound,
+                                status: .payloadTooLarge,
+                                message: "request body exceeds the proxy limit"
+                            )
+                            return
+                        }
                     case .end: break readBody
                     case .head: break readBody
                     }
                 }
-                let bodyData = Data(body.readableBytesView)
+                let bodyData = body.bytes
                 try await self.serveRequest(head: head, body: bodyData, outbound: outbound)
             }
         }
@@ -1378,19 +1465,33 @@ struct SSEUsageScanner {
               let model = response["model"] as? String,
               !model.isEmpty,
               let usage = response["usage"] as? [String: Any] else { return }
-        func intField(_ name: String) -> Int? {
-            if let n = usage[name] as? Int { return n }
-            if let d = usage[name] as? Double, d >= 0, d.rounded() == d { return Int(d) }
-            return nil
+        func intField(_ name: String, in source: [String: Any]) -> Int? {
+            UsageSafety.nonNegativeInteger(source[name])
         }
-        guard let input = intField("input_tokens"),
-              let output = intField("output_tokens") else { return }
-        let cached = intField("cached_input_tokens") ?? 0
+        guard let input = intField("input_tokens", in: usage),
+              let output = intField("output_tokens", in: usage) else { return }
+        let inputDetails = usage["input_tokens_details"] as? [String: Any]
+        // Current Responses usage nests cache reads and writes under input details;
+        // retain the legacy top-level aliases used by older Codex releases.
+        let cached = intField("cached_tokens", in: inputDetails ?? [:])
+            ?? intField("cached_input_tokens", in: usage)
+            ?? intField("cache_read_tokens", in: usage)
+        let requestedCacheWrite = intField("cache_write_tokens", in: inputDetails ?? [:])
+            ?? intField("cache_write_input_tokens", in: usage)
+            ?? intField("cache_write_tokens", in: usage)
+            ?? intField("cache_creation_input_tokens", in: usage)
+            ?? intField("cache_creation_tokens", in: usage)
+        let totalInput = max(0, input)
+        let cachedSubset = min(cached ?? 0, totalInput)
+        let cacheWriteSubset = min(requestedCacheWrite ?? 0, totalInput - cachedSubset)
         extracted = ProxyUsageSample(
             model: model,
-            inputTokens: input,
-            cachedInputTokens: cached,
-            outputTokens: output
+            inputTokens: totalInput,
+            cachedInputTokens: cachedSubset,
+            cacheWriteInputTokens: cacheWriteSubset,
+            outputTokens: output,
+            cachedInputPresence: cached == nil ? .absent : .present,
+            cacheWriteInputPresence: requestedCacheWrite == nil ? .absent : .present
         )
     }
 }
@@ -1420,6 +1521,6 @@ func limitInfo(headers: HTTPHeaders, body: ByteBuffer) -> (String, Date?) {
     let limit = headers.first(name: "x-codex-active-limit").flatMap { $0.isEmpty ? nil : $0 } ?? "codex"
     guard let obj = try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)) as? [String: Any],
           let err = obj["error"] as? [String: Any] else { return (limit, nil) }
-    let resets = (err["resets_at"] as? Int) ?? Int((err["resets_at"] as? Double) ?? 0)
+    let resets = UsageSafety.nonNegativeInteger(err["resets_at"]) ?? 0
     return (limit, resets > 0 ? Date(timeIntervalSince1970: TimeInterval(resets)) : nil)
 }

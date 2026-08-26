@@ -7,16 +7,39 @@ struct SubagentModelsSection: View {
     var body: some View {
         let state = model.subagentPolicyPresentation
 
-        SettingsSection(title: "Subagent Models") {
-            Text("Choose which installed models delegated subagents may use. This policy is subagent-only: your parent model, account routing, and normal Codex requests stay unchanged.")
+        VStack(alignment: .leading, spacing: 12) {
+            SettingsSection(title: "Subagent Models") {
+                Text("Choose which installed models delegated subagents may use. This policy is subagent-only: your parent model, account routing, and normal Codex requests stay unchanged.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            Label("Compatibility is checked against Codex's configured parent model when available. An already-running session can still differ, so keep the installed subagent roster on one provider family; a GPT↔Alpha cross-provider child may be rejected by Codex's native task encryption.", systemImage: "info.circle")
+                if let profileLabel = state.providerProfileLabel {
+                    Label(profileLabel, systemImage: "person.crop.circle.badge.checkmark")
+                        .font(.callout.weight(.semibold))
+                        .accessibilityIdentifier("subagent-policy-profile-label")
+                }
+
+                Text(SubagentPolicyPresentationState.interactiveSessionBoundary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("subagent-policy-profile-boundary")
+
+            Label(SubagentPolicyPresentationState.parentProviderCompatibilityCopy, systemImage: "info.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("subagent-policy-parent-boundary")
+
+            if let banner = state.parentCompatibilityBanner {
+                Label(banner, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("subagent-policy-parent-compatibility-banner")
+                    .accessibilityLabel("Subagent policy blocked by parent provider mismatch")
+                    .accessibilityValue(banner)
+            }
 
             HStack(alignment: .center, spacing: 10) {
                 statusLabel(for: state)
@@ -45,7 +68,9 @@ struct SubagentModelsSection: View {
                     .foregroundStyle(.secondary)
             }
 
-            alphaUltraControl(state)
+            if state.isAlphaUltraEditable {
+                alphaUltraControl(state)
+            }
             issueList(state)
 
             if let guidance = state.restartGuidance {
@@ -73,11 +98,14 @@ struct SubagentModelsSection: View {
                 .accessibilityLabel("Apply subagent model policy")
                 .disabled(!state.canApply)
             }
-        }
-        .task {
-            if model.subagentPolicyPresentation.phase == .loading {
-                model.actions.refreshSubagentPolicy()
             }
+            .task {
+                if model.subagentPolicyPresentation.phase == .loading {
+                    model.actions.refreshSubagentPolicy()
+                }
+            }
+
+            AlphaDelegationMCPSection(model: model)
         }
     }
 
@@ -88,8 +116,13 @@ struct SubagentModelsSection: View {
             Label("Loading", systemImage: "clock")
                 .foregroundStyle(.secondary)
         case .loaded:
-            Label("Ready to review", systemImage: "checkmark.circle")
-                .foregroundStyle(.secondary)
+            if state.blockingIssues.isEmpty {
+                Label(state.statusText, systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+            } else {
+                Label(state.statusText, systemImage: state.parentCompatibilityAffectedCount > 0 ? "xmark.octagon.fill" : "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
         case .applying:
             Label("Applying…", systemImage: "arrow.triangle.2.circlepath")
                 .foregroundStyle(.orange)
@@ -140,7 +173,9 @@ struct SubagentModelsSection: View {
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("subagent-model-use-all-\(accessibilityToken(modelID))")
                     .accessibilityLabel("Use \(modelID) for all installed subagent roles")
-                    .disabled(!state.isEligible(modelID: modelID) || state.sortedInstalledRoleIDs.isEmpty || state.isLoading || state.isApplying)
+                    .accessibilityHint(state.useAllRolesHelp(for: modelID))
+                    .help(state.useAllRolesHelp(for: modelID))
+                    .disabled(!state.canUseModelForAllRoles(modelID: modelID) || state.isLoading || state.isApplying)
                 }
             }
         }
@@ -153,6 +188,20 @@ struct SubagentModelsSection: View {
                 .font(.headline)
             ForEach(state.sortedInstalledRoleIDs, id: \.self) { roleID in
                 roleAssignmentRow(state, roleID: roleID)
+            }
+
+            if state.canRestoreCompatibleDefaults {
+                Button("Restore compatible defaults") {
+                    var next = model.subagentPolicyPresentation
+                    guard next.restoreCompatibleDefaults() else { return }
+                    model.updateSubagentDraft(next.draft)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("subagent-policy-restore-compatible-defaults")
+                .accessibilityLabel("Restore compatible defaults for installed subagent roles")
+                .accessibilityHint("Restores provider-compatible role assignments without changing the parent model or enabling Alpha Ultra.")
+                .help("Restore provider-compatible defaults for the installed roles. Review the draft, then Apply.")
+                .disabled(state.isLoading || state.isApplying)
             }
         }
     }
@@ -167,10 +216,14 @@ struct SubagentModelsSection: View {
                 Text(roleID)
                     .font(.system(.body, design: .monospaced))
                 Spacer()
-                if let issue = state.validation.issues.first(where: { $0.roleID == roleID }) {
+                if let issue = state.validation.issues.first(where: { $0.roleID == roleID && $0.code != .parentProviderMismatch }) {
                     Label(issue.severity == .error ? "Needs attention" : "Review", systemImage: issue.severity == .error ? "exclamationmark.triangle" : "info.circle")
                         .font(.caption)
                         .foregroundStyle(issue.severity == .error ? .orange : .secondary)
+                } else if state.roleCompatibilityHelp(for: roleID) != nil {
+                    Label("Parent mismatch", systemImage: "xmark.octagon")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
 
@@ -219,7 +272,15 @@ struct SubagentModelsSection: View {
                 .disabled(state.isLoading || state.isApplying)
             }
 
-            if let issue = state.validation.issues.first(where: { $0.roleID == roleID }) {
+            if let compatibilityHelp = state.roleCompatibilityHelp(for: roleID) {
+                Text("Blocked by the configured parent provider.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Parent provider mismatch")
+                    .accessibilityHint(compatibilityHelp)
+                    .help(compatibilityHelp)
+            } else if let issue = state.validation.issues.first(where: { $0.roleID == roleID && $0.code != .parentProviderMismatch }) {
                 Text(issue.message)
                     .font(.caption)
                     .foregroundStyle(issue.severity == .error ? .orange : .secondary)
@@ -242,10 +303,11 @@ struct SubagentModelsSection: View {
             .accessibilityLabel("Enable Alpha Ultra orchestration for subagents")
             .disabled(state.isLoading || state.isApplying || (state.descriptor(for: SubagentPolicyValidator.alphaModelID) == nil && !state.draft.alphaUltraEnabled))
 
-            Text("When enabled, CodexSwap orchestrates Alpha's Ultra-style delegation while the Alpha provider still receives its supported max effort. Refresh after changing this toggle to load the synthetic Ultra choice. It never changes the parent model or normal routing.")
+            Text(SubagentPolicyPresentationState.alphaUltraExplanation)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("subagent-alpha-ultra-help")
         }
     }
 
@@ -253,7 +315,7 @@ struct SubagentModelsSection: View {
     private func issueList(_ state: SubagentPolicyPresentationState) -> some View {
         if !state.validation.issues.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
-                ForEach(state.validation.issues) { issue in
+                ForEach(state.validation.issues.filter { $0.code != .parentProviderMismatch }) { issue in
                     Label(issue.message, systemImage: issue.severity == .error ? "exclamationmark.triangle.fill" : "info.circle")
                         .font(.caption)
                         .foregroundStyle(issue.severity == .error ? .orange : .secondary)

@@ -159,11 +159,27 @@ public actor BridgedSettingsPersistenceCoordinator {
 /// SwiftUI owns no policy semantics; it edits this value and delegates I/O to
 /// the app action path. Draft values are never discarded when a refresh or
 /// transaction fails.
+public struct SubagentPolicyPersistenceDecision: Sendable, Equatable {
+    public let shouldPersist: Bool
+    public let warning: String?
+
+    public init(shouldPersist: Bool, warning: String? = nil) {
+        self.shouldPersist = shouldPersist
+        self.warning = warning
+    }
+}
+
 public struct SubagentPolicyPresentationState: Sendable, Equatable {
+    public static let alphaUltraExplanation = "This only exposes Codex Ultra for Alpha-parent sessions. Alpha receives max effort on the provider wire; enabling it does not enable GPT→Alpha delegation or change the parent model."
+    public static let interactiveSessionBoundary = "Task Board selects the matching saved provider profile before launch. Interactive Codex uses the profile applied to global role files; start a new Codex session after applying changes."
+    public static let nativeCrossProviderCompatibilityCopy = "Native cross-provider spawn can produce an empty or unreadable child task."
+    public static let parentProviderCompatibilityCopy = "Compatibility is checked against Codex's configured parent model when available. An already-running session can still differ, so keep the installed subagent roster on one provider family. \(nativeCrossProviderCompatibilityCopy)"
+
     public private(set) var draft: SubagentModelPolicy
     public private(set) var catalog: [CodexModelDescriptor]
     public private(set) var installedRoleIDs: [String]
     public private(set) var parentProviderFamily: CodexModelProviderFamily?
+    public private(set) var providerProfileFamily: CodexModelProviderFamily?
     public private(set) var phase: SubagentPolicyPresentationPhase
     public private(set) var validation: SubagentPolicyValidationResult
     public private(set) var message: String?
@@ -174,6 +190,7 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
         self.catalog = []
         self.installedRoleIDs = []
         self.parentProviderFamily = nil
+        self.providerProfileFamily = nil
         self.phase = .loading
         self.validation = SubagentPolicyValidationResult(issues: [])
         self.message = nil
@@ -197,6 +214,135 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
 
     public var canApply: Bool {
         phase == .loaded && catalogAvailable && validation.canApply
+    }
+
+    public var hasKnownParentProviderFamily: Bool {
+        guard let parentProviderFamily else { return false }
+        return parentProviderFamily != .unknown
+    }
+
+    public var providerProfileLabel: String? {
+        switch providerProfileFamily {
+        case .openAI:
+            return "Editing OpenAI parent profile"
+        case .bridged:
+            return "Editing Alpha parent profile"
+        case .unknown, nil:
+            return nil
+        }
+    }
+
+    public var isAlphaUltraEditable: Bool {
+        providerProfileFamily == .bridged
+    }
+
+    public static func persistenceDecision(
+        originalFamily: CodexModelProviderFamily,
+        freshFamily: CodexModelProviderFamily
+    ) -> SubagentPolicyPersistenceDecision {
+        guard originalFamily != .unknown, freshFamily == originalFamily else {
+            let original = providerLabel(originalFamily)
+            let fresh = providerLabel(freshFamily)
+            let nextStep = freshFamily == .unknown
+                ? "Refresh after Codex reports a known parent provider, then start a new Codex session."
+                : "Refresh and Apply the " + fresh + " profile, then start a new Codex session."
+            return SubagentPolicyPersistenceDecision(
+                shouldPersist: false,
+                warning: "Codex's configured parent provider changed from " + original + " to " + fresh + ". The saved " + original + " profile was preserved. " + nextStep
+            )
+        }
+        return SubagentPolicyPersistenceDecision(shouldPersist: true)
+    }
+
+    public var statusText: String {
+        switch phase {
+        case .loading:
+            return "Loading"
+        case .loaded:
+            if !blockingIssues.isEmpty {
+                return parentCompatibilityIssues.isEmpty ? "Needs attention" : "Blocked"
+            }
+            return "Ready to review"
+        case .applying:
+            return "Applying…"
+        case .succeeded:
+            return "Applied"
+        case .catalogUnavailable:
+            return "Catalog unavailable"
+        case .failed:
+            return "Not applied"
+        }
+    }
+
+    public var parentCompatibilityIssues: [SubagentPolicyIssue] {
+        validation.issues.filter { $0.code == .parentProviderMismatch }
+    }
+
+    public var parentCompatibilityAffectedRoleIDs: [String] {
+        Array(Set(parentCompatibilityIssues.compactMap(\.roleID))).sorted()
+    }
+
+    public var parentCompatibilityAffectedCount: Int {
+        parentCompatibilityAffectedRoleIDs.count
+    }
+
+    public var parentCompatibilityBanner: String? {
+        guard !parentCompatibilityIssues.isEmpty else { return nil }
+        let parent = parentProviderFamily.map(Self.providerLabel) ?? "unknown"
+        let childProviders = Set<String>(parentCompatibilityIssues.compactMap { issue in
+            guard let modelID = issue.modelID else { return nil }
+            return descriptor(for: modelID).map { Self.providerLabel($0.providerFamily) }
+        })
+        let children = childProviders.sorted().joined(separator: " and ")
+        let count = parentCompatibilityAffectedCount
+        let roleWord = count == 1 ? "role" : "roles"
+        return "Blocked: native Codex delegation cannot cross provider families. The \(parent) parent conflicts with \(children.isEmpty ? "a different provider" : children) for \(count) \(roleWord) (installed). Use a homogeneous roster matching the parent, or restore compatible defaults."
+    }
+
+    public func roleCompatibilityHelp(for roleID: String) -> String? {
+        guard let issue = parentCompatibilityIssues.first(where: { $0.roleID == roleID }),
+              let modelID = issue.modelID,
+              let descriptor = descriptor(for: modelID),
+              let parentProviderFamily,
+              parentProviderFamily != .unknown else {
+            return nil
+        }
+        return "Blocked: \(modelDisplayName(for: modelID)) uses \(Self.providerLabel(descriptor.providerFamily)), but the parent uses \(Self.providerLabel(parentProviderFamily)). Choose a model in the parent's provider family."
+    }
+
+    public func canUseModelForAllRoles(modelID: String) -> Bool {
+        guard isEligible(modelID: modelID), !sortedInstalledRoleIDs.isEmpty,
+              let descriptor = descriptor(for: modelID) else {
+            return false
+        }
+        guard let parentProviderFamily, parentProviderFamily != .unknown else {
+            return true
+        }
+        return descriptor.providerFamily == parentProviderFamily
+    }
+
+    public func useAllRolesHelp(for modelID: String) -> String {
+        guard let descriptor = descriptor(for: modelID) else {
+            return "Unavailable: this model is not in the current catalog. Refresh before using it for all roles."
+        }
+        if let parentProviderFamily,
+           parentProviderFamily != .unknown,
+           descriptor.providerFamily != parentProviderFamily {
+            return "Unavailable: \(modelDisplayName(for: modelID)) uses \(Self.providerLabel(descriptor.providerFamily)), but the parent uses \(Self.providerLabel(parentProviderFamily)). Choose a compatible model or restore compatible defaults."
+        }
+        if parentProviderFamily == nil || parentProviderFamily == .unknown {
+            return "Parent provider is not verified; applying remains blocked until Codex reports a known family."
+        }
+        return "Use \(modelDisplayName(for: modelID)) for all installed subagent roles."
+    }
+
+    public var canRestoreCompatibleDefaults: Bool {
+        guard phase != .loading, phase != .applying, catalogAvailable,
+              let parentProviderFamily, parentProviderFamily != .unknown,
+              !sortedInstalledRoleIDs.isEmpty else {
+            return false
+        }
+        return !compatibleDescriptors(for: parentProviderFamily).isEmpty
     }
 
     public var sortedInstalledRoleIDs: [String] {
@@ -283,14 +429,22 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
         self.catalog = Self.stableCatalog(catalog)
         self.installedRoleIDs = Array(Set(installedRoleIDs)).sorted()
         self.parentProviderFamily = parentProviderFamily
+        self.providerProfileFamily = parentProviderFamily
+        normalizeDraftForProviderProfile()
         self.phase = .loaded
         let before = draft
         if let actualAssignments {
-            draft = policyReconciled(with: actualAssignments)
+            if canReconcile(actualAssignments, for: parentProviderFamily) {
+                draft = policyReconciled(with: actualAssignments)
+                self.message = draft == before
+                    ? nil
+                    : "Codex's installed role values differed from the saved draft, so the editor was reconciled to the actual role files. Review the affected roles before applying."
+            } else {
+                self.message = Self.providerMismatchWarning(for: parentProviderFamily)
+            }
+        } else {
+            self.message = nil
         }
-        self.message = draft == before
-            ? nil
-            : "Codex's installed role values differed from the saved draft, so the editor was reconciled to the actual role files. Review the affected roles before applying."
         self.restartGuidance = nil
         recomputeValidation()
     }
@@ -312,8 +466,15 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
     /// Replaces the startup draft with the first persisted policy snapshot.
     /// The view model owns the one-time guard so this method never guesses
     /// whether a draft is still a default value.
-    public mutating func bootstrapPersistedDraft(_ persisted: SubagentModelPolicy) {
+    public mutating func bootstrapPersistedDraft(
+        _ persisted: SubagentModelPolicy,
+        providerProfileFamily: CodexModelProviderFamily? = nil
+    ) {
         draft = persisted
+        if let providerProfileFamily {
+            self.providerProfileFamily = providerProfileFamily
+            normalizeDraftForProviderProfile()
+        }
         message = nil
         restartGuidance = nil
         recomputeValidation()
@@ -326,6 +487,7 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
     public mutating func updateDraft(_ draft: SubagentModelPolicy) {
         guard phase != .applying else { return }
         self.draft = draft
+        normalizeDraftForProviderProfile()
         if phase == .succeeded {
             phase = catalog.isEmpty ? .catalogUnavailable : .loaded
         } else if phase == .failed || phase == .catalogUnavailable {
@@ -388,7 +550,7 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
 
     public mutating func setAlphaUltraEnabled(_ enabled: Bool) {
         var next = draft
-        next.alphaUltraEnabled = enabled
+        next.alphaUltraEnabled = isAlphaUltraEditable && enabled
         updateDraft(next)
     }
 
@@ -431,6 +593,57 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
         updateDraft(next)
     }
 
+    /// Restores a provider-compatible, role-aware draft without persisting or
+    /// enabling Alpha Ultra. The caller still owns the explicit Apply action.
+    @discardableResult
+    public mutating func restoreCompatibleDefaults() -> Bool {
+        guard canRestoreCompatibleDefaults,
+              let parentProviderFamily else { return false }
+
+        let installedRoles = sortedInstalledRoleIDs
+        let compatible = compatibleDescriptors(for: parentProviderFamily)
+        guard !compatible.isEmpty else { return false }
+
+        var next = draft
+        var eligibleModelIDs = Set(next.eligibleModelIDs)
+        for roleID in installedRoles {
+            let defaultAssignment = SubagentModelPolicy.defaultAssignment(for: roleID)
+            let preferredID: String?
+            switch parentProviderFamily {
+            case .openAI:
+                preferredID = defaultAssignment?.modelID
+            case .bridged:
+                preferredID = SubagentPolicyValidator.alphaModelID
+            case .unknown:
+                preferredID = nil
+            }
+            let descriptor = preferredID.flatMap { preferred in
+                compatible.first { $0.modelID == preferred }
+            } ?? compatible.first
+            guard let descriptor else { return false }
+            eligibleModelIDs.insert(descriptor.modelID)
+            let effort = compatibleEffort(
+                for: descriptor,
+                preferredEffort: parentProviderFamily == .openAI ? defaultAssignment?.reasoningEffort : nil,
+                parentProviderFamily: parentProviderFamily
+            )
+            if let index = next.roleAssignments.firstIndex(where: { $0.roleID == roleID }) {
+                next.roleAssignments[index].modelID = descriptor.modelID
+                next.roleAssignments[index].reasoningEffort = effort
+            } else {
+                next.roleAssignments.append(SubagentRoleAssignment(
+                    roleID: roleID,
+                    modelID: descriptor.modelID,
+                    reasoningEffort: effort
+                ))
+            }
+        }
+        next.eligibleModelIDs = eligibleModelIDs.sorted()
+        next.roleAssignments.sort { $0.roleID < $1.roleID }
+        updateDraft(next)
+        return true
+    }
+
     @discardableResult
     public mutating func beginApplying() -> Bool {
         guard canApply else { return false }
@@ -445,28 +658,41 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
         installedRoleIDs: [String],
         parentProviderFamily: CodexModelProviderFamily? = nil,
         actualAssignments: [SubagentRoleAssignment]? = nil,
-        verificationWarning: String? = nil
+        verificationWarning: String? = nil,
+        persistedDraft: SubagentModelPolicy? = nil,
+        persistedProfileFamily: CodexModelProviderFamily? = nil
     ) {
         self.catalog = Self.stableCatalog(catalog)
         self.installedRoleIDs = Array(Set(installedRoleIDs)).sorted()
         self.parentProviderFamily = parentProviderFamily
+        self.providerProfileFamily = persistedProfileFamily ?? parentProviderFamily
+        if let persistedDraft {
+            draft = persistedDraft
+        }
+        normalizeDraftForProviderProfile()
         phase = .succeeded
         let before = draft
+        var readbackWarning: String?
         if let actualAssignments {
-            draft = policyReconciled(with: actualAssignments)
+            if canReconcile(actualAssignments, for: parentProviderFamily) {
+                draft = policyReconciled(with: actualAssignments)
+            } else {
+                readbackWarning = Self.providerMismatchWarning(for: parentProviderFamily)
+            }
         }
-        if let verificationWarning {
+        let warnings = [verificationWarning, readbackWarning].compactMap { $0 }
+        if !warnings.isEmpty {
             let warning = Self.safeMessage(
-                verificationWarning,
+                warnings.joined(separator: " "),
                 fallback: "Codex could not verify the installed role values after the transaction."
             )
             message = "Subagent policy applied with a warning: \(warning)"
+        } else if draft == before {
+            message = "Subagent policy applied successfully."
         } else {
-            message = draft == before
-                ? "Subagent policy applied successfully."
-                : "Subagent policy applied, but Codex reported role-value drift; the displayed draft was reconciled to the actual role files."
+            message = "Subagent policy applied, but Codex reported role-value drift; the displayed draft was reconciled to the actual role files."
         }
-        restartGuidance = "Restart Codex sessions for newly assigned roles to take effect. Parent model routing is unchanged."
+        restartGuidance = "Restart Codex and start a new Codex session for newly assigned roles to take effect. Task Board selects the matching saved provider profile before launch; parent model routing is unchanged."
         recomputeValidation()
     }
 
@@ -551,12 +777,40 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
         }
     }
 
+    private mutating func normalizeDraftForProviderProfile() {
+        guard providerProfileFamily == .openAI else { return }
+        draft.alphaUltraEnabled = false
+    }
+
+    private func canReconcile(
+        _ actualAssignments: [SubagentRoleAssignment],
+        for family: CodexModelProviderFamily?
+    ) -> Bool {
+        guard let family, family != .unknown else { return false }
+        return actualAssignments.allSatisfy { assignment in
+            let matches = catalog.filter { $0.modelID == assignment.modelID }
+            return matches.count == 1 && matches[0].providerFamily == family
+        }
+    }
+
+    public func actualAssignmentsAreCompatible(
+        _ actualAssignments: [SubagentRoleAssignment],
+        with family: CodexModelProviderFamily?
+    ) -> Bool {
+        canReconcile(actualAssignments, for: family)
+    }
+
+    public static func providerMismatchWarning(for family: CodexModelProviderFamily?) -> String {
+        let selected = family.map(providerLabel) ?? "the selected"
+        return "The installed global roles belong to a different provider than " + selected + ". Your saved profile was preserved. Review it, then Apply and start a new Codex session before refreshing again."
+    }
+
     private mutating func recomputeValidation() {
         guard phase != .loading, phase != .catalogUnavailable else {
             validation = SubagentPolicyValidationResult(issues: [])
             return
         }
-        validation = SubagentPolicyValidator.validate(
+        validation = SubagentPolicyValidator.validateForApply(
             policy: draft,
             catalog: catalog,
             installedRoleIDs: installedRoleIDs,
@@ -618,6 +872,40 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
         }
         let sanitized = String(String.UnicodeScalarView(scalars))
         return sanitized.isEmpty ? "redacted" : String(sanitized.prefix(64))
+    }
+
+    private func compatibleDescriptors(for parentProviderFamily: CodexModelProviderFamily) -> [CodexModelDescriptor] {
+        catalog
+            .filter { $0.providerFamily == parentProviderFamily }
+            .sorted {
+                if $0.modelID != $1.modelID { return $0.modelID < $1.modelID }
+                return $0.displayName < $1.displayName
+            }
+    }
+
+    private func compatibleEffort(
+        for descriptor: CodexModelDescriptor,
+        preferredEffort: CodexReasoningEffort?,
+        parentProviderFamily: CodexModelProviderFamily
+    ) -> CodexReasoningEffort {
+        if parentProviderFamily == .openAI,
+           let preferredEffort,
+           descriptor.supportedReasoningEfforts.contains(preferredEffort) {
+            return preferredEffort
+        }
+        if descriptor.supportedReasoningEfforts.contains(.max) {
+            return .max
+        }
+        let nonUltraEfforts = descriptor.supportedReasoningEfforts.filter { $0 != .ultra }
+        return Self.sortedEfforts(nonUltraEfforts).last ?? .max
+    }
+
+    private static func providerLabel(_ family: CodexModelProviderFamily) -> String {
+        switch family {
+        case .openAI: return "OpenAI"
+        case .bridged: return "Alpha (bridged)"
+        case .unknown: return "unknown"
+        }
     }
 }
 
