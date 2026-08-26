@@ -167,6 +167,7 @@ private struct AccountCard: View {
     @ObservedObject var model: SettingsViewModel
     let openRankingSheet: () -> Void
     @State private var resetConfirmationPresented = false
+    @State private var archiveConfirmationPresented = false
 
     var body: some View {
         GroupBox {
@@ -191,6 +192,18 @@ private struct AccountCard: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This is a manual reset. Automatic-reset protection does not block it.")
+        }
+        .confirmationDialog(
+            "Archive \(account.alias)?",
+            isPresented: $archiveConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Archive Account", role: .destructive) {
+                model.actions.archiveAccount(account.alias)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The account will leave routing and ranking, while its CodexBar management, OAuth credentials, and historical usage remain available.")
         }
     }
 
@@ -289,6 +302,9 @@ private struct AccountCard: View {
             Button("Use Reset…") { resetConfirmationPresented = true }
                 .disabled(!resetAvailable)
                 .accessibilityLabel("Use reset credit for \(account.alias)")
+            Button("Archive…") { archiveConfirmationPresented = true }
+                .help("Remove this account from routing and ranking while keeping its credentials and usage")
+                .accessibilityLabel("Archive \(account.alias)")
             if account.ownership == .codexBarManaged {
                 Button("Manage", action: model.actions.openCodexBar)
                     .help("Remove or reauthenticate this account in CodexBar")

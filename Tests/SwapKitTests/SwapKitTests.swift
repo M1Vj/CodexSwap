@@ -3213,6 +3213,33 @@ final class SettingsPresentationTests: XCTestCase {
         XCTAssertTrue(presentation.accounts[1].needsLogin)
     }
 
+    func testArchivedAccountsAreExcludedFromActiveRanking() {
+        let active = Account(alias: "active", accountID: "active", accessToken: "token", priority: 5)
+        let archived = Account(
+            alias: "archived",
+            accountID: "archived",
+            accessToken: "token",
+            priority: 10,
+            archivedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        let snapshot = EngineSnapshot(
+            accounts: [archived, active],
+            activeAlias: "active",
+            proxyURL: nil,
+            strategy: .priority,
+            routingState: .enabled
+        )
+
+        let presentation = SettingsPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(presentation.accounts.map(\.alias), ["active"])
+        XCTAssertEqual(presentation.accounts.map(\.rank), [1])
+        XCTAssertEqual(presentation.accounts.map(\.rankCount), [1])
+        XCTAssertEqual(presentation.archivedAccounts.map(\.alias), ["archived"])
+        XCTAssertEqual(presentation.archivedAccounts.map(\.rank), [0])
+        XCTAssertEqual(presentation.archivedAccounts.map(\.rankCount), [0])
+    }
+
     func testResetCreditStatesExposeOnlyActionableStatusAndExpiry() {
         let account = Account(alias: "primary", accountID: "private-account-id", accessToken: "private-token")
         let expiry = Date(timeIntervalSince1970: 1_800_000_000)

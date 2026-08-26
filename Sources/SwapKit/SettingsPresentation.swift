@@ -85,13 +85,15 @@ public struct SettingsPresentation: Sendable, Equatable {
                 if $0.priority == $1.priority { return $0.alias.localizedCaseInsensitiveCompare($1.alias) == .orderedAscending }
                 return $0.priority > $1.priority
             }
-        let rows = ranked.enumerated().map { index, account in
+        let activeRanked = ranked.filter { !$0.isArchived }
+        let archived = ranked.filter(\.isArchived)
+        func row(for account: Account, rank: Int, rankCount: Int) -> AccountSettingsRow {
             AccountSettingsRow(
                 alias: account.alias,
                 email: account.email,
                 priority: account.priority,
-                rank: index + 1,
-                rankCount: ranked.count,
+                rank: rank,
+                rankCount: rankCount,
                 ownership: AccountOwnership.classify(account: account),
                 isActive: account.alias == snapshot.activeAlias,
                 needsLogin: account.needsLogin,
@@ -104,11 +106,11 @@ public struct SettingsPresentation: Sendable, Equatable {
                 resetCreditStatus: resetCreditStatuses[account.alias] ?? .unavailable
             )
         }
-        accounts = rows.filter { row in
-            !(snapshot.accounts.first(where: { account in account.alias == row.alias })?.isArchived ?? false)
+        accounts = activeRanked.enumerated().map { index, account in
+            row(for: account, rank: index + 1, rankCount: activeRanked.count)
         }
-        archivedAccounts = rows.filter { row in
-            snapshot.accounts.first(where: { account in account.alias == row.alias })?.isArchived == true
+        archivedAccounts = archived.map { account in
+            row(for: account, rank: 0, rankCount: 0)
         }
 
         if let url = snapshot.proxyURL, let host = url.host, let port = url.port {

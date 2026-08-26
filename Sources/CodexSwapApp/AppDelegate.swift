@@ -730,6 +730,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await self.refreshSnapshot()
                 }
             },
+            archiveAccount: { [weak self] alias in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    _ = await self.engine.archiveAccount(alias: alias, confirmed: true)
+                    await self.refreshSnapshot()
+                }
+            },
             removeAccount: { [weak self] alias in self?.removeStandaloneAccount(alias) },
             importAccounts: { [weak self] in self?.rescanAccounts() },
             openCodexBar: { [weak self] in self?.openCodexBarForAccount() },

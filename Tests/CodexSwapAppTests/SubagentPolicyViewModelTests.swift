@@ -110,6 +110,7 @@ final class SubagentPolicyViewModelTests: XCTestCase {
             setAccountRouting: { _, _ in },
             setAutomaticResetProtection: { _, _ in },
             useResetCredit: { _, _ in },
+            archiveAccount: { _ in },
             removeAccount: { _ in },
             importAccounts: {},
             openCodexBar: {},

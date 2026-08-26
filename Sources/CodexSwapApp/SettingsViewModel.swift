@@ -16,6 +16,7 @@ struct SettingsActions {
     let setAccountRouting: (String, Bool) -> Void
     let setAutomaticResetProtection: (String, Bool) -> Void
     let useResetCredit: (String, Date?) -> Void
+    let archiveAccount: (String) -> Void
     let removeAccount: (String) -> Void
     let importAccounts: () -> Void
     let openCodexBar: () -> Void
