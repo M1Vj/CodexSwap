@@ -236,9 +236,7 @@ private struct AccountCard: View {
     }
 
     private func resetCaption(_ window: UsageWindow) -> String? {
-        guard let resetAt = window.resetAt else { return nil }
-        if resetAt <= Date() { return "resetting…" }
-        return "Resets " + resetAt.formatted(date: .abbreviated, time: .shortened)
+        UsageResetPresentation().appCaption(for: window)
     }
 
     // MARK: Status line

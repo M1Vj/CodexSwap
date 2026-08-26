@@ -7,7 +7,7 @@ func loadSettings() -> Settings {
     return s
 }
 
-func fmtReset(_ d: Date?) -> String {
+func fmtCooldown(_ d: Date?) -> String {
     guard let d else { return "-" }
     let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
     return f.string(from: d)
@@ -49,7 +49,7 @@ case "list":
     let ranked = accounts.sorted(by: { $0.priority > $1.priority })
     for (rank, a) in ranked.enumerated() {
         let mark = a.alias == active ? "*" : " "
-        let cooldown = a.cooldownUntil(now: Date()).map { " limited→\(fmtReset($0))" } ?? ""
+        let cooldown = a.cooldownUntil(now: Date()).map { " limited→\(fmtCooldown($0))" } ?? ""
         let needs = a.needsLogin ? " NEEDS-LOGIN" : ""
         let usage = a.usage.map { "\($0.label):\($0.usedPercent)%" }.joined(separator: " ")
         print("\(mark) [rank #\(rank + 1)/\(ranked.count)] \(a.alias)  <\(a.email)>  \(usage)\(cooldown)\(needs)")
@@ -61,7 +61,8 @@ case "usage":
         do {
             let windows = try await client.fetch(accessToken: a.accessToken, accountID: a.accountID)
             await store.updateUsage(a.alias, windows: windows)
-            let u = windows.map { "\($0.label):\($0.usedPercent)% reset \(fmtReset($0.resetAt))" }.joined(separator: "  ")
+            let formatter = UsageResetPresentation()
+            let u = windows.map { "\($0.label):\($0.usedPercent)% \(formatter.cliCaption(for: $0))" }.joined(separator: "  ")
             print("\(a.alias): \(u)")
         } catch {
             print("\(a.alias): usage error \(error)")

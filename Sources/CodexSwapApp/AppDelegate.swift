@@ -382,7 +382,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch event {
         case let .rotated(from, to, limit, resetAt):
             if settings.notifyOnRotate {
-                let when = resetAt.map { " (resets \(Self.shortTime($0)))" } ?? ""
+                let resetCaption = UsageResetPresentation().appCaption(
+                    windowSeconds: Self.quotaWindowSeconds(for: limit),
+                    resetAt: resetAt
+                )
+                let when = resetCaption.map { " (\($0))" } ?? ""
                 notify(title: "Switched account", body: "\(from) hit \(limit) limit → now using \(to)\(when)")
             }
         case let .exhausted(limit):
@@ -1223,6 +1227,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static func shortTime(_ date: Date) -> String {
         let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"; return f.string(from: date)
+    }
+
+    private static func quotaWindowSeconds(for label: String) -> Int? {
+        switch label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "5h", "5-hour", "5 hour":
+            UsageResetPresentation.fiveHourWindowSeconds
+        case "weekly", "week", "7d", "7-day", "7 day":
+            UsageResetPresentation.weeklyWindowSeconds
+        default:
+            nil
+        }
     }
 
     static func ago(_ date: Date) -> String {

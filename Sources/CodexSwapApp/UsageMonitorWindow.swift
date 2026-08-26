@@ -440,9 +440,7 @@ private struct WindowMeter: View {
     }
 
     private var resetText: String {
-        guard let resetAt = window.resetAt else { return "" }
-        if resetAt <= Date() { return "resetting…" }
-        return "Resets " + resetAt.formatted(date: .abbreviated, time: .shortened)
+        UsageResetPresentation().appCaption(for: window) ?? ""
     }
 
     /// Burn rate and time-to-exhaustion are suppressed until ≥3% is consumed so early-window

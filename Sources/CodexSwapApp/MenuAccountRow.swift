@@ -82,9 +82,7 @@ struct MenuAccountRow: View {
     }
 
     private func resetCaption(_ window: UsageWindow) -> String? {
-        guard let resetAt = window.resetAt else { return nil }
-        if resetAt <= Date() { return "resetting…" }
-        return "Resets " + resetAt.formatted(date: .abbreviated, time: .shortened)
+        UsageResetPresentation().appCaption(for: window)
     }
 
     private func badge(_ symbol: String, color: Color, help: String) -> some View {
