@@ -426,6 +426,48 @@ public actor AppEngine {
         )
     }
 
+    /// Returns the opt-in metadata dashboard snapshot without exposing the
+    /// telemetry store or any raw request data to the app target.
+    public func usageAnalytics(
+        range: UsageTelemetryRange,
+        includeArchivedHistory: Bool = false
+    ) async -> UsageAnalyticsDerivedSnapshot {
+        let accounts = await store.all()
+        let telemetrySnapshot = await telemetry.snapshot(range: range)
+        let rangeStart = telemetrySnapshot.rangeStart
+        let taskRuns = (await taskStore.all()).flatMap(\.runs).compactMap { run -> UsageTelemetryTaskBoardRun? in
+            if let rangeStart, let finishedAt = run.finishedAt, finishedAt < rangeStart {
+                return nil
+            }
+            return UsageTelemetryTaskBoardRun(
+                runID: run.id,
+                startedAt: run.startedAt,
+                finishedAt: run.finishedAt,
+                outcome: run.outcome,
+                inputTokens: run.inputTokens,
+                cachedInputTokens: run.cachedTokens,
+                outputTokens: run.outputTokens,
+                retryCount: 0,
+                modelFallbackCount: 0
+            )
+        }
+        return UsageAnalytics.derive(
+            snapshot: telemetrySnapshot,
+            accounts: accounts,
+            scope: includeArchivedHistory ? .all : .active,
+            taskRuns: taskRuns
+        )
+    }
+
+    public func metadataTelemetryEnabled() async -> Bool {
+        await settingsStore.metadataTelemetryEnabled()
+    }
+
+    public func clearMetadataTelemetry() async {
+        await telemetry.clear()
+        emit(.snapshotChanged)
+    }
+
     /// Token usage recovered from each account's local codex session logs (last 7 days),
     /// cached briefly so dashboard refreshes do not rescan the disk every tick.
     public func localUsageAttribution(forceRefresh: Bool = false) async -> LocalUsageAttribution {

@@ -54,6 +54,12 @@ struct SettingsView: View {
             .navigationTitle(selection.title)
         }
         .frame(minWidth: 720, minHeight: 480)
+        .onChange(of: model.requestedPane) { _, pane in
+            applyRequestedPane(pane)
+        }
+        .onAppear {
+            applyRequestedPane(model.requestedPane)
+        }
         .alert("CodexSwap", isPresented: messageIsPresented) {
             Button("OK") { model.message = nil }
         } message: {
@@ -66,6 +72,12 @@ struct SettingsView: View {
             get: { model.message != nil },
             set: { if !$0 { model.message = nil } }
         )
+    }
+
+    private func applyRequestedPane(_ pane: SettingsPane?) {
+        guard let pane else { return }
+        selection = pane
+        model.requestedPane = nil
     }
 }
 

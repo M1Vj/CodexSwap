@@ -2,7 +2,7 @@
 
 CodexSwap handles authentication tokens and sits in the request path between Codex and OpenAI. Please report security issues privately.
 
-Optional metadata telemetry is local-only and off by default. When enabled it uses a strict allowlist of bounded dimensions, counts, timestamps, durations, and completeness markers. It excludes prompts, responses, commands, paths, headers, raw errors, session identifiers, account identifiers, and OAuth tokens. Events are retained for 30 days and aggregates for 365 days/lifetime until cleared; no telemetry is uploaded.
+Optional metadata telemetry is local-only and off by default. When enabled it uses a strict allowlist of bounded dimensions, counts, timestamps, durations, and completeness markers. It excludes prompts, responses, commands, paths, headers, raw errors, session identifiers, account identifiers, and OAuth tokens. Events are retained for 30 days and aggregates for 365 days/lifetime until cleared; no telemetry is uploaded. Latency combines local and network time, and the dashboard does not infer interactive quality or productivity.
 
 ## Supported versions
 

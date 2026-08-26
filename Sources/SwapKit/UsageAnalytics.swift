@@ -76,6 +76,7 @@ public struct UsageCapacityWindowMetric: Codable, Sendable, Equatable, Identifia
     public let alias: String?
     public let isArchived: Bool
     public let label: String
+    public let resetAt: Date?
     public let usedPercent: Int
     public let headroomPercent: Int
     public let burnPercentPerHour: Double?
@@ -96,6 +97,7 @@ public struct UsageCapacityWindowMetric: Codable, Sendable, Equatable, Identifia
         alias: String? = nil,
         isArchived: Bool = false,
         label: String,
+        resetAt: Date? = nil,
         usedPercent: Int,
         headroomPercent: Int,
         burnPercentPerHour: Double? = nil,
@@ -111,6 +113,7 @@ public struct UsageCapacityWindowMetric: Codable, Sendable, Equatable, Identifia
         self.alias = alias
         self.isArchived = isArchived
         self.label = label
+        self.resetAt = resetAt
         self.usedPercent = min(max(usedPercent, 0), 100)
         self.headroomPercent = min(max(headroomPercent, 0), 100)
         self.burnPercentPerHour = burnPercentPerHour
@@ -1056,6 +1059,7 @@ public extension UsageAnalytics {
                     alias: account.alias,
                     isArchived: false,
                     label: window.label,
+                    resetAt: window.resetAt,
                     usedPercent: clampPercent(window.usedPercent),
                     headroomPercent: 100 - clampPercent(window.usedPercent),
                     burnPercentPerHour: assessment.burn,

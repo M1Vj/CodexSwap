@@ -207,7 +207,7 @@ CodexSwap handles authentication tokens, so its trust boundary is intentionally 
 | --- | --- |
 | **Local proxy only** | Listens on IPv4 loopback; no LAN listener. |
 | **No CodexSwap cloud** | Model requests go to OpenAI; account data is not sent to the maintainer. |
-| **Local metadata telemetry** | Off by default; when enabled, bounded request metadata stays local with 30-day event and 365-day aggregate retention. No prompts, responses, credentials, or uploads. |
+| **Local metadata telemetry** | Off by default; when enabled, bounded request metadata stays local with 30-day event, 365-day aggregate, and until-cleared lifetime retention. It records counts, categories, timings, token completeness, retry outcomes, and estimated-cost provenance. It never records prompts, responses, commands, paths, headers, OAuth data, or raw errors, and never uploads telemetry. Latency includes local and network time; metrics do not infer interactive quality or productivity. |
 | **Restricted local data** | Settings and imported state live under `~/Library/Application Support/CodexSwap/` with user-only permissions where supported. |
 | **Credential ownership** | CodexBar keeps ownership of CodexBar-managed accounts; standalone accounts come from standard Codex login files. |
 | **Recoverable configuration** | Routing changes are backed up and restored rather than silently replacing unrelated configuration. |

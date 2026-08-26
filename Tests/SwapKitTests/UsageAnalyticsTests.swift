@@ -606,6 +606,17 @@ final class UsageAnalyticsTests: XCTestCase {
         XCTAssertEqual(summary.models.first?.requests, max)
         XCTAssertEqual(summary.models.first?.inputTokens, max)
     }
+
+    func testCapacityMetricsPreserveResetTimeForDashboardPresentation() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let reset = now.addingTimeInterval(3_600)
+        var account = Account(alias: "active", accountID: "active")
+        account.usage = [UsageWindow(label: "5h", usedPercent: 40, windowSeconds: 18_000, resetAt: reset)]
+
+        let metrics = UsageAnalytics.capacityMetrics(accounts: [account], scope: .active, now: now)
+
+        XCTAssertEqual(try XCTUnwrap(metrics.windows.first).resetAt, reset)
+    }
 }
 
 /*
@@ -686,6 +697,7 @@ final class UsageAnalyticsDerivedTests: XCTestCase {
         let derived = UsageAnalytics.capacityMetrics(accounts: [account], scope: .active, now: now)
         let metric = derived.windows.first { $0.label == "5h" }
         XCTAssertEqual(metric?.headroomPercent, 50)
+        XCTAssertEqual(metric?.resetAt, reset)
         XCTAssertEqual(metric?.burnPercentPerHour ?? 0, 30, accuracy: 1e-9)
         XCTAssertEqual(metric?.projectedUsageAtResetPercent ?? 0, 80, accuracy: 1e-9)
         XCTAssertEqual(metric?.hoursUntilExhausted ?? 0, 50.0 / 30.0, accuracy: 1e-9)

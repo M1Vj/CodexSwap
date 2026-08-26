@@ -54,6 +54,7 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var subagentPolicyPresentation: SubagentPolicyPresentationState
     @Published private(set) var alphaDelegationMCPPresentation: AlphaDelegationMCPPresentationState
     @Published var message: String?
+    @Published var requestedPane: SettingsPane?
 
     let actions: SettingsActions
     private var bootstrappedSubagentPolicyFamily: CodexModelProviderFamily?
@@ -67,6 +68,7 @@ final class SettingsViewModel: ObservableObject {
         self.shimInstalled = ShimManager().isInstalled()
         self.subagentPolicyPresentation = SubagentPolicyPresentationState(draft: .default)
         self.alphaDelegationMCPPresentation = AlphaDelegationMCPPresentationState()
+        self.requestedPane = nil
     }
 
     var presentation: SettingsPresentation { SettingsPresentation(snapshot: snapshot) }

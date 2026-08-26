@@ -3,6 +3,66 @@ import XCTest
 import SwapKit
 
 final class UsageMonitorWindowTests: XCTestCase {
+    func testUsageMonitorPresentationExposesRangeSectionsAndPrivacyCopy() {
+        XCTAssertEqual(
+            UsageMonitorPresentation.rangeLabels,
+            ["7 days", "30 days", "Lifetime"]
+        )
+        XCTAssertEqual(
+            UsageMonitorPresentation.sectionTitles,
+            ["Capacity", "Efficiency", "Reliability", "Latency", "Trends", "Account mix", "Model mix", "Task Board"]
+        )
+        XCTAssertTrue(UsageMonitorPresentation.archivedHistoryLabel.contains("archived"))
+        XCTAssertTrue(UsageMonitorPresentation.telemetryDisclosure.contains("Prompts"))
+        XCTAssertTrue(UsageMonitorPresentation.telemetryDisclosure.contains("30 days"))
+        XCTAssertTrue(UsageMonitorPresentation.telemetryDisclosure.contains("365 days"))
+        XCTAssertTrue(UsageMonitorPresentation.telemetryDisclosure.contains("never uploaded"))
+        XCTAssertTrue(UsageMonitorPresentation.telemetryDisclosure.contains("productivity"))
+    }
+
+    func testUsageMonitorPresentationWithholdsPercentilesUntilDocumentedSampleCounts() {
+        XCTAssertEqual(UsageMonitorPresentation.percentileText(value: nil, sampleCount: 2, percentile: 0.5), "Not enough samples")
+        XCTAssertEqual(UsageMonitorPresentation.percentileText(value: 250, sampleCount: 3, percentile: 0.5), "~250 ms")
+        XCTAssertEqual(UsageMonitorPresentation.percentileText(value: nil, sampleCount: 19, percentile: 0.95), "Not enough samples")
+        XCTAssertEqual(UsageMonitorPresentation.percentileText(value: 600_000, sampleCount: 20, percentile: 0.95), "~≤10m")
+    }
+
+    func testUsageMonitorPresentationKeepsArchivedHistoryOutOfLiveCapacityCopy() {
+        XCTAssertEqual(UsageMonitorPresentation.scopeCaption(includeArchived: false), "Active accounts · current quota")
+        XCTAssertEqual(UsageMonitorPresentation.scopeCaption(includeArchived: true), "Active quota · archived usage is historical")
+        XCTAssertTrue(UsageMonitorPresentation.telemetryOffMessage.contains("Quota and local usage history remain available"))
+    }
+
+    func testUsageMonitorTrendPresentationCoversEveryPromisedMetricAndAccessibilitySummary() {
+        XCTAssertEqual(
+            UsageTrendMetric.allCases.map(\.label),
+            ["Attempts", "Tokens", "Estimated cost", "Errors", "Latency p50"]
+        )
+        let day = UsageDailyMetric(
+            dayKey: "2026-08-26",
+            utcOffsetSeconds: 28_800,
+            attempts: 3,
+            tokens: 1_200,
+            estimatedCostUSD: 0.04,
+            errors: 1
+        )
+        XCTAssertEqual(
+            UsageMonitorPresentation.trendAccessibilityValue([day]),
+            "1 day, 3 attempts, 1200 tokens, 1 error"
+        )
+    }
+
+    func testMenuPresentationExcludesArchivedAccountsAndAddsCountedDestination() {
+        var active = Account(alias: "active", accessToken: "token")
+        active.archivedAt = nil
+        var archived = Account(alias: "archived", accessToken: "token")
+        archived.archivedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+        XCTAssertEqual(AccountArchiveMenuPresentation.activeAccounts(from: [archived, active]).map(\.alias), ["active"])
+        XCTAssertEqual(AccountArchiveMenuPresentation.archivedTitle(count: 1), "Archived Accounts (1)")
+        XCTAssertNil(AccountArchiveMenuPresentation.archivedTitle(count: 0))
+    }
+
     func testBridgedUsageRefreshAdvancesOnlyAfterCommittedPricingAndDropsStaleLoads() {
         var refresh = BridgedUsageRefreshState()
 

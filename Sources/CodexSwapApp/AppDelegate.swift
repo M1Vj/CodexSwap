@@ -3,6 +3,16 @@ import UserNotifications
 import ServiceManagement
 import SwapKit
 
+enum AccountArchiveMenuPresentation {
+    static func activeAccounts(from accounts: [Account]) -> [Account] {
+        accounts.filter { !$0.isArchived }
+    }
+
+    static func archivedTitle(count: Int) -> String? {
+        count > 0 ? "Archived Accounts (\(count))" : nil
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum TaskNotification {
@@ -505,8 +515,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status.isEnabled = false
         menu.addItem(status)
 
-        let pool = UsageAnalytics.poolSummary(accounts: latest.accounts, drainingAliases: latest.drainingAliases)
-        if !latest.accounts.isEmpty {
+        let activeAccounts = AccountArchiveMenuPresentation.activeAccounts(from: latest.accounts)
+        let archivedAccounts = latest.accounts.filter(\.isArchived)
+        let activeAlias = latest.activeAlias.flatMap { alias in
+            activeAccounts.contains(where: { $0.alias == alias }) ? alias : nil
+        }
+        let activeAliases = Set(activeAccounts.map(\.alias))
+        let pool = UsageAnalytics.poolSummary(
+            accounts: activeAccounts,
+            drainingAliases: latest.drainingAliases.intersection(activeAliases)
+        )
+        if !activeAccounts.isEmpty {
             var poolParts = ["\(pool.healthyCount)/\(pool.accountCount) healthy"]
             if settings.smartSwitchEnabled {
                 poolParts.append("\(pool.drainingCount) draining by others")
@@ -520,7 +539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(poolLine)
         }
 
-        let active = NSMenuItem(title: "Active account: \(latest.activeAlias ?? "none")", action: nil, keyEquivalent: "")
+        let active = NSMenuItem(title: "Active account: \(activeAlias ?? "none")", action: nil, keyEquivalent: "")
         active.isEnabled = false
         menu.addItem(active)
 
@@ -550,7 +569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let resetAt = TaskBoardMenuStatus.nextQuotaReset(
                 tasks: activeTasks,
                 schedulingReasons: latest.schedulingReasons,
-                accounts: latest.accounts,
+                accounts: activeAccounts,
                 globalAliases: settings.automationAccounts,
                 now: Date()
             )
@@ -573,14 +592,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        if latest.accounts.isEmpty {
+        if activeAccounts.isEmpty {
             let empty = NSMenuItem(title: "No accounts — open Settings to add one", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
         }
 
         // Rank display order everywhere: priority desc, alias asc for stable ties.
-        let rankedAccounts = latest.accounts.sorted {
+        let rankedAccounts = activeAccounts.sorted {
             $0.priority == $1.priority
                 ? $0.alias.localizedCaseInsensitiveCompare($1.alias) == .orderedAscending
                 : $0.priority > $1.priority
@@ -592,10 +611,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let row = MenuAccountRow(
                 rank: index + 1,
                 alias: acc.alias,
-                isActive: acc.alias == latest.activeAlias,
+                isActive: acc.alias == activeAlias,
                 isEnabled: true,
                 needsLogin: acc.needsLogin,
-                isDraining: latest.drainingAliases.contains(acc.alias),
+                isDraining: activeAliases.contains(acc.alias) && latest.drainingAliases.contains(acc.alias),
                 cooldownUntil: acc.cooldownUntil(now: Date()),
                 windows: acc.usage,
                 costEstimate: acc.usageStats.map { UsageAnalytics.estimatedCost($0) }
@@ -628,6 +647,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             pausedItem.submenu = submenu
             menu.addItem(pausedItem)
+        }
+
+        if let archivedTitle = AccountArchiveMenuPresentation.archivedTitle(count: archivedAccounts.count) {
+            addAction(archivedTitle, #selector(showArchivedAccounts))
         }
 
         menu.addItem(.separator())
@@ -928,6 +951,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showSettings() {
+        presentSettings()
+    }
+
+    @objc private func showArchivedAccounts() {
+        presentSettings(pane: .accounts)
+    }
+
+    private func presentSettings(pane: SettingsPane? = nil) {
+        if let pane {
+            settingsViewModel.requestedPane = pane
+        }
         if settingsWindowController == nil {
             settingsWindowController = SettingsWindowController(viewModel: settingsViewModel)
         }
