@@ -90,6 +90,8 @@ final class RoutingContractProbeTests: XCTestCase {
         let finalUpstreamRequests = await upstream.requests()
         XCTAssertEqual(finalSettingsCalls, 1)
         XCTAssertEqual(finalUpstreamRequests, [.init(method: "POST", path: "/backend-api/codex/responses")])
+        let routedAt = await store.account("probe")?.lastServedByUs
+        XCTAssertNotNil(routedAt, "real upstream dispatches must stamp routed-use time for drain attribution")
 
         await server.stop()
         await upstream.stop()

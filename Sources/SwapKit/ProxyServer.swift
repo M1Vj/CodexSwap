@@ -1063,6 +1063,12 @@ public actor ProxyServer {
 
             let resp: HTTPClientResponse
             do {
+                // Stamp every real upstream dispatch, including retries and
+                // account fallbacks. Selection, polling, and warm-up setup do
+                // not count as routed use for drain attribution.
+                if !mode.isWarmup {
+                    await store.markServed(account.alias, date: Date())
+                }
                 resp = try await self.forward(head: head, body: body, account: account, target: target)
             } catch {
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")

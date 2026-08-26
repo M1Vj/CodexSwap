@@ -340,6 +340,33 @@ final class TaskAutomationTests: XCTestCase {
         XCTAssertNil(selected)
     }
 
+    func testTaskBoardInitialSelectionPrefersDrainingEligibleAccount() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var settings = Settings.default
+        settings.smartSwitchEnabled = true
+        let highRank = Account(
+            alias: "high-rank",
+            accessToken: "token",
+            priority: 10,
+            usage: [UsageWindow(label: "5h", usedPercent: 20, windowSeconds: 18_000, resetAt: nil)]
+        )
+        let draining = Account(
+            alias: "draining",
+            accessToken: "token",
+            priority: 1,
+            usage: [UsageWindow(label: "5h", usedPercent: 80, windowSeconds: 18_000, resetAt: nil)]
+        )
+
+        let selected = AppEngine.automationAccount(
+            from: [highRank, draining],
+            settings: settings,
+            now: now,
+            drainingAliases: ["draining"]
+        )
+
+        XCTAssertEqual(selected?.alias, "draining")
+    }
+
     func testTaskRunnerLaunchArgsContainSandboxModelProviderAndReadPromptFromStdin() throws {
         let task = makeTask(
             prompt: "The exact runner prompt.",

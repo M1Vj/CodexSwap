@@ -526,6 +526,19 @@ public actor AppEngine {
         publish: (@Sendable () async -> Void)? = nil
     ) async {
         await publish?()
+        let smartSwitchChanged = previous.smartSwitchEnabled != current.smartSwitchEnabled
+        if smartSwitchChanged {
+            if current.smartSwitchEnabled {
+                // Enabling Smart Switch establishes a fresh baseline for every
+                // active account immediately. A first reading remains Learning
+                // until a subsequent same-window reading can be compared.
+                await pollUsage(activeOnly: false, settingsOverride: current)
+            } else {
+                // Drain state is runtime-only and must not survive an opt-out.
+                await store.setDrainingAliases([])
+            }
+            emit(.snapshotChanged)
+        }
         let resetPolicyChanged = previous.automaticallyResetExhaustedAccounts
             != current.automaticallyResetExhaustedAccounts
             || previous.autoResetProtectedAccounts != current.autoResetProtectedAccounts
@@ -808,7 +821,12 @@ public actor AppEngine {
         if let proxyURL,
            !allowedAliases.isEmpty,
            occupiedCount < maximumConcurrent,
-           let account = Self.automationAccount(from: hydratedAccounts, settings: settings, now: now) {
+           let account = Self.automationAccount(
+               from: hydratedAccounts,
+               settings: settings,
+               now: now,
+               drainingAliases: settings.smartSwitchEnabled ? await store.currentDrainingAliases() : []
+           ) {
             switch await startTask(
                 task,
                 account: account,
@@ -1190,11 +1208,9 @@ public actor AppEngine {
                 cachedInputPresence: sample.cachedInputPresence,
                 cacheWriteInputPresence: sample.cacheWriteInputPresence
             )
-            await store.markServed(alias)
             needsLoginNotified.remove(alias)
         case .served:
             if let alias = event.from, !alias.isEmpty {
-                await store.markServed(alias)
                 needsLoginNotified.remove(alias)
             }
             if event.runID == nil {
@@ -1315,7 +1331,8 @@ public actor AppEngine {
                       let account = Self.automationAccount(
                         from: hydratedAccounts,
                         settings: settings,
-                        now: now
+                        now: now,
+                        drainingAliases: settings.smartSwitchEnabled ? await store.currentDrainingAliases() : []
                       ) else {
                     let reasons = Self.accountEligibilityReasons(
                         aliases: aliases,
@@ -1483,14 +1500,26 @@ public actor AppEngine {
     /// Same selection contract as the proxy: honor the configured rotation strategy and
     /// prefer accounts under the pre-emptive thresholds, falling back to the best
     /// over-threshold account when none has headroom.
-    static func automationAccount(from accounts: [Account], settings: Settings, now: Date) -> Account? {
-        let ordered = accounts
+    static func automationAccount(
+        from accounts: [Account],
+        settings: Settings,
+        now: Date,
+        drainingAliases: Set<String> = []
+    ) -> Account? {
+        let eligible = accounts
             .filter { account in
                 guard account.isEligible(now: now) else { return false }
                 if settings.automationConsumeBankedWindow { return true }
                 return hasStartedWindow(account)
             }
             .sorted { AccountStore.selectionOrder($0, $1, strategy: settings.rotationStrategy) }
+        let ordered: [Account]
+        if settings.smartSwitchEnabled {
+            let state = Dictionary(uniqueKeysWithValues: eligible.map { ($0.alias, drainingAliases.contains($0.alias)) })
+            ordered = SmartSwitchPolicy.sortWithDrainingFirst(eligible, drainState: state)
+        } else {
+            ordered = eligible
+        }
         // Starting a fresh unattended session on an over-threshold or headroom-starved
         // account is wasted quota; unlike serving live traffic, a start has no fallback.
         return ordered.first {
@@ -2016,12 +2045,23 @@ public actor AppEngine {
         if !reset.isEmpty { await automationTick() }
     }
 
-    private func pollUsage(activeOnly: Bool, aliases: Set<String>? = nil) async {
-        let settings = await settingsStore.get()
+    private func pollUsage(
+        activeOnly: Bool,
+        aliases: Set<String>? = nil,
+        settingsOverride: Settings? = nil
+    ) async {
+        let settings: Settings
+        if let settingsOverride {
+            settings = settingsOverride
+        } else {
+            settings = await settingsStore.get()
+        }
         let accounts = await store.activeAccounts()
         let activeAlias = await store.activeAlias()
-        var draining: Set<String> = []
-        let now = Date()
+        let lookback = SmartSwitchPolicy.dynamicLookbackSeconds(
+            forPollInterval: TimeInterval(max(0, settings.usagePollSeconds))
+        )
+        var assessments: [DrainAssessment] = []
         for acc in accounts where !acc.accessToken.isEmpty {
             if activeOnly && acc.alias != activeAlias { continue }
             if let aliases, !aliases.contains(acc.alias) { continue }
@@ -2030,19 +2070,29 @@ public actor AppEngine {
             // per tick until the user signs in again.
             guard !acc.needsLogin else { continue }
             if let windows = try? await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID) {
+                guard !windows.isEmpty else { continue }
                 await store.updateUsage(acc.alias, windows: windows)
                 if settings.smartSwitchEnabled, let updated = await store.account(acc.alias),
                    SmartSwitchPolicy.assess(
                        account: updated,
                        previousHistory: updated.usageHistory ?? [],
-                       now: now
+                       now: Date(),
+                       lookbackSeconds: lookback
                    ).isDraining {
-                    draining.insert(acc.alias)
+                    assessments.append(DrainAssessment(alias: acc.alias, isDraining: true))
+                } else if settings.smartSwitchEnabled {
+                    assessments.append(DrainAssessment(alias: acc.alias, isDraining: false))
                 }
             }
         }
         if settings.smartSwitchEnabled {
-            await store.setDrainingAliases(draining)
+            let assessedAt = Date()
+            await store.mergeDrainingAssessments(
+                assessments,
+                assessedAt: assessedAt,
+                lookbackSeconds: lookback
+            )
+            await store.expireDrainingObservations(now: assessedAt, lookbackSeconds: lookback)
         } else if !(await store.currentDrainingAliases()).isEmpty {
             await store.setDrainingAliases([])
         }

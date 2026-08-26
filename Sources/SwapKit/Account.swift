@@ -211,11 +211,16 @@ public struct WindowSample: Codable, Sendable, Equatable {
     public var capturedAt: Date
     public var label: String
     public var usedPercent: Int
+    /// Reset boundary observed with this reading. Keeping the boundary alongside
+    /// the usage value prevents a newly-reset window from being compared with the
+    /// previous window's baseline.
+    public var resetAt: Date?
 
-    public init(capturedAt: Date, label: String, usedPercent: Int) {
+    public init(capturedAt: Date, label: String, usedPercent: Int, resetAt: Date? = nil) {
         self.capturedAt = capturedAt
         self.label = label
         self.usedPercent = usedPercent
+        self.resetAt = resetAt
     }
 }
 

@@ -167,6 +167,102 @@ final class UsageMonitorStoreTests: XCTestCase {
     }
 }
 
+final class SmartSwitchDrainPreferenceTests: XCTestCase {
+    func testRoundRobinCurrentPrefersDrainingAccountOverCurrentEligibleAccount() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("smart-switch-round-robin-(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: url, strategy: .roundRobin)
+        await store.upsert(Account(alias: "active", accountID: "active", accessToken: "token"))
+        await store.upsert(Account(alias: "draining", accountID: "draining", accessToken: "token"))
+        _ = await store.setActive("active", now: now)
+        await store.setDrainingAliases(["draining"])
+
+        let selected = await store.current(now: now)
+
+        XCTAssertEqual(selected?.alias, "draining")
+    }
+
+    func testDrainingGroupUsesFiveHourThenWeeklyThenBaseOrder() {
+        func account(_ alias: String, fiveHour: Int, weekly: Int) -> Account {
+            Account(
+                alias: alias,
+                accountID: alias,
+                accessToken: "token",
+                usage: [
+                    UsageWindow(label: "5h", usedPercent: fiveHour, windowSeconds: 18_000, resetAt: nil),
+                    UsageWindow(label: "Weekly", usedPercent: weekly, windowSeconds: 604_800, resetAt: nil),
+                ]
+            )
+        }
+
+        let accounts = [
+            account("base-first", fiveHour: 80, weekly: 10),
+            account("weekly-heavy", fiveHour: 80, weekly: 40),
+            account("five-hour-heavy", fiveHour: 90, weekly: 1),
+            account("rest", fiveHour: 100, weekly: 100),
+        ]
+
+        let ordered = SmartSwitchPolicy.sortWithDrainingFirst(
+            accounts,
+            drainState: ["base-first": true, "weekly-heavy": true, "five-hour-heavy": true]
+        )
+
+        XCTAssertEqual(ordered.map(\.alias), ["five-hour-heavy", "weekly-heavy", "base-first", "rest"])
+    }
+
+    func testRestrictedPollMergeRetainsUnpolledObservationAndExpiresIt() async {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("smart-switch-merge-(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = AccountStore(url: url)
+        await store.upsert(Account(alias: "assessed", accountID: "assessed", accessToken: "token"))
+        await store.upsert(Account(alias: "unpolled", accountID: "unpolled", accessToken: "token"))
+
+        let baseline = Date(timeIntervalSince1970: 10_000)
+        await store.mergeDrainingAssessments(
+            [
+                DrainAssessment(alias: "assessed", isDraining: true),
+                DrainAssessment(alias: "unpolled", isDraining: true),
+            ],
+            assessedAt: baseline,
+            lookbackSeconds: 900
+        )
+        await store.mergeDrainingAssessments(
+            [DrainAssessment(alias: "assessed", isDraining: false)],
+            assessedAt: baseline.addingTimeInterval(60),
+            lookbackSeconds: 900
+        )
+
+        let retained = await store.currentDrainingAliases()
+        XCTAssertEqual(retained, ["unpolled"])
+        await store.expireDrainingObservations(now: baseline.addingTimeInterval(900), lookbackSeconds: 900)
+        let expired = await store.currentDrainingAliases()
+        XCTAssertTrue(expired.isEmpty)
+    }
+
+    func testAssessmentRequiresSameResetAndRejectsRoutedUseAtBaseline() {
+        let now = Date(timeIntervalSince1970: 20_000)
+        let oldReset = now.addingTimeInterval(3_600)
+        let newReset = now.addingTimeInterval(7_200)
+        let history = [WindowSample(capturedAt: now.addingTimeInterval(-600), label: "5h", usedPercent: 20, resetAt: oldReset)]
+        let resetAccount = Account(
+            alias: "reset",
+            accountID: "reset",
+            accessToken: "token",
+            usage: [UsageWindow(label: "5h", usedPercent: 80, windowSeconds: 18_000, resetAt: newReset)]
+        )
+        XCTAssertFalse(SmartSwitchPolicy.assess(account: resetAccount, previousHistory: history, now: now).isDraining)
+
+        var served = resetAccount
+        served.usage[0].resetAt = oldReset
+        served.lastServedByUs = history[0].capturedAt
+        XCTAssertFalse(SmartSwitchPolicy.assess(account: served, previousHistory: history, now: now).isDraining)
+    }
+}
+
 final class SSEUsageScannerTests: XCTestCase {
     private func feed(_ scanner: inout SSEUsageScanner, _ text: String) {
         var buffer = ByteBufferAllocator().buffer(capacity: text.utf8.count)

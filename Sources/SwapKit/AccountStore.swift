@@ -46,6 +46,10 @@ public actor AccountStore {
     public private(set) var strategy: RotationStrategy
     /// Aliases currently assessed as draining from other users' activity (smart switch).
     private var drainingAliases: Set<String> = []
+    /// Runtime-only confirmation times for drain observations. These are never
+    /// persisted and let restricted polls expire an unrefreshed observation
+    /// without clearing aliases that were not assessed.
+    private var drainingObservedAt: [String: Date] = [:]
     /// Reference-counted routing leases held by in-flight proxy or Task Board
     /// work. A lease defers automatic archival without changing the persisted
     /// pause timestamp; overlapping attempts on one alias remain protected
@@ -207,6 +211,7 @@ public actor AccountStore {
             data.accounts[i].routingEnabled = false
             if data.activeAlias == alias { data.activeAlias = nil }
             drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
             archived.append(data.accounts[i])
         }
         guard !archived.isEmpty else { return [] }
@@ -287,11 +292,11 @@ public actor AccountStore {
         } ?? ordered.first
     }
 
-    private func lruEligible(now: Date, excluding: String? = nil) -> Account? {
-        data.accounts
-            .filter { $0.isEligible(now: now) && $0.alias != excluding }
-            .sorted { ($0.lastUsedAt ?? .distantPast) < ($1.lastUsedAt ?? .distantPast) }
-            .first
+    private func eligibleOrdered(now: Date, excluding: String? = nil) -> [Account] {
+        strategySorted(
+            data.accounts.filter { $0.isEligible(now: now) && $0.alias != excluding },
+            strategy: strategy
+        )
     }
 
     // MARK: - Selection
@@ -302,18 +307,24 @@ public actor AccountStore {
         case .priority:
             let ranked = eligibleSorted(now: now)
             guard let best = ranked.first else { return nil }
-            if let active = account(data.activeAlias ?? ""), active.isEligible(now: now), active.priority == best.priority {
+            let hasEligibleDraining = ranked.contains { drainingAliases.contains($0.alias) }
+            if let active = account(data.activeAlias ?? ""), active.isEligible(now: now),
+               active.alias == best.alias ||
+                (!hasEligibleDraining && active.priority == best.priority) {
                 return active
             }
             activate(best.alias, now: now)
             return account(best.alias)
         case .roundRobin:
-            if let active = account(data.activeAlias ?? ""), active.isEligible(now: now) {
+            let ordered = eligibleOrdered(now: now)
+            guard let best = ordered.first else { return nil }
+            let hasEligibleDraining = ordered.contains { drainingAliases.contains($0.alias) }
+            if let active = account(data.activeAlias ?? ""), active.isEligible(now: now),
+               (!hasEligibleDraining || active.alias == best.alias) {
                 return active
             }
-            guard let next = lruEligible(now: now) else { return nil }
-            activate(next.alias, now: now)
-            return account(next.alias)
+            activate(best.alias, now: now)
+            return account(best.alias)
         }
     }
 
@@ -333,7 +344,7 @@ public actor AccountStore {
     /// account so usage spreads evenly across all of them. Stays put if nothing else is eligible.
     @discardableResult
     public func advanceRoundRobin(now: Date = Date()) -> Account? {
-        if let next = lruEligible(now: now, excluding: data.activeAlias) {
+        if let next = eligibleOrdered(now: now, excluding: data.activeAlias).first {
             activate(next.alias, now: now)
             return account(next.alias)
         }
@@ -352,7 +363,7 @@ public actor AccountStore {
         case .priority:
             next = eligibleSorted(now: now).first { $0.alias != alias }
         case .roundRobin:
-            next = lruEligible(now: now, excluding: alias)
+            next = eligibleOrdered(now: now, excluding: alias).first
         }
         guard let picked = next else { persist(); return RotationResult(next: nil, rotated: false) }
         activate(picked.alias, now: now)
@@ -368,15 +379,19 @@ public actor AccountStore {
     public func markNeedsLoginOnly(_ alias: String) {
         guard let i = index(alias) else { return }
         data.accounts[i].needsLogin = true
+        drainingAliases.remove(alias)
+        drainingObservedAt.removeValue(forKey: alias)
         persist()
     }
 
     public func markNeedsLogin(_ alias: String, now: Date = Date()) -> RotationResult {
         if let i = index(alias) { data.accounts[i].needsLogin = true }
+        drainingAliases.remove(alias)
+        drainingObservedAt.removeValue(forKey: alias)
         let next: Account?
         switch strategy {
         case .priority: next = eligibleSorted(now: now).first { $0.alias != alias }
-        case .roundRobin: next = lruEligible(now: now, excluding: alias)
+        case .roundRobin: next = eligibleOrdered(now: now, excluding: alias).first
         }
         guard let picked = next else { persist(); return RotationResult(next: nil, rotated: false) }
         activate(picked.alias, now: now)
@@ -427,6 +442,7 @@ public actor AccountStore {
             changed = true
         }
         if drainingAliases.remove(alias) != nil { changed = true }
+        if drainingObservedAt.removeValue(forKey: alias) != nil { changed = true }
         if changed {
             renumberRanks()
             persist()
@@ -446,6 +462,7 @@ public actor AccountStore {
         data.accounts[i].routingEnabled = false
         data.accounts[i].routingPausedAt = timestamp
         drainingAliases.remove(alias)
+        drainingObservedAt.removeValue(forKey: alias)
 
         let activeOthers = data.accounts.filter { !$0.isArchived && $0.alias != alias }
         let minimumRank = activeOthers.map(\.priority).min() ?? 1
@@ -469,6 +486,8 @@ public actor AccountStore {
             data.accounts[i].refreshToken = tokens.refreshToken
             if !tokens.accountId.isEmpty { data.accounts[i].accountID = tokens.accountId }
             data.accounts[i].needsLogin = false
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
             persist()
         }
         return data.accounts[i]
@@ -482,7 +501,11 @@ public actor AccountStore {
         data.accounts[i].accessToken = tokens.accessToken
         data.accounts[i].refreshToken = tokens.refreshToken
         if !tokens.accountId.isEmpty { data.accounts[i].accountID = tokens.accountId }
-        if clearNeedsLogin { data.accounts[i].needsLogin = false }
+        if clearNeedsLogin {
+            data.accounts[i].needsLogin = false
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
+        }
         persist()
     }
 
@@ -491,6 +514,15 @@ public actor AccountStore {
         // wham/usage always reports at least one window for an entitled account; a transient
         // empty response must not wipe a real reading off the display.
         if windows.isEmpty, !data.accounts[i].usage.isEmpty { return }
+        let previousWindows = data.accounts[i].usage
+        let resetLabels = Self.usageResetOrDecreaseLabels(previous: previousWindows, current: windows)
+        if !resetLabels.isEmpty {
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
+            data.accounts[i].usageHistory = (data.accounts[i].usageHistory ?? []).filter {
+                !resetLabels.contains($0.label)
+            }
+        }
         data.accounts[i].usage = windows
         appendHistorySamples(at: i, windows: windows)
         // Fresh usage reporting headroom supersedes a recorded cooldown: a limit hit before
@@ -505,7 +537,15 @@ public actor AccountStore {
 
     /// Appends fresh window readings to the burn-rate history ring (newest last).
     private func appendHistorySamples(at i: Int, windows: [UsageWindow]) {
-        let samples = UsageAnalytics.samples(from: windows)
+        let capturedAt = clock()
+        let samples = windows.map {
+            WindowSample(
+                capturedAt: capturedAt,
+                label: $0.label,
+                usedPercent: $0.usedPercent,
+                resetAt: $0.resetAt
+            )
+        }
         var history = data.accounts[i].usageHistory ?? []
         history.append(contentsOf: samples)
         if history.count > Self.historyCap {
@@ -549,9 +589,72 @@ public actor AccountStore {
 
     public func setDrainingAliases(_ aliases: Set<String>) {
         drainingAliases = aliases
+        if aliases.isEmpty {
+            drainingObservedAt.removeAll()
+            return
+        }
+        let observedAt = clock()
+        drainingObservedAt = Dictionary(uniqueKeysWithValues: aliases.map { alias in
+            (alias, drainingObservedAt[alias] ?? observedAt)
+        })
     }
 
     public func currentDrainingAliases() -> Set<String> { drainingAliases }
+
+    /// Merges assessments from one usage poll into the runtime-only drain state.
+    /// Aliases omitted from a restricted poll remain observed until expiry.
+    public func mergeDrainingAssessments(
+        _ assessments: [DrainAssessment],
+        assessedAt: Date = Date(),
+        lookbackSeconds: TimeInterval = SmartSwitchPolicy.lookbackSeconds
+    ) {
+        for assessment in assessments {
+            guard let account = account(assessment.alias), !account.isArchived else {
+                drainingAliases.remove(assessment.alias)
+                drainingObservedAt.removeValue(forKey: assessment.alias)
+                continue
+            }
+            if assessment.isDraining {
+                drainingAliases.insert(assessment.alias)
+                drainingObservedAt[assessment.alias] = assessedAt
+            } else {
+                drainingAliases.remove(assessment.alias)
+                drainingObservedAt.removeValue(forKey: assessment.alias)
+            }
+        }
+        expireDrainingObservations(now: assessedAt, lookbackSeconds: lookbackSeconds)
+    }
+
+    public func expireDrainingObservations(
+        now: Date = Date(),
+        lookbackSeconds: TimeInterval = SmartSwitchPolicy.lookbackSeconds
+    ) {
+        let expired = drainingObservedAt.compactMap { alias, observedAt -> String? in
+            now.timeIntervalSince(observedAt) >= lookbackSeconds ? alias : nil
+        }
+        for alias in expired {
+            drainingObservedAt.removeValue(forKey: alias)
+            drainingAliases.remove(alias)
+        }
+    }
+
+    public func clearDrainingObservation(_ alias: String) {
+        drainingAliases.remove(alias)
+        drainingObservedAt.removeValue(forKey: alias)
+    }
+
+    private static func usageResetOrDecreaseLabels(previous: [UsageWindow], current: [UsageWindow]) -> Set<String> {
+        let oldByLabel = Dictionary(uniqueKeysWithValues: previous.map { ($0.label, $0) })
+        let currentLabels = Set(current.map(\.label))
+        var changed = Set(previous.filter { !currentLabels.contains($0.label) }.map(\.label))
+        for window in current {
+            guard let old = oldByLabel[window.label] else { continue }
+            if old.resetAt != window.resetAt || window.usedPercent < old.usedPercent {
+                changed.insert(window.label)
+            }
+        }
+        return changed
+    }
 
     /// Applies a complete ranking (top first) to the active roster. Archived accounts
     /// are intentionally outside this visible rank sequence.
@@ -626,6 +729,7 @@ public actor AccountStore {
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
         drainingAliases.remove(alias)
+        drainingObservedAt.removeValue(forKey: alias)
         renumberRanks()
         persist()
         return removedTelemetryID
@@ -661,6 +765,7 @@ public actor AccountStore {
         data.accounts.removeAll { removed.contains($0.alias) }
         if let active = data.activeAlias, removed.contains(active) { data.activeAlias = nil }
         drainingAliases.subtract(removed)
+        for alias in removed { drainingObservedAt.removeValue(forKey: alias) }
         renumberRanks()
         persist()
         return AccountRemovalResult(
@@ -709,7 +814,18 @@ public actor AccountStore {
                 merged.refreshToken = data.accounts[i].refreshToken
                 merged.idToken = data.accounts[i].idToken
             }
+            let usageResetLabels = Self.usageResetOrDecreaseLabels(
+                previous: data.accounts[i].usage,
+                current: merged.usage
+            )
             data.accounts[i] = merged
+            if !usageResetLabels.isEmpty {
+                drainingAliases.remove(merged.alias)
+                drainingObservedAt.removeValue(forKey: merged.alias)
+                data.accounts[i].usageHistory = (data.accounts[i].usageHistory ?? []).filter {
+                    !usageResetLabels.contains($0.label)
+                }
+            }
             if data.accounts[i].routingPausedAt == nil,
                data.accounts[i].archivedAt == nil,
                !data.accounts[i].routingEnabled {
@@ -756,10 +872,16 @@ public actor AccountStore {
         data.accounts[i].routingEnabled = enabled
         if enabled {
             data.accounts[i].routingPausedAt = nil
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
         } else if wasEnabled {
             data.accounts[i].routingPausedAt = now ?? clock()
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
         } else if data.accounts[i].routingPausedAt == nil {
             data.accounts[i].routingPausedAt = now ?? clock()
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
         }
         if !enabled, data.activeAlias == alias { data.activeAlias = nil }
         persist()

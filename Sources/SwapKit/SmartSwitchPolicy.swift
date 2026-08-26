@@ -22,6 +22,12 @@ public enum SmartSwitchPolicy {
     /// Traffic we served within this grace window disqualifies the account (that drain was ours).
     public static let servedGraceSeconds: TimeInterval = 1800
 
+    /// Bounds drain detection to two polls while preventing a long poll interval
+    /// from retaining stale observations indefinitely.
+    public static func dynamicLookbackSeconds(forPollInterval pollInterval: TimeInterval) -> TimeInterval {
+        min(3_600, max(900, 2 * max(0, pollInterval)))
+    }
+
     public static func assess(
         account: Account,
         previousHistory: [WindowSample],
@@ -30,22 +36,27 @@ public enum SmartSwitchPolicy {
         lookbackSeconds: TimeInterval = SmartSwitchPolicy.lookbackSeconds,
         servedGraceSeconds: TimeInterval = SmartSwitchPolicy.servedGraceSeconds
     ) -> DrainAssessment {
-        guard !account.needsLogin else { return DrainAssessment(alias: account.alias, isDraining: false) }
-        if let servedAt = account.lastServedByUs, now.timeIntervalSince(servedAt) < servedGraceSeconds {
+        // Keep the old parameter for source compatibility. Attribution now uses
+        // the baseline timestamp itself instead of a fixed grace interval.
+        _ = servedGraceSeconds
+        guard account.isEligible(now: now) else {
             return DrainAssessment(alias: account.alias, isDraining: false)
         }
         let cutoff = now.addingTimeInterval(-lookbackSeconds)
-        var earliestByLabel: [String: WindowSample] = [:]
-        for sample in previousHistory where sample.capturedAt >= cutoff {
-            if let existing = earliestByLabel[sample.label] {
-                if sample.capturedAt < existing.capturedAt { earliestByLabel[sample.label] = sample }
-            } else {
-                earliestByLabel[sample.label] = sample
-            }
-        }
+        let recentHistory = previousHistory
+            .filter { $0.capturedAt >= cutoff && $0.capturedAt <= now }
+            .sorted { $0.capturedAt < $1.capturedAt }
         // Compare each window's oldest in-lookback reading against the freshest live reading.
         for window in account.usage {
-            guard let baseline = earliestByLabel[window.label] else { continue }
+            // A reset timestamp identifies the quota window. Legacy nil values
+            // remain compatible with other nil observations.
+            guard let baseline = recentHistory.first(where: {
+                $0.label == window.label && $0.resetAt == window.resetAt
+            }) else { continue }
+            guard baseline.capturedAt < now else { continue }
+            if let servedAt = account.lastServedByUs, servedAt >= baseline.capturedAt {
+                continue
+            }
             if window.usedPercent - baseline.usedPercent >= minimumDeltaPoints {
                 return DrainAssessment(alias: account.alias, isDraining: true)
             }
@@ -60,10 +71,22 @@ public enum SmartSwitchPolicy {
         let draining = accounts.filter { drainState[$0.alias] == true }
         guard !draining.isEmpty else { return accounts }
         let rest = accounts.filter { drainState[$0.alias] != true }
+        let baseOrder = Dictionary(uniqueKeysWithValues: accounts.enumerated().map { ($0.element.alias, $0.offset) })
+
+        func usage(_ account: Account, seconds: Int, label: String) -> Int {
+            account.usage.first(where: { $0.windowSeconds == seconds || $0.label == label })?.usedPercent ?? 0
+        }
+
         let heavyFirst = draining.sorted { a, b in
-            let ua = a.usage.map(\.usedPercent).max() ?? 0
-            let ub = b.usage.map(\.usedPercent).max() ?? 0
-            if ua != ub { return ua > ub }
+            let aFiveHour = usage(a, seconds: 18_000, label: "5h")
+            let bFiveHour = usage(b, seconds: 18_000, label: "5h")
+            if aFiveHour != bFiveHour { return aFiveHour > bFiveHour }
+            let aWeekly = usage(a, seconds: 604_800, label: "Weekly")
+            let bWeekly = usage(b, seconds: 604_800, label: "Weekly")
+            if aWeekly != bWeekly { return aWeekly > bWeekly }
+            let aOrder = baseOrder[a.alias] ?? Int.max
+            let bOrder = baseOrder[b.alias] ?? Int.max
+            if aOrder != bOrder { return aOrder < bOrder }
             return a.alias < b.alias
         }
         return heavyFirst + rest
