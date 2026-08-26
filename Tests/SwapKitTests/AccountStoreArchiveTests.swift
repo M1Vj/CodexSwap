@@ -122,6 +122,38 @@ final class AccountStoreArchiveTests: XCTestCase {
         XCTAssertEqual(reloadedPaused?.routingPausedAt, Self.migrationDate)
     }
 
+    func testMigrationClearsArchivedActiveAliasButPreservesAnActiveAlias() async throws {
+        var archived = account("archived")
+        archived.archivedAt = Self.migrationDate
+        archived.routingEnabled = false
+        archived.routingPausedAt = Self.migrationDate
+        let active = account("active")
+
+        let archivedAliasURL = temporaryStoreURL("archived-active-alias")
+        let archivedAliasData = try JSONEncoder.codex.encode(
+            StoreData(schemaVersion: 2, activeAlias: "archived", accounts: [archived, active])
+        )
+        try archivedAliasData.write(to: archivedAliasURL)
+        let migratedArchivedAliasStore = AccountStore(
+            url: archivedAliasURL,
+            clock: { AccountStoreArchiveTests.migrationDate }
+        )
+        let migratedArchivedAlias = await migratedArchivedAliasStore.activeAlias()
+        XCTAssertNil(migratedArchivedAlias)
+
+        let activeAliasURL = temporaryStoreURL("active-alias")
+        let activeAliasData = try JSONEncoder.codex.encode(
+            StoreData(schemaVersion: 2, activeAlias: "active", accounts: [archived, active])
+        )
+        try activeAliasData.write(to: activeAliasURL)
+        let migratedActiveAliasStore = AccountStore(
+            url: activeAliasURL,
+            clock: { AccountStoreArchiveTests.migrationDate }
+        )
+        let migratedActiveAlias = await migratedActiveAliasStore.activeAlias()
+        XCTAssertEqual(migratedActiveAlias, "active")
+    }
+
     func testMigrationPreservesFuturePauseAndNeverBackdatesFromUsageDates() async throws {
         let url = temporaryStoreURL("future")
         let futurePause = Self.migrationDate.addingTimeInterval(604_800 * 2)

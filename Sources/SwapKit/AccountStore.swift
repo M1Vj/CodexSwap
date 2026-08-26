@@ -77,6 +77,14 @@ public actor AccountStore {
             }
             return normalized
         }
+        if let activeAlias = loaded.activeAlias,
+           !loaded.accounts.contains(where: { $0.alias == activeAlias && !$0.isArchived }) {
+            // The active alias is part of the active-roster invariant. Clear stale
+            // references left by a previous archive/removal instead of allowing a
+            // historical record back into routing state.
+            loaded.activeAlias = nil
+            needsMigration = true
+        }
         if loaded.schemaVersion < Self.currentSchemaVersion {
             loaded.schemaVersion = Self.currentSchemaVersion
             needsMigration = true
