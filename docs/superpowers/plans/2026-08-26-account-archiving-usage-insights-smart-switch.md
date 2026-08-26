@@ -8,6 +8,14 @@
 
 **Tech Stack:** Swift 6, SwiftUI/AppKit, SwiftNIO, Swift Charts, Foundation Codable, XCTest, Swift Package Manager.
 
+**Commit gate for every task:** Stage only the task's named files, inspect `rtk git diff --cached` and `rtk git diff --cached --check`, then run the focused tests and this exact staged-diff scan. Exit 0 means the inner search found no private-key, OpenAI, GitHub, AWS, Google, Slack, or JWT token shape:
+
+```bash
+rtk proxy bash -o pipefail -c 'git diff --cached --no-ext-diff | rg -n "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"; result=$?; test "$result" -eq 1'
+```
+
+A clean scan is required before each commit; release repeats it against the frozen commit.
+
 ---
 
 ### Task 1: Centralize reset presentation
@@ -111,7 +119,7 @@
 
 - [ ] **Step 1: Write exact-boundary and zero-call tests**
 
-  Cover the instant before and exactly at seven days from `max(routingPausedAt, later lastServedByUs)`, future clocks, passive import/settings/log/quota activity, active routing leases, the first post-lease tick, and legacy grace. Add spies proving archived accounts never reach quota/reset/warm-up/log-scan/Task Board/pool/CLI consumers. Require `swapd quota --json` to skip CodexBar global `--all-accounts` prefetch whenever archives exist.
+  Cover the instant before and exactly at seven days from `max(routingPausedAt, later lastServedByUs)`, future clocks, passive import/settings/log/quota activity, active routing leases, the first post-lease tick, and legacy grace. Require enabled-to-paused to stamp `routingPausedAt` once, repeated paused saves not to extend it, re-enabling routing to clear it, and a later real in-flight attempt to extend the deadline. Add spies proving archived accounts never reach quota/reset/warm-up/log-scan/Task Board/pool/CLI consumers. Require `swapd quota --json` to skip CodexBar global `--all-accounts` prefetch whenever archives exist.
 
 - [ ] **Step 2: Verify RED**
 
@@ -121,11 +129,15 @@
 
   Add a deterministic seven-day eligibility helper and a store transaction that archives eligible paused accounts while excluding aliases with active routing leases. Run it after migration and before periodic quota network work. Do not mutate the persisted pause timestamp when a lease defers archival.
 
-- [ ] **Step 4: Route all operational consumers through the active roster**
+- [ ] **Step 4: Implement manual archive lease handoff**
+
+  When a manual archive targets an alias with an in-flight proxy or Task Board lease, surface an in-use warning and require confirmation. After confirmation, mark the account archived immediately so no new attempt can select it, allow the existing upstream attempt to finish and stamp routed use, then move Task Board work to another allowed eligible account or pause it with `No eligible account`. Add proxy and Task Board regression tests for both fallback and no-fallback cases.
+
+- [ ] **Step 5: Route all operational consumers through the active roster**
 
   Audit selection, rotation, task start, warm-up, quota, reset credits, scanning, pool summaries, menu snapshots, CLI reports, and notification inputs. Apply the guard at the lowest shared boundary and retain defensive checks at external-network entry points. `CodexQuotaReport` omits archived rows entirely; only the archive settings surface may show explicitly historical saved usage.
 
-- [ ] **Step 5: Verify GREEN and inspect call coverage**
+- [ ] **Step 6: Verify GREEN and inspect call coverage**
 
   Run:
 
@@ -152,7 +164,7 @@
 
 - [ ] **Step 1: Restore the reproduced regression as permanent tests**
 
-  Add the round-robin `current()` failure already reproduced, then cover ranking and round-robin current routing, new-turn advance, quota rotation, login recovery, and Task Board start. Cover restricted-poll merge, failed-poll retention, expiry, archive clearing, same-window baselines, reset timestamp changes, lower used percent, manual/hard pins, and warm-up exemptions.
+  Add the round-robin `current()` failure already reproduced, then cover ranking and round-robin current routing, new-turn advance, quota rotation, login recovery, interactive first-turn selection, Task Board start, retry/fallback, and fresh alternatives. Add deterministic fixtures proving draining candidates sort by five-hour used percent descending, weekly used percent descending, configured rank or LRU, then alias ascending, while non-draining order stays unchanged. Cover restricted-poll merge, failed-poll retention, expiry, archive clearing, same-window baselines, reset timestamp changes, lower used percent, manual/hard pins, and warm-up exemptions.
 
 - [ ] **Step 2: Verify RED**
 
@@ -160,11 +172,11 @@
 
 - [ ] **Step 3: Centralize eligible drain-aware ordering**
 
-  Make every automatic strategy derive its candidate sequence from one active-only eligibility boundary and then stably float valid draining candidates. Preserve visible rank, manual selection, hard task pins, cooldown/login eligibility, and warm-up exclusions.
+  Make every automatic strategy derive its candidate sequence from one active-only eligibility boundary and then float valid draining candidates. Inside the draining group, compare five-hour used percent descending, weekly used percent descending, the configured rank or LRU order, then alias ascending. Preserve the saved visible rank, the base non-draining sequence, manual selection, hard task pins, cooldown/login eligibility, and warm-up exclusions.
 
 - [ ] **Step 4: Make observations mergeable and reset-aware**
 
-  Merge restricted poll results by inspected alias instead of replacing the full set. Use lookback `min(3600, max(900, 2 * pollInterval))`. Retain uninspected observations until expiry; clear an observation when the reset timestamp changes, used percent falls, or the account archives.
+  Merge restricted poll results by inspected alias instead of replacing the full set. Use lookback `min(3600, max(900, 2 * pollInterval))`. Retain uninspected observations until expiry; clear an observation when the reset timestamp changes, used percent falls, the account archives/restores/pauses/logs out, or a successful assessment finds no drain. Turning Smart Switch off clears all runtime observations. Turning it on immediately polls the full active roster; the first baseline reports `Learning` and cannot claim drain.
 
 - [ ] **Step 5: Stamp routed use at the real attempt boundary**
 
@@ -194,7 +206,7 @@
 
 - [ ] **Step 1: Write failing privacy, retention, and aggregate tests**
 
-  Require `metadataTelemetryEnabled == false` for new and migrated settings. Test the strict serialized allowlist with prompt-, response-, command-, path-, header-, body-, raw-error-, provider-ID-, and session-shaped canaries. Cover 30-day event retention, the boundary instant, 50,000-event cap, 365 daily buckets, lifetime totals, retry attribution, scoped removal purge, global clear, future dates, duplicate compaction, saturation, and corrupted-file recovery.
+  Require `metadataTelemetryEnabled == false` for new and migrated settings. Test the strict serialized allowlist with prompt-, response-, command-, path-, header-, body-, raw-error-, provider-ID-, and session-shaped canaries. Cover 30-day event retention, the boundary instant, 50,000-event cap, recorded coverage start and truncation indicator, 365 daily buckets, lifetime totals, retry attribution, scoped removal purge, global clear, future and malformed dates, duplicate event-ID rejection, duplicate compaction, invalid duration/token/status rejection, non-finite values, saturation, and corrupted-file recovery.
 
 - [ ] **Step 2: Write exact histogram and percentile tests**
 
@@ -229,6 +241,7 @@
 **Files:**
 - Modify: `Sources/SwapKit/ProxyServer.swift`
 - Modify: `Sources/SwapKit/AppEngine.swift`
+- Modify: `Sources/SwapKit/AccountStore.swift`
 - Modify: `Sources/SwapKit/CodexEventDecoder.swift`
 - Modify: `Sources/SwapKit/AutomationTask.swift`
 - Modify: `Tests/SwapKitTests/RunTelemetryTests.swift`
@@ -236,6 +249,7 @@
 - Modify: `Tests/SwapKitTests/TaskOutcomeReducerTests.swift`
 - Modify: `Tests/SwapKitTests/ProxyShutdownRegressionTests.swift`
 - Modify: `Tests/SwapKitTests/QuotaSafetyRegressionTests.swift`
+- Modify: `Tests/SwapKitTests/UsageTelemetryTests.swift`
 
 - [ ] **Step 1: Write failing instrumentation tests**
 
@@ -257,7 +271,11 @@
 
   Extend existing run telemetry with reasoning/output completeness and terminal outcome inputs. Feed only numeric/category/timestamp fields into the telemetry store; never copy task text, commands, paths, session identifiers, logs, or model content.
 
-- [ ] **Step 6: Verify GREEN and inspect failure isolation**
+- [ ] **Step 6: Wire permanent-removal telemetry purge**
+
+  Make standalone removal and managed-roster reconciliation return the removed account telemetry UUIDs to `AppEngine`. Purge request events plus scoped daily/lifetime attempt aggregates for each UUID in the same owner-visible operation. Keep anonymous root-request aggregates unchanged until global clear. Add an end-to-end reconciliation test that restarts/imports before removal and proves the stable UUID is fully purged without touching unrelated account or root totals.
+
+- [ ] **Step 7: Verify GREEN and inspect failure isolation**
 
   Run:
 
@@ -280,7 +298,7 @@
 
 - [ ] **Step 1: Write failing formula and uncertainty tests**
 
-  Cover 7-day, 30-day, and lifetime ranges; local-day keys with stored offsets; active versus archived scopes; quota headroom and burn/forecast; cache hit/write/fresh input; reasoning share; tokens per root; retry amplification; failed-attempt tokens/time; fallback frequency; root success; attempt error/429 rates; latency thresholds; account/model shares; estimated cache savings/cost provenance; and Task Board outcomes. Require nil or partial output for zero denominators and incomplete fields.
+  Cover 7-day, 30-day, and lifetime ranges; local-day keys with stored offsets; active versus archived scopes; headroom `100 - used`; positive same-window burn per hour; projected usage clamped to `0...100`; positive-burn exhaustion time; reset/decrease discontinuity suppression; and the existing meaningful-usage threshold. Require forecast confidence to be low below three samples or 15 minutes, medium at three or more samples over 30 minutes, and high at five or more samples over 60 minutes with no discontinuity. Also cover cache hit/write/fresh input, reasoning share, tokens per root, retry amplification, failed-attempt tokens/time, fallback frequency, root success, attempt error/429 rates, latency thresholds, account/model shares, estimated cache savings/cost provenance, and Task Board outcomes. Require nil or partial output for zero denominators and incomplete fields.
 
 - [ ] **Step 2: Verify RED**
 
@@ -409,6 +427,8 @@
   rtk swift test
   rtk proxy bash Scripts/test-release-tools.sh
   rtk proxy bash Scripts/build-app.sh
+  rtk proxy bash Scripts/package-release.sh
+  rtk proxy bash Scripts/verify-release.sh
   rtk git diff --check
   rtk proxy codesign --verify --deep --strict dist/CodexSwap.app
   ```
@@ -417,7 +437,7 @@
 
 - [ ] **Step 3: Run privacy and data-boundary probes**
 
-  Secret-scan the exact staged diff and telemetry fixtures. Serialize malicious content-shaped observations and prove none of the forbidden strings persist. Verify telemetry files use `0700`/`0600`, disabling collection creates no events, clearing removes all telemetry, scoped removal purges only the removed UUID, and archive/restore produces no CodexBar/OAuth/managed-home writes.
+  Repeat the staged-diff secret scan against the frozen candidate commit and telemetry fixtures. Serialize malicious content-shaped observations and prove none of the forbidden strings persist. Verify telemetry files use `0700`/`0600`, disabling collection creates no events, clearing removes all telemetry, scoped removal purges only the removed UUID, and archive/restore produces no CodexBar/OAuth/managed-home writes.
 
 - [ ] **Step 4: Request independent frozen-candidate reviews**
 
@@ -425,7 +445,7 @@
 
 - [ ] **Step 5: Install without disturbing unrelated sessions**
 
-  Create a task-owned rollback bundle through the existing release workflow. Resolve the listener on `127.0.0.1:58432`, prove the exact PID belongs to CodexSwap, terminate only that process gracefully, install the verified app, reopen `/Applications/CodexSwap.app`, and poll until the listener returns. Never use `killall` or `pkill`; preserve owner Codex/OpenCode sessions and the watchdog.
+  Create a unique task-owned rollback directory, copy `/Applications/CodexSwap.app` into it, record and verify the existing bundle identifier, version, signature, executable hash, and listener PID before replacement, and prove the copy passes `codesign --verify --deep --strict`. Resolve the listener on `127.0.0.1:58432`, prove the exact PID belongs to CodexSwap, terminate only that process gracefully, install the bundle extracted and verified by `Scripts/verify-release.sh`, reopen `/Applications/CodexSwap.app`, and poll until the listener returns. If any installed verification fails, stop only the new exact process, restore the verified rollback copy, reopen it, and prove its listener, signature, and hash. Never use `killall` or `pkill`; preserve owner Codex/OpenCode sessions and the watchdog.
 
 - [ ] **Step 6: Verify the installed behavior**
 
