@@ -55,6 +55,9 @@ public actor AccountStore {
     /// pause timestamp; overlapping attempts on one alias remain protected
     /// until the final attempt releases its lease.
     private var routingLeases: [String: Int] = [:]
+    /// Reservations made by atomic selection and waiting to be consumed by the
+    /// corresponding attempt. These stay in-memory and are reference-counted.
+    private var routingReservations: [String: Int] = [:]
     private static let historyCap = 64
     private static let currentSchemaVersion = 2
     public static let automaticArchiveDelay: TimeInterval = 604_800
@@ -182,6 +185,52 @@ public actor AccountStore {
         }
     }
 
+    /// Selects and leases an account in one actor transaction. This closes the
+    /// selection-to-lease race when several proxy clients start at once.
+    public func reserveCurrent(avoidingLeased: Bool = false, now: Date = Date()) -> Account? {
+        guard let selected = current(now: now, avoidingLeased: avoidingLeased) else { return nil }
+        reserveLease(selected.alias)
+        return selected
+    }
+
+    public func reserveEligible(_ alias: String, now: Date = Date()) -> Account? {
+        guard let selected = account(alias), selected.isEligible(now: now) else { return nil }
+        reserveLease(alias)
+        return selected
+    }
+
+    public func reserveBestEligible(
+        among aliases: [String],
+        excluding excludedAlias: String? = nil,
+        primaryThreshold: Int = Int.max,
+        secondaryThreshold: Int = Int.max,
+        avoidingLeased: Bool = false,
+        now: Date = Date()
+    ) -> Account? {
+        guard let selected = bestEligible(
+            among: aliases.filter { $0 != excludedAlias },
+            primaryThreshold: primaryThreshold,
+            secondaryThreshold: secondaryThreshold,
+            avoidingLeased: avoidingLeased,
+            now: now
+        ) else { return nil }
+        reserveLease(selected.alias)
+        touchLastUsed(selected.alias, now: now)
+        return account(selected.alias)
+    }
+
+    private func reserveLease(_ alias: String) {
+        acquireRoutingLease(alias)
+        routingReservations[alias, default: 0] += 1
+    }
+
+    public func consumeRoutingReservation(_ alias: String) -> Bool {
+        guard let count = routingReservations[alias], count > 0 else { return false }
+        if count == 1 { routingReservations.removeValue(forKey: alias) }
+        else { routingReservations[alias] = count - 1 }
+        return true
+    }
+
     public func routingLeaseAliases() -> Set<String> {
         Set(routingLeases.compactMap { alias, count in count > 0 ? alias : nil })
     }
@@ -280,11 +329,14 @@ public actor AccountStore {
         among aliases: [String],
         primaryThreshold: Int = Int.max,
         secondaryThreshold: Int = Int.max,
+        avoidingLeased: Bool = false,
         now: Date = Date()
     ) -> Account? {
         let allowed = Set(aliases)
+        let eligible = data.accounts.filter { allowed.contains($0.alias) && $0.isEligible(now: now) }
+        let unleased = eligible.filter { routingLeases[$0.alias, default: 0] == 0 }
         let ordered = strategySorted(
-            data.accounts.filter { allowed.contains($0.alias) && $0.isEligible(now: now) },
+            avoidingLeased && !unleased.isEmpty ? unleased : eligible,
             strategy: strategy
         )
         return ordered.first {
@@ -302,13 +354,18 @@ public actor AccountStore {
     // MARK: - Selection
 
     /// The account the proxy should use right now, applying the configured strategy and stickiness.
-    public func current(now: Date = Date()) -> Account? {
+    /// New requests can avoid accounts that already have in-flight routed work so parallel
+    /// clients do not pile onto one account before upstream quota can react.
+    public func current(now: Date = Date(), avoidingLeased: Bool = false) -> Account? {
         switch strategy {
         case .priority:
-            let ranked = eligibleSorted(now: now)
+            let eligible = eligibleSorted(now: now)
+            let unleased = eligible.filter { routingLeases[$0.alias, default: 0] == 0 }
+            let ranked = avoidingLeased && !unleased.isEmpty ? unleased : eligible
             guard let best = ranked.first else { return nil }
             let hasEligibleDraining = ranked.contains { drainingAliases.contains($0.alias) }
             if let active = account(data.activeAlias ?? ""), active.isEligible(now: now),
+               (!avoidingLeased || routingLeases[active.alias, default: 0] == 0),
                active.alias == best.alias ||
                 (!hasEligibleDraining && active.priority == best.priority) {
                 return active
@@ -316,10 +373,13 @@ public actor AccountStore {
             activate(best.alias, now: now)
             return account(best.alias)
         case .roundRobin:
-            let ordered = eligibleOrdered(now: now)
+            let eligible = eligibleOrdered(now: now)
+            let unleased = eligible.filter { routingLeases[$0.alias, default: 0] == 0 }
+            let ordered = avoidingLeased && !unleased.isEmpty ? unleased : eligible
             guard let best = ordered.first else { return nil }
             let hasEligibleDraining = ordered.contains { drainingAliases.contains($0.alias) }
             if let active = account(data.activeAlias ?? ""), active.isEligible(now: now),
+               (!avoidingLeased || routingLeases[active.alias, default: 0] == 0),
                (!hasEligibleDraining || active.alias == best.alias) {
                 return active
             }

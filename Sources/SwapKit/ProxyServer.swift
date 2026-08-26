@@ -192,7 +192,7 @@ func selectProxyAccount(
            pinned.isEligible(now: now) {
             return pinned
         }
-        return await store.current(now: now)
+        return await store.current(now: now, avoidingLeased: true)
     case .warmup(let alias):
         // Hydrate managed tokens before judging eligibility, exactly like normal traffic does:
         // a stale store copy (old token, leftover needs-login flag) must not fail a warm-up
@@ -221,10 +221,54 @@ func selectProxyAccount(
             among: allowed,
             primaryThreshold: primaryThreshold,
             secondaryThreshold: secondaryThreshold,
+            avoidingLeased: true,
             now: now
         ) else { return nil }
         await store.touchLastUsed(account.alias, now: now)
         return account
+    }
+}
+
+/// Selects and acquires the initial routing lease before returning. AccountStore
+/// performs the unpinned choice and lease increment in one actor transaction.
+func reserveProxyAccount(
+    store: AccountStore,
+    mode: ProxyRequestMode,
+    primaryThreshold: Int = Int.max,
+    secondaryThreshold: Int = Int.max,
+    preferredTaskAlias: String? = nil,
+    hardPinnedTaskAlias: String? = nil,
+    now: Date = Date()
+) async -> Account? {
+    switch mode {
+    case .normal:
+        return await store.reserveCurrent(avoidingLeased: true, now: now)
+    case .warmup(let alias):
+        guard let hydrated = await store.hydrateFromManagedHome(alias), hydrated.isEligible(now: now) else { return nil }
+        return await store.reserveEligible(alias, now: now)
+    case .task(let allowed, _):
+        for alias in allowed {
+            _ = await store.hydrateFromManagedHome(alias)
+        }
+        if let pinned = hardPinnedTaskAlias, allowed.contains(pinned),
+           let account = await store.reserveEligible(pinned, now: now) {
+            await store.touchLastUsed(pinned, now: now)
+            return account
+        }
+        if let preferred = preferredTaskAlias, allowed.contains(preferred),
+           let sticky = await store.account(preferred), sticky.isEligible(now: now),
+           sticky.isWithinRotationThresholds(primaryPercent: primaryThreshold, secondaryPercent: secondaryThreshold),
+           let account = await store.reserveEligible(preferred, now: now) {
+            await store.touchLastUsed(preferred, now: now)
+            return account
+        }
+        return await store.reserveBestEligible(
+            among: allowed,
+            primaryThreshold: primaryThreshold,
+            secondaryThreshold: secondaryThreshold,
+            avoidingLeased: true,
+            now: now
+        )
     }
 }
 
@@ -237,7 +281,9 @@ func withRoutingLease<T>(
     alias: String,
     operation: @Sendable () async throws -> T
 ) async rethrows -> T {
-    await store.acquireRoutingLease(alias)
+    if !(await store.consumeRoutingReservation(alias)) {
+        await store.acquireRoutingLease(alias)
+    }
     do {
         let result = try await operation()
         await store.releaseRoutingLease(alias)
@@ -414,8 +460,13 @@ struct InteractiveTurnPins {
 actor InteractiveTurnSelector {
     typealias Selection = @Sendable () async -> String?
 
+    struct Result: Sendable {
+        let alias: String
+        let leaseReservedBySelection: Bool
+    }
+
     private var pins: InteractiveTurnPins
-    private var inflight: [String: (id: UUID, task: Task<String?, Never>)] = [:]
+    private var inflight: [String: (id: UUID, task: Task<Result?, Never>)] = [:]
     private var serializedTail: Task<Void, Never>?
     private let maxInflight: Int
 
@@ -435,13 +486,21 @@ actor InteractiveTurnSelector {
     func inflightCount() -> Int { inflight.count }
 
     func selectAlias(for key: String, selection: @escaping Selection) async -> String? {
-        if let pinned = pins.alias(for: key) { return pinned }
-        if let running = inflight[key] { return await running.task.value }
+        await selectAliasWithReservation(for: key, selection: selection)?.alias
+    }
+
+    func selectAliasWithReservation(for key: String, selection: @escaping Selection) async -> Result? {
+        if let pinned = pins.alias(for: key) {
+            return Result(alias: pinned, leaseReservedBySelection: false)
+        }
+        if let running = inflight[key], let result = await running.task.value {
+            return Result(alias: result.alias, leaseReservedBySelection: false)
+        }
         guard inflight.count < maxInflight else { return nil }
 
         let id = UUID()
         let predecessor = serializedTail
-        let task = Task<String?, Never> { [weak self] in
+        let task = Task<Result?, Never> { [weak self] in
             _ = await predecessor?.value
             guard let self else { return nil }
             return await self.performNewSelection(for: key, selection: selection)
@@ -454,12 +513,14 @@ actor InteractiveTurnSelector {
         return result
     }
 
-    private func performNewSelection(for key: String, selection: Selection) async -> String? {
+    private func performNewSelection(for key: String, selection: Selection) async -> Result? {
         // The key can become pinned while this operation waits behind another new turn.
-        if let pinned = pins.alias(for: key) { return pinned }
+        if let pinned = pins.alias(for: key) {
+            return Result(alias: pinned, leaseReservedBySelection: false)
+        }
         guard let alias = await selection() else { return nil }
         pins.bind(key, alias: alias, preserving: key)
-        return alias
+        return Result(alias: alias, leaseReservedBySelection: true)
     }
 }
 
@@ -656,6 +717,35 @@ public actor ProxyServer {
     func taskPinCount() -> Int { taskRunPins.count }
     func taskPinnedAlias(runID: String) -> String? { taskRunPins.alias(for: runID) }
 
+    func reserveInteractiveAccount(key: String, settings: Settings) async -> Account? {
+        let store = self.store
+        guard let selection = await interactiveSelector.selectAliasWithReservation(
+            for: key,
+            selection: {
+                if settings.rotationStrategy == .roundRobin {
+                    _ = await store.advanceRoundRobin()
+                }
+                return await store.reserveCurrent(avoidingLeased: true)?.alias
+            }
+        ) else { return nil }
+
+        if selection.leaseReservedBySelection,
+           let reserved = await store.account(selection.alias) {
+            return reserved
+        }
+        if selection.leaseReservedBySelection {
+            await store.releaseRoutingLease(selection.alias)
+        }
+        if let pinned = await store.reserveEligible(selection.alias) {
+            return pinned
+        }
+        guard let fallback = await store.reserveCurrent(avoidingLeased: true) else { return nil }
+        await interactiveSelector.bind(key, alias: fallback.alias, preserving: key)
+        return fallback
+    }
+
+    /// Selection-only helper retained for policy tests and diagnostics. Live proxy
+    /// requests use `reserveInteractiveAccount` so selection and leasing stay atomic.
     func selectInteractiveAccount(key: String, settings: Settings) async -> Account? {
         let store = self.store
         let alias = await interactiveSelector.selectAlias(for: key) {
@@ -986,20 +1076,21 @@ public actor ProxyServer {
         let interactiveKey = mode == .normal && head.method == .POST && rawPath.hasSuffix("/responses")
             ? interactiveTurnKey(headers: head.headers, body: body)
             : nil
-        var preferredInteractiveAlias: String?
-        if let interactiveKey {
-            preferredInteractiveAlias = (await selectInteractiveAccount(key: interactiveKey, settings: settings))?.alias
-        }
         let preferredTaskAlias = mode.taskRunID.flatMap { taskRunPins.alias(for: $0) }
 
-        guard var account = await selectProxyAccount(
-            store: store,
-            mode: mode,
-            primaryThreshold: settings.primaryThresholdPercent,
-            secondaryThreshold: settings.secondaryThresholdPercent,
-            hardPinnedTaskAlias: preferredTaskAlias,
-            preferredInteractiveAlias: preferredInteractiveAlias
-        ) else {
+        let reservedAccount: Account?
+        if let interactiveKey {
+            reservedAccount = await reserveInteractiveAccount(key: interactiveKey, settings: settings)
+        } else {
+            reservedAccount = await reserveProxyAccount(
+                store: store,
+                mode: mode,
+                primaryThreshold: settings.primaryThresholdPercent,
+                secondaryThreshold: settings.secondaryThresholdPercent,
+                hardPinnedTaskAlias: preferredTaskAlias
+            )
+        }
+        guard var account = reservedAccount else {
             log("\(head.method.rawValue) \(rawPath) -> no eligible account")
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
@@ -1090,7 +1181,10 @@ public actor ProxyServer {
         let sink = self.sink
         let exhaustionHandler = self.exhaustionHandler
         let freshAlternative = self.freshAlternative
-        return try await withRoutingLease(store: store, alias: initialAccount.alias) { () async throws -> ProxyAttemptResult in
+        return try await withRoutingLease(
+            store: store,
+            alias: initialAccount.alias
+        ) { () async throws -> ProxyAttemptResult in
             var account = initialAccount
             var tokenRefreshed = initialTokenRefreshed
             var exhaustionHandled = initialExhaustionHandled
@@ -1397,21 +1491,27 @@ public actor ProxyServer {
         } else {
             allowed = await store.all().map(\.alias)
         }
-        return await store.bestEligible(
-            among: allowed.filter { $0 != alias },
+        return await store.reserveBestEligible(
+            among: allowed,
+            excluding: alias,
             primaryThreshold: settings.primaryThresholdPercent,
-            secondaryThreshold: settings.secondaryThresholdPercent
+            secondaryThreshold: settings.secondaryThresholdPercent,
+            avoidingLeased: true
         )
     }
 
     private func selectNextTaskAccount(mode: ProxyRequestMode, excluding alias: String) async -> Account? {
         let settings = await settingsProvider()
-        guard let next = await selectProxyAccount(
-            store: store,
-            mode: mode,
+        let allowed: [String]
+        if case .task(let aliases, _) = mode { allowed = aliases }
+        else { allowed = await store.all().map(\.alias) }
+        guard let next = await store.reserveBestEligible(
+            among: allowed,
+            excluding: alias,
             primaryThreshold: settings.primaryThresholdPercent,
-            secondaryThreshold: settings.secondaryThresholdPercent
-        ), next.alias != alias else { return nil }
+            secondaryThreshold: settings.secondaryThresholdPercent,
+            avoidingLeased: true
+        ) else { return nil }
         await recordSelection(next.alias, mode: mode, interactiveKey: nil)
         return next
     }

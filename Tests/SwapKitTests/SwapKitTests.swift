@@ -2264,6 +2264,63 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(selected?.alias, "b")
     }
 
+    func testNormalSelectionPrefersAnUnleasedAccountForParallelSessions() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-session-lease-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+        await store.acquireRoutingLease("a")
+
+        let selected = await selectProxyAccount(store: store, mode: .normal)
+
+        XCTAssertEqual(selected?.alias, "b")
+    }
+
+    func testTaskSelectionPrefersAnUnleasedAccountForParallelRuns() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-task-lease-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+        await store.acquireRoutingLease("a")
+
+        let selected = await selectProxyAccount(
+            store: store,
+            mode: .task(allowed: ["a", "b"]),
+            primaryThreshold: 95,
+            secondaryThreshold: 98
+        )
+
+        XCTAssertEqual(selected?.alias, "b")
+    }
+
+    func testParallelSessionReservationsAreAtomic() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-session-reservation-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+
+        async let first = store.reserveCurrent(avoidingLeased: true)
+        async let second = store.reserveCurrent(avoidingLeased: true)
+        let aliases = await Set([first?.alias, second?.alias].compactMap { $0 })
+
+        XCTAssertEqual(aliases, Set(["a", "b"]))
+    }
+
+    func testParallelInteractiveSessionsReserveDistinctAccounts() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-interactive-reservation-\(UUID().uuidString).json"), strategy: .priority)
+        let selector = InteractiveTurnSelector(maxCount: 8, maxAge: 60)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+
+        async let first = selector.selectAliasWithReservation(for: "session-a") {
+            await store.reserveCurrent(avoidingLeased: true)?.alias
+        }
+        async let second = selector.selectAliasWithReservation(for: "session-b") {
+            await store.reserveCurrent(avoidingLeased: true)?.alias
+        }
+        let selections = await [first, second].compactMap { $0 }
+
+        XCTAssertEqual(Set(selections.map(\.alias)), Set(["a", "b"]))
+        XCTAssertTrue(selections.allSatisfy(\.leaseReservedBySelection))
+    }
+
     func testPausedTaskRunPinIsOverriddenOnNextSelection() async {
         let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("paused-task-pin-\(UUID().uuidString).json"))
         await store.upsert(account("a"))
