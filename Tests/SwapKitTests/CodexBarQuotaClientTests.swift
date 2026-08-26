@@ -3,6 +3,26 @@ import XCTest
 @testable import SwapKit
 
 final class CodexBarQuotaClientTests: XCTestCase {
+    func testFetchSkipsGlobalPrefetchWhenArchivedAccountExists() async throws {
+        let probe = InvocationProbe()
+        let client = CodexBarQuotaClient { executable, arguments, _, _ in
+            await probe.record(executable: executable, arguments: arguments)
+            return CodexBarCommandResult(stdout: Data("[]".utf8), exitCode: 0)
+        }
+        var archived = Account(alias: "archived", accountID: "archived-id", accessToken: "archived-token")
+        archived.archivedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        archived.routingEnabled = false
+
+        let snapshots = try await client.fetch(accounts: [
+            Account(alias: "active", accountID: "active-id", accessToken: "active-token"),
+            archived,
+        ])
+
+        XCTAssertTrue(snapshots.isEmpty)
+        let invocation = await probe.invocation()
+        XCTAssertNil(invocation)
+    }
+
     func testFetchUsesFixedExecutableAndExactOneShotArguments() async throws {
         let probe = InvocationProbe()
         let client = CodexBarQuotaClient { executable, arguments, _, _ in

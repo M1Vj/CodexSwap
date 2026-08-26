@@ -67,6 +67,7 @@ public enum TaskSchedulingReasonFormatter {
         return aliases.map { alias in
             let safeAlias = oneLine(alias)
             guard let account = byAlias[alias] else { return "\(safeAlias): unknown account" }
+            if account.isArchived { return "\(safeAlias): archived" }
             if account.needsLogin || account.accessToken.isEmpty { return "\(safeAlias): needs login" }
             if let cooldown = account.cooldownUntil(now: now) {
                 return "\(safeAlias): cooldown until \(shortDate(cooldown))"
@@ -97,7 +98,7 @@ public enum TaskSchedulingReasonFormatter {
         }
         let allowed = Set(aliases)
         return accounts
-            .filter { allowed.contains($0.alias) }
+            .filter { allowed.contains($0.alias) && !$0.isArchived }
             .compactMap { account in
                 if let cooldown = account.cooldownUntil(now: now) { return cooldown }
                 return account.usage.compactMap(\.resetAt).filter { $0 > now }.min()

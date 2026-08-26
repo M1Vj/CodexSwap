@@ -108,8 +108,11 @@ public struct QuotaReportService: Sendable {
     ) async throws -> CodexQuotaReport {
         try Task.checkCancellation()
         let fetchedAt = clock()
+        // Archived rows retain historical usage in the local store but are never
+        // part of a live quota report or its network lookups.
+        let activeAccounts = accounts.filter { !$0.isArchived }
         let activeKey = Self.normalizedAlias(activeAlias)
-        let orderedAccounts = accounts.enumerated()
+        let orderedAccounts = activeAccounts.enumerated()
             .sorted { lhs, rhs in
                 let lhsIsActive = activeKey != nil && Self.normalizedAlias(lhs.element.alias) == activeKey
                 let rhsIsActive = activeKey != nil && Self.normalizedAlias(rhs.element.alias) == activeKey

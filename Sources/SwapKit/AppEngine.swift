@@ -13,6 +13,12 @@ public enum AppEngineError: LocalizedError, Sendable {
     }
 }
 
+public enum AccountArchiveResult: Sendable, Equatable {
+    case archived(Account)
+    case confirmationRequired(alias: String)
+    case accountUnavailable
+}
+
 public enum AppEvent: Sendable {
     case rotated(from: String, to: String, limit: String, resetAt: Date?)
     case exhausted(limit: String)
@@ -125,6 +131,7 @@ public actor AppEngine {
     private var schedulingTaskIDs: Set<UUID> = []
     private var interruptingTaskIDs: Set<UUID> = []
     private var repositoryLeases: [UUID: String] = [:]
+    private var taskAccountLeases: [UUID: String] = [:]
     private var schedulingReasons: [String: String] = [:]
     /// Aliases whose logged-out episode already raised a notification; cleared on recovery.
     private var needsLoginNotified: Set<String> = []
@@ -266,6 +273,9 @@ public actor AppEngine {
         self.proxy = proxy
         if let url = await proxy.proxyURL() { RuntimeHandoff.writeProxyURL(url) }
 
+        // Store migration has completed in AccountStore's initializer. Archive due
+        // paused accounts before any periodic quota/reset/warm-up network work.
+        _ = await archiveDueAccounts()
         await syncCodexBar()
         if let current = AccountImporter.currentCodexAccount() { await store.upsert(current) }
 
@@ -338,6 +348,9 @@ public actor AppEngine {
                 await autoLog.write("lifecycle", "paused interrupted task \(Self.taskLabel(interrupted)) for shutdown")
             }
             repositoryLeases.removeValue(forKey: taskID)
+            if let alias = taskAccountLeases.removeValue(forKey: taskID) {
+                await store.releaseRoutingLease(alias)
+            }
         }
         interruptingTaskIDs.subtract(runningIDs)
         await autoLog.write("lifecycle", "engine stop: paused \(pausedCount) running task(s) for shutdown")
@@ -398,7 +411,7 @@ public actor AppEngine {
     public func usageOverview() async -> PoolUsageOverview {
         let settings = await settingsStore.get()
         return UsageOverviewBuilder.build(
-            accounts: await store.all(),
+            accounts: await store.activeAccounts(),
             activeAlias: await store.activeAlias(),
             drainingAliases: await store.currentDrainingAliases(),
             smartSwitchEnabled: settings.smartSwitchEnabled
@@ -412,7 +425,7 @@ public actor AppEngine {
            Date().timeIntervalSince(cache.generatedAt) < Self.localUsageCacheTTL {
             return cache.value
         }
-        let accounts = await store.all()
+        let accounts = await store.activeAccounts()
         // Managed homes attribute 1:1. Standalone accounts all share ~/.codex, so their
         // history is only attributable when exactly one standalone account exists.
         var byHome: [String: [String]] = [:]
@@ -469,6 +482,7 @@ public actor AppEngine {
     }
 
     private func refreshResetCreditsAndEmitSnapshot(aliases: Set<String>? = nil) async {
+        _ = await archiveDueAccounts()
         await quotaResetCoordinator.refreshCredits(aliases: aliases)
         emit(.snapshotChanged)
     }
@@ -521,6 +535,7 @@ public actor AppEngine {
     }
 
     public func resetQuota(alias: String, trigger: ResetTrigger) async -> ResetAttemptResult {
+        _ = await archiveDueAccounts()
         let result = await quotaResetCoordinator.reset(alias: alias, trigger: trigger)
         await quotaResetCoordinator.refreshCredits(aliases: [alias])
         emit(.snapshotChanged)
@@ -541,7 +556,7 @@ public actor AppEngine {
         allowedAliases: [String]?
     ) async -> Account? {
         let allowed = allowedAliases.map(Set.init)
-        let candidates = await store.all().filter { account in
+        let candidates = await store.activeAccounts().filter { account in
             account.alias != currentAlias
                 && (allowed?.contains(account.alias) ?? true)
                 && account.isEligible(now: Date())
@@ -566,7 +581,7 @@ public actor AppEngine {
         let coordinatorStatuses = await quotaResetCoordinator.cachedStatuses()
         let snapshots = await quotaResetCoordinator.cachedCreditSnapshots()
         var result: [String: AccountResetCreditStatus] = [:]
-        for account in await store.all() {
+        for account in await store.activeAccounts() {
             switch coordinatorStatuses[account.alias] {
             case .refreshing:
                 result[account.alias] = .loading
@@ -904,6 +919,39 @@ public actor AppEngine {
         emit(.snapshotChanged)
     }
 
+    /// Archives due paused accounts using the same store transaction as manual
+    /// archive. Active Task Board leases defer the operation without moving the
+    /// persisted pause timestamp; the next tick can archive immediately.
+    @discardableResult
+    public func archiveDueAccounts(now: Date? = nil) async -> [Account] {
+        let leasedAliases = Set(taskAccountLeases.values).union(await store.routingLeaseAliases())
+        let archived = await store.archiveDueAccounts(now: now, leasedAliases: leasedAliases)
+        if !archived.isEmpty { emit(.snapshotChanged) }
+        return archived
+    }
+
+    /// Manual archive entry point. A leased Task Board account requires an
+    /// explicit confirmation before it is removed from future selection. The
+    /// current in-flight attempt keeps its lease and may finish normally.
+    public func archiveAccount(alias: String, confirmed: Bool = false, now: Date? = nil) async -> AccountArchiveResult {
+        guard await store.account(alias) != nil else { return .accountUnavailable }
+        let storeLeases = await store.routingLeaseAliases()
+        let leased = taskAccountLeases.values.contains(alias)
+            || storeLeases.contains(alias)
+        guard !leased || confirmed else { return .confirmationRequired(alias: alias) }
+        guard let archived = await store.archive(alias: alias, now: now) else {
+            return .accountUnavailable
+        }
+        emit(.snapshotChanged)
+        return .archived(archived)
+    }
+
+    public func restoreAccount(alias: String, now: Date? = nil) async -> Account? {
+        let restored = await store.restore(alias: alias, now: now)
+        if restored != nil { emit(.snapshotChanged) }
+        return restored
+    }
+
     public func remove(_ alias: String) async {
         await store.remove(alias)
         needsLoginNotified.remove(alias)
@@ -982,7 +1030,7 @@ public actor AppEngine {
     /// fresher tokens for managed accounts so a stale store copy cannot silently starve warm-ups.
     private func warmupCandidates() async -> [Account] {
         var candidates: [Account] = []
-        for account in await store.all() {
+        for account in await store.activeAccounts() {
             if account.managedHomePath != nil, let hydrated = await store.hydrateFromManagedHome(account.alias) {
                 candidates.append(hydrated)
             } else {
@@ -993,7 +1041,8 @@ public actor AppEngine {
     }
 
     static func quotaWarmupEligible(_ account: Account, settings: Settings) -> Bool {
-        account.routingEnabled
+        !account.isArchived
+            && account.routingEnabled
             && !settings.warmupExcludedAccounts.contains(account.id)
             && !settings.warmupExcludedAccounts.contains(account.alias)
     }
@@ -1007,7 +1056,8 @@ public actor AppEngine {
     }
 
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
-        await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force)
+        _ = await archiveDueAccounts()
+        return await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force)
     }
 
     private func performWarmup(candidates: [Account], proxyURL: URL, force: Bool) async -> WarmupSummary {
@@ -1023,7 +1073,7 @@ public actor AppEngine {
         if !summary.warmed.isEmpty {
             let aliases = Set(summary.warmed)
             await pollUsage(activeOnly: false, aliases: aliases)
-            let refreshed = await store.all().filter { aliases.contains($0.alias) }
+            let refreshed = await store.activeAccounts().filter { aliases.contains($0.alias) }
             await warmupService.updateObservedUsage(for: refreshed)
         }
         warmupInProgress = false
@@ -1061,6 +1111,7 @@ public actor AppEngine {
     }
 
     public func refreshAllUsage() async {
+        _ = await archiveDueAccounts()
         await pollUsage(activeOnly: false)
         emit(.snapshotChanged)
     }
@@ -1407,7 +1458,12 @@ public actor AppEngine {
     private func hydratedAutomationAccounts(aliases: [String]) async -> [Account] {
         var accounts: [Account] = []
         for alias in aliases {
-            if let account = await store.hydrateFromManagedHome(alias) {
+            guard let stored = await store.account(alias) else { continue }
+            if stored.isArchived {
+                // Keep the row for an actionable "archived" scheduling reason,
+                // but never read credentials or otherwise hydrate it.
+                accounts.append(stored)
+            } else if let account = await store.hydrateFromManagedHome(alias) {
                 accounts.append(account)
             }
         }
@@ -1524,6 +1580,8 @@ public actor AppEngine {
             await autoLog.write("tick", "\(Self.taskLabel(task)) account became ineligible before launch")
             return .unavailable
         }
+        await store.acquireRoutingLease(currentAccount.alias)
+        taskAccountLeases[task.id] = currentAccount.alias
         repositoryLeases[task.id] = Self.canonicalRepositoryPath(task.repoPath)
 
         let startGate = TaskStartGate()
@@ -1557,7 +1615,7 @@ public actor AppEngine {
         await beforeTaskLaunch?(account.alias)
         guard let launchAccount = await store.account(account.alias), launchAccount.isEligible(now: Date()) else {
             await proxy?.unpinTaskStart(runID: runID.uuidString)
-            repositoryLeases.removeValue(forKey: task.id)
+            await releaseTaskLease(task.id)
             await taskStore.update(task)
             await autoLog.write("tick", "\(Self.taskLabel(task)) account became ineligible at launch gate")
             return .unavailable
@@ -1577,7 +1635,7 @@ public actor AppEngine {
             }
         } catch {
             await handleTaskLaunchError(taskID: task.id, error: error)
-            repositoryLeases.removeValue(forKey: task.id)
+            await releaseTaskLease(task.id)
             await proxy?.unpinTaskStart(runID: runID.uuidString)
             return .failed
         }
@@ -1585,6 +1643,7 @@ public actor AppEngine {
         guard await taskStore.task(id: task.id) != nil else {
             await proxy?.unpinTaskStart(runID: runID.uuidString)
             await taskRunner.stop(taskID: task.id)
+            await releaseTaskLease(task.id)
             await startGate.release()
             return .unavailable
         }
@@ -1596,6 +1655,13 @@ public actor AppEngine {
         emit(.snapshotChanged)
         await startGate.release()
         return .started
+    }
+
+    private func releaseTaskLease(_ taskID: UUID) async {
+        repositoryLeases.removeValue(forKey: taskID)
+        if let alias = taskAccountLeases.removeValue(forKey: taskID) {
+            await store.releaseRoutingLease(alias)
+        }
     }
 
     private func handleTaskLaunchError(taskID: UUID, error: any Error) async {
@@ -1663,18 +1729,22 @@ public actor AppEngine {
                 "lifecycle",
                 "deferred shutdown exit for task [\(Self.shortID(taskID))]"
             )
+            await releaseTaskLease(taskID)
             return
         }
-        defer { repositoryLeases.removeValue(forKey: taskID) }
         if let openRun = (await taskStore.task(id: taskID))?.runs.last(where: { $0.finishedAt == nil }) {
             await proxy?.unpinTaskStart(runID: openRun.id.uuidString)
         }
-        guard var task = await taskStore.task(id: taskID) else { return }
+        guard var task = await taskStore.task(id: taskID) else {
+            await releaseTaskLease(taskID)
+            return
+        }
         guard let lastRun = task.runs.last, lastRun.finishedAt == nil else {
             await autoLog.write(
                 "lifecycle",
                 "ignored late exit for \(Self.taskLabel(task)); run already closed"
             )
+            await releaseTaskLease(taskID)
             return
         }
         let now = Date()
@@ -1769,7 +1839,7 @@ public actor AppEngine {
             break
         }
         emit(.snapshotChanged)
-        repositoryLeases.removeValue(forKey: taskID)
+        await releaseTaskLease(taskID)
         if transition.scheduleAnotherTick { await automationTick() }
     }
 
@@ -1897,6 +1967,9 @@ public actor AppEngine {
             guard let self else { return }
             while !Task.isCancelled {
                 let settings = await self.settingsPoll()
+                // Archive due paused accounts before this tick can issue quota
+                // requests. Leases defer without extending their pause deadline.
+                await self.archiveDueAccounts()
                 await self.syncCodexBar()
                 await self.expireCooldownsAndNotify()
                 // Smart switching needs fresh readings for the whole pool: drain detection
@@ -1945,7 +2018,7 @@ public actor AppEngine {
 
     private func pollUsage(activeOnly: Bool, aliases: Set<String>? = nil) async {
         let settings = await settingsStore.get()
-        let accounts = await store.all()
+        let accounts = await store.activeAccounts()
         let activeAlias = await store.activeAlias()
         var draining: Set<String> = []
         let now = Date()

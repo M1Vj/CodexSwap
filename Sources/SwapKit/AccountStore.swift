@@ -46,8 +46,12 @@ public actor AccountStore {
     public private(set) var strategy: RotationStrategy
     /// Aliases currently assessed as draining from other users' activity (smart switch).
     private var drainingAliases: Set<String> = []
+    /// Routing leases held by in-flight proxy or Task Board work. A lease defers
+    /// automatic archival without changing the persisted pause timestamp.
+    private var routingLeases: Set<String> = []
     private static let historyCap = 64
     private static let currentSchemaVersion = 2
+    public static let automaticArchiveDelay: TimeInterval = 604_800
 
     public init(
         url: URL = AppPaths.storeFile(),
@@ -141,6 +145,66 @@ public actor AccountStore {
     public func all() -> [Account] { data.accounts }
     public func activeAlias() -> String? { data.activeAlias }
     public func account(_ alias: String) -> Account? { data.accounts.first { $0.alias == alias } }
+
+    /// Returns the persisted instant at which a paused account becomes eligible for
+    /// automatic archival. The later routed-use timestamp wins, so a request that
+    /// was already in flight when routing was paused gets a full seven-day grace
+    /// period from that attempt. Missing timestamps are never treated as due.
+    public static func automaticArchiveDeadline(for account: Account) -> Date? {
+        guard account.archivedAt == nil,
+              !account.routingEnabled,
+              let pausedAt = account.routingPausedAt else {
+            return nil
+        }
+        let baseline = max(pausedAt, account.lastServedByUs ?? pausedAt)
+        return baseline.addingTimeInterval(automaticArchiveDelay)
+    }
+
+    /// Acquires a lease for work that has already selected an account. Leases are
+    /// intentionally in-memory runtime state and never alter account persistence.
+    public func acquireRoutingLease(_ alias: String) {
+        guard data.accounts.contains(where: { $0.alias == alias }) else { return }
+        routingLeases.insert(alias)
+    }
+
+    public func releaseRoutingLease(_ alias: String) {
+        routingLeases.remove(alias)
+    }
+
+    public func routingLeaseAliases() -> Set<String> { routingLeases }
+
+    /// Archives every account whose persisted pause/use deadline has passed. The
+    /// comparison is inclusive at exactly seven days. A supplied lease set is a
+    /// snapshot for this transaction; when omitted, the store's active leases are
+    /// used. Deferred accounts retain their pause timestamp unchanged.
+    @discardableResult
+    public func archiveDueAccounts(now: Date? = nil, leasedAliases: Set<String>? = nil) -> [Account] {
+        let timestamp = now ?? clock()
+        let leases = leasedAliases ?? routingLeases
+        let dueAliases = data.accounts.compactMap { account -> String? in
+            guard !leases.contains(account.alias),
+                  let deadline = Self.automaticArchiveDeadline(for: account),
+                  timestamp >= deadline else {
+                return nil
+            }
+            return account.alias
+        }
+        guard !dueAliases.isEmpty else { return [] }
+
+        var archived: [Account] = []
+        for alias in dueAliases {
+            guard let i = index(alias), !data.accounts[i].isArchived else { continue }
+            data.accounts[i].archivedAt = timestamp
+            data.accounts[i].routingEnabled = false
+            if data.activeAlias == alias { data.activeAlias = nil }
+            drainingAliases.remove(alias)
+            archived.append(data.accounts[i])
+        }
+        guard !archived.isEmpty else { return [] }
+        renumberRanks()
+        persist()
+        return archived
+    }
 
     /// Accounts in the operational roster, in their dense visible rank order.
     /// Routing-paused accounts remain active until they are explicitly archived.

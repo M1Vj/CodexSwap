@@ -90,6 +90,7 @@ public actor QuotaWarmupService {
 
     public func updateObservedUsage(for accounts: [Account], now: Date = Date()) async {
         for account in accounts {
+            guard !account.isArchived else { continue }
             guard var record = await ledger.record(for: account.id) else { continue }
             if !account.usage.isEmpty {
                 record.primaryResetAt = nextWarmDue(account, now: now)
@@ -116,6 +117,7 @@ public actor QuotaWarmupService {
     }
 
     private func skipReason(_ account: Account, now: Date) -> String? {
+        if account.isArchived { return "archived" }
         if account.needsLogin { return "needs login" }
         if account.accessToken.isEmpty && account.refreshToken.isEmpty { return "missing credentials" }
         if account.cooldownUntil(now: now) != nil { return "usage limited" }

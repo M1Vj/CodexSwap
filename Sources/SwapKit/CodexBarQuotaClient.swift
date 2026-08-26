@@ -74,6 +74,10 @@ public struct CodexBarQuotaClient: Sendable {
 
     public func fetch(accounts: [Account]) async throws -> [String: PrefetchedQuotaSnapshot] {
         try Task.checkCancellation()
+        // CodexBar's global `--all-accounts` command cannot be scoped to the
+        // active roster. If the store contains archived history, callers must
+        // use direct active-account lookups instead of launching that command.
+        guard !accounts.contains(where: \.isArchived) else { return [:] }
 
         let result: CodexBarCommandResult
         do {

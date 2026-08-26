@@ -91,9 +91,13 @@ public actor QuotaResetCoordinator {
 
     @discardableResult
     public func refreshCredits(aliases: Set<String>? = nil, generation: UInt64? = nil) async -> Bool {
+        // A refresh can be triggered independently of the engine poller (for
+        // example by a CodexBar roster watcher), so reconcile due archives before
+        // selecting accounts for any quota request.
+        _ = await accountStore.archiveDueAccounts()
         let refreshGeneration = generation ?? reserveOperationGeneration()
         latestRefreshGeneration = max(latestRefreshGeneration, refreshGeneration)
-        let selected = await accountStore.all().filter { aliases?.contains($0.alias) ?? true }
+        let selected = await accountStore.activeAccounts().filter { aliases?.contains($0.alias) ?? true }
         for account in selected {
             guard let fresh = await accountStore.hydrateFromManagedHome(account.alias), !fresh.accessToken.isEmpty else {
                 if refreshGeneration == latestRefreshGeneration { statuses[account.alias] = .failed }
@@ -113,12 +117,17 @@ public actor QuotaResetCoordinator {
     }
 
     public func reset(alias: String, trigger: Trigger, generation: UInt64? = nil) async -> ResetAttemptResult {
+        // Keep direct reset callers on the same archive boundary as the poller.
+        _ = await accountStore.archiveDueAccounts()
         let normalizedAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedAlias.isEmpty else { return .accountUnavailable }
+        guard let currentAccount = await accountStore.account(normalizedAlias), !currentAccount.isArchived else {
+            return .accountUnavailable
+        }
         if trigger == .automatic {
             let current = await settings()
             guard current.automaticallyResetExhaustedAccounts else { return .automaticDisabled }
-            guard await accountStore.account(normalizedAlias)?.routingEnabled == true else { return .accountUnavailable }
+            guard currentAccount.routingEnabled else { return .accountUnavailable }
             let protected = Set(current.autoResetProtectedAccounts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
             guard !protected.contains(normalizedAlias.lowercased()) else { return .protectedAccount }
         }
@@ -133,7 +142,9 @@ public actor QuotaResetCoordinator {
     }
 
     private func performReset(alias normalizedAlias: String, generation: UInt64) async -> ResetAttemptResult {
-        guard let account = await accountStore.hydrateFromManagedHome(normalizedAlias), !account.accessToken.isEmpty else {
+        guard let account = await accountStore.hydrateFromManagedHome(normalizedAlias),
+              !account.isArchived,
+              !account.accessToken.isEmpty else {
             return .accountUnavailable
         }
 

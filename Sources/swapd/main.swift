@@ -17,6 +17,9 @@ let args = Array(CommandLine.arguments.dropFirst())
 let command = args.first ?? "help"
 
 let store = AccountStore(url: AppPaths.storeFile(), strategy: loadSettings().rotationStrategy)
+// Reconcile local pause deadlines before any command can perform quota or usage
+// network work. Archived records remain in the store for historical settings views.
+_ = await store.archiveDueAccounts()
 
 @Sendable func settingsProvider() async -> Settings { loadSettings() }
 let verboseEnabled = ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
@@ -43,7 +46,7 @@ case "import":
     print("done, \(added) account(s) processed. total: \(await store.all().count)")
 
 case "list":
-    let accounts = await store.all()
+    let accounts = await store.activeAccounts()
     let active = await store.activeAlias()
     if accounts.isEmpty { print("no accounts. run: swapd import"); break }
     let ranked = accounts.sorted(by: { $0.priority > $1.priority })
@@ -57,7 +60,7 @@ case "list":
 
 case "usage":
     let client = UsageClient()
-    for a in await store.all() where !a.accessToken.isEmpty {
+    for a in await store.activeAccounts() where !a.accessToken.isEmpty {
         do {
             let windows = try await client.fetch(accessToken: a.accessToken, accountID: a.accountID)
             await store.updateUsage(a.alias, windows: windows)
@@ -77,8 +80,11 @@ case "quota":
 
     do {
         let service = QuotaReportService(usageService: UsageClient(), resetService: QuotaResetClient())
-        let accounts = await store.all()
-        let prefetched = (try? await CodexBarQuotaClient().fetch(accounts: accounts)) ?? [:]
+        let accounts = await store.activeAccounts()
+        let hasArchivedAccounts = !(await store.archivedAccounts()).isEmpty
+        let prefetched: [String: PrefetchedQuotaSnapshot] = hasArchivedAccounts
+            ? [:]
+            : ((try? await CodexBarQuotaClient().fetch(accounts: accounts)) ?? [:])
         let activeAlias = await store.activeAlias()
         let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias, prefetched: prefetched)
         let encoded = try QuotaReportJSON.encode(report)
