@@ -46,9 +46,11 @@ public actor AccountStore {
     public private(set) var strategy: RotationStrategy
     /// Aliases currently assessed as draining from other users' activity (smart switch).
     private var drainingAliases: Set<String> = []
-    /// Routing leases held by in-flight proxy or Task Board work. A lease defers
-    /// automatic archival without changing the persisted pause timestamp.
-    private var routingLeases: Set<String> = []
+    /// Reference-counted routing leases held by in-flight proxy or Task Board
+    /// work. A lease defers automatic archival without changing the persisted
+    /// pause timestamp; overlapping attempts on one alias remain protected
+    /// until the final attempt releases its lease.
+    private var routingLeases: [String: Int] = [:]
     private static let historyCap = 64
     private static let currentSchemaVersion = 2
     public static let automaticArchiveDelay: TimeInterval = 604_800
@@ -164,14 +166,21 @@ public actor AccountStore {
     /// intentionally in-memory runtime state and never alter account persistence.
     public func acquireRoutingLease(_ alias: String) {
         guard data.accounts.contains(where: { $0.alias == alias }) else { return }
-        routingLeases.insert(alias)
+        routingLeases[alias, default: 0] += 1
     }
 
     public func releaseRoutingLease(_ alias: String) {
-        routingLeases.remove(alias)
+        guard let count = routingLeases[alias] else { return }
+        if count <= 1 {
+            routingLeases.removeValue(forKey: alias)
+        } else {
+            routingLeases[alias] = count - 1
+        }
     }
 
-    public func routingLeaseAliases() -> Set<String> { routingLeases }
+    public func routingLeaseAliases() -> Set<String> {
+        Set(routingLeases.compactMap { alias, count in count > 0 ? alias : nil })
+    }
 
     /// Archives every account whose persisted pause/use deadline has passed. The
     /// comparison is inclusive at exactly seven days. A supplied lease set is a
@@ -180,7 +189,7 @@ public actor AccountStore {
     @discardableResult
     public func archiveDueAccounts(now: Date? = nil, leasedAliases: Set<String>? = nil) -> [Account] {
         let timestamp = now ?? clock()
-        let leases = leasedAliases ?? routingLeases
+        let leases = leasedAliases ?? routingLeaseAliases()
         let dueAliases = data.accounts.compactMap { account -> String? in
             guard !leases.contains(account.alias),
                   let deadline = Self.automaticArchiveDeadline(for: account),

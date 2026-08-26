@@ -2,6 +2,49 @@ import Foundation
 import XCTest
 @testable import SwapKit
 
+private actor ArchiveTestGate {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending { continuation.resume() }
+    }
+}
+
+private actor ArchiveTestBarrier {
+    private let target: Int
+    private var count = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(target: Int) { self.target = target }
+
+    func mark() {
+        count += 1
+        guard count >= target else { return }
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending { continuation.resume() }
+    }
+
+    func wait() async {
+        if count >= target { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiters.append(continuation)
+        }
+    }
+}
+
 final class AutoArchiveLifecycleTests: XCTestCase {
     private func temporaryStoreURL() -> URL {
         FileManager.default.temporaryDirectory
@@ -69,6 +112,49 @@ final class AutoArchiveLifecycleTests: XCTestCase {
         XCTAssertEqual(observedLeases, ["proxy"])
         let releasedLeases = await store.routingLeaseAliases()
         XCTAssertTrue(releasedLeases.isEmpty)
+        let archived = await store.archiveDueAccounts(now: due)
+        XCTAssertEqual(archived.map(\.alias), ["proxy"])
+    }
+
+    func testOverlappingProxyLeasesRemainUntilTheFinalAttemptReleases() async throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: temporaryStoreURL(), clock: { start })
+        await store.upsert(Account(alias: "proxy", accessToken: "token", routingEnabled: false))
+        let stored = await store.account("proxy")
+        let pause = try XCTUnwrap(stored?.routingPausedAt)
+        let due = pause.addingTimeInterval(AccountStore.automaticArchiveDelay)
+        let entered = ArchiveTestBarrier(target: 2)
+        let firstGate = ArchiveTestGate()
+        let secondGate = ArchiveTestGate()
+
+        let first = Task {
+            await withRoutingLease(store: store, alias: "proxy") {
+                await entered.mark()
+                await firstGate.wait()
+            }
+        }
+        let second = Task {
+            await withRoutingLease(store: store, alias: "proxy") {
+                await entered.mark()
+                await secondGate.wait()
+            }
+        }
+
+        await entered.wait()
+        let bothLeases = await store.routingLeaseAliases()
+        XCTAssertEqual(bothLeases, ["proxy"])
+
+        await firstGate.release()
+        await first.value
+        let leaseAfterFirst = await store.routingLeaseAliases()
+        XCTAssertEqual(leaseAfterFirst, ["proxy"])
+        let deferred = await store.archiveDueAccounts(now: due)
+        XCTAssertTrue(deferred.isEmpty)
+
+        await secondGate.release()
+        await second.value
+        let leasesAfterSecond = await store.routingLeaseAliases()
+        XCTAssertTrue(leasesAfterSecond.isEmpty)
         let archived = await store.archiveDueAccounts(now: due)
         XCTAssertEqual(archived.map(\.alias), ["proxy"])
     }
