@@ -35,6 +35,24 @@ public actor SettingsStore {
 
     public func get() -> Settings { value }
 
+    public func metadataTelemetryEnabled() -> Bool {
+        value.metadataTelemetryEnabled
+    }
+
+    @discardableResult
+    public func setMetadataTelemetryEnabled(_ enabled: Bool) -> Settings {
+        update { settings in
+            settings.metadataTelemetryEnabled = enabled
+        }
+    }
+
+    @discardableResult
+    public func setMetadataTelemetryEnabledPersisting(_ enabled: Bool) throws -> Settings {
+        try updatePersisting { settings in
+            settings.metadataTelemetryEnabled = enabled
+        }
+    }
+
     public func update(_ mutate: @Sendable (inout Settings) -> Void) -> Settings {
         var copy = value
         mutate(&copy)

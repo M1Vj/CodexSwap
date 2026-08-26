@@ -130,6 +130,8 @@ public struct Settings: Codable, Sendable, Equatable {
     /// Free/gateway models served through the Responses<->Chat bridge instead of Codex accounts.
     public var bridgedModels: [BridgedModel]
     public var subagentModelPolicy: SubagentPolicyProfiles
+    /// Local metadata-only usage telemetry is explicit opt-in.
+    public var metadataTelemetryEnabled: Bool
 
     public static let defaultProxyPort = 58_432
 
@@ -167,7 +169,8 @@ public struct Settings: Codable, Sendable, Equatable {
                 displayName: "Ox Alpha Free",
                 baseURL: "https://opencode.ai/zen/v1"
             )
-        ]
+        ],
+        metadataTelemetryEnabled: false
     )
 
     public init(
@@ -199,7 +202,8 @@ public struct Settings: Codable, Sendable, Equatable {
         smartSwitchEnabled: Bool = false,
         proxyPort: Int,
         bridgedModels: [BridgedModel]? = nil,
-        subagentModelPolicy: SubagentPolicyProfiles = .default
+        subagentModelPolicy: SubagentPolicyProfiles = .default,
+        metadataTelemetryEnabled: Bool = false
     ) {
         self.rotationStrategy = rotationStrategy
         self.primaryThresholdPercent = primaryThresholdPercent
@@ -230,6 +234,7 @@ public struct Settings: Codable, Sendable, Equatable {
         self.proxyPort = proxyPort
         self.bridgedModels = bridgedModels ?? Settings.default.bridgedModels
         self.subagentModelPolicy = subagentModelPolicy
+        self.metadataTelemetryEnabled = metadataTelemetryEnabled
     }
 
     /// Tolerant decoder: missing keys fall back to defaults so new fields never invalidate an old file.
@@ -278,6 +283,7 @@ public struct Settings: Codable, Sendable, Equatable {
         } catch {
             subagentModelPolicy = d.subagentModelPolicy
         }
+        metadataTelemetryEnabled = try c.decodeIfPresent(Bool.self, forKey: .metadataTelemetryEnabled) ?? d.metadataTelemetryEnabled
     }
 }
 
@@ -291,4 +297,12 @@ public enum AppPaths {
     public static func settingsFile() -> URL { supportDir().appendingPathComponent("settings.json") }
     public static func historyFile() -> URL { supportDir().appendingPathComponent("history.jsonl") }
     public static func warmupFile() -> URL { supportDir().appendingPathComponent("warmup.json") }
+    public static func usageTelemetryFile() -> URL { supportDir().appendingPathComponent("usage-telemetry-v1.json") }
+}
+
+/// Settings-path spelling used by the design documentation. `AppPaths` remains
+/// the established path owner for the existing application stores.
+public enum SettingsPaths {
+    public static func supportDir() -> URL { AppPaths.supportDir() }
+    public static func usageTelemetryFile() -> URL { AppPaths.usageTelemetryFile() }
 }
