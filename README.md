@@ -18,7 +18,7 @@
   <a href="https://www.apple.com/macos/"><img src="https://img.shields.io/badge/macOS-14%2B-000000?logo=apple" alt="macOS 14 or newer"></a>
   <a href="https://www.swift.org/"><img src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white" alt="Swift 6"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/telemetry-none-22c55e" alt="No telemetry">
+  <img src="https://img.shields.io/badge/telemetry-local%20opt--in-22c55e" alt="Optional local metadata telemetry">
 </p>
 
 <p align="center">
@@ -46,7 +46,7 @@ CodexSwap solves the problem at the routing layer:
 - **Backlog can wait for capacity.** Queue repository tasks and let CodexSwap start them when quota returns.
 - **Your Codex identity stays intact.** Model traffic is routed locally while normal Codex identity and history traffic stays with the account signed in to Codex.
 
-**Your accounts. Your Mac. No CodexSwap cloud. No analytics.**
+**Your accounts. Your Mac. No CodexSwap cloud. Optional local metadata telemetry.**
 
 ## What you get
 
@@ -58,7 +58,7 @@ CodexSwap solves the problem at the routing layer:
 | 🧭 | **Clear exhaustion policies** | Choose Reset Current First, Switch First, or Stop & Notify separately for interactive work and automation. |
 | 🗂️ | **Automated Task Board** | Queue plan-first `codex exec` work for the next available quota window. |
 | ♾️ | **Evergreen tasks** | Run bounded improvement cycles continuously, with archived plans and resumable handoffs. |
-| 🛡️ | **Local safety boundaries** | Loopback-only proxy, reversible Codex configuration, no telemetry, and no approval bypass for task runs. |
+| 🛡️ | **Local safety boundaries** | Loopback-only proxy, reversible Codex configuration, optional local-only metadata telemetry, and no approval bypass for task runs. |
 | 🔌 | **Flexible onboarding** | Import CodexBar-managed accounts or use standalone accounts created through `codex login`. |
 | 🌉 | **Bridged free models** | Serve non-Codex models (Chat Completions gateways) through the same proxy with full Responses-API translation — configurable in Advanced Settings, never touches account quota. |
 
@@ -207,7 +207,7 @@ CodexSwap handles authentication tokens, so its trust boundary is intentionally 
 | --- | --- |
 | **Local proxy only** | Listens on IPv4 loopback; no LAN listener. |
 | **No CodexSwap cloud** | Model requests go to OpenAI; account data is not sent to the maintainer. |
-| **No analytics** | No usage telemetry or tracking service. |
+| **Local metadata telemetry** | Off by default; when enabled, bounded request metadata stays local with 30-day event and 365-day aggregate retention. No prompts, responses, credentials, or uploads. |
 | **Restricted local data** | Settings and imported state live under `~/Library/Application Support/CodexSwap/` with user-only permissions where supported. |
 | **Credential ownership** | CodexBar keeps ownership of CodexBar-managed accounts; standalone accounts come from standard Codex login files. |
 | **Recoverable configuration** | Routing changes are backed up and restored rather than silently replacing unrelated configuration. |
