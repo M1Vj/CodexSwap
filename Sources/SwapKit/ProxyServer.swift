@@ -46,6 +46,19 @@ enum ProxyRequestMode: Equatable, Sendable {
     }
 }
 
+private func telemetryCategory(for mode: ProxyRequestMode) -> UsageTelemetryRequestCategory {
+    if mode.isWarmup { return .warmup }
+    if mode.isTask { return .taskBoard }
+    return .interactive
+}
+
+private func telemetryModel(from body: Data) -> String {
+    guard body.count <= 1_048_576,
+          let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+          let raw = object["model"] as? String else { return "other" }
+    return UsageTelemetryAttemptEvent.normalizeModel(raw)
+}
+
 enum ExhaustionDecision: Equatable, Sendable {
     case retryCurrent
     case switchTo(String)
@@ -552,6 +565,7 @@ public actor ProxyServer {
     private let sink: ProxyEventSink
     private let exhaustionHandler: ExhaustionPolicyHandler
     private let freshAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?
+    private let telemetry: UsageTelemetryStore?
     private let config: Config
     private let group: MultiThreadedEventLoopGroup
     private let httpClient: HTTPClient
@@ -607,7 +621,8 @@ public actor ProxyServer {
         automaticQuotaReset: @escaping @Sendable (String) async -> ResetAttemptResult = { _ in .automaticDisabled },
         freshAlternative: @escaping @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account? = { _, _ in nil },
         sink: ProxyEventSink = NullEventSink(),
-        verbose: Bool = false
+        verbose: Bool = false,
+        telemetry: UsageTelemetryStore? = nil
     ) {
         self.routingEnabledProvider = routingEnabledProvider
         self.store = store
@@ -617,6 +632,7 @@ public actor ProxyServer {
         self.exhaustionHandler = ExhaustionPolicyHandler(reset: automaticQuotaReset)
         self.freshAlternative = freshAlternative
         self.sink = sink
+        self.telemetry = telemetry
         self.verbose = verbose
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         var cfg = HTTPClient.Configuration()
@@ -995,6 +1011,9 @@ public actor ProxyServer {
         var exhaustionHandled = false
         var finalReplay = false
         var attempts = 0
+        let rootRequestID = UUID()
+        let requestCategory = telemetryCategory(for: mode)
+        let requestModel = telemetryModel(from: body)
         // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
         while attempts < 8 {
             attempts += 1
@@ -1011,10 +1030,21 @@ public actor ProxyServer {
                 interactiveKey: interactiveKey,
                 tokenRefreshed: tokenRefreshed,
                 exhaustionHandled: exhaustionHandled,
-                finalReplay: finalReplay
+                finalReplay: finalReplay,
+                rootRequestID: rootRequestID,
+                attemptIndex: attempts,
+                requestCategory: requestCategory,
+                requestModel: requestModel
             )
             switch result {
             case .completed:
+                await telemetry?.recordRootTerminal(.init(
+                    rootRequestID: rootRequestID,
+                    finishedAt: Date(),
+                    category: requestCategory,
+                    outcome: .success,
+                    attemptCount: attempts
+                ))
                 return
             case let .retry(next, refreshed, handled, replay):
                 account = next
@@ -1023,6 +1053,13 @@ public actor ProxyServer {
                 finalReplay = replay
             }
         }
+        await telemetry?.recordRootTerminal(.init(
+            rootRequestID: rootRequestID,
+            finishedAt: Date(),
+            category: requestCategory,
+            outcome: .failure,
+            attemptCount: attempts
+        ))
         try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
     }
 
@@ -1038,7 +1075,11 @@ public actor ProxyServer {
         interactiveKey: String?,
         tokenRefreshed initialTokenRefreshed: Bool,
         exhaustionHandled initialExhaustionHandled: Bool,
-        finalReplay initialFinalReplay: Bool
+        finalReplay initialFinalReplay: Bool,
+        rootRequestID: UUID,
+        attemptIndex: Int,
+        requestCategory: UsageTelemetryRequestCategory,
+        requestModel: String
     ) async throws -> ProxyAttemptResult {
         // Capture the sendable collaborators before handing the attempt to the
         // nonisolated lease wrapper. Actor methods below are called explicitly
@@ -1054,6 +1095,7 @@ public actor ProxyServer {
             var tokenRefreshed = initialTokenRefreshed
             var exhaustionHandled = initialExhaustionHandled
             var finalReplay = initialFinalReplay
+            let attemptStartedAt = Date()
 
             // Prefer CodexBar's fresher token for managed accounts before spending a refresh ourselves.
             if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
@@ -1071,9 +1113,34 @@ public actor ProxyServer {
                 }
                 resp = try await self.forward(head: head, body: body, account: account, target: target)
             } catch {
+                await self.recordTelemetryAttempt(
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    startedAt: attemptStartedAt,
+                    finishedAt: Date(),
+                    account: account,
+                    model: requestModel,
+                    category: requestCategory,
+                    outcome: .transportError,
+                    status: nil,
+                    errorClass: .network
+                )
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
                 return .completed
             }
+
+            await self.recordTelemetryAttempt(
+                rootRequestID: rootRequestID,
+                attemptIndex: attemptIndex,
+                startedAt: attemptStartedAt,
+                finishedAt: Date(),
+                account: account,
+                model: requestModel,
+                category: requestCategory,
+                outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .httpError,
+                status: Int(resp.status.code),
+                errorClass: self.telemetryErrorClass(for: resp.status)
+            )
 
             // A quota decision permits exactly one replay. Its response is final: do
             // not refresh, fail over, or make another exhaustion decision from it.
@@ -1281,6 +1348,45 @@ public actor ProxyServer {
             )
             try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
             return .completed
+        }
+    }
+
+    private func recordTelemetryAttempt(
+        rootRequestID: UUID,
+        attemptIndex: Int,
+        startedAt: Date,
+        finishedAt: Date,
+        account: Account,
+        model: String,
+        category: UsageTelemetryRequestCategory,
+        outcome: UsageTelemetryAttemptOutcome,
+        status: Int?,
+        errorClass: UsageTelemetryErrorClass?
+    ) async {
+        guard let telemetry else { return }
+        let event = UsageTelemetryAttemptEvent(
+            rootRequestID: rootRequestID,
+            attemptIndex: max(0, attemptIndex - 1),
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            accountTelemetryID: account.telemetryID,
+            provider: .openAI,
+            model: model,
+            category: category,
+            outcome: outcome,
+            httpStatusCode: status,
+            errorClass: errorClass
+        )
+        await telemetry.recordAttempt(event)
+    }
+
+    private func telemetryErrorClass(for status: HTTPResponseStatus) -> UsageTelemetryErrorClass? {
+        switch status.code {
+        case 401, 403: return .authentication
+        case 408: return .timeout
+        case 429: return .rateLimit
+        case 500...599: return .upstream5xx
+        default: return status.code >= 400 ? .other : nil
         }
     }
 

@@ -43,6 +43,14 @@ final class RunTelemetryTests: XCTestCase {
         XCTAssertEqual(telemetry.outputTokens, 5)
     }
 
+    func testDecoderExtractsReasoningTokensWithoutAddingThemToOutput() {
+        let telemetry = CodexEventDecoder.decode(logText: #"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50,"output_tokens_details":{"reasoning_tokens":12}}}"#)
+
+        XCTAssertEqual(telemetry.outputTokens, 50)
+        XCTAssertEqual(telemetry.reasoningTokens, 12)
+        XCTAssertEqual(telemetry.reasoningTokensCompleteness, .complete)
+    }
+
     func testDecoderMarksMixedCachePresencePartialRegardlessOfTurnOrder() {
         let absent = #"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}"#
         let explicitZero = #"{"type":"turn.completed","usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":2}}"#

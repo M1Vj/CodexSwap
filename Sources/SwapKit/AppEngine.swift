@@ -117,6 +117,7 @@ public actor AppEngine {
     private let taskRunner: any TaskRunning
     private let autoLog: AutomationLog
     private let supportDir: URL
+    private let telemetry: UsageTelemetryStore
     private let beforeTaskLaunch: (@Sendable (String) async -> Void)?
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
@@ -167,6 +168,7 @@ public actor AppEngine {
         self.taskStore = taskStore
         self.autoLog = autoLog
         self.supportDir = supportDir
+        self.telemetry = UsageTelemetryStore(url: supportDir.appendingPathComponent(UsageTelemetryStore.defaultFileName))
         self.beforeTaskLaunch = nil
         self.taskRunner = taskRunner ?? TaskRunner(
             logSink: { [autoLog] category, message in
@@ -220,6 +222,7 @@ public actor AppEngine {
         self.taskRunner = taskRunning
         self.autoLog = autoLog
         self.supportDir = supportDir
+        self.telemetry = UsageTelemetryStore(url: supportDir.appendingPathComponent(UsageTelemetryStore.defaultFileName))
         self.proxy = proxyForTesting
         self.beforeTaskLaunch = beforeTaskLaunch
     }
@@ -232,6 +235,7 @@ public actor AppEngine {
 
     public func start() async throws {
         let settings = await settingsStore.get()
+        await telemetry.setEnabled(settings.metadataTelemetryEnabled)
         await store.setStrategy(settings.rotationStrategy)
 
         let sink = EngineSink(engine: self)
@@ -260,7 +264,8 @@ public actor AppEngine {
                 )
             },
             sink: sink,
-            verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
+            verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil,
+            telemetry: telemetry
         )
         do {
             try await proxy.start()
@@ -370,7 +375,10 @@ public actor AppEngine {
 
     func reconcileManagedAccounts(_ accounts: [Account], presentAccountIDs: Set<String>) async {
         for account in accounts { await store.upsert(account) }
-        await store.reconcileManaged(present: presentAccountIDs)
+        let removal = await store.reconcileManagedWithTelemetry(present: presentAccountIDs)
+        for telemetryID in removal.removedTelemetryIDs {
+            await telemetry.purge(accountTelemetryID: telemetryID)
+        }
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
     }
@@ -971,10 +979,20 @@ public actor AppEngine {
     }
 
     public func remove(_ alias: String) async {
-        await store.remove(alias)
+        let removal = await store.removeWithTelemetry(alias)
+        for telemetryID in removal.removedTelemetryIDs {
+            await telemetry.purge(accountTelemetryID: telemetryID)
+        }
         needsLoginNotified.remove(alias)
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
+    }
+
+    public func setMetadataTelemetryEnabled(_ enabled: Bool) async {
+        _ = await settingsStore.setMetadataTelemetryEnabled(enabled)
+        await telemetry.setEnabled(enabled)
+        if !enabled { await telemetry.prune() }
+        emit(.snapshotChanged)
     }
 
     public func setStrategy(_ s: RotationStrategy) async {

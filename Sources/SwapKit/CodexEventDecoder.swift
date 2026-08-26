@@ -8,6 +8,8 @@ public struct RunTelemetry: Sendable, Equatable {
     public var cacheWriteTokens: Int?
     public var cacheWriteTokensCompleteness: TokenFieldCompleteness = .unknown
     public var outputTokens: Int?
+    public var reasoningTokens: Int?
+    public var reasoningTokensCompleteness: TokenFieldCompleteness = .unknown
     public var finalMessage: String?
     public var lastError: String?
 
@@ -23,7 +25,7 @@ public struct RunTelemetry: Sendable, Equatable {
 
     public var isEmpty: Bool {
         sessionID == nil && inputTokens == nil && cachedTokens == nil && cacheWriteTokens == nil
-            && outputTokens == nil && finalMessage == nil && lastError == nil
+            && outputTokens == nil && reasoningTokens == nil && finalMessage == nil && lastError == nil
     }
 }
 
@@ -47,6 +49,7 @@ public enum CodexEventDecoder {
         var cached: Int?
         var cacheWrite: Int?
         var output: Int?
+        var reasoning: Int?
         var contributorCount = 0
         var cachedCompleteness: TokenFieldCompleteness = .unknown
         var cacheWriteCompleteness: TokenFieldCompleteness = .unknown
@@ -58,6 +61,8 @@ public enum CodexEventDecoder {
             telemetry.cacheWriteTokens = cacheWrite
             telemetry.cacheWriteTokensCompleteness = cacheWriteCompleteness
             telemetry.outputTokens = output
+            telemetry.reasoningTokens = reasoning
+            telemetry.reasoningTokensCompleteness = reasoning == nil ? .unknown : .complete
         }
     }
 
@@ -104,6 +109,10 @@ public enum CodexEventDecoder {
                     totals.contributorCount = UsageSafety.saturatingIncrement(totals.contributorCount)
                 }
                 if let value = intValue(usage["output_tokens"]) { totals.output = UsageSafety.saturatingAdd(totals.output ?? 0, value) }
+                let outputDetails = usage["output_tokens_details"] as? [String: Any] ?? usage["completion_tokens_details"] as? [String: Any] ?? [:]
+                if let value = intValue(outputDetails["reasoning_tokens"] ?? usage["reasoning_tokens"]) {
+                    totals.reasoning = UsageSafety.saturatingAdd(totals.reasoning ?? 0, value)
+                }
             }
         case "turn.failed":
             if let error = object["error"] as? [String: Any], let message = error["message"] as? String {
