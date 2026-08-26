@@ -530,7 +530,7 @@ actor RefreshBurnGuard {
 }
 
 private enum ProxyAttemptResult: Sendable {
-    case completed
+    case completed(outcome: UsageTelemetryRootOutcome)
     case retry(account: Account, tokenRefreshed: Bool, exhaustionHandled: Bool, finalReplay: Bool)
 }
 
@@ -1037,12 +1037,12 @@ public actor ProxyServer {
                 requestModel: requestModel
             )
             switch result {
-            case .completed:
+            case .completed(let outcome):
                 await telemetry?.recordRootTerminal(.init(
                     rootRequestID: rootRequestID,
                     finishedAt: Date(),
                     category: requestCategory,
-                    outcome: .success,
+                    outcome: outcome,
                     attemptCount: attempts
                 ))
                 return
@@ -1126,7 +1126,7 @@ public actor ProxyServer {
                     errorClass: .network
                 )
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
-                return .completed
+                return .completed(outcome: .failure)
             }
 
             await self.recordTelemetryAttempt(
@@ -1147,7 +1147,7 @@ public actor ProxyServer {
             if finalReplay {
                 await self.recordActivity(account.alias)
                 try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
-                return .completed
+                return .completed(outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure)
             }
 
             // 401 -> refresh once, then retry
@@ -1168,7 +1168,7 @@ public actor ProxyServer {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in")
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                     // A CodexBar-managed account may have lost the refresh race to CodexBar itself;
                     // adopt its rotated copy before condemning the account to needs-login.
@@ -1191,10 +1191,10 @@ public actor ProxyServer {
                                 finalReplay: finalReplay
                             )
                         }
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                     account = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
-                    if account.needsLogin { return .completed }
+                    if account.needsLogin { return .completed(outcome: .failure) }
                     await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                     tokenRefreshed = false
                     return .retry(
@@ -1205,7 +1205,7 @@ public actor ProxyServer {
                     )
                 } catch {
                     try await writeError(outbound, status: .unauthorized, message: "token refresh failed: \(error)")
-                    return .completed
+                    return .completed(outcome: .failure)
                 }
             }
 
@@ -1234,13 +1234,13 @@ public actor ProxyServer {
                                 finalReplay: finalReplay
                             )
                         }
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                     if mode.isWarmup {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                     if let next = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
@@ -1253,11 +1253,11 @@ public actor ProxyServer {
                             finalReplay: finalReplay
                         )
                     }
-                    return .completed
+                    return .completed(outcome: .failure)
                 }
                 await burn.markUnhelpful(alias: account.alias, refreshToken: account.refreshToken, now: Date())
                 try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                return .completed
+                return .completed(outcome: .failure)
             }
 
             // 429 usage limit -> rotate
@@ -1267,11 +1267,11 @@ public actor ProxyServer {
                     let (limit, resetAt) = limitInfo(headers: resp.headers, body: classified.prefix)
                     if mode.isWarmup {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                     guard !exhaustionHandled else {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                     exhaustionHandled = true
                     await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
@@ -1300,7 +1300,7 @@ public actor ProxyServer {
                     case .switchTo:
                         guard let alternative = outcome.alternative else {
                             try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                            return .completed
+                            return .completed(outcome: .failure)
                         }
                         await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
                         account = alternative
@@ -1316,7 +1316,7 @@ public actor ProxyServer {
                     case .stopAndNotify:
                         await sink.handle(ProxyEvent.taskScoped(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt, mode: mode))
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed
+                        return .completed(outcome: .failure)
                     }
                 }
                 try await streamClassifiedResponse(
@@ -1325,7 +1325,7 @@ public actor ProxyServer {
                     headers: resp.headers,
                     classified: classified
                 )
-                return .completed
+                return .completed(outcome: .failure)
             }
 
             // A 401 reaching here was suppressed by the burn guard; clearing would defeat it.
@@ -1347,7 +1347,7 @@ public actor ProxyServer {
                 requestKey: interactiveKey
             )
             try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
-            return .completed
+            return .completed(outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure)
         }
     }
 
