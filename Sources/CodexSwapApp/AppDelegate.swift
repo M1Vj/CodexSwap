@@ -542,6 +542,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let active = NSMenuItem(title: "Active account: \(activeAlias ?? "none")", action: nil, keyEquivalent: "")
         active.isEnabled = false
         menu.addItem(active)
+        if let stickyAlias = latest.stickyAlias {
+            let sticky = NSMenuItem(title: "Sticky account: \(stickyAlias) · until quota error", action: nil, keyEquivalent: "")
+            sticky.isEnabled = false
+            menu.addItem(sticky)
+        }
 
         let activeTasks = latest.tasks.filter { $0.archivedAt == nil }
         if !activeTasks.isEmpty {
@@ -612,6 +617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 rank: index + 1,
                 alias: acc.alias,
                 isActive: acc.alias == activeAlias,
+                isSticky: acc.alias == latest.stickyAlias,
                 isEnabled: true,
                 needsLogin: acc.needsLogin,
                 isDraining: activeAliases.contains(acc.alias) && latest.drainingAliases.contains(acc.alias),
@@ -621,9 +627,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
             let alias = acc.alias
-            item.view = MenuRowContainer(row: row, width: 340, isEnabled: true) { [weak self] in
+            item.view = MenuRowContainer(row: row, width: 340, isEnabled: true, onSelect: { [weak self] in
                 self?.activateAccount(alias)
-            }
+            }, onDoubleClick: { [weak self] in
+                Task { @MainActor in
+                    guard let self else { return }
+                    await self.engine.toggleStickyAccount(alias)
+                    await self.refreshSnapshot()
+                }
+            })
             menu.addItem(item)
         }
 

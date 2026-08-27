@@ -50,6 +50,12 @@ public actor AccountStore {
     /// persisted and let restricted polls expire an unrefreshed observation
     /// without clearing aliases that were not assessed.
     private var drainingObservedAt: [String: Date] = [:]
+    /// Explicit user-selected runtime hold. This is deliberately not persisted.
+    private var stickyAliasRuntime: String?
+    /// Runtime latch for the account Smart Switch identified as actively draining.
+    private var drainingHoldAlias: String?
+    /// Cooling accounts that already rejected a Luna probe, keyed by retry time.
+    private var lunaRejectedUntil: [String: Date] = [:]
     /// Reference-counted routing leases held by in-flight proxy or Task Board
     /// work. A lease defers automatic archival without changing the persisted
     /// pause timestamp; overlapping attempts on one alias remain protected
@@ -153,7 +159,51 @@ public actor AccountStore {
 
     public func all() -> [Account] { data.accounts }
     public func activeAlias() -> String? { data.activeAlias }
+    public func stickyAlias() -> String? { stickyAliasRuntime }
+    public func currentDrainingHoldAlias() -> String? { drainingHoldAlias }
     public func account(_ alias: String) -> Account? { data.accounts.first { $0.alias == alias } }
+
+    /// Toggles the runtime-only menu hold. A held account remains selected while
+    /// it is hard-eligible, regardless of displayed usage or in-flight leases.
+    @discardableResult
+    public func toggleStickyAlias(_ alias: String, now: Date = Date()) -> Bool {
+        if stickyAliasRuntime == alias {
+            stickyAliasRuntime = nil
+            return true
+        }
+        guard let selected = account(alias), selected.isEligible(now: now) else { return false }
+        stickyAliasRuntime = alias
+        activate(alias, now: now)
+        return true
+    }
+
+    private func clearStickyIfNeeded(_ alias: String) {
+        if stickyAliasRuntime == alias { stickyAliasRuntime = nil }
+    }
+
+    private func clearRuntimeHolds(_ alias: String) {
+        clearStickyIfNeeded(alias)
+        if drainingHoldAlias == alias { drainingHoldAlias = nil }
+        lunaRejectedUntil.removeValue(forKey: alias)
+    }
+
+    public func reserveLunaOpportunity(excluding alias: String? = nil, now: Date = Date()) -> Account? {
+        lunaRejectedUntil = lunaRejectedUntil.filter { $0.value > now }
+        let candidates = data.accounts.filter { account in
+            account.alias != alias && account.isRoutableIgnoringCooldown
+                && account.cooldownUntil(now: now) != nil
+                && lunaRejectedUntil[account.alias] == nil
+                && routingLeases[account.alias, default: 0] == 0
+        }
+        guard let selected = strategySorted(candidates, strategy: strategy).first else { return nil }
+        reserveLease(selected.alias)
+        touchLastUsed(selected.alias, now: now)
+        return selected
+    }
+
+    public func recordLunaRejection(_ alias: String, until: Date) {
+        lunaRejectedUntil[alias] = until
+    }
 
     /// Returns the persisted instant at which a paused account becomes eligible for
     /// automatic archival. The later routed-use timestamp wins, so a request that
@@ -259,6 +309,7 @@ public actor AccountStore {
             data.accounts[i].archivedAt = timestamp
             data.accounts[i].routingEnabled = false
             if data.activeAlias == alias { data.activeAlias = nil }
+            clearRuntimeHolds(alias)
             drainingAliases.remove(alias)
             drainingObservedAt.removeValue(forKey: alias)
             archived.append(data.accounts[i])
@@ -357,6 +408,22 @@ public actor AccountStore {
     /// New requests can avoid accounts that already have in-flight routed work so parallel
     /// clients do not pile onto one account before upstream quota can react.
     public func current(now: Date = Date(), avoidingLeased: Bool = false) -> Account? {
+        if let stickyAliasRuntime {
+            if let sticky = account(stickyAliasRuntime), sticky.isEligible(now: now) {
+                if data.activeAlias != sticky.alias { activate(sticky.alias, now: now) }
+                return sticky
+            } else {
+                self.stickyAliasRuntime = nil
+            }
+        }
+        if let drainingHoldAlias {
+            if let held = account(drainingHoldAlias), held.isEligible(now: now) {
+                if data.activeAlias != held.alias { activate(held.alias, now: now) }
+                return held
+            } else {
+                self.drainingHoldAlias = nil
+            }
+        }
         switch strategy {
         case .priority:
             let eligible = eligibleSorted(now: now)
@@ -414,6 +481,7 @@ public actor AccountStore {
 
     /// Disable `alias` for `limit` until `resetAt`, then pick the next eligible account.
     public func rotateFrom(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) -> RotationResult {
+        clearRuntimeHolds(alias)
         if let i = index(alias) {
             let until = resetAt ?? now.addingTimeInterval(fallbackCooldown)
             data.accounts[i].disabledUntil[limit] = until
@@ -432,12 +500,14 @@ public actor AccountStore {
 
     public func markLimited(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) {
         guard let i = index(alias) else { return }
+        clearRuntimeHolds(alias)
         data.accounts[i].disabledUntil[limit] = resetAt ?? now.addingTimeInterval(fallbackCooldown)
         persist()
     }
 
     public func markNeedsLoginOnly(_ alias: String) {
         guard let i = index(alias) else { return }
+        clearRuntimeHolds(alias)
         data.accounts[i].needsLogin = true
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
@@ -445,6 +515,7 @@ public actor AccountStore {
     }
 
     public func markNeedsLogin(_ alias: String, now: Date = Date()) -> RotationResult {
+        clearRuntimeHolds(alias)
         if let i = index(alias) { data.accounts[i].needsLogin = true }
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
@@ -501,6 +572,7 @@ public actor AccountStore {
             data.activeAlias = nil
             changed = true
         }
+        clearRuntimeHolds(alias)
         if drainingAliases.remove(alias) != nil { changed = true }
         if drainingObservedAt.removeValue(forKey: alias) != nil { changed = true }
         if changed {
@@ -651,7 +723,12 @@ public actor AccountStore {
         drainingAliases = aliases
         if aliases.isEmpty {
             drainingObservedAt.removeAll()
+            drainingHoldAlias = nil
             return
+        }
+        if drainingHoldAlias == nil {
+            drainingHoldAlias = data.activeAlias.flatMap { aliases.contains($0) ? $0 : nil }
+                ?? aliases.sorted().first
         }
         let observedAt = clock()
         drainingObservedAt = Dictionary(uniqueKeysWithValues: aliases.map { alias in
@@ -677,6 +754,9 @@ public actor AccountStore {
             if assessment.isDraining {
                 drainingAliases.insert(assessment.alias)
                 drainingObservedAt[assessment.alias] = assessedAt
+                if drainingHoldAlias == nil {
+                    drainingHoldAlias = assessment.alias
+                }
             } else {
                 drainingAliases.remove(assessment.alias)
                 drainingObservedAt.removeValue(forKey: assessment.alias)
@@ -788,6 +868,7 @@ public actor AccountStore {
         let removedTelemetryID = data.accounts.first(where: { $0.alias == alias })?.telemetryID
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
+        clearRuntimeHolds(alias)
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
         renumberRanks()
@@ -824,6 +905,9 @@ public actor AccountStore {
         let removed = Set(removedAccounts.map(\.alias))
         data.accounts.removeAll { removed.contains($0.alias) }
         if let active = data.activeAlias, removed.contains(active) { data.activeAlias = nil }
+        if let stickyAliasRuntime, removed.contains(stickyAliasRuntime) { self.stickyAliasRuntime = nil }
+        if let drainingHoldAlias, removed.contains(drainingHoldAlias) { self.drainingHoldAlias = nil }
+        for alias in removed { lunaRejectedUntil.removeValue(forKey: alias) }
         drainingAliases.subtract(removed)
         for alias in removed { drainingObservedAt.removeValue(forKey: alias) }
         renumberRanks()
@@ -944,6 +1028,7 @@ public actor AccountStore {
             drainingObservedAt.removeValue(forKey: alias)
         }
         if !enabled, data.activeAlias == alias { data.activeAlias = nil }
+        if !enabled { clearRuntimeHolds(alias) }
         persist()
     }
 }

@@ -36,6 +36,7 @@ public enum AppEvent: Sendable {
 public struct EngineSnapshot: Sendable {
     public let accounts: [Account]
     public let activeAlias: String?
+    public let stickyAlias: String?
     public let proxyURL: URL?
     public let strategy: RotationStrategy
     public let servedCount: Int
@@ -53,7 +54,7 @@ public struct EngineSnapshot: Sendable {
 
     public var isRunning: Bool { proxyURL != nil }
 
-    public init(accounts: [Account], activeAlias: String?, proxyURL: URL?, strategy: RotationStrategy,
+    public init(accounts: [Account], activeAlias: String?, stickyAlias: String? = nil, proxyURL: URL?, strategy: RotationStrategy,
                 servedCount: Int = 0, lastActivityAt: Date? = nil, lastActivityAlias: String? = nil,
                 routingState: CodexRoutingState = .disabled, warmupSummary: WarmupSummary? = nil,
                 warmupInProgress: Bool = false,
@@ -62,6 +63,7 @@ public struct EngineSnapshot: Sendable {
                 drainingAliases: Set<String> = []) {
         self.accounts = accounts
         self.activeAlias = activeAlias
+        self.stickyAlias = stickyAlias
         self.proxyURL = proxyURL
         self.strategy = strategy
         self.servedCount = servedCount
@@ -391,6 +393,7 @@ public actor AppEngine {
         return EngineSnapshot(
             accounts: await store.all(),
             activeAlias: await store.activeAlias(),
+            stickyAlias: await store.stickyAlias(),
             proxyURL: await proxy?.proxyURL(),
             strategy: await store.strategy,
             servedCount: activity?.servedCount ?? 0,
@@ -632,12 +635,11 @@ public actor AppEngine {
                     accessToken: fresh.accessToken,
                     accountID: fresh.accountID
                   ),
-                  !windows.isEmpty,
-                  windows.allSatisfy({ $0.usedPercent < 100 }) else { continue }
+                  !windows.isEmpty else { continue }
             await store.updateUsage(candidate.alias, windows: windows)
             verifiedAliases.append(candidate.alias)
         }
-        return await store.bestEligible(among: verifiedAliases)
+        return await store.reserveBestEligible(among: verifiedAliases)
     }
 
     private func sanitizedResetCreditStatuses() async -> [String: AccountResetCreditStatus] {
@@ -980,6 +982,12 @@ public actor AppEngine {
         await store.setActive(alias)
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
+    }
+
+    public func toggleStickyAccount(_ alias: String) async {
+        needsLoginNotified.remove(alias)
+        _ = await store.toggleStickyAlias(alias)
+        emit(.snapshotChanged)
     }
 
     public func setAccountRouting(_ alias: String, enabled: Bool) async {

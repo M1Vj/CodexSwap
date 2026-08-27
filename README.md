@@ -54,6 +54,7 @@ CodexSwap solves the problem at the routing layer:
 | --- | --- | --- |
 | 🔁 | **Quota-aware routing** | Select an eligible account for each new turn or run without replacing auth files mid-session. |
 | 📌 | **Sticky active work** | Usage polling and idle time never move an active turn or Task Board run. |
+| 📍 | **Runtime account lock** | Double-click an account row to keep normal traffic there until a real quota error; double-click again to release it. |
 | 📊 | **Quota cockpit** | Monitor usage in the menu bar—or ask Codex for a safe, live all-account quota report. |
 | 🧭 | **Clear exhaustion policies** | Choose Reset Current First, Switch First, or Stop & Notify separately for interactive work and automation. |
 | 🗂️ | **Automated Task Board** | Queue plan-first `codex exec` work for the next available quota window. |

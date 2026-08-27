@@ -339,6 +339,12 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         !isArchived && routingEnabled && !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
     }
 
+    /// Hard routing checks that intentionally ignore a temporary quota cooldown.
+    /// Used only for the bounded GPT-5.6 Luna opportunity probe.
+    public var isRoutableIgnoringCooldown: Bool {
+        !isArchived && routingEnabled && !accessToken.isEmpty && !needsLogin
+    }
+
     /// Mirrors the proxy's pre-emptive rotation gate: a reported window at or past its
     /// configured threshold means the account should be avoided while an alternative
     /// still has headroom.

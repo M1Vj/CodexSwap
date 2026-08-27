@@ -9,6 +9,7 @@ struct MenuAccountRow: View {
     let rank: Int
     let alias: String
     let isActive: Bool
+    let isSticky: Bool
     let isEnabled: Bool
     let needsLogin: Bool
     let isDraining: Bool
@@ -31,6 +32,13 @@ struct MenuAccountRow: View {
                     Text(alias)
                         .font(.system(size: 13, weight: isActive ? .semibold : .regular))
                         .lineLimit(1)
+                    if isSticky {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .help("Sticky until a quota error; double-click to release")
+                            .accessibilityLabel("Sticky until quota error")
+                    }
                     if isDraining {
                         badge("⚡︎", color: .orange, help: "Quota draining from other users")
                     }
@@ -75,6 +83,7 @@ struct MenuAccountRow: View {
 
     private var accessibilitySummary: String {
         var parts = ["Rank \(rank)", alias, isActive ? "active" : "inactive"]
+        if isSticky { parts.append("sticky until quota error") }
         parts += windows.map { "\($0.label) \($0.usedPercent)% used" }
         if needsLogin { parts.append("needs sign-in") }
         if isDraining { parts.append("draining from other users") }
@@ -147,13 +156,15 @@ extension HealthTier {
 @MainActor
 final class MenuRowContainer: NSView {
     private var onSelect: (() -> Void)?
+    private var onDoubleClick: (() -> Void)?
     private let rowIsEnabled: Bool
     private var hovering = false {
         didSet { layer?.backgroundColor = hovering && rowIsEnabled ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).cgColor : nil }
     }
 
-    init(row: MenuAccountRow, width: CGFloat, isEnabled: Bool, onSelect: @escaping () -> Void) {
+    init(row: MenuAccountRow, width: CGFloat, isEnabled: Bool, onSelect: @escaping () -> Void, onDoubleClick: (() -> Void)? = nil) {
         self.onSelect = onSelect
+        self.onDoubleClick = onDoubleClick
         self.rowIsEnabled = isEnabled
         let hosting = NSHostingView(rootView: row)
         // Rows flex to fill; pick a compact fixed width so the menu has no dead space.
@@ -164,7 +175,6 @@ final class MenuRowContainer: NSView {
         hosting.frame = bounds
         hosting.autoresizingMask = [.width, .height]
         addSubview(hosting)
-        addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(handleClick)))
     }
 
     @available(*, unavailable)
@@ -187,8 +197,12 @@ final class MenuRowContainer: NSView {
     override func mouseExited(with event: NSEvent) { hovering = false }
 
     /// Custom views bypass NSMenuItem's enabled state, so the disabled guard lives here.
-    @objc private func handleClick() {
+    override func mouseDown(with event: NSEvent) {
         guard rowIsEnabled else { return }
-        onSelect?()
+        if event.clickCount >= 2 {
+            onDoubleClick?()
+        } else {
+            onSelect?()
+        }
     }
 }

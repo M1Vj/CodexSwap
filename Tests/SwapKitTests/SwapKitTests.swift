@@ -2275,6 +2275,60 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(selected?.alias, "b")
     }
 
+    func testLunaSelectionPrefersHardRoutableCoolingAccount() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("luna-opportunity-\(UUID().uuidString).json"), strategy: .priority)
+        var cooling = account("cooling", usedPercent: 100, priority: 10)
+        cooling.disabledUntil = ["5h": now.addingTimeInterval(60)]
+        await store.upsert(cooling)
+        await store.upsert(account("healthy", priority: 1))
+
+        let selected = await reserveProxyAccount(
+            store: store,
+            mode: .normal,
+            requestModel: "gpt-5.6-luna",
+            now: now
+        )
+
+        XCTAssertEqual(selected?.alias, "cooling")
+        if let selected { await store.releaseRoutingLease(selected.alias) }
+    }
+
+    func testNonLunaSelectionDoesNotBypassCooldown() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("non-luna-cooldown-\(UUID().uuidString).json"), strategy: .priority)
+        var cooling = account("cooling", usedPercent: 100, priority: 10)
+        cooling.disabledUntil = ["5h": now.addingTimeInterval(60)]
+        await store.upsert(cooling)
+        await store.upsert(account("healthy", priority: 1))
+
+        let selected = await reserveProxyAccount(
+            store: store,
+            mode: .normal,
+            requestModel: "gpt-5.6-sol",
+            now: now
+        )
+
+        XCTAssertEqual(selected?.alias, "healthy")
+        if let selected { await store.releaseRoutingLease(selected.alias) }
+    }
+
+    func testParallelLunaReservationsDoNotPileOntoOneCoolingAccount() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-luna-opportunity-\(UUID().uuidString).json"), strategy: .priority)
+        var cooling = account("cooling", usedPercent: 100, priority: 10)
+        cooling.disabledUntil = ["5h": now.addingTimeInterval(60)]
+        await store.upsert(cooling)
+        await store.upsert(account("healthy", priority: 1))
+
+        async let first = reserveProxyAccount(store: store, mode: .normal, requestModel: "gpt-5.6-luna", now: now)
+        async let second = reserveProxyAccount(store: store, mode: .normal, requestModel: "gpt-5.6-luna", now: now)
+        let selections = await [first, second].compactMap { $0 }
+
+        XCTAssertEqual(Set(selections.map(\.alias)), Set(["cooling", "healthy"]))
+        for selection in selections { await store.releaseRoutingLease(selection.alias) }
+    }
+
     func testTaskSelectionPrefersAnUnleasedAccountForParallelRuns() async {
         let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-task-lease-\(UUID().uuidString).json"), strategy: .priority)
         await store.upsert(account("a", priority: 10))
@@ -2810,6 +2864,8 @@ final class TurnPinningTests: XCTestCase {
             settingsProvider: { settings },
             freshAlternative: { _, _ in await store.account("b") }
         )
+        let didStick = await store.toggleStickyAlias("a")
+        XCTAssertTrue(didStick)
         await server.recordSelection("a", mode: .normal, interactiveKey: "429-turn")
         try await server.start()
         let boundPort = await server.port()
@@ -2823,6 +2879,8 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(recovered.0, "b")
         XCTAssertEqual(repeated.0, "b")
         XCTAssertEqual(aliases, ["a", "b", "b"])
+        let stickyAfterUsageLimit = await store.stickyAlias()
+        XCTAssertNil(stickyAfterUsageLimit)
         await server.stop()
         await upstream.stop()
     }
@@ -2845,6 +2903,8 @@ final class TurnPinningTests: XCTestCase {
             settingsProvider: { capturedSettings },
             automaticQuotaReset: { alias in await recorder.reset(alias) }
         )
+        let didStick = await store.toggleStickyAlias("a")
+        XCTAssertTrue(didStick)
         try await server.start()
         let boundPort = await server.port()
         let port = try XCTUnwrap(boundPort)
@@ -2856,6 +2916,8 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(response.1.statusCode, 429)
         XCTAssertEqual(aliases, ["a"])
         XCTAssertEqual(resetAliases, [])
+        let stickyAfterGeneric429 = await store.stickyAlias()
+        XCTAssertEqual(stickyAfterGeneric429, "a")
         await server.stop()
         await upstream.stop()
     }

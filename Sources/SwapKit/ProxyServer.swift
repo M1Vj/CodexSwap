@@ -234,6 +234,7 @@ func selectProxyAccount(
 func reserveProxyAccount(
     store: AccountStore,
     mode: ProxyRequestMode,
+    requestModel: String = "other",
     primaryThreshold: Int = Int.max,
     secondaryThreshold: Int = Int.max,
     preferredTaskAlias: String? = nil,
@@ -242,6 +243,16 @@ func reserveProxyAccount(
 ) async -> Account? {
     switch mode {
     case .normal:
+        if await store.stickyAlias() != nil {
+            return await store.reserveCurrent(avoidingLeased: true, now: now)
+        }
+        if await store.currentDrainingHoldAlias() != nil {
+            return await store.reserveCurrent(avoidingLeased: true, now: now)
+        }
+        if requestModel == "gpt-5.6-luna",
+           let opportunity = await store.reserveLunaOpportunity(now: now) {
+            return opportunity
+        }
         return await store.reserveCurrent(avoidingLeased: true, now: now)
     case .warmup(let alias):
         guard let hydrated = await store.hydrateFromManagedHome(alias), hydrated.isEligible(now: now) else { return nil }
@@ -717,11 +728,25 @@ public actor ProxyServer {
     func taskPinCount() -> Int { taskRunPins.count }
     func taskPinnedAlias(runID: String) -> String? { taskRunPins.alias(for: runID) }
 
-    func reserveInteractiveAccount(key: String, settings: Settings) async -> Account? {
+    func reserveInteractiveAccount(key: String, settings: Settings, requestModel: String = "other") async -> Account? {
         let store = self.store
+        if await store.stickyAlias() != nil,
+           let held = await store.reserveCurrent(avoidingLeased: true) {
+            await interactiveSelector.bind(key, alias: held.alias, preserving: key)
+            return held
+        }
+        if await store.currentDrainingHoldAlias() != nil,
+           let held = await store.reserveCurrent(avoidingLeased: true) {
+            await interactiveSelector.bind(key, alias: held.alias, preserving: key)
+            return held
+        }
         guard let selection = await interactiveSelector.selectAliasWithReservation(
             for: key,
             selection: {
+                if requestModel == "gpt-5.6-luna",
+                   let opportunity = await store.reserveLunaOpportunity() {
+                    return opportunity.alias
+                }
                 if settings.rotationStrategy == .roundRobin {
                     _ = await store.advanceRoundRobin()
                 }
@@ -738,6 +763,11 @@ public actor ProxyServer {
         }
         if let pinned = await store.reserveEligible(selection.alias) {
             return pinned
+        }
+        if requestModel == "gpt-5.6-luna",
+           let opportunity = await store.reserveLunaOpportunity() {
+            await interactiveSelector.bind(key, alias: opportunity.alias, preserving: key)
+            return opportunity
         }
         guard let fallback = await store.reserveCurrent(avoidingLeased: true) else { return nil }
         await interactiveSelector.bind(key, alias: fallback.alias, preserving: key)
@@ -1073,6 +1103,7 @@ public actor ProxyServer {
             return
         }
 
+        let requestModel = telemetryModel(from: body)
         let interactiveKey = mode == .normal && head.method == .POST && rawPath.hasSuffix("/responses")
             ? interactiveTurnKey(headers: head.headers, body: body)
             : nil
@@ -1080,11 +1111,12 @@ public actor ProxyServer {
 
         let reservedAccount: Account?
         if let interactiveKey {
-            reservedAccount = await reserveInteractiveAccount(key: interactiveKey, settings: settings)
+            reservedAccount = await reserveInteractiveAccount(key: interactiveKey, settings: settings, requestModel: requestModel)
         } else {
             reservedAccount = await reserveProxyAccount(
                 store: store,
                 mode: mode,
+                requestModel: requestModel,
                 primaryThreshold: settings.primaryThresholdPercent,
                 secondaryThreshold: settings.secondaryThresholdPercent,
                 hardPinnedTaskAlias: preferredTaskAlias
@@ -1104,7 +1136,6 @@ public actor ProxyServer {
         var attempts = 0
         let rootRequestID = UUID()
         let requestCategory = telemetryCategory(for: mode)
-        let requestModel = telemetryModel(from: body)
         // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
         while attempts < 8 {
             attempts += 1
@@ -1369,6 +1400,12 @@ public actor ProxyServer {
                     }
                     exhaustionHandled = true
                     await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
+                    if requestModel == "gpt-5.6-luna" {
+                        await store.recordLunaRejection(
+                            account.alias,
+                            until: resetAt ?? Date().addingTimeInterval(TimeInterval(settings.defaultCooldownSeconds))
+                        )
+                    }
                     let currentAlias = account.alias
                     let allowedAliases: [String]?
                     if case .task(let allowed, _) = mode { allowedAliases = allowed }

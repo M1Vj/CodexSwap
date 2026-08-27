@@ -27,6 +27,103 @@ final class AccountStoreArchiveTests: XCTestCase {
         )
     }
 
+    func testRuntimeStickyAliasIgnoresUsageAndIsNotPersisted() async throws {
+        let url = temporaryStoreURL("sticky")
+        var first = account("first", priority: 10)
+        first.usage = [UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: nil)]
+        let second = account("second", priority: 1)
+        let store = AccountStore(url: url)
+        await store.upsert(first)
+        await store.upsert(second)
+
+        let didStick = await store.toggleStickyAlias("first")
+        let stickyAlias = await store.stickyAlias()
+        let currentAlias = await store.current(avoidingLeased: true)?.alias
+        XCTAssertTrue(didStick)
+        XCTAssertEqual(stickyAlias, "first")
+        XCTAssertEqual(currentAlias, "first")
+
+        let didRelease = await store.toggleStickyAlias("first")
+        XCTAssertTrue(didRelease)
+        let releasedAlias = await store.stickyAlias()
+        XCTAssertNil(releasedAlias)
+
+        let didRestick = await store.toggleStickyAlias("first")
+        XCTAssertTrue(didRestick)
+
+        let reloaded = AccountStore(url: url)
+        let reloadedStickyAlias = await reloaded.stickyAlias()
+        XCTAssertNil(reloadedStickyAlias)
+    }
+
+    func testUsageLimitClearsRuntimeStickyAlias() async throws {
+        let store = AccountStore(url: temporaryStoreURL("sticky-limit"))
+        await store.upsert(account("first"))
+        let didStick = await store.toggleStickyAlias("first")
+        XCTAssertTrue(didStick)
+
+        await store.markLimited("first", limit: "5h", resetAt: Date().addingTimeInterval(60), fallbackCooldown: 60)
+
+        let stickyAlias = await store.stickyAlias()
+        let current = await store.current()
+        XCTAssertNil(stickyAlias)
+        XCTAssertNil(current)
+    }
+
+    func testStickyHardInvalidationFallsBackToAnotherAccount() async throws {
+        let store = AccountStore(url: temporaryStoreURL("sticky-invalidation"))
+        await store.upsert(account("first", priority: 10))
+        await store.upsert(account("second", priority: 1))
+        let didStick = await store.toggleStickyAlias("first")
+        XCTAssertTrue(didStick)
+
+        await store.setRoutingEnabled("first", enabled: false)
+
+        let stickyAlias = await store.stickyAlias()
+        let currentAlias = await store.current()?.alias
+        XCTAssertNil(stickyAlias)
+        XCTAssertEqual(currentAlias, "second")
+    }
+
+    func testRotateFromClearsStickyAndSelectsFallback() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: temporaryStoreURL("sticky-rotation"))
+        await store.upsert(account("first", priority: 10))
+        await store.upsert(account("second", priority: 1))
+        let didStick = await store.toggleStickyAlias("first", now: now)
+        XCTAssertTrue(didStick)
+
+        let result = await store.rotateFrom(
+            "first",
+            limit: "5h",
+            resetAt: now.addingTimeInterval(60),
+            now: now,
+            fallbackCooldown: 60
+        )
+
+        let stickyAlias = await store.stickyAlias()
+        XCTAssertNil(stickyAlias)
+        XCTAssertEqual(result.next?.alias, "second")
+        XCTAssertTrue(result.rotated)
+    }
+
+    func testDrainingHoldSurvivesAssessmentClearUntilLimit() async throws {
+        let store = AccountStore(url: temporaryStoreURL("draining-hold"))
+        await store.upsert(account("first", priority: 10))
+        await store.upsert(account("second", priority: 1))
+        await store.setDrainingAliases(["first"])
+        await store.clearDrainingObservation("first")
+
+        let heldAlias = await store.current()?.alias
+        XCTAssertEqual(heldAlias, "first")
+
+        await store.markLimited("first", limit: "5h", resetAt: Date().addingTimeInterval(60), fallbackCooldown: 60)
+        let drainingHoldAlias = await store.currentDrainingHoldAlias()
+        let fallbackAlias = await store.current()?.alias
+        XCTAssertNil(drainingHoldAlias)
+        XCTAssertEqual(fallbackAlias, "second")
+    }
+
     private func legacyAccountJSON(
         alias: String,
         accountID: String,

@@ -415,7 +415,7 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(status, .unavailable)
     }
 
-    func testFreshAlternativeUsesAllowedAliasesAndFreshUsageInsteadOfCachedHeadroom() async throws {
+    func testFreshAlternativeAllowsFreshlyReportedHundredPercentUntilUpstreamRejectsIt() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppEngineFreshAlternative-\(UUID().uuidString)", isDirectory: true)
         let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
@@ -438,9 +438,10 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
             allowedAliases: ["cached-clear", "fresh-clear"]
         )
 
-        XCTAssertEqual(alternative?.alias, "fresh-clear")
+        XCTAssertEqual(alternative?.alias, "cached-clear")
         let requestedAliases = await usage.requestedAliases()
         XCTAssertEqual(requestedAliases, ["cached-clear", "fresh-clear"])
+        if let alternative { await store.releaseRoutingLease(alternative.alias) }
     }
 
     func testFreshAlternativeSkipsRoutingDisabledAccountWithoutFetchingUsage() async throws {
