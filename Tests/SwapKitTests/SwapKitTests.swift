@@ -1940,6 +1940,7 @@ actor LocalRoutingUpstream {
         case success(state: String)
         case usageLimitFirst(state: String)
         case nonUsageLimitFirst(state: String)
+        case transient429First(state: String, retryAfter: String)
         case usageLimitAlways(state: String)
         case usageLimitThenUnauthorized(state: String, sessionInvalidated: Bool)
     }
@@ -2041,6 +2042,11 @@ actor LocalRoutingUpstream {
             body = requests == 1
                 ? Data(#"{"error":{"code":"rate_limit_exceeded","message":"usage_limit_reached"}}"#.utf8)
                 : try JSONSerialization.data(withJSONObject: ["alias": alias])
+        case .transient429First(let value, _):
+            state = value; status = requests == 1 ? .tooManyRequests : .ok
+            body = requests == 1
+                ? Data(#"{"detail":"Rate limit reached"}"#.utf8)
+                : try JSONSerialization.data(withJSONObject: ["alias": alias])
         case .usageLimitAlways(let value):
             state = value; status = .tooManyRequests
             body = Data(#"{"error":{"code":"usage_limit_reached"}}"#.utf8)
@@ -2061,6 +2067,9 @@ actor LocalRoutingUpstream {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "application/json")
         headers.add(name: "Content-Length", value: String(body.count))
+        if case .transient429First(_, let retryAfter) = behavior, requests == 1 {
+            headers.add(name: "Retry-After", value: retryAfter)
+        }
         headers.add(name: "x-codex-turn-state", value: state)
         try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
         try await outbound.write(.body(.byteBuffer(ByteBuffer(bytes: body))))
@@ -2918,6 +2927,29 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(resetAliases, [])
         let stickyAfterGeneric429 = await store.stickyAlias()
         XCTAssertEqual(stickyAfterGeneric429, "a")
+        await server.stop()
+        await upstream.stop()
+    }
+
+    func testProxyHTTPTransient429HonorsRetryAfterAndRecovers() async throws {
+        let upstream = LocalRoutingUpstream(.transient429First(state: "transient-429-state", retryAfter: "0"))
+        let upstreamURL = try await upstream.start()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-transient-429-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let server = ProxyServer(store: store, config: config, settingsProvider: { .default })
+        try await server.start()
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(port: port, headers: ["x-codex-turn-metadata": "transient-429-turn"])
+
+        XCTAssertEqual(response.0, "a")
+        XCTAssertEqual(response.1.statusCode, 200)
+        let requestCount = await upstream.requestCount()
+        XCTAssertEqual(requestCount, 2)
         await server.stop()
         await upstream.stop()
     }

@@ -601,9 +601,30 @@ actor RefreshBurnGuard {
     func clear(alias: String) { suppressedUntil[alias] = nil }
 }
 
+/// Shares upstream Retry-After backoff across all requests served by one proxy.
+/// Cloudflare edge 429s are often transient and lack Codex's usage-limit JSON;
+/// without a shared gate, concurrent clients retry together and extend the throttle.
+actor UpstreamRateLimitBackoff {
+    private var blockedUntil = Date.distantPast
+    private let maximumDelay: TimeInterval = 30
+
+    func waitIfNeeded(now: Date = Date()) async {
+        let delay = min(max(0, blockedUntil.timeIntervalSince(now)), maximumDelay)
+        guard delay > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+    }
+
+    func note(retryAfter: TimeInterval, now: Date = Date()) {
+        guard retryAfter.isFinite, retryAfter >= 0 else { return }
+        let deadline = now.addingTimeInterval(min(retryAfter, maximumDelay))
+        if deadline > blockedUntil { blockedUntil = deadline }
+    }
+}
+
 private enum ProxyAttemptResult: Sendable {
     case completed(outcome: UsageTelemetryRootOutcome)
     case retry(account: Account, tokenRefreshed: Bool, exhaustionHandled: Bool, finalReplay: Bool)
+    case retryTransient(account: Account, retries: Int)
 }
 
 public actor ProxyServer {
@@ -642,6 +663,7 @@ public actor ProxyServer {
     private let group: MultiThreadedEventLoopGroup
     private let httpClient: HTTPClient
     private let burn = RefreshBurnGuard()
+    private let upstreamRateLimitBackoff = UpstreamRateLimitBackoff()
 
     private var boundPort: Int?
     private var serving = false
@@ -1133,6 +1155,7 @@ public actor ProxyServer {
         var tokenRefreshed = false
         var exhaustionHandled = false
         var finalReplay = false
+        var transientRateLimitRetries = 0
         var attempts = 0
         let rootRequestID = UUID()
         let requestCategory = telemetryCategory(for: mode)
@@ -1156,7 +1179,8 @@ public actor ProxyServer {
                 rootRequestID: rootRequestID,
                 attemptIndex: attempts,
                 requestCategory: requestCategory,
-                requestModel: requestModel
+                requestModel: requestModel,
+                transientRateLimitRetries: transientRateLimitRetries
             )
             switch result {
             case .completed(let outcome):
@@ -1173,6 +1197,11 @@ public actor ProxyServer {
                 tokenRefreshed = refreshed
                 exhaustionHandled = handled
                 finalReplay = replay
+            case let .retryTransient(next, retries):
+                account = next
+                tokenRefreshed = false
+                finalReplay = false
+                transientRateLimitRetries = retries
             }
         }
         await telemetry?.recordRootTerminal(.init(
@@ -1201,7 +1230,8 @@ public actor ProxyServer {
         rootRequestID: UUID,
         attemptIndex: Int,
         requestCategory: UsageTelemetryRequestCategory,
-        requestModel: String
+        requestModel: String,
+        transientRateLimitRetries initialTransientRateLimitRetries: Int
     ) async throws -> ProxyAttemptResult {
         // Capture the sendable collaborators before handing the attempt to the
         // nonisolated lease wrapper. Actor methods below are called explicitly
@@ -1220,6 +1250,7 @@ public actor ProxyServer {
             var tokenRefreshed = initialTokenRefreshed
             var exhaustionHandled = initialExhaustionHandled
             var finalReplay = initialFinalReplay
+            let transientRateLimitRetries = initialTransientRateLimitRetries
             let attemptStartedAt = Date()
 
             // Prefer CodexBar's fresher token for managed accounts before spending a refresh ourselves.
@@ -1236,6 +1267,7 @@ public actor ProxyServer {
                 if !mode.isWarmup {
                     await store.markServed(account.alias, date: Date())
                 }
+                await self.upstreamRateLimitBackoff.waitIfNeeded()
                 resp = try await self.forward(head: head, body: body, account: account, target: target)
             } catch {
                 await self.recordTelemetryAttempt(
@@ -1449,6 +1481,14 @@ public actor ProxyServer {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
                         return .completed(outcome: .failure)
                     }
+                }
+                // Cloudflare may return a transient edge 429 without Codex's
+                // `usage_limit_reached` marker. Honor its Retry-After and retry
+                // inside the proxy so every Codex client does not immediately
+                // replay the same request in lockstep.
+                if let retryAfter = retryAfterDelay(headers: resp.headers), transientRateLimitRetries < 3 {
+                    await self.upstreamRateLimitBackoff.note(retryAfter: retryAfter)
+                    return .retryTransient(account: account, retries: transientRateLimitRetries + 1)
                 }
                 try await streamClassifiedResponse(
                     outbound,
@@ -1880,6 +1920,14 @@ func bodyHasUsageLimit(_ buffer: ByteBuffer) -> Bool {
     }
     let error = root["error"] as? [String: Any] ?? root
     return [error["code"], error["type"]].contains { ($0 as? String) == "usage_limit_reached" }
+}
+
+func retryAfterDelay(headers: HTTPHeaders) -> TimeInterval? {
+    guard let raw = headers.first(name: "retry-after")?.trimmingCharacters(in: .whitespacesAndNewlines),
+          let seconds = TimeInterval(raw),
+          seconds.isFinite,
+          seconds >= 0 else { return nil }
+    return min(seconds, 30)
 }
 
 func isSessionInvalidated(_ buffer: ByteBuffer) -> Bool {
