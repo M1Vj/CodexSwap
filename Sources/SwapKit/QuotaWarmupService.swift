@@ -22,16 +22,19 @@ public actor QuotaWarmupService {
     private let runner: any WarmupCommandRunning
     private let ledger: WarmupLedgerStore
     private let failureRetrySeconds: TimeInterval
+    private let unknownRetrySeconds: TimeInterval
     private var isRunning = false
 
     public init(
         runner: any WarmupCommandRunning = ProcessWarmupRunner(),
         ledger: WarmupLedgerStore = WarmupLedgerStore(),
-        failureRetrySeconds: TimeInterval = 300
+        failureRetrySeconds: TimeInterval = 300,
+        unknownRetrySeconds: TimeInterval = 1_800
     ) {
         self.runner = runner
         self.ledger = ledger
         self.failureRetrySeconds = failureRetrySeconds
+        self.unknownRetrySeconds = unknownRetrySeconds
     }
 
     public func run(accounts: [Account], proxyURL: URL, force: Bool = false, now: Date = Date()) async -> WarmupSummary {
@@ -53,19 +56,33 @@ public actor QuotaWarmupService {
                 continue
             }
 
+            // A successful process exit only proves that the command completed. Keep the
+            // account unverified until a fresh usage observation anchors the reset lineage.
+            // Persist this before launching so a crash or cancellation cannot immediately
+            // re-arm the same account on the next poll.
+            let pendingRecord = WarmupRecord(
+                succeededAt: now,
+                primaryResetAt: attemptDue(for: account, now: now),
+                secondaryResetAt: weeklyReset(account, after: now),
+                retryAfter: now.addingTimeInterval(unknownRetrySeconds),
+                outcome: .unknown,
+                attemptedAt: now
+            )
+            await ledger.setRecord(pendingRecord, for: key)
+            summary.attempted.append(account.alias)
+
             do {
                 try await runner.run(alias: account.alias, proxyURL: proxyURL)
-                let secondary = weeklyReset(account, after: now)
-                await ledger.setRecord(WarmupRecord(succeededAt: now, primaryResetAt: nextWarmDue(account, now: now), secondaryResetAt: secondary), for: key)
-                summary.warmed.append(account.alias)
             } catch {
+                var failedRecord = pendingRecord
+                failedRecord.outcome = .failed
+                // A definite command failure should retry on the bounded failure
+                // schedule even when the pre-attempt account snapshot had a stale
+                // future reset timestamp.
+                failedRecord.primaryResetAt = now
+                failedRecord.retryAfter = now.addingTimeInterval(failureRetrySeconds)
                 await ledger.setRecord(
-                    WarmupRecord(
-                        succeededAt: now,
-                        primaryResetAt: now,
-                        secondaryResetAt: nil,
-                        retryAfter: now.addingTimeInterval(failureRetrySeconds)
-                    ),
+                    failedRecord,
                     for: key
                 )
                 summary.failed[account.alias] = error is WarmupCommandError
@@ -80,6 +97,29 @@ public actor QuotaWarmupService {
 
     public func lastSummary() async -> WarmupSummary? { await ledger.lastSummary() }
 
+    /// Reclassifies a completed summary from the ledger after the caller has supplied
+    /// fresh usage observations. Process failures are cleared when that evidence proves
+    /// an active reset cycle; unverified attempts remain in `attempted` and out of `warmed`.
+    public func reconcileSummary(_ summary: WarmupSummary, accounts: [Account]) async -> WarmupSummary {
+        var reconciled = summary
+        for alias in summary.attempted {
+            guard let account = accounts.first(where: { $0.alias == alias }),
+                  let record = await ledger.record(for: account.id) else {
+                continue
+            }
+            if record.outcome == .verified {
+                if !reconciled.warmed.contains(alias) {
+                    reconciled.warmed.append(alias)
+                }
+                reconciled.failed.removeValue(forKey: alias)
+            } else {
+                reconciled.warmed.removeAll { $0 == alias }
+            }
+        }
+        await ledger.setLastSummary(reconciled)
+        return reconciled
+    }
+
     public func hasDueAccount(in accounts: [Account], now: Date = Date()) async -> Bool {
         for account in accounts where skipReason(account, now: now) == nil {
             guard let record = await ledger.record(for: account.id) else { return true }
@@ -90,26 +130,118 @@ public actor QuotaWarmupService {
 
     public func updateObservedUsage(for accounts: [Account], now: Date = Date()) async {
         for account in accounts {
-            guard !account.isArchived else { continue }
-            guard var record = await ledger.record(for: account.id) else { continue }
-            if !account.usage.isEmpty {
-                record.primaryResetAt = nextWarmDue(account, now: now)
-            }
-            if let secondary = weeklyReset(account, after: now) {
-                record.secondaryResetAt = secondary
-            }
-            await ledger.setRecord(record, for: account.id)
+            await observeUsage(for: account, now: now)
         }
+    }
+
+    /// Reconciles one fresh usage reading with the persisted warm-up cycle.
+    ///
+    /// A reset timestamp can anchor a cycle only when it belongs to a future
+    /// short window. Non-zero usage is sufficient evidence immediately; a
+    /// zero-percent reading needs two consecutive observations of the same
+    /// reset because the display is rounded and may hide a request.
+    public func observeUsage(for account: Account, now: Date = Date()) async {
+        guard !account.isArchived else { return }
+        guard var record = await ledger.record(for: account.id) else { return }
+
+        let short = shortUsage(account)
+        if let reset = short?.resetAt, reset > now {
+            record.observedAt = now
+
+            let matchesPrevious = record.observedPrimaryResetAt == reset
+            record.observedPrimaryResetAt = reset
+            if short?.usedPercent ?? 0 > 0 {
+                record.stableObservationCount = matchesPrevious && record.stableObservationCount > 0 ? 2 : 1
+                record.outcome = .verified
+                record.primaryResetAt = reset
+                record.retryAfter = nil
+            } else {
+                record.stableObservationCount = matchesPrevious && record.stableObservationCount > 0 ? 2 : 1
+                if record.stableObservationCount >= 2 {
+                    record.outcome = .verified
+                    record.primaryResetAt = reset
+                    record.retryAfter = nil
+                } else {
+                    record.outcome = .pending
+                    keepDue(&record, now: now)
+                }
+            }
+        } else if short != nil {
+            // A short window with no future reset is not evidence. Keep the
+            // previous scheduler deadline due rather than replacing it with a
+            // synthetic five-hour cadence.
+            record.observedPrimaryResetAt = nil
+            record.observedAt = now
+            record.stableObservationCount = 0
+            record.outcome = .pending
+            keepDue(&record, now: now)
+        } else {
+            // A missing short window breaks reset-lineage continuity. Clear
+            // the prior observation before preserving a weekly-only schedule;
+            // the same short reset on a later poll must start at one again.
+            let hadObservedShortReset = record.observedPrimaryResetAt != nil
+            let preservesWeeklyOnlyDeadline = record.observedPrimaryResetAt == nil
+                && record.secondaryResetAt.map { $0 > now } == true
+                && record.primaryResetAt == record.secondaryResetAt
+            record.observedPrimaryResetAt = nil
+            record.observedAt = now
+            record.stableObservationCount = 0
+
+            if let weekly = weeklyReset(account, after: now) {
+                // Preserve the existing weekly-only schedule. Weekly evidence
+                // never verifies a short-window warm-up cycle, so a previously
+                // verified short lineage becomes pending if that window vanishes.
+                record.primaryResetAt = weekly
+                record.secondaryResetAt = weekly
+                if hadObservedShortReset || record.outcome == .verified {
+                    record.outcome = .pending
+                }
+            } else {
+                // With no usable reset evidence, the cycle is still pending
+                // and must remain due for a bounded catch-up attempt. A known
+                // weekly-only deadline is the exception: retain it until the
+                // weekly reset instead of creating an immediate retry.
+                if preservesWeeklyOnlyDeadline {
+                    if record.outcome == .verified {
+                        record.outcome = .pending
+                    }
+                } else {
+                    record.outcome = .pending
+                    keepDue(&record, now: now)
+                }
+            }
+        }
+
+        if let secondary = weeklyReset(account, after: now) {
+            record.secondaryResetAt = secondary
+        }
+        await ledger.setRecord(record, for: account.id)
     }
 
     /// When the next warm-up can start a fresh quota cycle. Normally the short (5h) window's
     /// reset; while that limit is suspended (only a weekly window reported) it is the weekly
     /// reset — a 5h cadence would then only burn weekly quota with nothing to restart.
-    private func nextWarmDue(_ account: Account, now: Date) -> Date {
-        let short = account.usage.first { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
-        if let reset = short?.resetAt, reset > now { return reset }
-        if short == nil, let weekly = weeklyReset(account, after: now) { return weekly }
-        return now.addingTimeInterval(18_000)
+    private func shortUsage(_ account: Account) -> UsageWindow? {
+        account.usage.first { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
+    }
+
+    /// Keep weekly-only accounts on their existing weekly cadence. A currently reported
+    /// future short reset remains the scheduler deadline, while accounts without usable
+    /// reset evidence use the bounded retry deadline anchored at this attempt.
+    private func attemptDue(for account: Account, now: Date) -> Date {
+        if let reset = shortUsage(account)?.resetAt, reset > now {
+            return reset
+        }
+        if shortUsage(account) == nil, let weekly = weeklyReset(account, after: now) {
+            return weekly
+        }
+        return now
+    }
+
+    private func keepDue(_ record: inout WarmupRecord, now: Date) {
+        if record.primaryResetAt == nil || record.primaryResetAt! > now {
+            record.primaryResetAt = now
+        }
     }
 
     private func weeklyReset(_ account: Account, after now: Date) -> Date? {
