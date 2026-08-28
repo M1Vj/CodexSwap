@@ -69,19 +69,51 @@ public struct WarmupSummary: Codable, Sendable, Equatable {
     public var startedAt: Date
     public var finishedAt: Date
     public var warmed: [String]
+    /// Aliases for which CodexSwap invoked the warm-up command. An attempt is not
+    /// considered warmed until a subsequent fresh usage observation verifies its
+    /// reset lineage.
+    public var attempted: [String]
     public var skipped: [String: String]
     public var failed: [String: String]
 
-    public init(startedAt: Date, finishedAt: Date, warmed: [String] = [], skipped: [String: String] = [:], failed: [String: String] = [:]) {
+    public init(
+        startedAt: Date,
+        finishedAt: Date,
+        warmed: [String] = [],
+        attempted: [String] = [],
+        skipped: [String: String] = [:],
+        failed: [String: String] = [:]
+    ) {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.warmed = warmed
+        self.attempted = attempted
         self.skipped = skipped
         self.failed = failed
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case startedAt, finishedAt, warmed, attempted, skipped, failed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        finishedAt = try container.decode(Date.self, forKey: .finishedAt)
+        warmed = try container.decodeIfPresent([String].self, forKey: .warmed) ?? []
+        // `attempted` was added after the first persisted summary schema.
+        attempted = try container.decodeIfPresent([String].self, forKey: .attempted) ?? []
+        skipped = try container.decodeIfPresent([String: String].self, forKey: .skipped) ?? [:]
+        failed = try container.decodeIfPresent([String: String].self, forKey: .failed) ?? [:]
+    }
+
+    /// Attempts which have not yet been verified by fresh reset evidence.
+    public var unverified: [String] {
+        attempted.filter { !warmed.contains($0) }
+    }
+
     public var statusText: String {
-        "\(warmed.count) warmed · \(skipped.count) skipped · \(failed.count) failed"
+        "\(warmed.count) warmed · \(attempted.count) attempted · \(skipped.count) skipped · \(failed.count) failed"
     }
 }
 

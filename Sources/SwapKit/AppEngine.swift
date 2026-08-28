@@ -1095,7 +1095,7 @@ public actor AppEngine {
         _ = await settingsStore.update { $0.automaticallyWarmAccounts = enabled }
         emit(.snapshotChanged)
         if enabled, let url = await proxy?.proxyURL() {
-            _ = await performWarmup(proxyURL: url, force: false)
+            _ = await automaticWarmupTick(proxyURL: url)
         }
     }
 
@@ -1143,27 +1143,75 @@ public actor AppEngine {
 
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
         _ = await archiveDueAccounts()
-        return await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force)
+        return await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force, now: Date())
     }
 
-    private func performWarmup(candidates: [Account], proxyURL: URL, force: Bool) async -> WarmupSummary {
+    /// Runs the automatic path after reconciling all candidate usage that could have
+    /// changed while the app was asleep or not running. The poller calls this after its
+    /// ordinary refresh; tests and wake/relaunch callers can invoke it directly to make
+    /// the catch-up ordering explicit.
+    func automaticWarmupTick(
+        proxyURL: URL,
+        settings: Settings? = nil,
+        now: Date = Date(),
+        usageAlreadyRefreshed: Bool = false
+    ) async -> WarmupSummary? {
+        let currentSettings: Settings
+        if let settings {
+            currentSettings = settings
+        } else {
+            currentSettings = await settingsStore.get()
+        }
+        guard currentSettings.automaticallyWarmAccounts else { return nil }
+        let autoCandidates = (await warmupCandidates()).filter {
+            Self.autoWarmupEligible($0, settings: currentSettings)
+        }
+        guard !autoCandidates.isEmpty else { return nil }
+
+        if !usageAlreadyRefreshed {
+            let aliases = Set(autoCandidates.map(\.alias))
+            _ = await pollUsage(
+                activeOnly: false,
+                aliases: aliases,
+                settingsOverride: currentSettings,
+                now: now
+            )
+        }
+        guard await warmupService.hasDueAccount(in: autoCandidates, now: now) else { return nil }
+        return await performWarmup(
+            candidates: autoCandidates,
+            proxyURL: proxyURL,
+            force: false,
+            now: now
+        )
+    }
+
+    private func performWarmup(
+        candidates: [Account],
+        proxyURL: URL,
+        force: Bool,
+        now: Date
+    ) async -> WarmupSummary {
         guard !warmupInProgress else {
-            let now = Date()
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         }
         warmupInProgress = true
         emit(.snapshotChanged)
+        defer {
+            warmupInProgress = false
+            emit(.snapshotChanged)
+        }
         let settings = await settingsStore.get()
         let allowedCandidates = candidates.filter { Self.quotaWarmupEligible($0, settings: settings) }
-        let summary = await warmupService.run(accounts: allowedCandidates, proxyURL: proxyURL, force: force)
-        if !summary.warmed.isEmpty {
-            let aliases = Set(summary.warmed)
-            await pollUsage(activeOnly: false, aliases: aliases)
-            let refreshed = await store.activeAccounts().filter { aliases.contains($0.alias) }
-            await warmupService.updateObservedUsage(for: refreshed)
+        var summary = await warmupService.run(accounts: allowedCandidates, proxyURL: proxyURL, force: force, now: now)
+        // Refresh every command attempt, including failures. `warmed` is deliberately
+        // not used as the target set because a zero exit is only an unverified attempt.
+        let attemptedAliases = Set(summary.attempted)
+        if !attemptedAliases.isEmpty {
+            _ = await pollUsage(activeOnly: false, aliases: attemptedAliases, now: now)
+            let refreshed = await store.activeAccounts().filter { attemptedAliases.contains($0.alias) }
+            summary = await warmupService.reconcileSummary(summary, accounts: refreshed)
         }
-        warmupInProgress = false
-        emit(.snapshotChanged)
         return summary
     }
 
@@ -2072,17 +2120,18 @@ public actor AppEngine {
                 // Smart switching needs fresh readings for the whole pool: drain detection
                 // watches accounts CodexSwap itself is not serving, which active-only
                 // polling never sees.
-                await self.pollUsage(activeOnly: !settings.smartSwitchEnabled)
+                // Automatic warm-up needs fresh lineage for every eligible account before
+                // its due check. Poll the whole pool once when that mode is enabled.
+                await self.pollUsage(activeOnly: !settings.smartSwitchEnabled && !settings.automaticallyWarmAccounts)
                 await self.pollRunningTaskUsage(settings: settings)
                 await self.automationTick()
                 if settings.automaticallyWarmAccounts,
                    let url = await self.proxy?.proxyURL() {
-                    let autoCandidates = (await self.warmupCandidates()).filter {
-                        Self.autoWarmupEligible($0, settings: settings)
-                    }
-                    if await self.warmupService.hasDueAccount(in: autoCandidates) {
-                        _ = await self.performWarmup(candidates: autoCandidates, proxyURL: url, force: false)
-                    }
+                    _ = await self.automaticWarmupTick(
+                        proxyURL: url,
+                        settings: settings,
+                        usageAlreadyRefreshed: true
+                    )
                 }
                 await self.emitSnapshot()
                 try? await Task.sleep(nanoseconds: UInt64(max(15, settings.usagePollSeconds)) * 1_000_000_000)
@@ -2113,11 +2162,13 @@ public actor AppEngine {
         if !reset.isEmpty { await automationTick() }
     }
 
+    @discardableResult
     private func pollUsage(
         activeOnly: Bool,
         aliases: Set<String>? = nil,
-        settingsOverride: Settings? = nil
-    ) async {
+        settingsOverride: Settings? = nil,
+        now: Date = Date()
+    ) async -> [Account] {
         let settings: Settings
         if let settingsOverride {
             settings = settingsOverride
@@ -2130,23 +2181,29 @@ public actor AppEngine {
             forPollInterval: TimeInterval(max(0, settings.usagePollSeconds))
         )
         var assessments: [DrainAssessment] = []
+        var refreshedAccounts: [Account] = []
         for acc in accounts where !acc.accessToken.isEmpty {
             if activeOnly && acc.alias != activeAlias { continue }
             if let aliases, !aliases.contains(acc.alias) { continue }
-            guard !JWT.isStale(acc.accessToken) else { continue }
+            guard !JWT.isStale(acc.accessToken, now: now) else { continue }
             // A needs-login account rejects every usage call; polling it wastes a request
             // per tick until the user signs in again.
             guard !acc.needsLogin else { continue }
             if let windows = try? await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID) {
                 guard !windows.isEmpty else { continue }
                 await store.updateUsage(acc.alias, windows: windows)
-                if settings.smartSwitchEnabled, let updated = await store.account(acc.alias),
+                guard let updated = await store.account(acc.alias) else { continue }
+                refreshedAccounts.append(updated)
+                // The warm-up ledger is reconciled from the same fresh reading that backs
+                // the dashboard. This keeps due selection from trusting stale deadlines.
+                await warmupService.observeUsage(for: updated, now: now)
+                if settings.smartSwitchEnabled,
                    SmartSwitchPolicy.assess(
                        account: updated,
                        previousHistory: updated.usageHistory ?? [],
-                       now: Date(),
+                       now: now,
                        lookbackSeconds: lookback
-                   ).isDraining {
+                    ).isDraining {
                     assessments.append(DrainAssessment(alias: acc.alias, isDraining: true))
                 } else if settings.smartSwitchEnabled {
                     assessments.append(DrainAssessment(alias: acc.alias, isDraining: false))
@@ -2154,7 +2211,7 @@ public actor AppEngine {
             }
         }
         if settings.smartSwitchEnabled {
-            let assessedAt = Date()
+            let assessedAt = now
             await store.mergeDrainingAssessments(
                 assessments,
                 assessedAt: assessedAt,
@@ -2164,6 +2221,7 @@ public actor AppEngine {
         } else if !(await store.currentDrainingAliases()).isEmpty {
             await store.setDrainingAliases([])
         }
+        return refreshedAccounts
     }
 
 }
