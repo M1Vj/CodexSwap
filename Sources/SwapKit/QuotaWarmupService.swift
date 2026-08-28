@@ -180,6 +180,9 @@ public actor QuotaWarmupService {
             // the prior observation before preserving a weekly-only schedule;
             // the same short reset on a later poll must start at one again.
             let hadObservedShortReset = record.observedPrimaryResetAt != nil
+            let preservesWeeklyOnlyDeadline = record.observedPrimaryResetAt == nil
+                && record.secondaryResetAt.map { $0 > now } == true
+                && record.primaryResetAt == record.secondaryResetAt
             record.observedPrimaryResetAt = nil
             record.observedAt = now
             record.stableObservationCount = 0
@@ -195,9 +198,17 @@ public actor QuotaWarmupService {
                 }
             } else {
                 // With no usable reset evidence, the cycle is still pending
-                // and must remain due for a bounded catch-up attempt.
-                record.outcome = .pending
-                keepDue(&record, now: now)
+                // and must remain due for a bounded catch-up attempt. A known
+                // weekly-only deadline is the exception: retain it until the
+                // weekly reset instead of creating an immediate retry.
+                if preservesWeeklyOnlyDeadline {
+                    if record.outcome == .verified {
+                        record.outcome = .pending
+                    }
+                } else {
+                    record.outcome = .pending
+                    keepDue(&record, now: now)
+                }
             }
         }
 

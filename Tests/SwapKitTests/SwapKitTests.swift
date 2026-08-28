@@ -1709,6 +1709,48 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(record?.outcome, .pending)
     }
 
+    func testEmptyUsagePreservesWeeklyOnlyDeadlineUntilWeeklyReset() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-weekly-empty-usage-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let runner = FakeWarmupRunner()
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = now.addingTimeInterval(604_800)
+        let weeklyUsage = [
+            UsageWindow(label: "Weekly", usedPercent: 3, windowSeconds: 604_800, resetAt: weeklyReset)
+        ]
+        let account = Account(alias: "a", accountID: "id-a", accessToken: "token", usage: weeklyUsage)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+        await ledger.setRecord(
+            WarmupRecord(
+                succeededAt: now.addingTimeInterval(-100),
+                primaryResetAt: weeklyReset,
+                secondaryResetAt: weeklyReset,
+                outcome: .pending,
+                attemptedAt: now.addingTimeInterval(-100)
+            ),
+            for: "id-a"
+        )
+
+        var emptyUsage = account
+        emptyUsage.usage = []
+        await service.updateObservedUsage(for: [emptyUsage], now: now)
+
+        let beforeReset = await service.run(accounts: [account], proxyURL: proxy, now: now)
+        let runnerCallsBeforeReset = await runner.calls()
+        let dueBeforeReset = await service.hasDueAccount(in: [account], now: now)
+        let dueAtWeeklyReset = await service.hasDueAccount(in: [account], now: weeklyReset)
+        let record = await ledger.record(for: "id-a")
+
+        XCTAssertEqual(account.usage, weeklyUsage)
+        XCTAssertEqual(beforeReset.attempted, [])
+        XCTAssertEqual(runnerCallsBeforeReset, [])
+        XCTAssertFalse(dueBeforeReset)
+        XCTAssertTrue(dueAtWeeklyReset)
+        XCTAssertEqual(record?.primaryResetAt, weeklyReset)
+        XCTAssertEqual(record?.secondaryResetAt, weeklyReset)
+    }
+
     func testWarmupRecordClampsStableObservationCountInConstructorAndDecoder() throws {
         let negative = WarmupRecord(
             succeededAt: Date(timeIntervalSince1970: 1_800_000_000),
