@@ -135,10 +135,19 @@ public actor QuotaWarmupService {
             record.stableObservationCount = 0
             record.outcome = .pending
             keepDue(&record, now: now)
-        } else if let weekly = weeklyReset(account, after: now) {
-            // Preserve the existing weekly-only schedule. Weekly evidence
-            // never verifies a short-window warm-up cycle.
-            record.primaryResetAt = weekly
+        } else {
+            // A missing short window breaks reset-lineage continuity. Clear
+            // the prior observation before preserving a weekly-only schedule;
+            // the same short reset on a later poll must start at one again.
+            record.observedPrimaryResetAt = nil
+            record.observedAt = now
+            record.stableObservationCount = 0
+
+            if let weekly = weeklyReset(account, after: now) {
+                // Preserve the existing weekly-only schedule. Weekly evidence
+                // never verifies a short-window warm-up cycle.
+                record.primaryResetAt = weekly
+            }
         }
 
         if let secondary = weeklyReset(account, after: now) {

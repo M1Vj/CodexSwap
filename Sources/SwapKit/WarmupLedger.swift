@@ -35,7 +35,7 @@ public struct WarmupRecord: Codable, Sendable, Equatable {
         self.retryAfter = retryAfter
         self.observedPrimaryResetAt = observedPrimaryResetAt
         self.observedAt = observedAt
-        self.stableObservationCount = max(0, stableObservationCount)
+        self.stableObservationCount = min(2, max(0, stableObservationCount))
         self.outcome = outcome
         self.attemptedAt = attemptedAt
     }
@@ -53,7 +53,7 @@ public struct WarmupRecord: Codable, Sendable, Equatable {
         retryAfter = try container.decodeIfPresent(Date.self, forKey: .retryAfter)
         observedPrimaryResetAt = try container.decodeIfPresent(Date.self, forKey: .observedPrimaryResetAt)
         observedAt = try container.decodeIfPresent(Date.self, forKey: .observedAt)
-        stableObservationCount = max(0, try container.decodeIfPresent(Int.self, forKey: .stableObservationCount) ?? 0)
+        stableObservationCount = min(2, max(0, try container.decodeIfPresent(Int.self, forKey: .stableObservationCount) ?? 0))
         let rawOutcome = try? container.decode(String.self, forKey: .outcome)
         outcome = rawOutcome.flatMap(WarmupOutcome.init(rawValue:)) ?? .unknown
         attemptedAt = try container.decodeIfPresent(Date.self, forKey: .attemptedAt)
