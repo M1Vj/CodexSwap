@@ -1,16 +1,62 @@
 import Foundation
 
+public enum WarmupOutcome: String, Codable, Sendable {
+    case verified
+    case pending
+    case failed
+    case unknown
+}
+
 public struct WarmupRecord: Codable, Sendable, Equatable {
     public var succeededAt: Date
     public var primaryResetAt: Date?
     public var secondaryResetAt: Date?
     public var retryAfter: Date?
+    public var observedPrimaryResetAt: Date?
+    public var observedAt: Date?
+    public var stableObservationCount: Int
+    public var outcome: WarmupOutcome
+    public var attemptedAt: Date?
 
-    public init(succeededAt: Date, primaryResetAt: Date?, secondaryResetAt: Date?, retryAfter: Date? = nil) {
+    public init(
+        succeededAt: Date,
+        primaryResetAt: Date?,
+        secondaryResetAt: Date?,
+        retryAfter: Date? = nil,
+        observedPrimaryResetAt: Date? = nil,
+        observedAt: Date? = nil,
+        stableObservationCount: Int = 0,
+        outcome: WarmupOutcome = .unknown,
+        attemptedAt: Date? = nil
+    ) {
         self.succeededAt = succeededAt
         self.primaryResetAt = primaryResetAt
         self.secondaryResetAt = secondaryResetAt
         self.retryAfter = retryAfter
+        self.observedPrimaryResetAt = observedPrimaryResetAt
+        self.observedAt = observedAt
+        self.stableObservationCount = max(0, stableObservationCount)
+        self.outcome = outcome
+        self.attemptedAt = attemptedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case succeededAt, primaryResetAt, secondaryResetAt, retryAfter
+        case observedPrimaryResetAt, observedAt, stableObservationCount, outcome, attemptedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        succeededAt = try container.decode(Date.self, forKey: .succeededAt)
+        primaryResetAt = try container.decodeIfPresent(Date.self, forKey: .primaryResetAt)
+        secondaryResetAt = try container.decodeIfPresent(Date.self, forKey: .secondaryResetAt)
+        retryAfter = try container.decodeIfPresent(Date.self, forKey: .retryAfter)
+        observedPrimaryResetAt = try container.decodeIfPresent(Date.self, forKey: .observedPrimaryResetAt)
+        observedAt = try container.decodeIfPresent(Date.self, forKey: .observedAt)
+        stableObservationCount = max(0, try container.decodeIfPresent(Int.self, forKey: .stableObservationCount) ?? 0)
+        let rawOutcome = try? container.decode(String.self, forKey: .outcome)
+        outcome = rawOutcome.flatMap(WarmupOutcome.init(rawValue:)) ?? .unknown
+        attemptedAt = try container.decodeIfPresent(Date.self, forKey: .attemptedAt)
     }
 
     public func isDue(at now: Date) -> Bool {

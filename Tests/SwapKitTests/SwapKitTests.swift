@@ -1406,6 +1406,18 @@ final class QuotaWarmupServiceTests: XCTestCase {
         )
     }
 
+    func testWarmupRecordDecodesBeforeObservationFieldsWereAdded() throws {
+        let data = #"{"succeededAt":"2027-01-15T13:00:00Z","primaryResetAt":"2027-01-15T18:00:00Z","secondaryResetAt":null,"retryAfter":null}"#.data(using: .utf8)!
+
+        let record = try JSONDecoder.codex.decode(WarmupRecord.self, from: data)
+
+        XCTAssertNil(record.observedPrimaryResetAt)
+        XCTAssertNil(record.observedAt)
+        XCTAssertEqual(record.stableObservationCount, 0)
+        XCTAssertEqual(record.outcome, .unknown)
+        XCTAssertNil(record.attemptedAt)
+    }
+
     func testRunsEligibleAccountsSequentiallyAndDeduplicatesCurrentCycle() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-service-\(UUID().uuidString)")
         let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
@@ -1490,6 +1502,94 @@ final class QuotaWarmupServiceTests: XCTestCase {
         let record = await ledger.record(for: "id-a")
         XCTAssertEqual(record?.primaryResetAt, weeklyReset)
         XCTAssertEqual(record?.secondaryResetAt, weeklyReset)
+    }
+
+    func testFutureResetWithNonzeroUsageVerifiesStaleCycle() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-verified-nonzero-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let stale = Date(timeIntervalSince1970: 1_800_000_000)
+        let now = stale.addingTimeInterval(18_001)
+        let reset = now.addingTimeInterval(9_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [account("a", now: stale)], proxyURL: proxy, now: stale)
+        var observed = account("a", now: now)
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)]
+
+        let dueBeforeObservation = await service.hasDueAccount(in: [observed], now: now)
+        XCTAssertTrue(dueBeforeObservation)
+        await service.updateObservedUsage(for: [observed], now: now)
+
+        let dueAfterObservation = await service.hasDueAccount(in: [observed], now: now)
+        XCTAssertFalse(dueAfterObservation)
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.primaryResetAt, reset)
+        XCTAssertEqual(record?.observedPrimaryResetAt, reset)
+        XCTAssertEqual(record?.stableObservationCount, 1)
+        XCTAssertEqual(record?.outcome, .verified)
+        XCTAssertEqual(record?.observedAt, now)
+    }
+
+    func testTwoMatchingZeroPercentObservationsVerifyStaleCycle() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-verified-zero-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let stale = Date(timeIntervalSince1970: 1_800_000_000)
+        let firstPoll = stale.addingTimeInterval(18_001)
+        let secondPoll = firstPoll.addingTimeInterval(60)
+        let reset = secondPoll.addingTimeInterval(9_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [account("a", now: stale)], proxyURL: proxy, now: stale)
+        var observed = account("a", now: firstPoll)
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        await service.updateObservedUsage(for: [observed], now: firstPoll)
+
+        let dueAfterFirstObservation = await service.hasDueAccount(in: [observed], now: firstPoll)
+        XCTAssertTrue(dueAfterFirstObservation)
+
+        await service.updateObservedUsage(for: [observed], now: secondPoll)
+
+        let dueAfterSecondObservation = await service.hasDueAccount(in: [observed], now: secondPoll)
+        XCTAssertFalse(dueAfterSecondObservation)
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.primaryResetAt, reset)
+        XCTAssertEqual(record?.observedPrimaryResetAt, reset)
+        XCTAssertEqual(record?.stableObservationCount, 2)
+        XCTAssertEqual(record?.outcome, .verified)
+        XCTAssertEqual(record?.observedAt, secondPoll)
+    }
+
+    func testMovingZeroPercentFutureResetRemainsPendingAndDue() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-pending-moving-reset-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let stale = Date(timeIntervalSince1970: 1_800_000_000)
+        let firstPoll = stale.addingTimeInterval(18_001)
+        let secondPoll = firstPoll.addingTimeInterval(60)
+        let firstReset = firstPoll.addingTimeInterval(9_000)
+        let movingReset = firstReset.addingTimeInterval(60)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [account("a", now: stale)], proxyURL: proxy, now: stale)
+        var observed = account("a", now: firstPoll)
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: firstReset)]
+        await service.updateObservedUsage(for: [observed], now: firstPoll)
+        let dueAfterFirstObservation = await service.hasDueAccount(in: [observed], now: firstPoll)
+        XCTAssertTrue(dueAfterFirstObservation)
+
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: movingReset)]
+        await service.updateObservedUsage(for: [observed], now: secondPoll)
+
+        let dueAfterMovingObservation = await service.hasDueAccount(in: [observed], now: secondPoll)
+        XCTAssertTrue(dueAfterMovingObservation)
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.primaryResetAt, stale.addingTimeInterval(18_000))
+        XCTAssertEqual(record?.observedPrimaryResetAt, movingReset)
+        XCTAssertEqual(record?.stableObservationCount, 1)
+        XCTAssertEqual(record?.outcome, .pending)
+        XCTAssertEqual(record?.observedAt, secondPoll)
     }
 
     func testFailedAutomaticWarmupBacksOffBeforeRetrying() async throws {

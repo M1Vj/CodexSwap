@@ -90,16 +90,62 @@ public actor QuotaWarmupService {
 
     public func updateObservedUsage(for accounts: [Account], now: Date = Date()) async {
         for account in accounts {
-            guard !account.isArchived else { continue }
-            guard var record = await ledger.record(for: account.id) else { continue }
-            if !account.usage.isEmpty {
-                record.primaryResetAt = nextWarmDue(account, now: now)
-            }
-            if let secondary = weeklyReset(account, after: now) {
-                record.secondaryResetAt = secondary
-            }
-            await ledger.setRecord(record, for: account.id)
+            await observeUsage(for: account, now: now)
         }
+    }
+
+    /// Reconciles one fresh usage reading with the persisted warm-up cycle.
+    ///
+    /// A reset timestamp can anchor a cycle only when it belongs to a future
+    /// short window. Non-zero usage is sufficient evidence immediately; a
+    /// zero-percent reading needs two consecutive observations of the same
+    /// reset because the display is rounded and may hide a request.
+    public func observeUsage(for account: Account, now: Date = Date()) async {
+        guard !account.isArchived else { return }
+        guard var record = await ledger.record(for: account.id) else { return }
+
+        let short = shortUsage(account)
+        if let reset = short?.resetAt, reset > now {
+            record.observedAt = now
+
+            let matchesPrevious = record.observedPrimaryResetAt == reset
+            record.observedPrimaryResetAt = reset
+            if short?.usedPercent ?? 0 > 0 {
+                record.stableObservationCount = matchesPrevious
+                    ? max(record.stableObservationCount, 1) + 1
+                    : 1
+                record.outcome = .verified
+                record.primaryResetAt = reset
+                record.retryAfter = nil
+            } else {
+                record.stableObservationCount = matchesPrevious
+                    ? record.stableObservationCount + 1
+                    : 1
+                if record.stableObservationCount >= 2 {
+                    record.outcome = .verified
+                    record.primaryResetAt = reset
+                    record.retryAfter = nil
+                } else {
+                    record.outcome = .pending
+                    keepDue(&record, now: now)
+                }
+            }
+        } else if short != nil {
+            // A short window with no future reset is not evidence. Keep the
+            // previous scheduler deadline due rather than replacing it with a
+            // synthetic five-hour cadence.
+            record.outcome = .pending
+            keepDue(&record, now: now)
+        } else if let weekly = weeklyReset(account, after: now) {
+            // Preserve the existing weekly-only schedule. Weekly evidence
+            // never verifies a short-window warm-up cycle.
+            record.primaryResetAt = weekly
+        }
+
+        if let secondary = weeklyReset(account, after: now) {
+            record.secondaryResetAt = secondary
+        }
+        await ledger.setRecord(record, for: account.id)
     }
 
     /// When the next warm-up can start a fresh quota cycle. Normally the short (5h) window's
@@ -110,6 +156,16 @@ public actor QuotaWarmupService {
         if let reset = short?.resetAt, reset > now { return reset }
         if short == nil, let weekly = weeklyReset(account, after: now) { return weekly }
         return now.addingTimeInterval(18_000)
+    }
+
+    private func shortUsage(_ account: Account) -> UsageWindow? {
+        account.usage.first { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
+    }
+
+    private func keepDue(_ record: inout WarmupRecord, now: Date) {
+        if record.primaryResetAt == nil || record.primaryResetAt! > now {
+            record.primaryResetAt = now
+        }
     }
 
     private func weeklyReset(_ account: Account, after now: Date) -> Date? {
