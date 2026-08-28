@@ -147,6 +147,11 @@ public actor QuotaWarmupService {
                 // Preserve the existing weekly-only schedule. Weekly evidence
                 // never verifies a short-window warm-up cycle.
                 record.primaryResetAt = weekly
+            } else {
+                // With no usable reset evidence, the cycle is still pending
+                // and must remain due for a bounded catch-up attempt.
+                record.outcome = .pending
+                keepDue(&record, now: now)
             }
         }
 

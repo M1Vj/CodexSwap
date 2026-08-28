@@ -1553,12 +1553,16 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         let dueAfterSecondObservation = await service.hasDueAccount(in: [observed], now: secondPoll)
         XCTAssertFalse(dueAfterSecondObservation)
+        let thirdPoll = secondPoll.addingTimeInterval(60)
+        let fourthPoll = thirdPoll.addingTimeInterval(60)
+        await service.updateObservedUsage(for: [observed], now: thirdPoll)
+        await service.updateObservedUsage(for: [observed], now: fourthPoll)
         let record = await ledger.record(for: "id-a")
         XCTAssertEqual(record?.primaryResetAt, reset)
         XCTAssertEqual(record?.observedPrimaryResetAt, reset)
         XCTAssertEqual(record?.stableObservationCount, 2)
         XCTAssertEqual(record?.outcome, .verified)
-        XCTAssertEqual(record?.observedAt, secondPoll)
+        XCTAssertEqual(record?.observedAt, fourthPoll)
     }
 
     func testMovingZeroPercentFutureResetRemainsPendingAndDue() async throws {
@@ -1652,6 +1656,35 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertTrue(dueAfterAbsentWindow)
         XCTAssertEqual(record?.observedPrimaryResetAt, reset)
         XCTAssertEqual(record?.stableObservationCount, 1)
+        XCTAssertEqual(record?.outcome, .pending)
+    }
+
+    func testEmptyUsageAfterVerifiedResetClearsLineageAndIsDue() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-pending-empty-usage-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let stale = Date(timeIntervalSince1970: 1_800_000_000)
+        let verifiedPoll = stale.addingTimeInterval(18_001)
+        let emptyPoll = verifiedPoll.addingTimeInterval(60)
+        let reset = verifiedPoll.addingTimeInterval(9_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [account("a", now: stale)], proxyURL: proxy, now: stale)
+        var observed = account("a", now: verifiedPoll)
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: reset)]
+        await service.updateObservedUsage(for: [observed], now: verifiedPoll)
+        let verifiedRecord = await ledger.record(for: "id-a")
+        XCTAssertEqual(verifiedRecord?.outcome, .verified)
+
+        observed.usage = []
+        await service.updateObservedUsage(for: [observed], now: emptyPoll)
+
+        let dueAfterEmptyUsage = await service.hasDueAccount(in: [observed], now: emptyPoll)
+        let record = await ledger.record(for: "id-a")
+        XCTAssertTrue(dueAfterEmptyUsage)
+        XCTAssertNil(record?.observedPrimaryResetAt)
+        XCTAssertEqual(record?.stableObservationCount, 0)
+        XCTAssertEqual(record?.primaryResetAt, emptyPoll)
         XCTAssertEqual(record?.outcome, .pending)
     }
 
