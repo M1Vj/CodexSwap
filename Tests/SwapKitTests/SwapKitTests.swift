@@ -2273,15 +2273,18 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(selected?.alias, "b")
     }
 
-    func testNormalSelectionPrefersAnUnleasedAccountForParallelSessions() async {
-        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-session-lease-\(UUID().uuidString).json"), strategy: .priority)
+    func testUnkeyedNormalReservationKeepsCurrentAccountDuringOverlappingRequests() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("unkeyed-session-lease-\(UUID().uuidString).json"), strategy: .priority)
         await store.upsert(account("a", priority: 10))
         await store.upsert(account("b", priority: 1))
         await store.acquireRoutingLease("a")
 
-        let selected = await selectProxyAccount(store: store, mode: .normal)
+        let selected = await reserveProxyAccount(store: store, mode: .normal)
+        let activeAlias = await store.activeAlias()
 
-        XCTAssertEqual(selected?.alias, "b")
+        XCTAssertEqual(selected?.alias, "a")
+        XCTAssertEqual(activeAlias, "a")
+        if let selected { await store.releaseRoutingLease(selected.alias) }
     }
 
     func testLunaSelectionPrefersHardRoutableCoolingAccount() async {

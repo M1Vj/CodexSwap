@@ -192,7 +192,11 @@ func selectProxyAccount(
            pinned.isEligible(now: now) {
             return pinned
         }
-        return await store.current(now: now, avoidingLeased: true)
+        // Session-keyed Responses requests use `reserveInteractiveAccount`, which
+        // spreads distinct turns atomically. If no turn key is available, keep
+        // overlapping work on the active account instead of treating it as a new
+        // parallel session and changing accounts without an upstream failure.
+        return await store.current(now: now)
     case .warmup(let alias):
         // Hydrate managed tokens before judging eligibility, exactly like normal traffic does:
         // a stale store copy (old token, leftover needs-login flag) must not fail a warm-up
@@ -253,7 +257,10 @@ func reserveProxyAccount(
            let opportunity = await store.reserveLunaOpportunity(now: now) {
             return opportunity
         }
-        return await store.reserveCurrent(avoidingLeased: true, now: now)
+        // Distinct interactive sessions are lease-aware before reaching this
+        // fallback. Unkeyed overlap belongs to the current default session and
+        // must not rotate merely because that account already has work in flight.
+        return await store.reserveCurrent(now: now)
     case .warmup(let alias):
         guard let hydrated = await store.hydrateFromManagedHome(alias), hydrated.isEligible(now: now) else { return nil }
         return await store.reserveEligible(alias, now: now)
