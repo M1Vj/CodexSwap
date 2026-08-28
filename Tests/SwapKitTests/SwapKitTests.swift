@@ -1991,6 +1991,116 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(runnerCalls, [])
     }
 
+    func testEmptyUsageReconcilesWarmupWithoutWipingDisplayedUsage() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-empty-usage-\(UUID().uuidString)")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let displayedReset = now.addingTimeInterval(9_000)
+        let displayedUsage = [
+            UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: displayedReset)
+        ]
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: freshToken(now: now),
+            priority: 1,
+            usage: displayedUsage
+        ))
+        let settingsStore = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let settings = await settingsStore.update {
+            $0.automaticallyWarmAccounts = true
+        }
+        let usage = ScriptedUsageFetcher(windowsByAccountID: ["id-a": []])
+        let runner = FakeWarmupRunner()
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        await ledger.setRecord(
+            WarmupRecord(
+                succeededAt: now.addingTimeInterval(-18_001),
+                primaryResetAt: displayedReset,
+                secondaryResetAt: nil,
+                retryAfter: now.addingTimeInterval(300),
+                outcome: .verified,
+                attemptedAt: now.addingTimeInterval(-18_001)
+            ),
+            for: "id-a"
+        )
+        let warmup = QuotaWarmupService(runner: runner, ledger: ledger)
+        let engine = AppEngine(
+            store: store,
+            settingsStore: settingsStore,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: warmup
+        )
+
+        let summary = await engine.automaticWarmupTick(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            settings: settings,
+            now: now
+        )
+
+        XCTAssertNil(summary)
+        let runnerCalls = await runner.calls()
+        let usageCalls = await usage.calls()
+        XCTAssertEqual(runnerCalls, [])
+        XCTAssertEqual(usageCalls, ["id-a"])
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.outcome, .pending)
+        XCTAssertEqual(record?.primaryResetAt, now)
+        XCTAssertNil(record?.observedPrimaryResetAt)
+        let storedAccount = await store.account("a")
+        let dueAfterRetry = await warmup.hasDueAccount(
+            in: [storedAccount!],
+            now: now.addingTimeInterval(300)
+        )
+        XCTAssertTrue(dueAfterRetry)
+        let storedUsage = await store.account("a")?.usage
+        XCTAssertEqual(storedUsage, displayedUsage)
+    }
+
+    func testFailedWarmupWithRefreshOnlyCredentialsFailsClosed() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-failed-refresh-only-\(UUID().uuidString)")
+        let staleReference = Date().addingTimeInterval(-7_200)
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: freshToken(now: staleReference),
+            refreshToken: "refresh-only"
+        ))
+        let usage = ScriptedUsageFetcher(windowsByAccountID: [
+            "id-a": [UsageWindow(
+                label: "5h",
+                usedPercent: 4,
+                windowSeconds: 18_000,
+                resetAt: Date().addingTimeInterval(9_000)
+            )]
+        ])
+        let runner = FakeWarmupRunner(failing: ["a"])
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let engine = AppEngine(
+            store: store,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(runner: runner, ledger: ledger)
+        )
+
+        let summary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
+
+        let runnerCalls = await runner.calls()
+        let usageCalls = await usage.calls()
+        XCTAssertEqual(runnerCalls, ["a"])
+        XCTAssertEqual(usageCalls, [])
+        XCTAssertEqual(summary.warmed, [])
+        XCTAssertEqual(summary.attempted, ["a"])
+        XCTAssertNotNil(summary.failed["a"])
+        let record = await ledger.record(for: "id-a")
+        XCTAssertEqual(record?.outcome, .failed)
+        let retryAfter = try XCTUnwrap(record?.retryAfter)
+        XCTAssertGreaterThan(retryAfter, record?.attemptedAt ?? .distantPast)
+        XCTAssertLessThanOrEqual(retryAfter.timeIntervalSince(record?.attemptedAt ?? retryAfter), 300)
+    }
+
     func testManualWarmupRefreshesAllAttemptedAliasesIncludingFailures() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-attempted-\(UUID().uuidString)")
         let now = Date()

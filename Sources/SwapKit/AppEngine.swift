@@ -1208,6 +1208,9 @@ public actor AppEngine {
         // not used as the target set because a zero exit is only an unverified attempt.
         let attemptedAliases = Set(summary.attempted)
         if !attemptedAliases.isEmpty {
+            // A stale access token cannot produce fresh WHAM evidence here. ProxyServer
+            // owns refresh-token coalescing and updates AccountStore before a successful
+            // runner return; do not add a second refresh path or reinterpret this as verified.
             _ = await pollUsage(activeOnly: false, aliases: attemptedAliases, now: now)
             let refreshed = await store.activeAccounts().filter { attemptedAliases.contains($0.alias) }
             summary = await warmupService.reconcileSummary(summary, accounts: refreshed)
@@ -2191,7 +2194,15 @@ public actor AppEngine {
             // per tick until the user signs in again.
             guard !acc.needsLogin else { continue }
             if let windows = try? await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID) {
-                guard !windows.isEmpty else { continue }
+                if windows.isEmpty {
+                    // AccountStore intentionally retains the dashboard's last non-empty
+                    // reading, but warm-up reconciliation must still observe a successful
+                    // empty response so stale reset lineage cannot remain verified.
+                    var observation = acc
+                    observation.usage = []
+                    await warmupService.observeUsage(for: observation, now: now)
+                    continue
+                }
                 await store.updateUsage(acc.alias, windows: windows)
                 guard let updated = await store.account(acc.alias) else { continue }
                 refreshedAccounts.append(updated)
