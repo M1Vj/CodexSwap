@@ -61,6 +61,16 @@ public struct WarmupRecord: Codable, Sendable, Equatable {
 
     public func isDue(at now: Date) -> Bool {
         if let retryAfter, retryAfter > now { return false }
+        // A completed command without verification must be retried after its
+        // bounded backoff even if the pre-attempt snapshot carried a stale
+        // future short-window reset. Weekly-only records intentionally retain
+        // their weekly cadence instead of creating a synthetic five-hour retry.
+        if attemptedAt != nil, outcome != .verified {
+            if let primaryResetAt, let secondaryResetAt, primaryResetAt == secondaryResetAt {
+                return primaryResetAt <= now
+            }
+            return true
+        }
         return (primaryResetAt ?? succeededAt.addingTimeInterval(18_000)) <= now
     }
 }

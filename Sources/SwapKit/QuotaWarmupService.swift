@@ -22,16 +22,19 @@ public actor QuotaWarmupService {
     private let runner: any WarmupCommandRunning
     private let ledger: WarmupLedgerStore
     private let failureRetrySeconds: TimeInterval
+    private let unknownRetrySeconds: TimeInterval
     private var isRunning = false
 
     public init(
         runner: any WarmupCommandRunning = ProcessWarmupRunner(),
         ledger: WarmupLedgerStore = WarmupLedgerStore(),
-        failureRetrySeconds: TimeInterval = 300
+        failureRetrySeconds: TimeInterval = 300,
+        unknownRetrySeconds: TimeInterval = 1_800
     ) {
         self.runner = runner
         self.ledger = ledger
         self.failureRetrySeconds = failureRetrySeconds
+        self.unknownRetrySeconds = unknownRetrySeconds
     }
 
     public func run(accounts: [Account], proxyURL: URL, force: Bool = false, now: Date = Date()) async -> WarmupSummary {
@@ -61,7 +64,7 @@ public actor QuotaWarmupService {
                 succeededAt: now,
                 primaryResetAt: attemptDue(for: account, now: now),
                 secondaryResetAt: weeklyReset(account, after: now),
-                retryAfter: now.addingTimeInterval(failureRetrySeconds),
+                retryAfter: now.addingTimeInterval(unknownRetrySeconds),
                 outcome: .unknown,
                 attemptedAt: now
             )
@@ -77,6 +80,7 @@ public actor QuotaWarmupService {
                 // schedule even when the pre-attempt account snapshot had a stale
                 // future reset timestamp.
                 failedRecord.primaryResetAt = now
+                failedRecord.retryAfter = now.addingTimeInterval(failureRetrySeconds)
                 await ledger.setRecord(
                     failedRecord,
                     for: key
@@ -175,14 +179,20 @@ public actor QuotaWarmupService {
             // A missing short window breaks reset-lineage continuity. Clear
             // the prior observation before preserving a weekly-only schedule;
             // the same short reset on a later poll must start at one again.
+            let hadObservedShortReset = record.observedPrimaryResetAt != nil
             record.observedPrimaryResetAt = nil
             record.observedAt = now
             record.stableObservationCount = 0
 
             if let weekly = weeklyReset(account, after: now) {
                 // Preserve the existing weekly-only schedule. Weekly evidence
-                // never verifies a short-window warm-up cycle.
+                // never verifies a short-window warm-up cycle, so a previously
+                // verified short lineage becomes pending if that window vanishes.
                 record.primaryResetAt = weekly
+                record.secondaryResetAt = weekly
+                if hadObservedShortReset || record.outcome == .verified {
+                    record.outcome = .pending
+                }
             } else {
                 // With no usable reset evidence, the cycle is still pending
                 // and must remain due for a bounded catch-up attempt.

@@ -1767,12 +1767,12 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(record?.outcome, .unknown)
         XCTAssertEqual(record?.attemptedAt, now)
         XCTAssertNotNil(record?.retryAfter)
-        let dueBeforeBackoff = await service.hasDueAccount(in: [bare], now: now.addingTimeInterval(299))
+        let dueBeforeBackoff = await service.hasDueAccount(in: [bare], now: now.addingTimeInterval(1_799))
         XCTAssertFalse(dueBeforeBackoff)
 
         var missing = bare
         missing.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)]
-        let afterBackoff = now.addingTimeInterval(301)
+        let afterBackoff = now.addingTimeInterval(1_801)
         await service.updateObservedUsage(for: [missing], now: afterBackoff)
         let pendingRecord = await ledger.record(for: "id-a")
 
@@ -1930,6 +1930,65 @@ final class WarmupEngineTests: XCTestCase {
         let record = await ledger.record(for: "id-a")
         XCTAssertEqual(record?.outcome, .verified)
         XCTAssertEqual(record?.primaryResetAt, reset)
+    }
+
+    func testAutomaticWarmupPollsOnlyEligibleAliasesWhenSmartSwitchIsOff() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-scope-\(UUID().uuidString)")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(9_000)
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "eligible",
+            accountID: "id-eligible",
+            accessToken: freshToken(now: now),
+            priority: 1
+        ))
+        await store.upsert(Account(
+            alias: "unranked",
+            accountID: "id-unranked",
+            accessToken: freshToken(now: now)
+        ))
+        let settingsStore = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let settings = await settingsStore.update {
+            $0.automaticallyWarmAccounts = true
+            $0.smartSwitchEnabled = false
+            $0.warmupExcludedAccounts = ["unranked"]
+        }
+        let usage = ScriptedUsageFetcher(windowsByAccountID: [
+            "id-eligible": [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)],
+            "id-unranked": [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)]
+        ])
+        let runner = FakeWarmupRunner()
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        await ledger.setRecord(
+            WarmupRecord(
+                succeededAt: now.addingTimeInterval(-18_001),
+                primaryResetAt: now.addingTimeInterval(-1),
+                secondaryResetAt: nil,
+                outcome: .unknown,
+                attemptedAt: now.addingTimeInterval(-18_001)
+            ),
+            for: "id-eligible"
+        )
+        let engine = AppEngine(
+            store: store,
+            settingsStore: settingsStore,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(runner: runner, ledger: ledger)
+        )
+
+        let summary = await engine.automaticWarmupTick(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            settings: settings,
+            now: now
+        )
+
+        XCTAssertNil(summary)
+        let usageCalls = await usage.calls()
+        let runnerCalls = await runner.calls()
+        XCTAssertEqual(usageCalls, ["id-eligible"])
+        XCTAssertEqual(runnerCalls, [])
     }
 
     func testManualWarmupRefreshesAllAttemptedAliasesIncludingFailures() async throws {

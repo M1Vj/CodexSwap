@@ -2120,9 +2120,10 @@ public actor AppEngine {
                 // Smart switching needs fresh readings for the whole pool: drain detection
                 // watches accounts CodexSwap itself is not serving, which active-only
                 // polling never sees.
-                // Automatic warm-up needs fresh lineage for every eligible account before
-                // its due check. Poll the whole pool once when that mode is enabled.
-                await self.pollUsage(activeOnly: !settings.smartSwitchEnabled && !settings.automaticallyWarmAccounts)
+                // Keep ordinary polling scoped as before. The automatic tick adds an
+                // alias-filtered refresh for its own eligible candidates when Smart Switch
+                // is off, while a full Smart Switch poll can be reused directly.
+                await self.pollUsage(activeOnly: !settings.smartSwitchEnabled)
                 await self.pollRunningTaskUsage(settings: settings)
                 await self.automationTick()
                 if settings.automaticallyWarmAccounts,
@@ -2130,7 +2131,7 @@ public actor AppEngine {
                     _ = await self.automaticWarmupTick(
                         proxyURL: url,
                         settings: settings,
-                        usageAlreadyRefreshed: true
+                        usageAlreadyRefreshed: settings.smartSwitchEnabled
                     )
                 }
                 await self.emitSnapshot()
