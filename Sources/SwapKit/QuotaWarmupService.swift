@@ -111,16 +111,12 @@ public actor QuotaWarmupService {
             let matchesPrevious = record.observedPrimaryResetAt == reset
             record.observedPrimaryResetAt = reset
             if short?.usedPercent ?? 0 > 0 {
-                record.stableObservationCount = matchesPrevious
-                    ? max(record.stableObservationCount, 1) + 1
-                    : 1
+                record.stableObservationCount = matchesPrevious && record.stableObservationCount > 0 ? 2 : 1
                 record.outcome = .verified
                 record.primaryResetAt = reset
                 record.retryAfter = nil
             } else {
-                record.stableObservationCount = matchesPrevious
-                    ? record.stableObservationCount + 1
-                    : 1
+                record.stableObservationCount = matchesPrevious && record.stableObservationCount > 0 ? 2 : 1
                 if record.stableObservationCount >= 2 {
                     record.outcome = .verified
                     record.primaryResetAt = reset
@@ -134,6 +130,9 @@ public actor QuotaWarmupService {
             // A short window with no future reset is not evidence. Keep the
             // previous scheduler deadline due rather than replacing it with a
             // synthetic five-hour cadence.
+            record.observedPrimaryResetAt = nil
+            record.observedAt = now
+            record.stableObservationCount = 0
             record.outcome = .pending
             keepDue(&record, now: now)
         } else if let weekly = weeklyReset(account, after: now) {

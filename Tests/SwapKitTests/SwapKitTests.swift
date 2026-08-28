@@ -1592,6 +1592,36 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(record?.observedAt, secondPoll)
     }
 
+    func testMissingShortResetBreaksZeroObservationStability() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-pending-missing-reset-\(UUID().uuidString)")
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let service = QuotaWarmupService(runner: FakeWarmupRunner(), ledger: ledger)
+        let stale = Date(timeIntervalSince1970: 1_800_000_000)
+        let firstPoll = stale.addingTimeInterval(18_001)
+        let missingResetPoll = firstPoll.addingTimeInterval(60)
+        let finalPoll = missingResetPoll.addingTimeInterval(60)
+        let reset = finalPoll.addingTimeInterval(9_000)
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        _ = await service.run(accounts: [account("a", now: stale)], proxyURL: proxy, now: stale)
+        var observed = account("a", now: firstPoll)
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        await service.updateObservedUsage(for: [observed], now: firstPoll)
+
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)]
+        await service.updateObservedUsage(for: [observed], now: missingResetPoll)
+
+        observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        await service.updateObservedUsage(for: [observed], now: finalPoll)
+
+        let dueAfterMissingReset = await service.hasDueAccount(in: [observed], now: finalPoll)
+        let record = await ledger.record(for: "id-a")
+        XCTAssertTrue(dueAfterMissingReset)
+        XCTAssertEqual(record?.observedPrimaryResetAt, reset)
+        XCTAssertEqual(record?.stableObservationCount, 1)
+        XCTAssertEqual(record?.outcome, .pending)
+    }
+
     func testFailedAutomaticWarmupBacksOffBeforeRetrying() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-backoff-\(UUID().uuidString)")
         let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
