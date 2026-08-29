@@ -311,7 +311,11 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         accessToken = try c.decodeIfPresent(String.self, forKey: .accessToken) ?? ""
         refreshToken = try c.decodeIfPresent(String.self, forKey: .refreshToken) ?? ""
         idToken = try c.decodeIfPresent(String.self, forKey: .idToken) ?? ""
-        priority = AccountPriority.normalize(try c.decodeIfPresent(Int.self, forKey: .priority) ?? 0)
+        // Persisted ranks are dense ordinals (N…1), so they may exceed the
+        // legacy 0…10 import range when the roster has more than ten accounts.
+        // AccountStore validates/repairs malformed sets at the store boundary;
+        // decoding must not collapse a valid rank before that check runs.
+        priority = try c.decodeIfPresent(Int.self, forKey: .priority) ?? 0
         disabledUntil = try c.decodeIfPresent([String: Date].self, forKey: .disabledUntil) ?? [:]
         needsLogin = try c.decodeIfPresent(Bool.self, forKey: .needsLogin) ?? false
         lastUsedAt = try c.decodeIfPresent(Date.self, forKey: .lastUsedAt)

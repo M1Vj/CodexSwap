@@ -316,6 +316,49 @@ final class AccountStoreArchiveTests: XCTestCase {
         XCTAssertEqual(observedUsage, 1)
     }
 
+    func testStaleMutationCannotReintroduceAliasClearedByAnotherWriter() async throws {
+        let url = temporaryStoreURL("stale-active-clear")
+        let seed = AccountStore(url: url)
+        await seed.upsert(account("gone"))
+        await seed.upsert(account("keep"))
+        _ = await seed.setActive("gone", now: Self.migrationDate)
+
+        let stale = AccountStore(url: url)
+        let latest = AccountStore(url: url)
+        _ = await latest.archive(alias: "gone", now: Self.migrationDate.addingTimeInterval(1))
+
+        // The stale writer mutates a different account. Its old activeAlias must
+        // not be written back after the latest writer cleared the active account.
+        _ = await stale.archive(alias: "keep", now: Self.migrationDate.addingTimeInterval(2))
+
+        XCTAssertNil(try persistedStoreData(at: url).activeAlias)
+        let reloaded = AccountStore(url: url)
+        let activeAlias = await reloaded.activeAlias()
+        XCTAssertNil(activeAlias)
+    }
+
+    func testDenseRankingAboveLegacyPriorityLimitSurvivesRestart() async throws {
+        let url = temporaryStoreURL("dense-ranking-restart")
+        let orderedAliases = [
+            "zeta", "alpha", "mu", "beta", "omega", "gamma", "delta",
+            "epsilon", "theta", "iota", "kappa", "lambda", "nu"
+        ]
+        let store = AccountStore(url: url)
+        for alias in orderedAliases {
+            await store.upsert(account(alias))
+        }
+        await store.applyRanking(orderedAliases)
+
+        let beforeRestart = await store.activeAccounts()
+        XCTAssertEqual(beforeRestart.map(\.alias), orderedAliases)
+        XCTAssertEqual(beforeRestart.map(\.priority), Array(stride(from: orderedAliases.count, through: 1, by: -1)))
+
+        let reloaded = AccountStore(url: url)
+        let reloadedAccounts = await reloaded.activeAccounts()
+        XCTAssertEqual(reloadedAccounts.map(\.alias), orderedAliases)
+        XCTAssertEqual(reloadedAccounts.map(\.priority), Array(stride(from: orderedAliases.count, through: 1, by: -1)))
+    }
+
     func testAutoArchivePersistsClearedActiveAlias() async throws {
         let url = temporaryStoreURL("auto-archive-active")
         let now = Self.migrationDate

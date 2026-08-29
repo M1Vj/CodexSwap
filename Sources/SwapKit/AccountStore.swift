@@ -132,7 +132,11 @@ public actor AccountStore {
         return try? JSONDecoder.codex.decode(StoreData.self, from: raw)
     }
 
-    private func persist(preservingRanking: Bool = true, preservingActiveAlias: Bool = true) {
+    private func persist(
+        preservingRanking: Bool = true,
+        preservingActiveAlias: Bool = true,
+        clearingActiveAliases: Set<String> = []
+    ) {
         let encoder = JSONEncoder.codex
         _ = Self.withStoreLock(url) {
             var snapshot = data
@@ -142,6 +146,11 @@ public actor AccountStore {
                 }
                 if preservingActiveAlias {
                     snapshot.activeAlias = latest.activeAlias
+                }
+                if !clearingActiveAliases.isEmpty {
+                    snapshot.activeAlias = latest.activeAlias.flatMap { activeAlias in
+                        clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
+                    }
                 }
             }
             guard let raw = try? encoder.encode(snapshot) else { return }
@@ -384,7 +393,7 @@ public actor AccountStore {
         }
         guard !archived.isEmpty else { return [] }
         renumberRanks()
-        persist(preservingRanking: false, preservingActiveAlias: false)
+        persist(preservingRanking: false, clearingActiveAliases: Set(dueAliases))
         return archived
     }
 
@@ -645,7 +654,7 @@ public actor AccountStore {
         if drainingObservedAt.removeValue(forKey: alias) != nil { changed = true }
         if changed {
             renumberRanks()
-            persist(preservingRanking: false, preservingActiveAlias: data.activeAlias != nil)
+            persist(preservingRanking: false, clearingActiveAliases: [alias])
         }
         return data.accounts[i]
     }
@@ -940,7 +949,7 @@ public actor AccountStore {
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
         renumberRanks()
-        persist(preservingRanking: false, preservingActiveAlias: false)
+        persist(preservingRanking: false, clearingActiveAliases: [alias])
         return removedTelemetryID
     }
 
@@ -979,7 +988,7 @@ public actor AccountStore {
         drainingAliases.subtract(removed)
         for alias in removed { drainingObservedAt.removeValue(forKey: alias) }
         renumberRanks()
-        persist(preservingRanking: false, preservingActiveAlias: false)
+        persist(preservingRanking: false, clearingActiveAliases: removed)
         return AccountRemovalResult(
             removedAliases: removedAccounts.map(\.alias),
             removedTelemetryIDs: removedAccounts.map(\.telemetryID)
