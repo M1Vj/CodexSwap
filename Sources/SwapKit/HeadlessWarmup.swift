@@ -198,6 +198,10 @@ public enum HeadlessWarmup {
             return skippedStatus(for: reason)
         }
         if summary.skipped["all"] != nil { return .skippedAlreadyRunning }
+        // A runner success is only an attempt until a fresh usage observation
+        // verifies the reset. Keep that state safe and non-terminal in the
+        // headless report rather than claiming warmed or failed.
+        if summary.unverified.contains(account.alias) { return .skipped }
         return .failed
     }
 
