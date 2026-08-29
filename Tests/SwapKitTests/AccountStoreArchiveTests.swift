@@ -27,6 +27,10 @@ final class AccountStoreArchiveTests: XCTestCase {
         )
     }
 
+    private func persistedStoreData(at url: URL) throws -> StoreData {
+        try JSONDecoder.codex.decode(StoreData.self, from: Data(contentsOf: url))
+    }
+
     func testRuntimeStickyAliasIgnoresUsageAndIsNotPersisted() async throws {
         let url = temporaryStoreURL("sticky")
         var first = account("first", priority: 10)
@@ -280,6 +284,79 @@ final class AccountStoreArchiveTests: XCTestCase {
         XCTAssertEqual(migrated.routingPausedAt, futurePause)
         XCTAssertLessThan(migrated.lastUsedAt!, migrated.routingPausedAt!)
         XCTAssertLessThan(migrated.lastServedByUs!, migrated.routingPausedAt!)
+    }
+
+    func testStaleWriterCannotOverwriteRankingOrActiveAlias() async throws {
+        let url = temporaryStoreURL("stale-writer")
+        let first = AccountStore(url: url)
+        await first.upsert(account("alyy2"))
+        await first.upsert(account("xfn"))
+        await first.applyRanking(["alyy2", "xfn"])
+
+        let initialDate = Self.migrationDate
+        _ = await first.setActive("alyy2", now: initialDate)
+
+        // A helper process can load the store before the app applies a manual
+        // reorder. Its later usage write must not restore that stale snapshot.
+        let stale = AccountStore(url: url)
+        await first.applyRanking(["xfn", "alyy2"])
+        _ = await first.setActive("xfn", now: initialDate.addingTimeInterval(1))
+
+        await stale.updateUsage(
+            "alyy2",
+            windows: [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: nil)]
+        )
+
+        let reloaded = AccountStore(url: url)
+        let ranked = await reloaded.activeAccounts().map(\.alias)
+        let activeAlias = await reloaded.activeAlias()
+        let observedUsage = await reloaded.account("alyy2")?.usage.first?.usedPercent
+        XCTAssertEqual(ranked, ["xfn", "alyy2"])
+        XCTAssertEqual(activeAlias, "xfn")
+        XCTAssertEqual(observedUsage, 1)
+    }
+
+    func testAutoArchivePersistsClearedActiveAlias() async throws {
+        let url = temporaryStoreURL("auto-archive-active")
+        let now = Self.migrationDate
+        var paused = account("paused", routingEnabled: false)
+        paused.routingPausedAt = now.addingTimeInterval(-AccountStore.automaticArchiveDelay)
+        let keep = account("keep")
+        let stored = StoreData(schemaVersion: 2, activeAlias: "paused", accounts: [paused, keep])
+        try JSONEncoder.codex.encode(stored).write(to: url)
+
+        let store = AccountStore(url: url, clock: { now })
+        let archived = await store.archiveDueAccounts(now: now)
+        XCTAssertEqual(archived.map(\.alias), ["paused"])
+        XCTAssertNil(try persistedStoreData(at: url).activeAlias)
+    }
+
+    func testRemovalPersistsClearedActiveAlias() async throws {
+        let url = temporaryStoreURL("remove-active")
+        let gone = account("gone", priority: 2)
+        let keep = account("keep", priority: 1)
+        try JSONEncoder.codex.encode(
+            StoreData(schemaVersion: 2, activeAlias: "gone", accounts: [gone, keep])
+        ).write(to: url)
+
+        let store = AccountStore(url: url)
+        _ = await store.remove("gone")
+        XCTAssertNil(try persistedStoreData(at: url).activeAlias)
+    }
+
+    func testManagedReconciliationPersistsClearedActiveAlias() async throws {
+        let url = temporaryStoreURL("reconcile-active")
+        var gone = account("gone", priority: 2)
+        gone.managedHomePath = "/managed/gone"
+        let keep = account("keep", priority: 1)
+        try JSONEncoder.codex.encode(
+            StoreData(schemaVersion: 2, activeAlias: "gone", accounts: [gone, keep])
+        ).write(to: url)
+
+        let store = AccountStore(url: url)
+        let result = await store.reconcileManagedWithTelemetry(present: ["id-keep"])
+        XCTAssertEqual(result.removedAliases, ["gone"])
+        XCTAssertNil(try persistedStoreData(at: url).activeAlias)
     }
 
     func testArchiveIsIdempotentClearsActiveAndDrainStateAndRetainsHistory() async throws {

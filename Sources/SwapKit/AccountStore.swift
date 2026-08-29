@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 struct StoreData: Codable {
     var schemaVersion: Int = 2
@@ -108,7 +113,12 @@ public actor AccountStore {
             loaded.schemaVersion = Self.currentSchemaVersion
             needsMigration = true
         }
-        Self.renumberRanks(&loaded)
+        if !Self.hasDenseActiveRanks(loaded) {
+            // Only repair legacy or malformed rank sets. A valid dense ranking is
+            // user-owned state and must survive every process restart unchanged.
+            Self.renumberRanks(&loaded)
+            needsMigration = true
+        }
         self.data = loaded
         if needsMigration { Self.persist(loaded, to: url) }
     }
@@ -122,10 +132,22 @@ public actor AccountStore {
         return try? JSONDecoder.codex.decode(StoreData.self, from: raw)
     }
 
-    private func persist() {
+    private func persist(preservingRanking: Bool = true, preservingActiveAlias: Bool = true) {
         let encoder = JSONEncoder.codex
-        guard let raw = try? encoder.encode(data) else { return }
-        Self.persist(raw, to: url)
+        _ = Self.withStoreLock(url) {
+            var snapshot = data
+            if let latest = Self.loadFrom(url) {
+                if preservingRanking {
+                    Self.mergePersistedRanking(into: &snapshot, from: latest)
+                }
+                if preservingActiveAlias {
+                    snapshot.activeAlias = latest.activeAlias
+                }
+            }
+            guard let raw = try? encoder.encode(snapshot) else { return }
+            Self.persistUnlocked(raw, to: url)
+            data = snapshot
+        }
     }
 
     private static func persist(_ data: StoreData, to url: URL) {
@@ -135,6 +157,31 @@ public actor AccountStore {
     }
 
     private static func persist(_ raw: Data, to url: URL) {
+        _ = withStoreLock(url) {
+            persistUnlocked(raw, to: url)
+        }
+    }
+
+    /// Serializes every account-store writer across the app and headless helper
+    /// processes. The lock file is a stable 0600 sentinel; the descriptor owns
+    /// the lock lifetime so a crashed process cannot strand it.
+    @discardableResult
+    private static func withStoreLock(_ url: URL, _ body: () -> Void) -> Bool {
+        let fileManager = FileManager.default
+        let dir = url.deletingLastPathComponent()
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let lockURL = dir.appendingPathComponent("." + url.lastPathComponent + ".lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR, mode_t(0o600))
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { return false }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: lockURL.path)
+        body()
+        return true
+    }
+
+    private static func persistUnlocked(_ raw: Data, to url: URL) {
         let fileManager = FileManager.default
         let dir = url.deletingLastPathComponent()
         try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -153,6 +200,27 @@ public actor AccountStore {
         } catch {
             try? fileManager.removeItem(at: tmp)
         }
+    }
+
+    private static func mergePersistedRanking(into local: inout StoreData, from latest: StoreData) {
+        for index in local.accounts.indices {
+            let account = local.accounts[index]
+            let latestAccount = latest.accounts.first {
+                !account.accountID.isEmpty && !$0.accountID.isEmpty && $0.accountID == account.accountID
+            } ?? latest.accounts.first { $0.alias == account.alias }
+            if let latestAccount {
+                local.accounts[index].priority = latestAccount.priority
+            }
+        }
+    }
+
+    private static func hasDenseActiveRanks(_ data: StoreData) -> Bool {
+        let ranks = data.accounts
+            .filter { !$0.isArchived }
+            .map(\.priority)
+        if ranks.isEmpty { return true }
+        guard ranks.count == Set(ranks).count else { return false }
+        return Set(ranks) == Set(1...ranks.count)
     }
 
     // MARK: - Reads
@@ -316,7 +384,7 @@ public actor AccountStore {
         }
         guard !archived.isEmpty else { return [] }
         renumberRanks()
-        persist()
+        persist(preservingRanking: false, preservingActiveAlias: false)
         return archived
     }
 
@@ -458,7 +526,7 @@ public actor AccountStore {
     private func activate(_ alias: String, now: Date) {
         data.activeAlias = alias
         if let i = index(alias) { data.accounts[i].lastUsedAt = now }
-        persist()
+        persist(preservingActiveAlias: false)
     }
 
     public func touchLastUsed(_ alias: String, now: Date = Date()) {
@@ -538,7 +606,7 @@ public actor AccountStore {
         data.accounts[i].routingPausedAt = nil
         data.accounts[i].lastUsedAt = now
         data.activeAlias = alias
-        persist()
+        persist(preservingActiveAlias: false)
         return data.accounts[i]
     }
 
@@ -577,7 +645,7 @@ public actor AccountStore {
         if drainingObservedAt.removeValue(forKey: alias) != nil { changed = true }
         if changed {
             renumberRanks()
-            persist()
+            persist(preservingRanking: false, preservingActiveAlias: data.activeAlias != nil)
         }
         return data.accounts[i]
     }
@@ -600,7 +668,7 @@ public actor AccountStore {
         let minimumRank = activeOthers.map(\.priority).min() ?? 1
         data.accounts[i].priority = minimumRank - 1
         renumberRanks()
-        persist()
+        persist(preservingRanking: false)
         return data.accounts[i]
     }
 
@@ -808,7 +876,7 @@ public actor AccountStore {
                 data.accounts[i].priority = count - position
             }
         }
-        persist()
+        persist(preservingRanking: false)
     }
 
     /// Moves an active account within the priority-sorted ranking and renumbers every rank
@@ -830,7 +898,7 @@ public actor AccountStore {
                 data.accounts[i].priority = count - position
             }
         }
-        persist()
+        persist(preservingRanking: false)
     }
 
     public func setPriority(_ alias: String, priority: Int) {
@@ -839,7 +907,7 @@ public actor AccountStore {
         // ranking stays dense and every rank change stays visible.
         data.accounts[i].priority = max(0, priority)
         renumberRanks()
-        persist()
+        persist(preservingRanking: false)
     }
 
     /// Rewrites active priorities to dense ordinals (N…1), leaving archived records out of
@@ -872,7 +940,7 @@ public actor AccountStore {
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
         renumberRanks()
-        persist()
+        persist(preservingRanking: false, preservingActiveAlias: false)
         return removedTelemetryID
     }
 
@@ -911,7 +979,7 @@ public actor AccountStore {
         drainingAliases.subtract(removed)
         for alias in removed { drainingObservedAt.removeValue(forKey: alias) }
         renumberRanks()
-        persist()
+        persist(preservingRanking: false, preservingActiveAlias: false)
         return AccountRemovalResult(
             removedAliases: removedAccounts.map(\.alias),
             removedTelemetryIDs: removedAccounts.map(\.telemetryID)
@@ -993,7 +1061,7 @@ public actor AccountStore {
             data.accounts[i].priority = minimumRank - 1
         }
         renumberRanks()
-        persist()
+        persist(preservingRanking: false)
         guard let stored = index(account.alias) else { return account }
         return data.accounts[stored]
     }
