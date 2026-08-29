@@ -11,6 +11,20 @@ Run exactly:
 /bin/bash "${CODEX_HOME:-$HOME/.codex}/skills/codexswap-quotas/scripts/check-quotas.sh"
 ```
 
+If the user explicitly asks to “warm and check”, “warm up then check/show
+quotas”, or equivalent, run the combined helper instead:
+
+```bash
+/bin/bash "${CODEX_HOME:-$HOME/.codex}/skills/codexswap-quotas/scripts/warm-and-check.sh"
+```
+
+The combined helper first asks the installed CodexSwap app's `swapd` for
+`warmup --all --json` through its existing loopback proxy, then performs the
+same read-only quota check. Warming consumes a small amount of quota and is
+allowed only for that explicit request; never add it to an ordinary inspection.
+Validate and present both safe sections: warm-up aliases/status/counts/timestamps,
+then the quota report. Do not infer a warm-up success from the quota report.
+
 Treat the helper output as the only quota source. Present every returned account
 alias with its state and plan (or “unknown”), and each returned `5h` or `Weekly`
 window's used and remaining percentages and reset time converted to
@@ -32,8 +46,12 @@ Handle outcomes explicitly:
   for a CodexSwap build/update; do not inspect private files.
 
 Keep this inspection read-only. Never run `swapd usage`, `swapd list`, raw
-account-store/auth reads, account switching, importing, warming, or credit
-consumption. Never redeem a reset credit merely because quota was requested.
+account-store/auth reads, account switching, importing, or credit consumption.
+Never run warming merely because quota was requested, and never redeem a reset
+credit merely because quota was requested. The explicit combined helper is the
+only supported warm-then-check path.
 Never expose email addresses, access/refresh tokens, account IDs, reset-credit
 IDs, authorization data, or raw private JSON; report only the sanitized fields
-listed above.
+or raw private JSON; report only the sanitized fields listed above. For the
+warm-up section, report only aliases, safe status values, counts, and timestamps;
+do not display command errors or stderr.
