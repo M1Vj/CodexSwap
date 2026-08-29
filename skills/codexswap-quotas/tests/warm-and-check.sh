@@ -22,7 +22,7 @@ fixture="$tmp_dir/swapd"
   '    printf '\''%s\n'\'' '\''{"schemaVersion":1,"status":"ok","startedAt":"2026-08-08T00:00:00Z","finishedAt":"2026-08-08T00:00:01Z","accounts":[{"alias":"Account 1","status":"warmed"}],"counts":{"total":1,"warmed":1,"skipped":0,"failed":0}}'\''' \
   '  fi' \
   'elif [ "$1" = quota ]; then' \
-  '  printf '\''%s\n'\'' '\''{"schemaVersion":1,"fetchedAt":"2026-08-08T00:00:01Z","accounts":[{"alias":"Account 1","state":"available","usageStatus":"ok","windows":[{"label":"5h","usedPercent":25,"remainingPercent":75,"resetAt":null}],"resetCreditStatus":"ok","availableResetCredits":0,"earliestResetCreditExpiry":null}]}'\''' \
+  '  printf '\''%s\n'\'' '\''{"schemaVersion":1,"fetchedAt":"2026-08-08T00:00:01Z","accounts":[{"alias":"Account 1","state":"available","usageStatus":"ok","windows":[{"label":"5h","usedPercent":25,"remainingPercent":75,"resetAt":null},{"label":"30d","usedPercent":0,"remainingPercent":100,"resetAt":"2026-09-07T00:00:01Z"}],"resetCreditStatus":"ok","availableResetCredits":0,"earliestResetCreditExpiry":null}]}'\''' \
   'else' \
   '  exit 64' \
   'fi' > "$fixture"
@@ -57,6 +57,7 @@ output="$(PATH="$hostile_path" /bin/bash "$warm_probe" 2>"$stderr_file")"
 [[ ! -s "$stderr_file" ]]
 /usr/bin/grep -Fq '"warmup":' <<< "$output"
 /usr/bin/grep -Fq '"quota":' <<< "$output"
+/usr/bin/grep -Fq '"label":"30d"' <<< "$output"
 
 if raw_output="$(WARM_RAW=1 PATH="$hostile_path" /bin/bash "$warm_probe" 2>"$stderr_file")"; then
   printf '%s\n' 'raw warm-up fixture was accepted' >&2

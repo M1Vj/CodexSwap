@@ -73,7 +73,7 @@ QUOTA_ACCOUNT_ALLOWED = {
 QUOTA_ACCOUNT_REQUIRED = {"alias", "state", "usageStatus", "windows", "resetCreditStatus"}
 WINDOW_ALLOWED = {"label", "usedPercent", "remainingPercent", "resetAt"}
 WINDOW_REQUIRED = {"label", "usedPercent", "remainingPercent"}
-WINDOW_LABELS = {"5h", "Weekly"}
+WINDOW_LABELS = {"5h", "Weekly", "30d"}
 QUOTA_STATES = {"active", "available", "paused", "signInRequired"}
 LOOKUP_STATUSES = {
     "ok",

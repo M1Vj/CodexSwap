@@ -37,7 +37,7 @@ ACCOUNT_ALLOWED = {
 ACCOUNT_REQUIRED = {"alias", "state", "usageStatus", "windows", "resetCreditStatus"}
 WINDOW_ALLOWED = {"label", "usedPercent", "remainingPercent", "resetAt"}
 WINDOW_REQUIRED = {"label", "usedPercent", "remainingPercent"}
-WINDOW_LABELS = {"5h", "Weekly"}
+WINDOW_LABELS = {"5h", "Weekly", "30d"}
 FORBIDDEN_KEY = re.compile(r"email|token|accountid|creditid|authorization|bearer", re.IGNORECASE)
 FORBIDDEN_VALUE = re.compile(
     r"email|token|account[\s_-]*id|credit[\s_-]*id|authorization|bearer",
