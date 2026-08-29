@@ -1177,9 +1177,12 @@ public actor AppEngine {
                 now: now
             )
         }
-        guard await warmupService.hasDueAccount(in: autoCandidates, now: now) else { return nil }
+        let refreshedCandidates = (await warmupCandidates()).filter {
+            Self.autoWarmupEligible($0, settings: currentSettings)
+        }
+        guard await warmupService.hasDueAccount(in: refreshedCandidates, now: now) else { return nil }
         return await performWarmup(
-            candidates: autoCandidates,
+            candidates: refreshedCandidates,
             proxyURL: proxyURL,
             force: false,
             now: now
@@ -1202,7 +1205,10 @@ public actor AppEngine {
             emit(.snapshotChanged)
         }
         let settings = await settingsStore.get()
-        let allowedCandidates = candidates.filter { Self.quotaWarmupEligible($0, settings: settings) }
+        let allowedCandidates = candidates.filter {
+            Self.quotaWarmupEligible($0, settings: settings)
+                && QuotaWarmupService.usageAllowsWarmup($0)
+        }
         var summary = await warmupService.run(accounts: allowedCandidates, proxyURL: proxyURL, force: force, now: now)
         // Refresh every command attempt, including failures. `warmed` is deliberately
         // not used as the target set because a zero exit is only an unverified attempt.

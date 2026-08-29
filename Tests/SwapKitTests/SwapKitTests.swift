@@ -1418,7 +1418,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
             accountID: "id-\(alias)",
             accessToken: "token",
             needsLogin: needsLogin,
-            usage: [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))]
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))]
         )
     }
 
@@ -1897,7 +1897,12 @@ final class WarmupEngineTests: XCTestCase {
     func testManualWarmupForcesRunRefreshesUsageAndPublishesSummary() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-\(UUID().uuidString)")
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
-        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: freshToken(),
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        ))
         let settings = SettingsStore(url: root.appendingPathComponent("settings.json"))
         let runner = FakeWarmupRunner()
         let usage = FakeUsageFetcher()
@@ -2224,6 +2229,7 @@ final class WarmupEngineTests: XCTestCase {
             accessToken: "e30.\(stalePayload).sig",
             refreshToken: "r1",
             needsLogin: true,
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))],
             managedHomePath: home.path
         ))
         let engine = AppEngine(

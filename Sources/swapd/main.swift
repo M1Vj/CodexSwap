@@ -98,6 +98,25 @@ case "quota":
         exit(1)
     }
 
+case "warmup":
+    guard args.count == 3, args[1] == "--all", args[2] == "--json" else {
+        FileHandle.standardError.write(Data("usage: swapd warmup --all --json\n".utf8))
+        exit(64)
+    }
+
+    let report = await HeadlessWarmup.runFromRuntimeHandoff(
+        store: store,
+        settings: loadSettings()
+    )
+    do {
+        let encoded = try HeadlessWarmupReportJSON.encode(report)
+        FileHandle.standardOutput.write(encoded)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    } catch {
+        FileHandle.standardError.write(Data("warmup report failed\n".utf8))
+        exit(1)
+    }
+
 case "priority":
     guard args.count >= 3, let p = Int(args[2]) else { print("usage: swapd priority <alias> <int>"); break }
     guard await store.account(args[1]) != nil else { print("no such account: \(args[1])"); exit(1) }
@@ -161,6 +180,7 @@ func printHelp() {
       list             list accounts, priority, usage, cooldowns
       usage            poll wham/usage for each account
       quota --json     fresh read-only usage/reset-credit status for every account
+      warmup --all --json  force a safe all-account quota warm-up through the running app proxy
       priority <a> <n> set account priority (higher consumed first)
       switch <a>       set active account
       shim             print the codexswap shim script
