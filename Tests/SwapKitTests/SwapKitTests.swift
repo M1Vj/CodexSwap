@@ -2917,6 +2917,27 @@ final class TurnPinningTests: XCTestCase {
         if let selected { await store.releaseRoutingLease(selected.alias) }
     }
 
+    func testPriorityInteractiveSessionsStayOnActiveAccountWhenFirstIsLeasedAtDisplayedHundred() async {
+        let store = AccountStore(
+            url: FileManager.default.temporaryDirectory.appendingPathComponent("priority-interactive-sticky-\(UUID().uuidString).json"),
+            strategy: .priority
+        )
+        await store.upsert(account("a", usedPercent: 100, priority: 10))
+        await store.upsert(account("b", priority: 1))
+        let server = ProxyServer(store: store, settingsProvider: { .default })
+
+        let first = await server.reserveInteractiveAccount(key: "session-a", settings: .default)
+        let second = await server.reserveInteractiveAccount(key: "session-b", settings: .default)
+        let activeAlias = await store.activeAlias()
+
+        XCTAssertEqual(first?.alias, "a")
+        XCTAssertEqual(second?.alias, "a")
+        XCTAssertEqual(activeAlias, "a")
+        if let first { await store.releaseRoutingLease(first.alias) }
+        if let second { await store.releaseRoutingLease(second.alias) }
+        await server.stop()
+    }
+
     func testLunaSelectionPrefersHardRoutableCoolingAccount() async {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("luna-opportunity-\(UUID().uuidString).json"), strategy: .priority)
@@ -2999,17 +3020,19 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(aliases, Set(["a", "b"]))
     }
 
-    func testParallelInteractiveSessionsReserveDistinctAccounts() async {
-        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-interactive-reservation-\(UUID().uuidString).json"), strategy: .priority)
+    func testRoundRobinInteractiveSessionsReserveDistinctAccounts() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("parallel-interactive-reservation-\(UUID().uuidString).json"), strategy: .roundRobin)
         let selector = InteractiveTurnSelector(maxCount: 8, maxAge: 60)
         await store.upsert(account("a", priority: 10))
         await store.upsert(account("b", priority: 1))
 
         async let first = selector.selectAliasWithReservation(for: "session-a") {
-            await store.reserveCurrent(avoidingLeased: true)?.alias
+            _ = await store.advanceRoundRobin()
+            return await store.reserveCurrent(avoidingLeased: true)?.alias
         }
         async let second = selector.selectAliasWithReservation(for: "session-b") {
-            await store.reserveCurrent(avoidingLeased: true)?.alias
+            _ = await store.advanceRoundRobin()
+            return await store.reserveCurrent(avoidingLeased: true)?.alias
         }
         let selections = await [first, second].compactMap { $0 }
 

@@ -779,7 +779,9 @@ public actor ProxyServer {
                 if settings.rotationStrategy == .roundRobin {
                     _ = await store.advanceRoundRobin()
                 }
-                return await store.reserveCurrent(avoidingLeased: true)?.alias
+                return await store.reserveCurrent(
+                    avoidingLeased: settings.rotationStrategy == .roundRobin
+                )?.alias
             }
         ) else { return nil }
 
@@ -798,7 +800,9 @@ public actor ProxyServer {
             await interactiveSelector.bind(key, alias: opportunity.alias, preserving: key)
             return opportunity
         }
-        guard let fallback = await store.reserveCurrent(avoidingLeased: true) else { return nil }
+        guard let fallback = await store.reserveCurrent(
+            avoidingLeased: settings.rotationStrategy == .roundRobin
+        ) else { return nil }
         await interactiveSelector.bind(key, alias: fallback.alias, preserving: key)
         return fallback
     }
