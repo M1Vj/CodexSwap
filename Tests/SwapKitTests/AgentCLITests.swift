@@ -195,6 +195,24 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(reloaded.rotationStrategy, .roundRobin)
     }
 
+    func testSettingsSetAcceptsTypedCaseInsensitiveStrategyAndReportsPersistence() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLISettingsSet-\(UUID().uuidString)", isDirectory: true)
+        let cli = AgentCLI(
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let result = await cli.run(["agent", "settings", "set", "rotationStrategy", "roundrobin", "--json"])
+        XCTAssertEqual(result.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertTrue(result.envelope.ok)
+        guard case .object(let value)? = result.envelope.data else { return XCTFail("missing settings data") }
+        XCTAssertEqual(value["persisted"], .bool(true))
+        XCTAssertEqual(value["restartRequired"], .bool(false))
+        XCTAssertEqual(value["value"], .string("roundRobin"))
+    }
+
     private func accountRows(from data: Data) throws -> [[String: Any]] {
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let payload = try XCTUnwrap(root["data"] as? [String: Any])

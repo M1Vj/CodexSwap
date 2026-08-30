@@ -1482,9 +1482,13 @@ public struct AgentCLI: Sendable {
             guard let integer = Int(raw), range.contains(integer) else { return nil }
             return .integer(integer)
         case .strategy:
-            return RotationStrategy(rawValue: raw.lowercased()).map { .string($0.rawValue) }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return RotationStrategy.allCases.first { $0.rawValue.lowercased() == normalized }
+                .map { .string($0.rawValue) }
         case .exhaustionPolicy:
-            return QuotaExhaustionPolicy(rawValue: raw).map { .string($0.rawValue) }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return QuotaExhaustionPolicy.allCases.first { $0.rawValue.lowercased() == normalized }
+                .map { .string($0.rawValue) }
         }
     }
 
