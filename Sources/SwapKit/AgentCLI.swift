@@ -227,11 +227,15 @@ public struct AgentCLIOptions: Sendable, Equatable {
     public let json: Bool
     public let confirm: Bool
     public let dryRun: Bool
+    /// Optional per-account routing/sticky mode (`--enable`/`--disable`).
+    /// `nil` retains the sticky toggle behavior for backwards-compatible calls.
+    public let accountMode: Bool?
 
-    public init(json: Bool = false, confirm: Bool = false, dryRun: Bool = false) {
+    public init(json: Bool = false, confirm: Bool = false, dryRun: Bool = false, accountMode: Bool? = nil) {
         self.json = json
         self.confirm = confirm
         self.dryRun = dryRun
+        self.accountMode = accountMode
     }
 }
 
@@ -243,7 +247,7 @@ public enum AgentCLIOperation: Sendable, Equatable {
     case accountsImport
     case accountsReconcile
     case accountSwitch(String)
-    case accountSticky(String)
+    case accountSticky(String, desired: Bool?)
     case accountRouting(String, enabled: Bool)
     case accountRank(String, rank: Int)
     case accountArchive(String)
@@ -328,12 +332,19 @@ public enum AgentCLIParser {
         var json = false
         var confirm = false
         var dryRun = false
+        var accountMode: Bool?
 
         for argument in arguments.dropFirst() {
             switch argument {
             case "--json": json = true
             case "--confirm": confirm = true
             case "--dry-run": dryRun = true
+            case "--enable", "--on":
+                guard accountMode == nil else { throw AgentCLIParseError.invalidFlag }
+                accountMode = true
+            case "--disable", "--off":
+                guard accountMode == nil else { throw AgentCLIParseError.invalidFlag }
+                accountMode = false
             case "--help", "-h": positional.append("help")
             case let value where value.hasPrefix("-"): throw AgentCLIParseError.invalidFlag
             default: positional.append(argument)
@@ -360,6 +371,9 @@ public enum AgentCLIParser {
             case "show": guard rest.count == 1 else { throw rest.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }; operation = .accountsShow(rest[0])
             case "import": guard rest.isEmpty else { throw AgentCLIParseError.invalidArgument }; operation = .accountsImport
             case "reconcile": guard rest.isEmpty else { throw AgentCLIParseError.invalidArgument }; operation = .accountsReconcile
+            case "archive": guard rest.count == 1 else { throw rest.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }; operation = .accountArchive(rest[0])
+            case "restore": guard rest.count == 1 else { throw rest.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }; operation = .accountRestore(rest[0])
+            case "remove": guard rest.count == 1 else { throw rest.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }; operation = .accountRemove(rest[0])
             default: throw AgentCLIParseError.unknownCommand
             }
         case "account":
@@ -371,9 +385,13 @@ public enum AgentCLIParser {
                 operation = .accountSwitch(rest[0])
             case "sticky":
                 guard rest.count == 1 else { throw rest.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
-                operation = .accountSticky(rest[0])
+                operation = .accountSticky(rest[0], desired: accountMode)
             case "routing":
-                guard rest.count == 2 else { throw rest.count < 2 ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
+                if rest.count == 1, let accountMode {
+                    operation = .accountRouting(rest[0], enabled: accountMode)
+                    break
+                }
+                guard rest.count == 2, accountMode == nil else { throw rest.count < 2 ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
                 let first = rest[0].lowercased()
                 let second = rest[1].lowercased()
                 if ["enable", "on"].contains(first) {
@@ -441,7 +459,7 @@ public enum AgentCLIParser {
             throw AgentCLIParseError.unknownCommand
         }
 
-        let options = AgentCLIOptions(json: json, confirm: confirm, dryRun: dryRun)
+        let options = AgentCLIOptions(json: json, confirm: confirm, dryRun: dryRun, accountMode: accountMode)
         try validateOptions(options, operation: operation)
         return AgentCLICommand(operation: operation, options: options)
     }
@@ -463,6 +481,12 @@ public enum AgentCLIParser {
         }
         if options.confirm && !supportsConfirm { throw AgentCLIParseError.unsupportedFlag }
         if options.dryRun && !supportsDryRun { throw AgentCLIParseError.unsupportedFlag }
+        if options.accountMode != nil {
+            switch operation {
+            case .accountSticky, .accountRouting: break
+            default: throw AgentCLIParseError.unsupportedFlag
+            }
+        }
     }
 }
 
@@ -630,8 +654,8 @@ public struct AgentCLI: Sendable {
             return await accountsReconcile(command)
         case .accountSwitch(let target):
             return await accountSwitch(target: target, command: command)
-        case .accountSticky(let target):
-            return await accountSticky(target: target, command: command)
+        case .accountSticky(let target, let desired):
+            return await accountSticky(target: target, desired: desired, command: command)
         case .accountRouting(let target, let enabled):
             return await accountRouting(target: target, enabled: enabled, command: command)
         case .accountRank(let target, let rank):
@@ -898,15 +922,22 @@ public struct AgentCLI: Sendable {
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
     }
 
-    private func accountSticky(target: String, command: AgentCLICommand) async -> AgentCLIResult {
+    private func accountSticky(target: String, desired: Bool?, command: AgentCLICommand) async -> AgentCLIResult {
         let accountRoster = await roster()
         guard let entry = accountRoster.resolve(target) else { return missingAccount(command: command.canonicalName) }
         if command.options.dryRun {
             let currentlySticky = await store.stickyAlias() == entry.account.alias
-            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["wouldSetSticky": .bool(!currentlySticky), "ref": .string(entry.reference)])), exitCode: .ok)
+            let next = desired ?? !currentlySticky
+            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["wouldSetSticky": .bool(next), "ref": .string(entry.reference)])), exitCode: .ok)
         }
         let wasSticky = await store.stickyAlias() == entry.account.alias
-        await engine.toggleStickyAccount(entry.account.alias)
+        if let desired {
+            if desired != wasSticky {
+                await engine.toggleStickyAccount(entry.account.alias)
+            }
+        } else {
+            await engine.toggleStickyAccount(entry.account.alias)
+        }
         let isSticky = await store.stickyAlias() == entry.account.alias
         guard wasSticky != isSticky || wasSticky else {
             return AgentCLIResult(envelope: .failure(command: command.canonicalName, code: "account_not_eligible", message: "account is not eligible for sticky routing"), exitCode: .data)
