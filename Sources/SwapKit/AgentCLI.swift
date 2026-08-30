@@ -1,7 +1,5 @@
 import Foundation
-#if canImport(CryptoKit)
 import CryptoKit
-#endif
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -744,16 +742,10 @@ public struct AgentCLI: Sendable {
         // telemetryID is a local random identifier, not an upstream account ID.
         // Never expose even a prefix of it: refs are one-way, deterministic
         // handles that remain stable across rank changes and CLI processes.
-        #if canImport(CryptoKit)
         let domainSeparated = Data("CodexSwap agent account ref v1:\(account.telemetryID.uuidString.lowercased())".utf8)
         let digest = SHA256.hash(data: domainSeparated)
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return "acct-\(String(hex.prefix(16)))"
-        #else
-        // CodexSwap is a macOS target (where CryptoKit is available). Keep a
-        // non-sensitive fallback for source builds on platforms without it.
-        return "acct-opaque-\(String(account.telemetryID.uuidString.hashValue, radix: 16))"
-        #endif
     }
 
     private static func looksLikeReference(_ value: String) -> Bool {
