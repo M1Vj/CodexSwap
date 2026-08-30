@@ -259,12 +259,13 @@ public actor QuotaWarmupService {
     /// Returns whether an account has a usable, current-looking quota snapshot
     /// that is safe to spend a warm-up request against. A short window is
     /// required because weekly-only or empty observations cannot establish the
-    /// five-hour budget. Every reported window must be exactly zero; unknown or
-    /// non-zero readings fail closed.
+    /// five-hour budget. Every short window must be exactly zero; unknown or
+    /// non-zero short-window readings fail closed. Weekly usage does not block
+    /// restarting a fresh short window.
     public nonisolated static func usageAllowsWarmup(_ account: Account) -> Bool {
         let shortWindows = account.usage.filter { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
         guard !shortWindows.isEmpty else { return false }
-        return account.usage.allSatisfy { $0.usedPercent == 0 }
+        return shortWindows.allSatisfy { $0.usedPercent == 0 }
     }
 }
 

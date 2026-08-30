@@ -23,6 +23,21 @@ final class WarmupQuotaGateTests: XCTestCase {
         XCTAssertTrue(QuotaWarmupService.usageAllowsWarmup(zero))
     }
 
+    func testWarmupEligibilityIgnoresNonzeroWeeklyUsageWhenShortWindowIsCurrentAndZero() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = Account(
+            alias: "weekly-used",
+            accountID: "id-weekly-used",
+            accessToken: "token",
+            usage: [
+                UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000)),
+                UsageWindow(label: "Weekly", usedPercent: 16, windowSeconds: 604_800, resetAt: now.addingTimeInterval(604_800)),
+            ]
+        )
+
+        XCTAssertTrue(QuotaWarmupService.usageAllowsWarmup(account))
+    }
+
     func testWarmupEligibilityFailsClosedForEmptyAndWeeklyOnlyUsage() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let empty = Account(alias: "empty", accountID: "id-empty", accessToken: "token")
