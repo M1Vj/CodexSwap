@@ -17,6 +17,7 @@ let args = Array(CommandLine.arguments.dropFirst())
 let command = args.first ?? "help"
 
 let store = AccountStore(url: AppPaths.storeFile(), strategy: loadSettings().rotationStrategy)
+let settingsStore = SettingsStore(url: AppPaths.settingsFile())
 // Reconcile local pause deadlines before any command can perform quota or usage
 // network work. Archived records remain in the store for historical settings views.
 _ = await store.archiveDueAccounts()
@@ -25,6 +26,18 @@ _ = await store.archiveDueAccounts()
 let verboseEnabled = ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
 
 switch command {
+case "agent":
+    let cli = AgentCLI(
+        store: store,
+        settingsStore: settingsStore,
+        supportDir: AppPaths.supportDir(),
+        runtimeURLProvider: RuntimeHandoff.readProxyURL
+    )
+    let result = await cli.run(args)
+    FileHandle.standardOutput.write(result.encoded)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    exit(Int32(result.exitCode))
+
 case "import":
     let importer = AccountImporter.self
     var added = 0
