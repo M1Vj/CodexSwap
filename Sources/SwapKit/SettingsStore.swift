@@ -23,6 +23,7 @@ public enum SettingsStoreError: Error, LocalizedError, Sendable, Equatable {
 public actor SettingsStore {
     private let url: URL
     private var value: Settings
+    private var persistedModificationDate: Date?
 
     public init(url: URL = AppPaths.settingsFile()) {
         self.url = url
@@ -31,12 +32,17 @@ public actor SettingsStore {
         } else {
             self.value = .default
         }
+        self.persistedModificationDate = Self.modificationDate(for: url)
     }
 
-    public func get() -> Settings { value }
+    public func get() -> Settings {
+        reloadExternalStateIfNeeded()
+        return value
+    }
 
     public func metadataTelemetryEnabled() -> Bool {
-        value.metadataTelemetryEnabled
+        reloadExternalStateIfNeeded()
+        return value.metadataTelemetryEnabled
     }
 
     @discardableResult
@@ -54,6 +60,7 @@ public actor SettingsStore {
     }
 
     public func update(_ mutate: @Sendable (inout Settings) -> Void) -> Settings {
+        reloadExternalStateIfNeeded()
         var copy = value
         mutate(&copy)
         value = copy
@@ -64,6 +71,7 @@ public actor SettingsStore {
     /// Persists a settings change and updates the actor cache only after the
     /// atomic write can be read back and decoded as the requested value.
     public func updatePersisting(_ mutate: @Sendable (inout Settings) -> Void) throws -> Settings {
+        reloadExternalStateIfNeeded()
         var copy = value
         mutate(&copy)
         let encoder = JSONEncoder()
@@ -92,7 +100,21 @@ public actor SettingsStore {
             throw SettingsStoreError.verificationFailed
         }
         value = copy
+        persistedModificationDate = Self.modificationDate(for: url)
         return copy
+    }
+
+    private func reloadExternalStateIfNeeded() {
+        let currentDate = Self.modificationDate(for: url)
+        guard currentDate != persistedModificationDate,
+              let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode(Settings.self, from: data) else { return }
+        value = decoded
+        persistedModificationDate = currentDate
+    }
+
+    private static func modificationDate(for url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
     }
 
     private func persist() {
@@ -101,5 +123,6 @@ public actor SettingsStore {
         guard let data = try? encoder.encode(value) else { return }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? data.write(to: url, options: .atomic)
+        persistedModificationDate = Self.modificationDate(for: url)
     }
 }

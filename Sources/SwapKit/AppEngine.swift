@@ -579,6 +579,16 @@ public actor AppEngine {
         publish: (@Sendable () async -> Void)? = nil
     ) async {
         await publish?()
+        // SettingsStore is shared with the agent CLI. Keep the live engine's
+        // actor caches in step with an external update instead of waiting for
+        // a process restart (the proxy also reads SettingsStore per request).
+        if previous.rotationStrategy != current.rotationStrategy {
+            await store.setStrategy(current.rotationStrategy)
+        }
+        if previous.metadataTelemetryEnabled != current.metadataTelemetryEnabled {
+            await telemetry.setEnabled(current.metadataTelemetryEnabled)
+            if !current.metadataTelemetryEnabled { await telemetry.prune() }
+        }
         let smartSwitchChanged = previous.smartSwitchEnabled != current.smartSwitchEnabled
         if smartSwitchChanged {
             if current.smartSwitchEnabled {

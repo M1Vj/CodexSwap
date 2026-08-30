@@ -759,6 +759,10 @@ public actor ProxyServer {
 
     func reserveInteractiveAccount(key: String, settings: Settings, requestModel: String = "other") async -> Account? {
         let store = self.store
+        // An agent CLI process can update rotationStrategy while the live app
+        // remains running. Apply the freshly loaded setting before any actor
+        // selection so the next request observes it.
+        await store.setStrategy(settings.rotationStrategy)
         if await store.stickyAlias() != nil,
            let held = await store.reserveCurrent(avoidingLeased: true) {
             await interactiveSelector.bind(key, alias: held.alias, preserving: key)
@@ -811,6 +815,7 @@ public actor ProxyServer {
     /// requests use `reserveInteractiveAccount` so selection and leasing stay atomic.
     func selectInteractiveAccount(key: String, settings: Settings) async -> Account? {
         let store = self.store
+        await store.setStrategy(settings.rotationStrategy)
         let alias = await interactiveSelector.selectAlias(for: key) {
             if settings.rotationStrategy == .roundRobin {
                 _ = await store.advanceRoundRobin()

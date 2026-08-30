@@ -31,7 +31,7 @@ final class AccountStoreArchiveTests: XCTestCase {
         try JSONDecoder.codex.decode(StoreData.self, from: Data(contentsOf: url))
     }
 
-    func testRuntimeStickyAliasIgnoresUsageAndIsNotPersisted() async throws {
+    func testRuntimeStickyAliasIgnoresUsageAndPersistsForLiveAppHandoff() async throws {
         let url = temporaryStoreURL("sticky")
         var first = account("first", priority: 10)
         first.usage = [UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: nil)]
@@ -57,7 +57,7 @@ final class AccountStoreArchiveTests: XCTestCase {
 
         let reloaded = AccountStore(url: url)
         let reloadedStickyAlias = await reloaded.stickyAlias()
-        XCTAssertNil(reloadedStickyAlias)
+        XCTAssertEqual(reloadedStickyAlias, "first")
     }
 
     func testUsageLimitClearsRuntimeStickyAlias() async throws {

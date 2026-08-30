@@ -8,15 +8,20 @@ import Glibc
 struct StoreData: Codable {
     var schemaVersion: Int = 2
     var activeAlias: String?
+    /// Persisted control-plane sticky selection.  The menu UI still treats the
+    /// value as runtime state, but persisting it lets a separate agent CLI
+    /// process hand the selection to the live app safely.
+    var stickyAlias: String?
     var accounts: [Account] = []
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, activeAlias, accounts
+        case schemaVersion, activeAlias, stickyAlias, accounts
     }
 
-    init(schemaVersion: Int = 2, activeAlias: String? = nil, accounts: [Account] = []) {
+    init(schemaVersion: Int = 2, activeAlias: String? = nil, stickyAlias: String? = nil, accounts: [Account] = []) {
         self.schemaVersion = schemaVersion
         self.activeAlias = activeAlias
+        self.stickyAlias = stickyAlias
         self.accounts = accounts
     }
 
@@ -25,6 +30,7 @@ struct StoreData: Codable {
         // A missing version identifies the original account store format.
         schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         activeAlias = try c.decodeIfPresent(String.self, forKey: .activeAlias)
+        stickyAlias = try c.decodeIfPresent(String.self, forKey: .stickyAlias)
         accounts = try c.decodeIfPresent([Account].self, forKey: .accounts) ?? []
     }
 }
@@ -48,6 +54,7 @@ public actor AccountStore {
     private let url: URL
     private let clock: @Sendable () -> Date
     private var data: StoreData
+    private var persistedModificationDate: Date?
     public private(set) var strategy: RotationStrategy
     /// Aliases currently assessed as draining from other users' activity (smart switch).
     private var drainingAliases: Set<String> = []
@@ -120,10 +127,31 @@ public actor AccountStore {
             needsMigration = true
         }
         self.data = loaded
+        self.persistedModificationDate = Self.modificationDate(for: url)
+        self.stickyAliasRuntime = loaded.stickyAlias
         if needsMigration { Self.persist(loaded, to: url) }
     }
 
-    public func setStrategy(_ s: RotationStrategy) { strategy = s }
+    public func setStrategy(_ s: RotationStrategy) {
+        refreshExternalStateIfNeeded()
+        strategy = s
+    }
+
+    /// Picks up account/routing/sticky changes made by another CodexSwap
+    /// process (notably the agent CLI) without disturbing in-memory leases.
+    /// AccountStore remains the sole writer; this is a read-side handoff.
+    private func refreshExternalStateIfNeeded() {
+        let currentDate = Self.modificationDate(for: url)
+        guard currentDate != persistedModificationDate,
+              let loaded = Self.loadFrom(url) else { return }
+        data = loaded
+        persistedModificationDate = currentDate
+        stickyAliasRuntime = loaded.stickyAlias
+    }
+
+    private static func modificationDate(for url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+    }
 
     // MARK: - Persistence
 
@@ -135,6 +163,7 @@ public actor AccountStore {
     private func persist(
         preservingRanking: Bool = true,
         preservingActiveAlias: Bool = true,
+        preservingStickyAlias: Bool = true,
         clearingActiveAliases: Set<String> = []
     ) {
         let encoder = JSONEncoder.codex
@@ -147,6 +176,9 @@ public actor AccountStore {
                 if preservingActiveAlias {
                     snapshot.activeAlias = latest.activeAlias
                 }
+                if preservingStickyAlias {
+                    snapshot.stickyAlias = latest.stickyAlias
+                }
                 if !clearingActiveAliases.isEmpty {
                     snapshot.activeAlias = latest.activeAlias.flatMap { activeAlias in
                         clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
@@ -156,6 +188,7 @@ public actor AccountStore {
             guard let raw = try? encoder.encode(snapshot) else { return }
             Self.persistUnlocked(raw, to: url)
             data = snapshot
+            persistedModificationDate = Self.modificationDate(for: url)
         }
     }
 
@@ -234,34 +267,52 @@ public actor AccountStore {
 
     // MARK: - Reads
 
-    public func all() -> [Account] { data.accounts }
-    public func activeAlias() -> String? { data.activeAlias }
-    public func stickyAlias() -> String? { stickyAliasRuntime }
-    public func currentDrainingHoldAlias() -> String? { drainingHoldAlias }
-    public func account(_ alias: String) -> Account? { data.accounts.first { $0.alias == alias } }
+    public func all() -> [Account] { refreshExternalStateIfNeeded(); return data.accounts }
+    public func activeAlias() -> String? { refreshExternalStateIfNeeded(); return data.activeAlias }
+    public func stickyAlias() -> String? { refreshExternalStateIfNeeded(); return stickyAliasRuntime }
+    public func currentDrainingHoldAlias() -> String? { refreshExternalStateIfNeeded(); return drainingHoldAlias }
+    public func account(_ alias: String) -> Account? { refreshExternalStateIfNeeded(); return data.accounts.first { $0.alias == alias } }
 
-    /// Toggles the runtime-only menu hold. A held account remains selected while
-    /// it is hard-eligible, regardless of displayed usage or in-flight leases.
+    /// Toggles the menu hold. A held account remains selected while it is
+    /// hard-eligible, regardless of displayed usage or in-flight leases. The
+    /// selected alias is persisted so a separate agent process can hand the
+    /// preference to the live app.
     @discardableResult
     public func toggleStickyAlias(_ alias: String, now: Date = Date()) -> Bool {
+        refreshExternalStateIfNeeded()
         if stickyAliasRuntime == alias {
             stickyAliasRuntime = nil
+            data.stickyAlias = nil
+            persist(preservingStickyAlias: false)
             return true
         }
         guard let selected = account(alias), selected.isEligible(now: now) else { return false }
         stickyAliasRuntime = alias
-        activate(alias, now: now)
+        data.stickyAlias = alias
+        activate(alias, now: now, preservingStickyAlias: false)
         return true
     }
 
-    private func clearStickyIfNeeded(_ alias: String) {
-        if stickyAliasRuntime == alias { stickyAliasRuntime = nil }
+    @discardableResult
+    private func clearStickyIfNeeded(_ alias: String) -> Bool {
+        if stickyAliasRuntime == alias {
+            stickyAliasRuntime = nil
+            data.stickyAlias = nil
+            return true
+        }
+        if data.stickyAlias == alias {
+            data.stickyAlias = nil
+            return true
+        }
+        return false
     }
 
-    private func clearRuntimeHolds(_ alias: String) {
-        clearStickyIfNeeded(alias)
+    @discardableResult
+    private func clearRuntimeHolds(_ alias: String) -> Bool {
+        let stickyCleared = clearStickyIfNeeded(alias)
         if drainingHoldAlias == alias { drainingHoldAlias = nil }
         lunaRejectedUntil.removeValue(forKey: alias)
+        return stickyCleared
     }
 
     public func reserveLunaOpportunity(excluding alias: String? = nil, now: Date = Date()) -> Account? {
@@ -368,6 +419,7 @@ public actor AccountStore {
     /// used. Deferred accounts retain their pause timestamp unchanged.
     @discardableResult
     public func archiveDueAccounts(now: Date? = nil, leasedAliases: Set<String>? = nil) -> [Account] {
+        refreshExternalStateIfNeeded()
         let timestamp = now ?? clock()
         let leases = leasedAliases ?? routingLeaseAliases()
         let dueAliases = data.accounts.compactMap { account -> String? in
@@ -393,20 +445,22 @@ public actor AccountStore {
         }
         guard !archived.isEmpty else { return [] }
         renumberRanks()
-        persist(preservingRanking: false, clearingActiveAliases: Set(dueAliases))
+        persist(preservingRanking: false, preservingStickyAlias: false, clearingActiveAliases: Set(dueAliases))
         return archived
     }
 
     /// Accounts in the operational roster, in their dense visible rank order.
     /// Routing-paused accounts remain active until they are explicitly archived.
     public func activeAccounts() -> [Account] {
-        rankedAccounts(data.accounts.filter { !$0.isArchived })
+        refreshExternalStateIfNeeded()
+        return rankedAccounts(data.accounts.filter { !$0.isArchived })
     }
 
     /// Accounts retained for history and ownership, excluded from all active
     /// routing and quota consumers.
     public func archivedAccounts() -> [Account] {
-        data.accounts
+        refreshExternalStateIfNeeded()
+        return data.accounts
             .filter(\.isArchived)
             .sorted {
                 switch ($0.archivedAt, $1.archivedAt) {
@@ -485,12 +539,18 @@ public actor AccountStore {
     /// New requests can avoid accounts that already have in-flight routed work so parallel
     /// clients do not pile onto one account before upstream quota can react.
     public func current(now: Date = Date(), avoidingLeased: Bool = false) -> Account? {
+        refreshExternalStateIfNeeded()
         if let stickyAliasRuntime {
             if let sticky = account(stickyAliasRuntime), sticky.isEligible(now: now) {
                 if data.activeAlias != sticky.alias { activate(sticky.alias, now: now) }
                 return sticky
             } else {
                 self.stickyAliasRuntime = nil
+                data.stickyAlias = nil
+                // Clearing an invalid sticky is an explicit control-plane
+                // mutation. Do not merge a stale value from another process
+                // back into the file while persisting the clear.
+                persist(preservingStickyAlias: false)
             }
         }
         if let drainingHoldAlias {
@@ -532,13 +592,15 @@ public actor AccountStore {
         }
     }
 
-    private func activate(_ alias: String, now: Date) {
+    private func activate(_ alias: String, now: Date, preservingStickyAlias: Bool = true) {
+        refreshExternalStateIfNeeded()
         data.activeAlias = alias
         if let i = index(alias) { data.accounts[i].lastUsedAt = now }
-        persist(preservingActiveAlias: false)
+        persist(preservingActiveAlias: false, preservingStickyAlias: preservingStickyAlias)
     }
 
     public func touchLastUsed(_ alias: String, now: Date = Date()) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         data.accounts[i].lastUsedAt = now
         persist()
@@ -558,6 +620,7 @@ public actor AccountStore {
 
     /// Disable `alias` for `limit` until `resetAt`, then pick the next eligible account.
     public func rotateFrom(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) -> RotationResult {
+        refreshExternalStateIfNeeded()
         clearRuntimeHolds(alias)
         if let i = index(alias) {
             let until = resetAt ?? now.addingTimeInterval(fallbackCooldown)
@@ -570,28 +633,34 @@ public actor AccountStore {
         case .roundRobin:
             next = eligibleOrdered(now: now, excluding: alias).first
         }
-        guard let picked = next else { persist(); return RotationResult(next: nil, rotated: false) }
-        activate(picked.alias, now: now)
+        guard let picked = next else {
+            persist(preservingStickyAlias: false)
+            return RotationResult(next: nil, rotated: false)
+        }
+        activate(picked.alias, now: now, preservingStickyAlias: false)
         return RotationResult(next: account(picked.alias), rotated: true)
     }
 
     public func markLimited(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         clearRuntimeHolds(alias)
         data.accounts[i].disabledUntil[limit] = resetAt ?? now.addingTimeInterval(fallbackCooldown)
-        persist()
+        persist(preservingStickyAlias: false)
     }
 
     public func markNeedsLoginOnly(_ alias: String) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         clearRuntimeHolds(alias)
         data.accounts[i].needsLogin = true
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
-        persist()
+        persist(preservingStickyAlias: false)
     }
 
     public func markNeedsLogin(_ alias: String, now: Date = Date()) -> RotationResult {
+        refreshExternalStateIfNeeded()
         clearRuntimeHolds(alias)
         if let i = index(alias) { data.accounts[i].needsLogin = true }
         drainingAliases.remove(alias)
@@ -601,14 +670,18 @@ public actor AccountStore {
         case .priority: next = eligibleSorted(now: now).first { $0.alias != alias }
         case .roundRobin: next = eligibleOrdered(now: now, excluding: alias).first
         }
-        guard let picked = next else { persist(); return RotationResult(next: nil, rotated: false) }
-        activate(picked.alias, now: now)
+        guard let picked = next else {
+            persist(preservingStickyAlias: false)
+            return RotationResult(next: nil, rotated: false)
+        }
+        activate(picked.alias, now: now, preservingStickyAlias: false)
         return RotationResult(next: account(picked.alias), rotated: true)
     }
 
     /// Manual switch: clears the target's cooldowns and needs-login, then activates it.
     @discardableResult
     public func setActive(_ alias: String, now: Date = Date()) -> Account? {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias), data.accounts[i].routingEnabled, !data.accounts[i].isArchived else { return nil }
         data.accounts[i].disabledUntil = [:]
         data.accounts[i].needsLogin = false
@@ -623,6 +696,7 @@ public actor AccountStore {
     /// usage history, and user preferences. Repeating the operation is a no-op.
     @discardableResult
     public func archive(alias: String, now: Date? = nil) -> Account? {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return nil }
         var changed = false
         if !data.accounts[i].isArchived {
@@ -649,12 +723,12 @@ public actor AccountStore {
             data.activeAlias = nil
             changed = true
         }
-        clearRuntimeHolds(alias)
+        let stickyCleared = clearRuntimeHolds(alias)
         if drainingAliases.remove(alias) != nil { changed = true }
         if drainingObservedAt.removeValue(forKey: alias) != nil { changed = true }
-        if changed {
+        if changed || stickyCleared {
             renumberRanks()
-            persist(preservingRanking: false, clearingActiveAliases: [alias])
+            persist(preservingRanking: false, preservingStickyAlias: false, clearingActiveAliases: [alias])
         }
         return data.accounts[i]
     }
@@ -663,6 +737,7 @@ public actor AccountStore {
     /// until the owner explicitly enables routing. Repeating restore is a no-op.
     @discardableResult
     public func restore(alias: String, now: Date? = nil) -> Account? {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return nil }
         guard data.accounts[i].isArchived else { return data.accounts[i] }
 
@@ -876,6 +951,7 @@ public actor AccountStore {
     /// Applies a complete ranking (top first) to the active roster. Archived accounts
     /// are intentionally outside this visible rank sequence.
     public func applyRanking(_ orderedAliases: [String]) {
+        refreshExternalStateIfNeeded()
         let activeAliases = Set(data.accounts.filter { !$0.isArchived }.map(\.alias))
         guard orderedAliases.count == activeAliases.count,
               Set(orderedAliases) == activeAliases else { return }
@@ -891,6 +967,7 @@ public actor AccountStore {
     /// Moves an active account within the priority-sorted ranking and renumbers every rank
     /// densely so the change is always visible. `toIndex` is a position where 0 is top.
     public func reorderAccount(_ alias: String, toIndex target: Int) {
+        refreshExternalStateIfNeeded()
         let ranked = data.accounts
             .filter { !$0.isArchived }
             .sorted { Self.selectionOrder($0, $1, strategy: .priority) }
@@ -911,6 +988,7 @@ public actor AccountStore {
     }
 
     public func setPriority(_ alias: String, priority: Int) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         // Legacy numeric setter: keep the value in a sane range, then renumber so the
         // ranking stays dense and every rank change stays visible.
@@ -942,6 +1020,7 @@ public actor AccountStore {
 
     @discardableResult
     public func remove(_ alias: String) -> UUID? {
+        refreshExternalStateIfNeeded()
         let removedTelemetryID = data.accounts.first(where: { $0.alias == alias })?.telemetryID
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
@@ -949,7 +1028,7 @@ public actor AccountStore {
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
         renumberRanks()
-        persist(preservingRanking: false, clearingActiveAliases: [alias])
+        persist(preservingRanking: false, preservingStickyAlias: false, clearingActiveAliases: [alias])
         return removedTelemetryID
     }
 
@@ -975,6 +1054,7 @@ public actor AccountStore {
     /// subsequent scoped purge. Non-managed accounts are intentionally left untouched.
     @discardableResult
     public func reconcileManagedWithTelemetry(present: Set<String>) -> AccountRemovalResult {
+        refreshExternalStateIfNeeded()
         let removedAccounts = data.accounts.filter {
             $0.managedHomePath != nil && !present.contains($0.accountID)
         }
@@ -982,13 +1062,20 @@ public actor AccountStore {
         let removed = Set(removedAccounts.map(\.alias))
         data.accounts.removeAll { removed.contains($0.alias) }
         if let active = data.activeAlias, removed.contains(active) { data.activeAlias = nil }
-        if let stickyAliasRuntime, removed.contains(stickyAliasRuntime) { self.stickyAliasRuntime = nil }
+        if let stickyAliasRuntime, removed.contains(stickyAliasRuntime) {
+            self.stickyAliasRuntime = nil
+            data.stickyAlias = nil
+        }
+        if let stickyAlias = data.stickyAlias, removed.contains(stickyAlias) {
+            data.stickyAlias = nil
+            stickyAliasRuntime = nil
+        }
         if let drainingHoldAlias, removed.contains(drainingHoldAlias) { self.drainingHoldAlias = nil }
         for alias in removed { lunaRejectedUntil.removeValue(forKey: alias) }
         drainingAliases.subtract(removed)
         for alias in removed { drainingObservedAt.removeValue(forKey: alias) }
         renumberRanks()
-        persist(preservingRanking: false, clearingActiveAliases: removed)
+        persist(preservingRanking: false, preservingStickyAlias: false, clearingActiveAliases: removed)
         return AccountRemovalResult(
             removedAliases: removedAccounts.map(\.alias),
             removedTelemetryIDs: removedAccounts.map(\.telemetryID)
@@ -998,6 +1085,7 @@ public actor AccountStore {
     /// Insert or update an account keyed by accountID (falling back to alias). Preserves priority on update.
     @discardableResult
     public func upsert(_ account: Account) -> Account {
+        refreshExternalStateIfNeeded()
         var account = account
         account.priority = AccountPriority.normalize(account.priority)
         if let i = data.accounts.firstIndex(where: { !$0.accountID.isEmpty && $0.accountID == account.accountID })
@@ -1076,6 +1164,7 @@ public actor AccountStore {
     }
 
     public func expireCooldowns(now: Date = Date()) -> [Account] {
+        refreshExternalStateIfNeeded()
         var reset: [Account] = []
         for i in data.accounts.indices {
             let before = data.accounts[i].disabledUntil.count
@@ -1087,6 +1176,7 @@ public actor AccountStore {
     }
 
     public func setRoutingEnabled(_ alias: String, enabled: Bool, now: Date? = nil) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         if data.accounts[i].isArchived, enabled { return }
         let wasEnabled = data.accounts[i].routingEnabled
@@ -1106,7 +1196,7 @@ public actor AccountStore {
         }
         if !enabled, data.activeAlias == alias { data.activeAlias = nil }
         if !enabled { clearRuntimeHolds(alias) }
-        persist()
+        persist(preservingStickyAlias: enabled)
     }
 }
 

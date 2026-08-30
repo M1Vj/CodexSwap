@@ -1,4 +1,12 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // MARK: - Stable machine-readable contract
 
@@ -180,9 +188,10 @@ public struct AgentCLIEnvelope: Codable, Sendable, Equatable {
         try container.encode(schemaVersion, forKey: .schemaVersion)
         try container.encode(command, forKey: .command)
         try container.encode(ok, forKey: .ok)
-        try container.encodeIfPresent(data, forKey: .data)
-        try container.encodeIfPresent(warnings, forKey: .warnings)
+        try container.encode(data ?? .null, forKey: .data)
+        try container.encode(warnings ?? [], forKey: .warnings)
         try container.encodeIfPresent(error, forKey: .error)
+        if error == nil { try container.encodeNil(forKey: .error) }
     }
 
     public init(from decoder: Decoder) throws {
@@ -495,6 +504,7 @@ public enum AgentCLIParser {
 private struct AgentAccountEntry: Sendable {
     let account: Account
     let reference: String
+    let number: Int
     let displayAlias: String?
 }
 
@@ -705,7 +715,7 @@ public struct AgentCLI: Sendable {
         var entries: [AgentAccountEntry] = []
         entries.reserveCapacity(accounts.count)
         for (index, account) in accounts.enumerated() {
-            let reference = "Account \(index + 1)"
+            let reference = Self.stableReference(for: account)
             let candidate = AgentSanitizer.safeAlias(account.alias, privateValues: privateValues)
             let normalized = candidate?.lowercased()
             let displayAlias: String?
@@ -717,7 +727,7 @@ public struct AgentCLI: Sendable {
             } else {
                 displayAlias = nil
             }
-            entries.append(AgentAccountEntry(account: account, reference: reference, displayAlias: displayAlias))
+            entries.append(AgentAccountEntry(account: account, reference: reference, number: index + 1, displayAlias: displayAlias))
         }
         var byReference: [String: AgentAccountEntry] = [:]
         var bySafeAlias: [String: AgentAccountEntry] = [:]
@@ -730,6 +740,22 @@ public struct AgentCLI: Sendable {
         return AgentAccountRoster(entries: entries, byReference: byReference, bySafeAlias: bySafeAlias)
     }
 
+    private static func stableReference(for account: Account) -> String {
+        // telemetryID is a local random identifier, not an upstream account ID.
+        // Never expose even a prefix of it: refs are one-way, deterministic
+        // handles that remain stable across rank changes and CLI processes.
+        #if canImport(CryptoKit)
+        let domainSeparated = Data("CodexSwap agent account ref v1:\(account.telemetryID.uuidString.lowercased())".utf8)
+        let digest = SHA256.hash(data: domainSeparated)
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "acct-\(String(hex.prefix(16)))"
+        #else
+        // CodexSwap is a macOS target (where CryptoKit is available). Keep a
+        // non-sensitive fallback for source builds on platforms without it.
+        return "acct-opaque-\(String(account.telemetryID.uuidString.hashValue, radix: 16))"
+        #endif
+    }
+
     private static func looksLikeReference(_ value: String) -> Bool {
         let parts = value.split(separator: " ", omittingEmptySubsequences: true)
         return parts.count == 2 && parts[0].lowercased() == "account" && Int(parts[1]) != nil
@@ -739,6 +765,7 @@ public struct AgentCLI: Sendable {
         let privateValues = Set([entry.account.email, entry.account.accountID, entry.account.accessToken, entry.account.refreshToken, entry.account.idToken])
         var object: [String: AgentCLIJSONValue] = [
             "ref": .string(entry.reference),
+            "number": .integer(entry.number),
             "rank": .integer(max(0, entry.account.priority)),
             "active": .bool(entry.account.alias == activeAlias),
             "archived": .bool(entry.account.isArchived),
@@ -746,7 +773,10 @@ public struct AgentCLI: Sendable {
             "needsLogin": .bool(entry.account.needsLogin),
             "draining": .bool(draining.contains(entry.account.alias)),
         ]
-        if let displayAlias = entry.displayAlias { object["alias"] = .string(displayAlias) }
+        // Unsafe aliases are intentionally replaced with a numbered display
+        // label. The label is presentation-only; mutations resolve only the
+        // opaque `ref` (or an exact safe alias), never `Account N`.
+        object["alias"] = .string(entry.displayAlias ?? "Account \(entry.number)")
         if let cooldown = entry.account.cooldownUntil(now: Date()) {
             object["cooldownUntil"] = .string(Self.iso8601(cooldown))
         }
@@ -785,7 +815,7 @@ public struct AgentCLI: Sendable {
         return formatter.string(from: date)
     }
 
-    private static func isUsableLoopback(_ url: URL?) -> Bool {
+    private static func isSyntacticallyUsableLoopback(_ url: URL?) -> Bool {
         guard let url,
               url.scheme?.lowercased() == "http",
               let host = url.host?.lowercased(), ["127.0.0.1", "localhost", "::1"].contains(host),
@@ -794,6 +824,70 @@ public struct AgentCLI: Sendable {
               url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/" else { return false }
         return true
+    }
+
+    private static func isUsableLoopback(_ url: URL?) -> Bool {
+        guard isSyntacticallyUsableLoopback(url),
+              let host = url?.host?.lowercased(),
+              let port = url?.port else { return false }
+        return isLoopbackListenerReachable(host: host, port: port)
+    }
+
+    private static func isLoopbackListenerReachable(host: String, port: Int) -> Bool {
+        #if canImport(Darwin) || canImport(Glibc)
+        var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
+        if host == "::1" {
+            let descriptor = socket(AF_INET6, SOCK_STREAM, 0)
+            guard descriptor >= 0 else { return false }
+            defer { _ = close(descriptor) }
+            _ = withUnsafePointer(to: &timeout) { pointer in
+                setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, pointer, socklen_t(MemoryLayout<timeval>.size))
+            }
+            var address = sockaddr_in6()
+            address.sin6_family = sa_family_t(AF_INET6)
+            address.sin6_port = in_port_t(UInt16(port).bigEndian)
+            guard inet_pton(AF_INET6, host, &address.sin6_addr) == 1 else { return false }
+            return withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0
+                }
+            }
+        }
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { _ = close(descriptor) }
+        _ = withUnsafePointer(to: &timeout) { pointer in
+            setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, pointer, socklen_t(MemoryLayout<timeval>.size))
+        }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port).bigEndian)
+        let addressValue = host == "localhost" ? "127.0.0.1" : host
+        guard inet_pton(AF_INET, addressValue, &address.sin_addr) == 1 else { return false }
+        return withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        #else
+        return false
+        #endif
+    }
+
+    /// Resolve a live listener without trusting a stale handoff file. When the
+    /// app has not written `proxy.url` (for example during an upgrade), probe the
+    /// configured loopback port before handing it to a mutating operation.
+    private func runtimeURLCandidate(settings: Settings? = nil) async -> URL? {
+        if let handoff = runtimeURLProvider(), Self.isSyntacticallyUsableLoopback(handoff), Self.isUsableLoopback(handoff) {
+            return handoff
+        }
+        let resolved: Settings
+        if let settings {
+            resolved = settings
+        } else {
+            resolved = await settingsStore.get()
+        }
+        return URL(string: "http://127.0.0.1:\(resolved.proxyPort)")
     }
 
     private static func routingValue(_ state: CodexRoutingState) -> AgentCLIJSONValue {
@@ -805,17 +899,20 @@ public struct AgentCLI: Sendable {
     }
 
     private func status(_ command: AgentCLICommand) async -> AgentCLIResult {
+        let settings = await settingsStore.get()
+        await store.setStrategy(settings.rotationStrategy)
         let snapshot = await engine.snapshot()
         let accountRoster = await roster()
         let activeCount = accountRoster.entries.filter { !$0.account.isArchived }.count
         let archivedCount = accountRoster.entries.filter { $0.account.isArchived }.count
-        let runtimeURL = runtimeURLProvider()
+        let runtimeURL = await runtimeURLCandidate()
+        let proxyAvailable = Self.isUsableLoopback(runtimeURL)
         let activeRef = snapshot.activeAlias.flatMap { alias in accountRoster.entries.first(where: { $0.account.alias == alias })?.reference }
         let stickyRef = snapshot.stickyAlias.flatMap { alias in accountRoster.entries.first(where: { $0.account.alias == alias })?.reference }
         let drainingRefs = snapshot.drainingAliases.compactMap { alias in accountRoster.entries.first(where: { $0.account.alias == alias })?.reference }.sorted()
         var data: [String: AgentCLIJSONValue] = [
             "proxy": .object([
-                "available": .bool(Self.isUsableLoopback(runtimeURL)),
+                "available": .bool(proxyAvailable),
                 "port": .integer(runtimeURL?.port ?? 0),
             ]),
             "routing": Self.routingValue(snapshot.routingState),
@@ -840,7 +937,7 @@ public struct AgentCLI: Sendable {
             ])
         }
         var warnings: [String] = []
-        if !Self.isUsableLoopback(runtimeURL) { warnings.append("proxy_unavailable") }
+        if !proxyAvailable { warnings.append("proxy_unavailable") }
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(data), warnings: warnings), exitCode: .ok)
     }
 
@@ -878,6 +975,7 @@ public struct AgentCLI: Sendable {
 
     private func accountsReconcile(_ command: AgentCLICommand) async -> AgentCLIResult {
         let before = (await store.all()).count
+        let beforeRefs = Set((await roster()).entries.map(\.reference))
         let available = CodexBarBridge.isPresent()
         if !command.options.confirm && !command.options.dryRun {
             return confirmationRequired(command: command.canonicalName, action: "reconcile managed accounts")
@@ -889,17 +987,21 @@ public struct AgentCLI: Sendable {
                 "before": .integer(before),
                 "after": .integer(before),
                 "dryRun": .bool(true),
+                "affectedRefs": .array([]),
             ])
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data, warnings: warnings), exitCode: .ok)
         }
         await engine.syncCodexBar()
         let after = (await store.all()).count
+        let afterRefs = Set((await roster()).entries.map(\.reference))
+        let affectedRefs = (beforeRefs.symmetricDifference(afterRefs)).sorted()
         var warnings: [String] = []
         if !available { warnings.append("codexbar_unavailable") }
         let data: AgentCLIJSONValue = .object([
             "before": .integer(before),
             "after": .integer(after),
             "removedOrAdded": .integer(after - before),
+            "affectedRefs": .array(affectedRefs.map(AgentCLIJSONValue.string)),
         ])
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data, warnings: warnings), exitCode: .ok)
     }
@@ -1028,16 +1130,27 @@ public struct AgentCLI: Sendable {
     private func quotaReport(_ command: AgentCLICommand) async throws -> AgentCLIResult {
         let accounts = await store.activeAccounts()
         let service = QuotaReportService(usageService: usageService, resetService: resetService)
-        let report = try await service.fetch(accounts: accounts, activeAlias: await store.activeAlias())
+        let activeAlias = await store.activeAlias()
+        let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias)
         let privateValues = Set(accounts.flatMap { [$0.email, $0.accountID, $0.accessToken, $0.refreshToken, $0.idToken] })
-        let data = sanitizedQuotaData(report, privateValues: privateValues)
+        let reportOrder = accounts.sorted { lhs, rhs in
+            let lhsActive = activeAlias.map { lhs.alias.caseInsensitiveCompare($0) == .orderedSame } ?? false
+            let rhsActive = activeAlias.map { rhs.alias.caseInsensitiveCompare($0) == .orderedSame } ?? false
+            if lhsActive != rhsActive { return lhsActive }
+            let l = lhs.alias.lowercased(); let r = rhs.alias.lowercased()
+            if l != r { return l < r }
+            return lhs.alias < rhs.alias
+        }
+        let rosterEntries = await roster().entries
+        let reportRefs = reportOrder.compactMap { account in rosterEntries.first(where: { $0.account.alias == account.alias })?.reference }
+        let data = sanitizedQuotaData(report, privateValues: privateValues, refs: reportRefs)
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
     }
 
-    private func sanitizedQuotaData(_ report: CodexQuotaReport, privateValues: Set<String>) -> AgentCLIJSONValue {
+    private func sanitizedQuotaData(_ report: CodexQuotaReport, privateValues: Set<String>, refs: [String]) -> AgentCLIJSONValue {
         var usedAliases = Set<String>()
         var genericIndex = 1
-        let accountValues = report.accounts.map { account -> AgentCLIJSONValue in
+        let accountValues = report.accounts.enumerated().map { index, account -> AgentCLIJSONValue in
             let candidate = AgentSanitizer.safeAlias(account.alias, privateValues: privateValues)
             let alias: String
             if let candidate, !usedAliases.contains(candidate.lowercased()), !Self.looksLikeReference(candidate.lowercased()) {
@@ -1051,6 +1164,7 @@ public struct AgentCLI: Sendable {
             }
             var value: [String: AgentCLIJSONValue] = [
                 "alias": .string(alias),
+                "ref": .string(index < refs.count ? refs[index] : "acct-unknown"),
                 "state": .string(account.state.rawValue),
                 "usageStatus": .string(account.usageStatus.rawValue),
                 "resetCreditStatus": .string(account.resetCreditStatus.rawValue),
@@ -1082,7 +1196,7 @@ public struct AgentCLI: Sendable {
         let accountRoster = await roster()
         let activeEntries = accountRoster.entries.filter { !$0.account.isArchived }
         let settings = await settingsStore.get()
-        let runtimeURL = runtimeURLProvider()
+        let runtimeURL = await runtimeURLCandidate(settings: settings)
         if !command.options.confirm && !command.options.dryRun {
             return confirmationRequired(command: command.canonicalName, action: "run warm-up")
         }
@@ -1220,10 +1334,11 @@ public struct AgentCLI: Sendable {
     private func routingGet(_ command: AgentCLICommand) async -> AgentCLIResult {
         let snapshot = await engine.snapshot()
         let settings = await settingsStore.get()
+        let runtimeURL = await runtimeURLCandidate(settings: settings)
         let data = AgentCLIJSONValue.object([
             "state": Self.routingValue(snapshot.routingState),
             "configured": .bool(settings.routeCodexAutomatically),
-            "proxyAvailable": .bool(Self.isUsableLoopback(runtimeURLProvider())),
+            "proxyAvailable": .bool(Self.isUsableLoopback(runtimeURL)),
         ])
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
     }
@@ -1232,8 +1347,13 @@ public struct AgentCLI: Sendable {
         if command.options.dryRun {
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["wouldEnable": .bool(enabled)])), exitCode: .ok)
         }
+        let settings = await settingsStore.get()
+        let runtimeURL = await runtimeURLCandidate(settings: settings)
+        if enabled && !Self.isUsableLoopback(runtimeURL) {
+            return AgentCLIResult(envelope: .failure(command: command.canonicalName, code: "runtime_unavailable", message: "running loopback proxy is required for routing"), exitCode: .unavailable)
+        }
         do {
-            try await engine.setAutomaticRouting(enabled, proxyURL: runtimeURLProvider())
+            try await engine.setAutomaticRouting(enabled, proxyURL: runtimeURL)
         } catch is CancellationError {
             return cancelled(command: command.canonicalName)
         } catch is AppEngineError {
@@ -1250,8 +1370,13 @@ public struct AgentCLI: Sendable {
         if command.options.dryRun {
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["wouldRepair": .bool(true)])), exitCode: .ok)
         }
+        let settings = await settingsStore.get()
+        let runtimeURL = await runtimeURLCandidate(settings: settings)
+        guard Self.isUsableLoopback(runtimeURL) else {
+            return AgentCLIResult(envelope: .failure(command: command.canonicalName, code: "runtime_unavailable", message: "running loopback proxy is required for routing repair"), exitCode: .unavailable)
+        }
         do {
-            try await engine.repairAutomaticRouting(proxyURL: runtimeURLProvider())
+            try await engine.repairAutomaticRouting(proxyURL: runtimeURL)
         } catch is CancellationError {
             return cancelled(command: command.canonicalName)
         } catch is AppEngineError {
@@ -1290,6 +1415,10 @@ public struct AgentCLI: Sendable {
         "metadataTelemetryEnabled": .bool,
     ]
 
+    /// Registration with the host login service is owned by the app process;
+    /// changing this persisted preference takes effect after the app reloads.
+    private static let settingRestartRequired: Set<String> = ["launchAtLogin"]
+
     private func settingsGet(key: String?, command: AgentCLICommand) async -> AgentCLIResult {
         let settings = await settingsStore.get()
         if let key {
@@ -1311,11 +1440,30 @@ public struct AgentCLI: Sendable {
         if command.options.dryRun {
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["key": .string(key), "value": parsed, "dryRun": .bool(true)])), exitCode: .ok)
         }
-        let updated = await settingsStore.update { settings in
-            Self.applySetting(&settings, key: key, value: parsed)
+        let updated: Settings
+        do {
+            updated = try await settingsStore.updatePersisting { settings in
+                Self.applySetting(&settings, key: key, value: parsed)
+            }
+        } catch {
+            return AgentCLIResult(
+                envelope: .failure(command: command.canonicalName, code: "settings_write_failed", message: "settings could not be persisted safely"),
+                exitCode: .permission
+            )
         }
         await engine.settingsDidChange(from: previous, to: updated)
-        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["key": .string(key), "value": Self.settingValue(updated, key: key)])), exitCode: .ok)
+        return AgentCLIResult(
+            envelope: .success(
+                command: command.canonicalName,
+                data: .object([
+                    "key": .string(key),
+                    "value": Self.settingValue(updated, key: key),
+                    "persisted": .bool(true),
+                    "restartRequired": .bool(Self.settingRestartRequired.contains(key)),
+                ])
+            ),
+            exitCode: .ok
+        )
     }
 
     private func unknownSetting(command: String) -> AgentCLIResult {

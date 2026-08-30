@@ -32,8 +32,8 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(json["schemaVersion"] as? Int, 1)
         XCTAssertEqual(json["command"] as? String, "agent status")
         XCTAssertEqual(json["ok"] as? Bool, true)
-        XCTAssertNil(json["warnings"])
-        XCTAssertNil(json["error"])
+        XCTAssertEqual((json["warnings"] as? [Any])?.isEmpty, true)
+        XCTAssertTrue(json["error"] is NSNull)
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("SECRET"))
     }
 
@@ -129,5 +129,75 @@ final class AgentCLITests: XCTestCase {
         XCTAssertFalse(text.contains("@example.com"))
         XCTAssertFalse(text.contains("id-b"))
         XCTAssertFalse(text.contains("token-b"))
+    }
+
+    func testOpaqueReferenceIsStableAcrossRankMutationAndNeverContainsTelemetryID() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIRefs-\(UUID().uuidString)", isDirectory: true)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        let telemetryID = UUID(uuidString: "12345678-1234-5678-9abc-def012345678")!
+        await store.upsert(Account(alias: "alpha", accountID: "internal-a", accessToken: "secret-a", telemetryID: telemetryID))
+        await store.upsert(Account(alias: "beta", accountID: "internal-b", accessToken: "secret-b"))
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let first = await cli.run(["agent", "accounts", "list", "--json"])
+        let firstRows = try accountRows(from: first.encoded)
+        let alphaRef = try XCTUnwrap(firstRows.first(where: { $0["alias"] as? String == "alpha" })?["ref"] as? String)
+        XCTAssertTrue(alphaRef.hasPrefix("acct-"))
+        XCTAssertFalse(alphaRef.contains(telemetryID.uuidString))
+        XCTAssertFalse(alphaRef.contains(telemetryID.uuidString.replacingOccurrences(of: "-", with: "").lowercased()))
+        XCTAssertFalse(String(decoding: first.encoded, as: UTF8.self).contains("internal-a"))
+        XCTAssertFalse(String(decoding: first.encoded, as: UTF8.self).contains("secret-a"))
+
+        let ranked = await cli.run(["agent", "account", "rank", alphaRef, "1", "--json"])
+        XCTAssertEqual(ranked.exitCode, AgentCLIExitCode.ok.rawValue)
+        let second = await cli.run(["agent", "accounts", "list", "--json"])
+        let secondRows = try accountRows(from: second.encoded)
+        let secondRef = try XCTUnwrap(secondRows.first(where: { $0["alias"] as? String == "alpha" })?["ref"] as? String)
+        XCTAssertEqual(alphaRef, secondRef)
+    }
+
+    func testAccountStoreStickyHandoffSurvivesSeparateActorsAndClearStaysCleared() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLISticky-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("accounts.json")
+        let liveStore = AccountStore(url: url)
+        await liveStore.upsert(Account(alias: "alpha", accessToken: "secret"))
+        let cliStore = AccountStore(url: url)
+
+        let didStick = await liveStore.toggleStickyAlias("alpha")
+        XCTAssertTrue(didStick)
+        let handedOffSticky = await cliStore.stickyAlias()
+        XCTAssertEqual(handedOffSticky, "alpha")
+        _ = await cliStore.archive(alias: "alpha")
+
+        let reloaded = AccountStore(url: url)
+        let clearedSticky = await reloaded.stickyAlias()
+        XCTAssertNil(clearedSticky)
+        let persisted = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertNil(persisted["stickyAlias"] as? String)
+    }
+
+    func testSettingsStoreReloadsExternalAgentMutation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLISettings-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("settings.json")
+        let liveStore = SettingsStore(url: url)
+        let agentStore = SettingsStore(url: url)
+
+        _ = try await agentStore.updatePersisting { $0.rotationStrategy = .roundRobin }
+        let reloaded = await liveStore.get()
+        XCTAssertEqual(reloaded.rotationStrategy, .roundRobin)
+    }
+
+    private func accountRows(from data: Data) throws -> [[String: Any]] {
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let payload = try XCTUnwrap(root["data"] as? [String: Any])
+        return try XCTUnwrap(payload["accounts"] as? [[String: Any]])
     }
 }
