@@ -105,6 +105,10 @@ final class AgentCLITests: XCTestCase {
         let preview = await cli.run(["agent", "accounts", "reconcile", "--dry-run", "--json"])
         XCTAssertEqual(preview.exitCode, AgentCLIExitCode.ok.rawValue)
         XCTAssertTrue(preview.envelope.ok)
+        guard case .object(let previewData)? = preview.envelope.data else { return XCTFail("missing reconcile preview data") }
+        XCTAssertNotNil(previewData["impactKnown"])
+        XCTAssertNotNil(previewData["confirmationRequired"])
+        XCTAssertNotNil(previewData["affectedRefs"])
     }
 
     func testRepresentativeDispatchSwitchesAccountWithoutLeakingIdentity() async throws {
@@ -193,6 +197,31 @@ final class AgentCLITests: XCTestCase {
         _ = try await agentStore.updatePersisting { $0.rotationStrategy = .roundRobin }
         let reloaded = await liveStore.get()
         XCTAssertEqual(reloaded.rotationStrategy, .roundRobin)
+    }
+
+    func testSettingsStoreConcurrentActorsMergeDisjointPersistedUpdates() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLISettingsMerge-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("settings.json")
+        let strategyStore = SettingsStore(url: url)
+        let notificationStore = SettingsStore(url: url)
+
+        // Both actors are initialized before either write. Their transactions
+        // must reload under the shared lock so the second update cannot erase
+        // the first actor's disjoint field.
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                _ = try? await strategyStore.updatePersisting { $0.rotationStrategy = .roundRobin }
+            }
+            group.addTask {
+                _ = try? await notificationStore.updatePersisting { $0.notifyOnRotate = false }
+            }
+        }
+
+        let reloaded = SettingsStore(url: url)
+        let merged = await reloaded.get()
+        XCTAssertEqual(merged.rotationStrategy, .roundRobin)
+        XCTAssertFalse(merged.notifyOnRotate)
     }
 
     func testSettingsSetAcceptsTypedCaseInsensitiveStrategyAndReportsPersistence() async throws {
