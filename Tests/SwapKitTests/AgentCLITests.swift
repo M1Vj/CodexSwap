@@ -211,6 +211,12 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(value["persisted"], .bool(true))
         XCTAssertEqual(value["restartRequired"], .bool(false))
         XCTAssertEqual(value["value"], .string("roundRobin"))
+
+        let telemetry = await cli.run(["agent", "settings", "set", "metadataTelemetryEnabled", "true", "--json"])
+        XCTAssertEqual(telemetry.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertEqual(telemetry.envelope.warnings, ["restart_required_for_live_app"])
+        guard case .object(let telemetryValue)? = telemetry.envelope.data else { return XCTFail("missing telemetry data") }
+        XCTAssertEqual(telemetryValue["restartRequired"], .bool(true))
     }
 
     private func accountRows(from data: Data) throws -> [[String: Any]] {

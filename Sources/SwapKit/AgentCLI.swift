@@ -1417,7 +1417,13 @@ public struct AgentCLI: Sendable {
 
     /// Registration with the host login service is owned by the app process;
     /// changing this persisted preference takes effect after the app reloads.
-    private static let settingRestartRequired: Set<String> = ["launchAtLogin"]
+    private static let settingRestartRequired: Set<String> = [
+        // Launch registration and the telemetry actor are initialized by the
+        // host app at startup; a standalone agent process cannot safely poke
+        // those live resources.
+        "launchAtLogin",
+        "metadataTelemetryEnabled",
+    ]
 
     private func settingsGet(key: String?, command: AgentCLICommand) async -> AgentCLIResult {
         let settings = await settingsStore.get()
@@ -1452,6 +1458,7 @@ public struct AgentCLI: Sendable {
             )
         }
         await engine.settingsDidChange(from: previous, to: updated)
+        let restartRequired = Self.settingRestartRequired.contains(key)
         return AgentCLIResult(
             envelope: .success(
                 command: command.canonicalName,
@@ -1459,8 +1466,9 @@ public struct AgentCLI: Sendable {
                     "key": .string(key),
                     "value": Self.settingValue(updated, key: key),
                     "persisted": .bool(true),
-                    "restartRequired": .bool(Self.settingRestartRequired.contains(key)),
-                ])
+                    "restartRequired": .bool(restartRequired),
+                ]),
+                warnings: restartRequired ? ["restart_required_for_live_app"] : nil
             ),
             exitCode: .ok
         )
