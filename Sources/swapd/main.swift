@@ -194,6 +194,7 @@ func printHelp() {
       usage            poll wham/usage for each account
       quota --json     fresh read-only usage/reset-credit status for every account
       warmup --all --json  force a safe all-account quota warm-up through the running app proxy
+      agent ...         machine-readable, sanitized control namespace (run `swapd agent --help`)
       priority <a> <n> set account priority (higher consumed first)
       switch <a>       set active account
       shim             print the codexswap shim script

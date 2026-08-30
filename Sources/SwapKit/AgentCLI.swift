@@ -712,6 +712,7 @@ public struct AgentCLI: Sendable {
     }
 
     private func accountView(_ entry: AgentAccountEntry, activeAlias: String? = nil, stickyAlias: String? = nil, draining: Set<String> = []) -> AgentCLIJSONValue {
+        let privateValues = Set([entry.account.email, entry.account.accountID, entry.account.accessToken, entry.account.refreshToken, entry.account.idToken])
         var object: [String: AgentCLIJSONValue] = [
             "ref": .string(entry.reference),
             "rank": .integer(max(0, entry.account.priority)),
@@ -727,7 +728,7 @@ public struct AgentCLI: Sendable {
         }
         let windows = entry.account.usage.enumerated().map { index, window -> AgentCLIJSONValue in
             var value: [String: AgentCLIJSONValue] = [
-                "label": .string(Self.safeWindowLabel(window.label, fallbackIndex: index + 1)),
+                "label": .string(Self.safeWindowLabel(window.label, fallbackIndex: index + 1, privateValues: privateValues)),
                 "usedPercent": .integer(min(max(window.usedPercent, 0), 100)),
                 "windowSeconds": .integer(max(0, window.windowSeconds)),
             ]
@@ -739,12 +740,15 @@ public struct AgentCLI: Sendable {
         return .object(object)
     }
 
-    private static func safeWindowLabel(_ raw: String, fallbackIndex: Int) -> String {
+    private static func safeWindowLabel(_ raw: String, fallbackIndex: Int, privateValues: Set<String> = []) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = trimmed.lowercased()
         let forbidden = ["email", "token", "accountid", "account-id", "account_id", "authorization", "bearer"]
+        let normalizedPrivateValues = Set(privateValues.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })
         guard (1...32).contains(trimmed.unicodeScalars.count),
               trimmed.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || [" ", ".", "_", "+", "-"].contains(String($0)) }),
+              !normalizedPrivateValues.contains(normalized),
+              !(normalized.count >= 6 && normalizedPrivateValues.contains(where: { normalized.contains($0) })),
               !forbidden.contains(where: { normalized.contains($0) }) else {
             return "Window \(fallbackIndex)"
         }
@@ -918,7 +922,7 @@ public struct AgentCLI: Sendable {
         }
         await engine.setAccountRouting(entry.account.alias, enabled: enabled)
         let refreshed = (await roster()).entries.first(where: { $0.account.alias == entry.account.alias }) ?? entry
-        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed)), exitCode: .ok)
+        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed, activeAlias: await store.activeAlias(), stickyAlias: await store.stickyAlias(), draining: await store.currentDrainingAliases())), exitCode: .ok)
     }
 
     private func accountRank(target: String, rank: Int, command: AgentCLICommand) async -> AgentCLIResult {
@@ -933,7 +937,7 @@ public struct AgentCLI: Sendable {
         }
         await engine.reorderRank(entry.account.alias, toIndex: rank - 1)
         let refreshed = (await roster()).entries.first(where: { $0.account.alias == entry.account.alias }) ?? entry
-        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed)), exitCode: .ok)
+        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed, activeAlias: await store.activeAlias(), stickyAlias: await store.stickyAlias(), draining: await store.currentDrainingAliases())), exitCode: .ok)
     }
 
     private func accountArchive(target: String, command: AgentCLICommand) async -> AgentCLIResult {
@@ -948,7 +952,7 @@ public struct AgentCLI: Sendable {
         switch await engine.archiveAccount(alias: entry.account.alias, confirmed: command.options.confirm) {
         case .archived(let archived):
             let refreshed = (await roster()).entries.first(where: { $0.account.alias == archived.alias }) ?? entry
-            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed)), exitCode: .ok)
+            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed, activeAlias: await store.activeAlias(), stickyAlias: await store.stickyAlias(), draining: await store.currentDrainingAliases())), exitCode: .ok)
         case .confirmationRequired:
             return confirmationRequired(command: command.canonicalName, action: "archive")
         case .accountUnavailable:
@@ -964,7 +968,7 @@ public struct AgentCLI: Sendable {
         }
         guard let restored = await engine.restoreAccount(alias: entry.account.alias) else { return missingAccount(command: command.canonicalName) }
         let refreshed = (await roster()).entries.first(where: { $0.account.alias == restored.alias }) ?? entry
-        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed)), exitCode: .ok)
+        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: accountView(refreshed, activeAlias: await store.activeAlias(), stickyAlias: await store.stickyAlias(), draining: await store.currentDrainingAliases())), exitCode: .ok)
     }
 
     private func accountRemove(target: String, command: AgentCLICommand) async -> AgentCLIResult {
@@ -994,20 +998,34 @@ public struct AgentCLI: Sendable {
         let accounts = await store.activeAccounts()
         let service = QuotaReportService(usageService: usageService, resetService: resetService)
         let report = try await service.fetch(accounts: accounts, activeAlias: await store.activeAlias())
-        let data = sanitizedQuotaData(report)
+        let privateValues = Set(accounts.flatMap { [$0.email, $0.accountID, $0.accessToken, $0.refreshToken, $0.idToken] })
+        let data = sanitizedQuotaData(report, privateValues: privateValues)
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
     }
 
-    private func sanitizedQuotaData(_ report: CodexQuotaReport) -> AgentCLIJSONValue {
-        let accountValues = report.accounts.enumerated().map { index, account -> AgentCLIJSONValue in
+    private func sanitizedQuotaData(_ report: CodexQuotaReport, privateValues: Set<String>) -> AgentCLIJSONValue {
+        var usedAliases = Set<String>()
+        var genericIndex = 1
+        let accountValues = report.accounts.map { account -> AgentCLIJSONValue in
+            let candidate = AgentSanitizer.safeAlias(account.alias, privateValues: privateValues)
+            let alias: String
+            if let candidate, !usedAliases.contains(candidate.lowercased()), !Self.looksLikeReference(candidate.lowercased()) {
+                alias = candidate
+                usedAliases.insert(candidate.lowercased())
+            } else {
+                while usedAliases.contains("account \(genericIndex)") { genericIndex += 1 }
+                alias = "Account \(genericIndex)"
+                genericIndex += 1
+                usedAliases.insert(alias.lowercased())
+            }
             var value: [String: AgentCLIJSONValue] = [
-                "alias": .string(AgentSanitizer.safeAlias(account.alias, privateValues: []) ?? "Account \(index + 1)"),
+                "alias": .string(alias),
                 "state": .string(account.state.rawValue),
                 "usageStatus": .string(account.usageStatus.rawValue),
                 "resetCreditStatus": .string(account.resetCreditStatus.rawValue),
                 "windows": .array(account.windows.enumerated().map { windowIndex, window in
                     var windowValue: [String: AgentCLIJSONValue] = [
-                        "label": .string(Self.safeWindowLabel(window.label, fallbackIndex: windowIndex + 1)),
+                        "label": .string(Self.safeWindowLabel(window.label, fallbackIndex: windowIndex + 1, privateValues: privateValues)),
                         "usedPercent": .integer(min(max(window.usedPercent, 0), 100)),
                         "remainingPercent": .integer(min(max(window.remainingPercent, 0), 100)),
                     ]
@@ -1034,6 +1052,9 @@ public struct AgentCLI: Sendable {
         let activeEntries = accountRoster.entries.filter { !$0.account.isArchived }
         let settings = await settingsStore.get()
         let runtimeURL = runtimeURLProvider()
+        if !command.options.confirm && !command.options.dryRun {
+            return confirmationRequired(command: command.canonicalName, action: "run warm-up")
+        }
         guard Self.isUsableLoopback(runtimeURL) else {
             let reports = activeEntries.map { entry in
                 AgentCLIJSONValue.object(["ref": .string(entry.reference), "status": .string("skippedProxyUnavailable")])
@@ -1049,9 +1070,6 @@ public struct AgentCLI: Sendable {
                 ]),
             ])
             return AgentCLIResult(envelope: .failure(command: command.canonicalName, code: "runtime_unavailable", message: "running loopback proxy is required for warm-up", data: data), exitCode: .unavailable)
-        }
-        if !command.options.confirm && !command.options.dryRun {
-            return confirmationRequired(command: command.canonicalName, action: "run warm-up")
         }
         if command.options.dryRun {
             let eligible = activeEntries.filter {
