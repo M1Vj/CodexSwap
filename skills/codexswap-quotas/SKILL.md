@@ -55,3 +55,34 @@ IDs, authorization data, or raw private JSON; report only the sanitized fields
 or raw private JSON; report only the sanitized fields listed above. For the
 warm-up section, report only aliases, safe status values, counts, and timestamps;
 do not display command errors or stderr.
+
+## Reset-aware background monitor
+
+When automatic warm-up is unavailable or the Mac was asleep at reset time, use
+the bundled monitor. It polls the sanitized `swapd agent quota report --json`
+surface, establishes a baseline on its first run, and requests
+`swapd agent warmup all --confirm --json` only after a reset transition is
+observed. A lower used percentage or an expired prior reset followed by a new
+future reset is evidence; a moving future deadline alone is not. The monitor
+stores only opaque `acct-...` references, reset fingerprints, percentages, and
+timestamps in a mode-700 directory. It never reads the account store or auth
+files and never logs command output.
+
+For a one-shot poll:
+
+```bash
+/usr/bin/python3 "${CODEX_HOME:-$HOME/.codex}/skills/codexswap-quotas/scripts/reset_warm_monitor.py" --once --json
+```
+
+Install the per-user launchd job (one poll per minute) with the bundled helper:
+
+```bash
+/bin/bash "${CODEX_HOME:-$HOME/.codex}/skills/codexswap-quotas/scripts/install-reset-warm-monitor.sh"
+```
+
+The helper installs an exact user LaunchAgent label,
+`com.codexswap.reset-warm-monitor`. It does not start, stop, or restart
+CodexSwap. Verify the CodexSwap endpoint separately before allowing a warm-up;
+the monitor fails closed when `agent status --json` reports an unavailable
+loopback proxy. State and sanitized event logs live under
+`~/Library/Application Support/CodexSwap/reset-warm-monitor/`.
