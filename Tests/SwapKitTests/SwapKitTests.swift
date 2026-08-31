@@ -1366,14 +1366,22 @@ private actor FakeWarmupRunner: WarmupCommandRunning {
 
 private actor BlockingWarmupRunner: WarmupCommandRunning {
     private var continuation: CheckedContinuation<Void, Never>?
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
     private var started = false
 
     func run(alias: String, proxyURL: URL) async throws {
         started = true
+        startedWaiters.forEach { $0.resume() }
+        startedWaiters.removeAll()
         await withCheckedContinuation { continuation = $0 }
     }
 
     func hasStarted() -> Bool { started }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
 
     func finish() {
         continuation?.resume()
@@ -1455,6 +1463,40 @@ final class QuotaWarmupServiceTests: XCTestCase {
         XCTAssertEqual(forced.warmed, [])
         XCTAssertEqual(forced.attempted, ["a"])
         XCTAssertEqual(calls, ["a", "a"])
+    }
+
+    func testWarmupUsesSharedInterprocessLockAcrossServiceActors() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-process-lock-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lockURL = root.appendingPathComponent("warmup.lock")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = account("a", now: now)
+        let firstRunner = BlockingWarmupRunner()
+        let first = QuotaWarmupService(
+            runner: firstRunner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("first.json")),
+            lockURL: lockURL
+        )
+        let secondRunner = FakeWarmupRunner()
+        let second = QuotaWarmupService(
+            runner: secondRunner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("second.json")),
+            lockURL: lockURL
+        )
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let firstTask = Task { await first.run(accounts: [account], proxyURL: proxy, now: now) }
+        await firstRunner.waitUntilStarted()
+        let firstStarted = await firstRunner.hasStarted()
+        XCTAssertTrue(firstStarted)
+
+        let overlapping = await second.run(accounts: [account], proxyURL: proxy, now: now)
+        XCTAssertEqual(overlapping.skipped["all"], "warm-up already running")
+        let secondCalls = await secondRunner.calls()
+        XCTAssertEqual(secondCalls, [])
+
+        await firstRunner.finish()
+        _ = await firstTask.value
     }
 
     func testRunsAgainAfterRecordedPrimaryResetAndRedactsFailures() async throws {

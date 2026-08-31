@@ -297,6 +297,7 @@ public enum AppPaths {
     public static func settingsFile() -> URL { supportDir().appendingPathComponent("settings.json") }
     public static func historyFile() -> URL { supportDir().appendingPathComponent("history.jsonl") }
     public static func warmupFile() -> URL { supportDir().appendingPathComponent("warmup.json") }
+    public static func warmupLockFile() -> URL { supportDir().appendingPathComponent("warmup.lock") }
     public static func usageTelemetryFile() -> URL { supportDir().appendingPathComponent("usage-telemetry-v1.json") }
 }
 

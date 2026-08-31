@@ -381,6 +381,38 @@ def parse_warmup_success(value: Any) -> tuple[bool, set[str]]:
     return envelope["ok"], warmed_refs
 
 
+def parse_targeted_warmup_success(value: Any, expected_ref: str) -> tuple[bool, bool]:
+    """Validate one-account warm-up output without accepting roster-wide data."""
+
+    envelope = _parse_envelope(value, "agent warmup account")
+    data = envelope["data"]
+    if not isinstance(data, Mapping):
+        raise MonitorError("unexpected_warmup_shape")
+    allowed_data = {"status", "ref", "accountStatus", "counts", "startedAt", "finishedAt"}
+    if set(data) - allowed_data or not {"status", "ref", "accountStatus"}.issubset(data):
+        raise MonitorError("unexpected_warmup_shape")
+    if data["status"] not in {"ok", "proxyUnavailable", "failed", "dryRun"}:
+        raise MonitorError("unexpected_warmup_shape")
+    ref = data["ref"]
+    account_status = data["accountStatus"]
+    if not isinstance(ref, str) or not REF_PATTERN.fullmatch(ref) or ref != expected_ref:
+        raise MonitorError("unexpected_warmup_shape")
+    if account_status not in SAFE_WARM_STATUSES:
+        raise MonitorError("unexpected_warmup_shape")
+    counts = data.get("counts")
+    if not isinstance(counts, Mapping):
+        raise MonitorError("unexpected_warmup_shape")
+    if set(counts) - {"total", "eligible", "warmed", "skipped", "failed"}:
+        raise MonitorError("unexpected_warmup_shape")
+    for key in counts:
+        if type(counts[key]) is not int or counts[key] < 0:
+            raise MonitorError("unexpected_warmup_shape")
+    for key in ("startedAt", "finishedAt"):
+        if key in data:
+            parse_timestamp(data[key])
+    return envelope["ok"], account_status == "warmed"
+
+
 def reset_fingerprint(snapshot: AccountSnapshot) -> Optional[str]:
     if snapshot.window is None or snapshot.window.reset_at is None:
         return None
@@ -835,65 +867,65 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
             }
 
         append_log(log_path(config.state_dir), "warm_requested", pending=len(pending))
-        warm_response = run_command(
-            binary,
-            ["agent", "warmup", "all", "--confirm", "--json"],
-            config.warmup_timeout_seconds,
+        # A reset marker identifies one account.  Keep each request targeted so
+        # a reset in one account cannot spend quota or acquire a lease for the
+        # rest of the roster.  Continue through the pending set so independent
+        # resets are handled in the same poll; failed refs remain pending for
+        # the cooldown retry.
+        successful_refs: set[str] = set()
+        warmed_refs: set[str] = set()
+        failed_refs: set[str] = set()
+        for ref in pending:
+            warm_response = run_command(
+                binary,
+                ["agent", "warmup", "account", ref, "--confirm", "--json"],
+                config.warmup_timeout_seconds,
+            )
+            if warm_response.payload is None:
+                failed_refs.add(ref)
+                append_log(log_path(config.state_dir), "warm_failed", code=warm_response.failure or "unknown")
+                continue
+            try:
+                warm_ok, warmed = parse_targeted_warmup_success(warm_response.payload, ref)
+            except MonitorError as error:
+                failed_refs.add(ref)
+                append_log(log_path(config.state_dir), "warm_invalid", code=error.code)
+                continue
+            if warm_ok:
+                successful_refs.add(ref)
+                if warmed:
+                    warmed_refs.add(ref)
+            else:
+                failed_refs.add(ref)
+
+        # A valid targeted response is the deduplication boundary for that ref.
+        # Even a safe skip (for example a race into cooldown) must not be
+        # replayed for the same reset fingerprint on every monitor tick.
+        _mark_warmed(state, successful_refs, now)
+        if successful_refs:
+            state["lastWarmAt"] = timestamp_string(now)
+        state["lastWarmStatus"] = "failed" if failed_refs else "succeeded"
+        state["nextAttemptAfter"] = (
+            timestamp_string(now + _datetime.timedelta(seconds=config.cooldown_seconds))
+            if failed_refs
+            else None
         )
-        if warm_response.payload is None:
-            state["lastWarmStatus"] = "failed"
-            state["nextAttemptAfter"] = timestamp_string(now + _datetime.timedelta(seconds=config.cooldown_seconds))
-            save_state(state_file, state)
-            append_log(log_path(config.state_dir), "warm_failed", code=warm_response.failure or "unknown")
+        save_state(state_file, state)
+        if failed_refs:
+            append_log(log_path(config.state_dir), "warm_failed", failed=len(failed_refs), warmed=len(warmed_refs))
             return EXIT_TEMPORARY, {
                 "status": "warmFailed",
                 "observedResetCount": observed,
-                "pendingCount": len(pending),
-            }
-        try:
-            warm_ok, warmed_refs = parse_warmup_success(warm_response.payload)
-        except MonitorError as error:
-            warm_ok, warmed_refs = False, set()
-            append_log(log_path(config.state_dir), "warm_invalid", code=error.code)
-        mark_refs = sorted(set(pending).intersection(warmed_refs)) if warmed_refs else []
-        if warm_ok:
-            # A valid warm-up response is the deduplication boundary. The
-            # response may report an account as skipped (for example because
-            # it became ineligible between quota polling and the request),
-            # but replaying the whole-account command for the same fingerprint
-            # would spend quota on unrelated accounts. Clear all pending reset
-            # work from this invocation; a later reset creates a new marker.
-            attempted_refs = set(pending)
-            _mark_warmed(state, mark_refs, now)
-            for ref in attempted_refs.difference(mark_refs):
-                record = state["accounts"].get(ref)
-                if record is None:
-                    continue
-                record["lastWarmFingerprint"] = record.get("pendingFingerprint")
-                record["lastWarmAt"] = timestamp_string(now)
-                record["pendingFingerprint"] = None
-                record["pendingObservedAt"] = None
-            state["lastWarmAt"] = timestamp_string(now)
-            state["lastWarmStatus"] = "succeeded"
-            state["nextAttemptAfter"] = None
-            save_state(state_file, state)
-            append_log(log_path(config.state_dir), "warm_succeeded", warmed=len(mark_refs), pending=len(pending))
-            remaining = len(_pending_refs(state, snapshots))
-            return EXIT_OK, {
-                "status": "warmed" if mark_refs else "warmSkipped",
-                "observedResetCount": observed,
-                "pendingCount": remaining,
-                "warmedCount": len(mark_refs),
+                "pendingCount": len(_pending_refs(state, snapshots)),
+                "warmedCount": len(warmed_refs),
             }
 
-        state["lastWarmStatus"] = "failed"
-        state["nextAttemptAfter"] = timestamp_string(now + _datetime.timedelta(seconds=config.cooldown_seconds))
-        save_state(state_file, state)
-        append_log(log_path(config.state_dir), "warm_failed", pending=len(pending))
-        return EXIT_TEMPORARY, {
-            "status": "warmFailed",
+        append_log(log_path(config.state_dir), "warm_succeeded", warmed=len(warmed_refs), pending=len(pending))
+        return EXIT_OK, {
+            "status": "warmed" if warmed_refs else "warmSkipped",
             "observedResetCount": observed,
-            "pendingCount": len(pending),
+            "pendingCount": len(_pending_refs(state, snapshots)),
+            "warmedCount": len(warmed_refs),
         }
     finally:
         try:

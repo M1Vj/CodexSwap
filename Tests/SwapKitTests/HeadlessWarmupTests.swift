@@ -150,6 +150,66 @@ final class HeadlessWarmupTests: XCTestCase {
         XCTAssertEqual(report.accounts.first?.status, .skippedProxyUnavailable)
     }
 
+    func testTargetedWarmupOnlyHydratesAndRunsTheRequestedAccount() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("headless-warmup-targeted-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "target", accountID: "target-id", accessToken: "target-access", usage: warmupUsage(now: now)))
+        await store.upsert(Account(alias: "other", accountID: "other-id", accessToken: "other-access", usage: warmupUsage(now: now)))
+        let runner = RecordingWarmupRunner()
+        let service = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")),
+            lockURL: root.appendingPathComponent("warmup.lock")
+        )
+
+        let report = await HeadlessWarmup.run(
+            proxyURL: URL(string: "http://127.0.0.1:58432"),
+            store: store,
+            settings: .default,
+            warmupService: service,
+            targetAliases: ["target"],
+            now: now
+        )
+
+        let calls = await runner.calls()
+        XCTAssertEqual(calls, ["target"])
+        XCTAssertEqual(report.counts.total, 1)
+        XCTAssertEqual(report.accounts.first?.alias, "target")
+    }
+
+    func testTargetedWarmupPreservesSafeProxyUnavailableReport() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("headless-warmup-targeted-no-proxy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "target", accountID: "target-id", accessToken: "target-access"))
+        await store.upsert(Account(alias: "other", accountID: "other-id", accessToken: "other-access"))
+        let runner = RecordingWarmupRunner()
+        let service = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")),
+            lockURL: root.appendingPathComponent("warmup.lock")
+        )
+
+        let report = await HeadlessWarmup.run(
+            proxyURL: nil,
+            store: store,
+            settings: .default,
+            warmupService: service,
+            targetAliases: ["target"]
+        )
+
+        XCTAssertEqual(report.counts.total, 1)
+        XCTAssertEqual(report.accounts.first?.status, .skippedProxyUnavailable)
+        let calls = await runner.calls()
+        XCTAssertEqual(calls, [])
+    }
+
 }
 
 private func fakeJWT(expiry: TimeInterval, signature: String) -> String {

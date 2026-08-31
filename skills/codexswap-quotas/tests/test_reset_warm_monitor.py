@@ -84,12 +84,13 @@ def status_report(*, available: bool) -> dict[str, object]:
     )
 
 
-def warm_report() -> dict[str, object]:
+def warm_report(*, ref: str = REF) -> dict[str, object]:
     return envelope(
-        "agent warmup all",
+        "agent warmup account",
         {
             "status": "ok",
-            "accounts": [{"ref": REF, "status": "warmed"}],
+            "ref": ref,
+            "accountStatus": "warmed",
             "counts": {"total": 1, "warmed": 1, "skipped": 0, "failed": 0},
             "startedAt": "2026-08-31T00:20:00Z",
             "finishedAt": "2026-08-31T00:20:01Z",
@@ -157,8 +158,10 @@ if arguments == ['agent', 'quota', 'report', '--json']:
 elif arguments == ['agent', 'status', '--json']:
     state = PROXY.read_text(encoding='utf-8').strip()
     print((FIXTURES / ('status-' + state + '.json')).read_text(encoding='utf-8'), end='')
-elif arguments == ['agent', 'warmup', 'all', '--confirm', '--json']:
-    print((FIXTURES / 'warm.json').read_text(encoding='utf-8'), end='')
+elif len(arguments) == 6 and arguments[:3] == ['agent', 'warmup', 'account'] and arguments[4:] == ['--confirm', '--json']:
+    payload = json.loads((FIXTURES / 'warm.json').read_text(encoding='utf-8'))
+    payload['data']['ref'] = arguments[3]
+    print(json.dumps(payload, separators=(',', ':')), end='')
 else:
     raise SystemExit(64)
 """
@@ -203,7 +206,7 @@ else:
             [
                 ["agent", "quota", "report", "--json"],
                 ["agent", "status", "--json"],
-                ["agent", "warmup", "all", "--confirm", "--json"],
+                ["agent", "warmup", "account", REF, "--confirm", "--json"],
             ],
         )
 
@@ -219,7 +222,7 @@ else:
         code, result = monitor.monitor_once(replacement, now=instant("2026-08-31T00:21:00Z"))
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "noReset")
-        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "all"]), 1)
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
 
     def test_lower_usage_with_same_reset_is_a_reset_signal(self) -> None:
         self.write_phase("baseline", used=80, reset_at="2026-08-31T02:00:00Z")
@@ -236,7 +239,7 @@ else:
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:11:00Z"))
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "noReset")
-        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "all"]), 1)
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
 
     def test_future_deadline_move_without_lower_usage_does_not_warm(self) -> None:
         self.write_phase("baseline", used=40, reset_at="2026-08-31T02:00:00Z")
@@ -256,13 +259,13 @@ else:
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
         self.assertEqual(code, monitor.EXIT_UNAVAILABLE)
         self.assertEqual(result["status"], "proxyUnavailable")
-        self.assertFalse(any(call[:3] == ["agent", "warmup", "all"] for call in self.calls()))
+        self.assertFalse(any(call[:2] == ["agent", "warmup"] for call in self.calls()))
 
         self.proxy_file.write_text("available", encoding="utf-8")
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:30Z"))
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "cooldown")
-        self.assertFalse(any(call[:3] == ["agent", "warmup", "all"] for call in self.calls()))
+        self.assertFalse(any(call[:2] == ["agent", "warmup"] for call in self.calls()))
 
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:36:00Z"))
         self.assertEqual(code, monitor.EXIT_OK)

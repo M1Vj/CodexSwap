@@ -85,11 +85,18 @@ public enum HeadlessWarmup {
         store: AccountStore = AccountStore(),
         settings: Settings = .default,
         warmupService: QuotaWarmupService = QuotaWarmupService(),
+        targetAliases: Set<String>? = nil,
         now: Date = Date()
     ) async -> HeadlessWarmupReport {
         // Keep archived rows out of both credential hydration and the operational
         // warm-up roster. The service still defends this boundary for direct callers.
-        let originalAccounts = await store.activeAccounts()
+        let allAccounts = await store.activeAccounts()
+        let originalAccounts: [Account]
+        if let targetAliases {
+            originalAccounts = allAccounts.filter { targetAliases.contains($0.alias) }
+        } else {
+            originalAccounts = allAccounts
+        }
         let accounts = await hydrateManagedHomes(originalAccounts, store: store)
         let aliases = safeAliases(for: accounts)
 

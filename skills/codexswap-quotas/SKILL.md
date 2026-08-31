@@ -60,13 +60,13 @@ do not display command errors or stderr.
 
 When automatic warm-up is unavailable or the Mac was asleep at reset time, use
 the bundled monitor. It polls the sanitized `swapd agent quota report --json`
-surface, establishes a baseline on its first run, and requests
-`swapd agent warmup all --confirm --json` only after a reset transition is
-observed. A lower used percentage or an expired prior reset followed by a new
-future reset is evidence; a moving future deadline alone is not. The monitor
-stores only opaque `acct-...` references, reset fingerprints, percentages, and
-timestamps in a mode-700 directory. It never reads the account store or auth
-files and never logs command output.
+surface, establishes a baseline on its first run, and requests one
+`swapd agent warmup account <acct-ref> --confirm --json` per detected reset
+only after a reset transition is observed. A lower used percentage or an
+expired prior reset followed by a new future reset is evidence; a moving future
+deadline alone is not. The monitor stores only opaque `acct-...` references,
+reset fingerprints, percentages, and timestamps in a mode-700 directory. It
+never reads the account store or auth files and never logs command output.
 
 For a one-shot poll:
 

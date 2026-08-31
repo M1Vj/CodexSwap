@@ -13,6 +13,18 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(command.canonicalName, "agent status")
     }
 
+    func testParserRecognisesTargetedWarmupAccount() throws {
+        let reference = "acct-0123456789abcdef"
+        let command = try AgentCLIParser.parse([
+            "agent", "warmup", "account", reference, "--confirm", "--json"
+        ])
+
+        XCTAssertEqual(command.operation, .warmupAccount(reference))
+        XCTAssertTrue(command.options.confirm)
+        XCTAssertTrue(command.options.json)
+        XCTAssertEqual(command.canonicalName, "agent warmup account")
+    }
+
     func testParserRejectsUnknownFlagsAndMissingTargets() {
         XCTAssertThrowsError(try AgentCLIParser.parse(["agent", "status", "--wat"]))
         XCTAssertThrowsError(try AgentCLIParser.parse(["agent", "account", "switch"]))

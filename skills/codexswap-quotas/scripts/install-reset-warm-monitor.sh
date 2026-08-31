@@ -21,9 +21,10 @@ Usage:
   install-reset-warm-monitor.sh [--dry-run]
 
 The monitor is one-shot and launchd invokes it every 60 seconds. It records a
-baseline first, then invokes `swapd agent warmup all --confirm --json` only
-after a sanitized quota report proves a reset transition. It never edits the
-CodexSwap account store and does not restart CodexSwap.
+baseline first, then invokes one targeted `swapd agent warmup account
+<acct-ref> --confirm --json` per reset reference only after a sanitized quota
+report proves a reset transition. It never edits the CodexSwap account store
+and does not restart CodexSwap.
 EOF
 }
 

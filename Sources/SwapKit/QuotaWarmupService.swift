@@ -23,24 +23,36 @@ public actor QuotaWarmupService {
     private let ledger: WarmupLedgerStore
     private let failureRetrySeconds: TimeInterval
     private let unknownRetrySeconds: TimeInterval
+    private let lockURL: URL
     private var isRunning = false
 
     public init(
         runner: any WarmupCommandRunning = ProcessWarmupRunner(),
         ledger: WarmupLedgerStore = WarmupLedgerStore(),
         failureRetrySeconds: TimeInterval = 300,
-        unknownRetrySeconds: TimeInterval = 1_800
+        unknownRetrySeconds: TimeInterval = 1_800,
+        lockURL: URL = AppPaths.warmupLockFile()
     ) {
         self.runner = runner
         self.ledger = ledger
         self.failureRetrySeconds = failureRetrySeconds
         self.unknownRetrySeconds = unknownRetrySeconds
+        self.lockURL = lockURL
     }
 
     public func run(accounts: [Account], proxyURL: URL, force: Bool = false, now: Date = Date()) async -> WarmupSummary {
         guard !isRunning else {
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         }
+        let processLock: WarmupInterprocessLock
+        do {
+            processLock = try WarmupInterprocessLock(url: lockURL)
+        } catch WarmupInterprocessLockError.busy {
+            return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
+        } catch {
+            return WarmupSummary(startedAt: now, finishedAt: now, failed: ["all": "warm-up lock unavailable"])
+        }
+        defer { processLock.release() }
         isRunning = true
         defer { isRunning = false }
 

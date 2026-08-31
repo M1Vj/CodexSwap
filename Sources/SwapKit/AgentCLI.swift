@@ -270,6 +270,7 @@ public enum AgentCLIOperation: Sendable, Equatable {
     case routingRepair
     case settingsGet(String?)
     case settingsSet(String, String)
+    case warmupAccount(String)
 }
 
 public struct AgentCLICommand: Sendable, Equatable {
@@ -306,6 +307,7 @@ public struct AgentCLICommand: Sendable, Equatable {
         case .routingRepair: return "agent routing repair"
         case .settingsGet: return "agent settings get"
         case .settingsSet: return "agent settings set"
+        case .warmupAccount: return "agent warmup account"
         }
     }
 }
@@ -431,8 +433,18 @@ public enum AgentCLIParser {
             guard tail.count == 1, tail[0] == "report" else { throw tail.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
             operation = .quotaReport
         case "warmup":
-            guard tail.count == 1, tail[0] == "all" else { throw tail.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
-            operation = .warmupAll
+            guard let subcommand = tail.first else { throw AgentCLIParseError.missingArgument }
+            let rest = Array(tail.dropFirst())
+            switch subcommand {
+            case "all":
+                guard rest.isEmpty else { throw AgentCLIParseError.invalidArgument }
+                operation = .warmupAll
+            case "account":
+                guard rest.count == 1 else { throw rest.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
+                operation = .warmupAccount(rest[0])
+            default:
+                throw AgentCLIParseError.unknownCommand
+            }
         case "reset":
             guard let subcommand = tail.first else { throw AgentCLIParseError.missingArgument }
             let rest = Array(tail.dropFirst())
@@ -475,7 +487,7 @@ public enum AgentCLIParser {
         let supportsConfirm: Bool
         let supportsDryRun: Bool
         switch operation {
-        case .accountArchive, .accountRemove, .resetUse, .warmupAll, .accountsReconcile:
+        case .accountArchive, .accountRemove, .resetUse, .warmupAll, .warmupAccount, .accountsReconcile:
             supportsConfirm = true
             supportsDryRun = true
         case .accountSwitch, .accountSticky, .accountRouting, .accountRank, .accountRestore,
@@ -641,6 +653,7 @@ public struct AgentCLI: Sendable {
       account switch|sticky|routing|rank|archive|restore|remove ... [--json]
       quota report --json
       warmup all --json --confirm
+      warmup account <alias-or-ref> --json --confirm
       reset status --json; reset use <alias-or-ref> --json --confirm
       routing get|enable|disable|repair --json
       settings get|set <allowlisted-key> <typed-value> --json
@@ -678,6 +691,8 @@ public struct AgentCLI: Sendable {
             return try await quotaReport(command)
         case .warmupAll:
             return await warmupAll(command)
+        case .warmupAccount(let target):
+            return await warmupAccount(target: target, command: command)
         case .resetStatus:
             return await resetStatus(command)
         case .resetUse(let target):
@@ -1291,6 +1306,97 @@ public struct AgentCLI: Sendable {
         ])
         if report.status == .failed {
             return AgentCLIResult(envelope: .failure(command: command.canonicalName, code: "warmup_failed", message: "one or more warm-up attempts failed", data: data), exitCode: .tempFailure)
+        }
+        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
+    }
+
+    /// Warm exactly one resolved account.  The reset monitor uses this narrow
+    /// command so a reset-triggered request cannot consume unrelated accounts
+    /// from the roster.  The account reference is resolved against the same
+    /// sanitized roster used by the other agent commands; the underlying
+    /// warm-up service still enforces credentials, routing, usage and the
+    /// shared interprocess lock.
+    private func warmupAccount(target: String, command: AgentCLICommand) async -> AgentCLIResult {
+        let accountRoster = await roster()
+        guard let entry = accountRoster.resolve(target), !entry.account.isArchived else {
+            return missingAccount(command: command.canonicalName)
+        }
+        if !command.options.confirm && !command.options.dryRun {
+            return confirmationRequired(command: command.canonicalName, action: "run warm-up")
+        }
+
+        let settings = await settingsStore.get()
+        let runtimeURL = await runtimeURLCandidate(settings: settings)
+        let ref = entry.reference
+        let unavailableData: AgentCLIJSONValue = .object([
+            "status": .string("proxyUnavailable"),
+            "ref": .string(ref),
+            "accountStatus": .string("skippedProxyUnavailable"),
+            "counts": .object([
+                "total": .integer(1),
+                "warmed": .integer(0),
+                "skipped": .integer(1),
+                "failed": .integer(0),
+            ]),
+        ])
+        guard Self.isUsableLoopback(runtimeURL) else {
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "runtime_unavailable",
+                    message: "running loopback proxy is required for warm-up",
+                    data: unavailableData
+                ),
+                exitCode: .unavailable
+            )
+        }
+
+        if command.options.dryRun {
+            let eligible = AppEngine.quotaWarmupEligible(entry.account, settings: settings)
+                && QuotaWarmupService.usageAllowsWarmup(entry.account)
+            let data: AgentCLIJSONValue = .object([
+                "status": .string("dryRun"),
+                "ref": .string(ref),
+                "accountStatus": .string(eligible ? "wouldWarm" : "skipped"),
+                "counts": .object([
+                    "total": .integer(1),
+                    "eligible": .integer(eligible ? 1 : 0),
+                ]),
+            ])
+            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
+        }
+
+        let report = await HeadlessWarmup.run(
+            proxyURL: runtimeURL,
+            store: store,
+            settings: settings,
+            warmupService: warmupService,
+            targetAliases: [entry.account.alias]
+        )
+        let accountStatus = report.accounts.first?.status.rawValue ?? "skipped"
+        let data: AgentCLIJSONValue = .object([
+            "status": .string(report.status.rawValue),
+            "ref": .string(ref),
+            "accountStatus": .string(accountStatus),
+            "counts": .object([
+                "total": .integer(report.counts.total),
+                "warmed": .integer(report.counts.warmed),
+                "skipped": .integer(report.counts.skipped),
+                "failed": .integer(report.counts.failed),
+            ]),
+            "startedAt": .string(Self.iso8601(report.startedAt)),
+            "finishedAt": .string(Self.iso8601(report.finishedAt)),
+        ])
+        if report.status == .failed || accountStatus == HeadlessWarmupAccountStatus.failed.rawValue {
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "warmup_failed",
+                    message: "warm-up attempt failed",
+                    data: data
+                ),
+                exitCode: .tempFailure
+            )
         }
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
     }
