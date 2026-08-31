@@ -2038,6 +2038,77 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(runnerCalls, [])
     }
 
+    func testAutomaticWarmupRefreshesHydratedManagedAccountBeforeDueDecision() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-smart-switch-hydration-\(UUID().uuidString)")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(9_000)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let staleAccessToken = freshToken(now: now.addingTimeInterval(-7_200))
+        let freshAccessToken = freshToken(now: now)
+        try CodexAuth.write(
+            CodexTokens(
+                idToken: "fresh-id-token",
+                accessToken: freshAccessToken,
+                refreshToken: "fresh-refresh-token",
+                accountId: "id-managed"
+            ),
+            to: managedHome.appendingPathComponent("auth.json")
+        )
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "managed",
+            accountID: "id-managed",
+            accessToken: staleAccessToken,
+            refreshToken: "stale-refresh-token",
+            priority: 1,
+            managedHomePath: managedHome.path
+        ))
+        let settingsStore = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let settings = await settingsStore.update {
+            $0.automaticallyWarmAccounts = true
+            $0.smartSwitchEnabled = true
+        }
+        let usage = ScriptedUsageFetcher(windowsByAccountID: [
+            "id-managed": [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)]
+        ])
+        let runner = FakeWarmupRunner()
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        await ledger.setRecord(
+            WarmupRecord(
+                succeededAt: now.addingTimeInterval(-18_001),
+                primaryResetAt: now.addingTimeInterval(-1),
+                secondaryResetAt: nil,
+                outcome: .unknown,
+                attemptedAt: now.addingTimeInterval(-18_001)
+            ),
+            for: "id-managed"
+        )
+        let engine = AppEngine(
+            store: store,
+            settingsStore: settingsStore,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(runner: runner, ledger: ledger)
+        )
+
+        let summary = await engine.automaticWarmupTick(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            settings: settings,
+            now: now,
+            usageAlreadyRefreshed: true
+        )
+
+        let usageCalls = await usage.calls()
+        let runnerCalls = await runner.calls()
+        XCTAssertNil(summary)
+        XCTAssertEqual(usageCalls, ["id-managed"])
+        XCTAssertEqual(runnerCalls, [])
+        let record = await ledger.record(for: "id-managed")
+        XCTAssertEqual(record?.outcome, .verified)
+        XCTAssertEqual(record?.primaryResetAt, reset)
+    }
+
     func testEmptyUsageReconcilesWarmupWithoutWipingDisplayedUsage() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-empty-usage-\(UUID().uuidString)")
         let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -2263,7 +2334,12 @@ final class WarmupEngineTests: XCTestCase {
     func testOverlappingWarmupDoesNotClearActiveProgress() async {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-overlap-\(UUID().uuidString)")
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
-        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: freshToken(),
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        ))
         let runner = BlockingWarmupRunner()
         let warmup = QuotaWarmupService(
             runner: runner,

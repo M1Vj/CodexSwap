@@ -1178,15 +1178,22 @@ public actor AppEngine {
         }
         guard !autoCandidates.isEmpty else { return nil }
 
-        if !usageAlreadyRefreshed {
-            let aliases = Set(autoCandidates.map(\.alias))
-            _ = await pollUsage(
-                activeOnly: false,
-                aliases: aliases,
-                settingsOverride: currentSettings,
-                now: now
-            )
-        }
+        // Hydrating managed homes above can replace an expired access token with
+        // a fresher CodexBar-owned token. The poller's preceding Smart Switch
+        // refresh may have skipped that account before hydration because it
+        // rejected stale tokens. Always refresh the filtered candidates after
+        // hydration so reset detection never relies on stale usage evidence.
+        // `usageAlreadyRefreshed` is retained for source compatibility with
+        // wake/relaunch callers; the filtered refresh is deliberately cheap and
+        // bounded to automatic-warmup candidates.
+        _ = usageAlreadyRefreshed
+        let aliases = Set(autoCandidates.map(\.alias))
+        _ = await pollUsage(
+            activeOnly: false,
+            aliases: aliases,
+            settingsOverride: currentSettings,
+            now: now
+        )
         let refreshedCandidates = (await warmupCandidates()).filter {
             Self.autoWarmupEligible($0, settings: currentSettings)
         }
