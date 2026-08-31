@@ -2109,6 +2109,74 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(record?.primaryResetAt, reset)
     }
 
+    func testAutomaticWarmupDoesNotRepollFreshManagedCandidate() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-smart-switch-fresh-\(UUID().uuidString)")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(9_000)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let accessToken = freshToken(now: now)
+        try CodexAuth.write(
+            CodexTokens(
+                idToken: "fresh-id-token",
+                accessToken: accessToken,
+                refreshToken: "fresh-refresh-token",
+                accountId: "id-managed"
+            ),
+            to: managedHome.appendingPathComponent("auth.json")
+        )
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "managed",
+            accountID: "id-managed",
+            accessToken: accessToken,
+            refreshToken: "fresh-refresh-token",
+            priority: 1,
+            usage: [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)],
+            managedHomePath: managedHome.path
+        ))
+        let settingsStore = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let settings = await settingsStore.update {
+            $0.automaticallyWarmAccounts = true
+            $0.smartSwitchEnabled = true
+        }
+        let usage = ScriptedUsageFetcher(windowsByAccountID: [
+            "id-managed": [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)]
+        ])
+        let runner = FakeWarmupRunner()
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        await ledger.setRecord(
+            WarmupRecord(
+                succeededAt: now.addingTimeInterval(-1),
+                primaryResetAt: reset,
+                secondaryResetAt: nil,
+                outcome: .verified,
+                attemptedAt: now.addingTimeInterval(-1)
+            ),
+            for: "id-managed"
+        )
+        let engine = AppEngine(
+            store: store,
+            settingsStore: settingsStore,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(runner: runner, ledger: ledger)
+        )
+
+        let summary = await engine.automaticWarmupTick(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            settings: settings,
+            now: now,
+            usageAlreadyRefreshed: true
+        )
+
+        let usageCalls = await usage.calls()
+        let runnerCalls = await runner.calls()
+        XCTAssertNil(summary)
+        XCTAssertEqual(usageCalls, [])
+        XCTAssertEqual(runnerCalls, [])
+    }
+
     func testEmptyUsageReconcilesWarmupWithoutWipingDisplayedUsage() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-empty-usage-\(UUID().uuidString)")
         let now = Date(timeIntervalSince1970: 1_800_000_000)

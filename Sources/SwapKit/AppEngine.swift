@@ -1173,6 +1173,14 @@ public actor AppEngine {
             currentSettings = await settingsStore.get()
         }
         guard currentSettings.automaticallyWarmAccounts else { return nil }
+        let preHydrationAccounts = await store.activeAccounts()
+        let staleManagedAliases = Set(
+            preHydrationAccounts.compactMap { account -> String? in
+                guard account.managedHomePath != nil,
+                      JWT.isStale(account.accessToken, now: now) else { return nil }
+                return account.alias
+            }
+        )
         let autoCandidates = (await warmupCandidates()).filter {
             Self.autoWarmupEligible($0, settings: currentSettings)
         }
@@ -1181,19 +1189,21 @@ public actor AppEngine {
         // Hydrating managed homes above can replace an expired access token with
         // a fresher CodexBar-owned token. The poller's preceding Smart Switch
         // refresh may have skipped that account before hydration because it
-        // rejected stale tokens. Always refresh the filtered candidates after
-        // hydration so reset detection never relies on stale usage evidence.
-        // `usageAlreadyRefreshed` is retained for source compatibility with
-        // wake/relaunch callers; the filtered refresh is deliberately cheap and
-        // bounded to automatic-warmup candidates.
-        _ = usageAlreadyRefreshed
-        let aliases = Set(autoCandidates.map(\.alias))
-        _ = await pollUsage(
-            activeOnly: false,
-            aliases: aliases,
-            settingsOverride: currentSettings,
-            now: now
-        )
+        // rejected stale tokens. Refresh only those recovered aliases; fresh
+        // candidates were already covered by the ordinary poll and must not
+        // incur another request on every automatic tick.
+        let eligibleAliases = Set(autoCandidates.map(\.alias))
+        let aliasesToRefresh = usageAlreadyRefreshed
+            ? eligibleAliases.intersection(staleManagedAliases)
+            : eligibleAliases
+        if !aliasesToRefresh.isEmpty {
+            _ = await pollUsage(
+                activeOnly: false,
+                aliases: aliasesToRefresh,
+                settingsOverride: currentSettings,
+                now: now
+            )
+        }
         let refreshedCandidates = (await warmupCandidates()).filter {
             Self.autoWarmupEligible($0, settings: currentSettings)
         }
