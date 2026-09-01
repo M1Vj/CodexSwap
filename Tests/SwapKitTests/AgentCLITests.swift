@@ -30,6 +30,171 @@ final class AgentCLITests: XCTestCase {
         XCTAssertThrowsError(try AgentCLIParser.parse(["agent", "account", "switch"]))
     }
 
+    func testParserRecognisesUsageLimitShowAndSetFlags() throws {
+        let reference = "acct-0123456789abcdef"
+        let show = try AgentCLIParser.parse(["agent", "account", "usage-limit", "show", reference])
+        XCTAssertEqual(show.operation, .accountUsageLimitShow(reference))
+
+        let set = try AgentCLIParser.parse([
+            "agent", "account", "usage-limit", "set", reference,
+            "--five-hour", "80", "--weekly", "90", "--enable", "--dry-run", "--confirm"
+        ])
+        XCTAssertEqual(set.operation, .accountUsageLimitSet(reference, fiveHour: 80, weekly: 90, enabled: true))
+        XCTAssertTrue(set.options.dryRun)
+        XCTAssertTrue(set.options.confirm)
+    }
+
+    func testParserRejectsUsageLimitDuplicateUnknownAndOutOfRangeFlags() {
+        XCTAssertThrowsError(try AgentCLIParser.parse([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "80", "--five-hour", "90", "--weekly", "90"
+        ]))
+        XCTAssertThrowsError(try AgentCLIParser.parse([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "80", "--weekly", "90", "--wat"
+        ]))
+        XCTAssertThrowsError(try AgentCLIParser.parse([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "0", "--weekly", "90"
+        ]))
+        XCTAssertThrowsError(try AgentCLIParser.parse([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "80", "--weekly", "101"
+        ]))
+    }
+
+    func testUsageLimitDryRunDoesNotPersistAndShowProjectsPausedWindows() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIUsageLimitDryRun-\(UUID().uuidString)", isDirectory: true)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "alpha",
+            accountID: "id-alpha",
+            accessToken: "token-alpha",
+            usage: [
+                UsageWindow(label: "5h", usedPercent: 85, windowSeconds: 18_000, resetAt: nil),
+                UsageWindow(label: "Weekly", usedPercent: 25, windowSeconds: 604_800, resetAt: nil),
+            ]
+        ))
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let preview = await cli.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "80", "--weekly", "90", "--enable", "--dry-run", "--json"
+        ])
+        XCTAssertEqual(preview.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertTrue(preview.envelope.ok)
+        guard case .object(let previewData)? = preview.envelope.data else { return XCTFail("missing usage-limit preview data") }
+        XCTAssertEqual(previewData["dryRun"], .bool(true))
+        XCTAssertEqual(previewData["persisted"], .bool(false))
+        let unchanged = await store.account("alpha")
+        XCTAssertEqual(unchanged?.usageLimitSettings, .disabled)
+
+        let show = await cli.run(["agent", "account", "usage-limit", "show", "alpha", "--json"])
+        XCTAssertEqual(show.exitCode, AgentCLIExitCode.ok.rawValue)
+        guard case .object(let showData)? = show.envelope.data else { return XCTFail("missing usage-limit show data") }
+        guard case .object(let usageLimit)? = showData["usageLimit"] else { return XCTFail("missing usageLimit data") }
+        XCTAssertEqual(usageLimit["enabled"], .bool(false))
+        XCTAssertEqual(showData["pausedWindows"], .array([]))
+        XCTAssertEqual(showData["pausedReason"], .null)
+    }
+
+    func testUsageLimitSetPersistsSafeFieldsAndRequiresConfirmOnlyForActivePause() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIUsageLimitSet-\(UUID().uuidString)", isDirectory: true)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "alpha",
+            accountID: "id-alpha",
+            accessToken: "token-alpha",
+            usage: [
+                UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: nil),
+                UsageWindow(label: "Weekly", usedPercent: 25, windowSeconds: 604_800, resetAt: nil),
+            ]
+        ))
+        await store.upsert(Account(alias: "beta", accountID: "id-beta", accessToken: "token-beta"))
+        _ = await store.setActive("alpha")
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let rejected = await cli.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "40", "--weekly", "90", "--enable", "--json"
+        ])
+        XCTAssertEqual(rejected.exitCode, AgentCLIExitCode.usage.rawValue)
+        XCTAssertEqual(rejected.envelope.error?.code, "confirmation_required")
+        let unchanged = await store.account("alpha")
+        XCTAssertFalse(unchanged?.usageLimitSettings.enabled ?? true)
+
+        let applied = await cli.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "40", "--weekly", "90", "--enable", "--confirm", "--json"
+        ])
+        XCTAssertEqual(applied.exitCode, AgentCLIExitCode.ok.rawValue)
+        guard case .object(let appliedData)? = applied.envelope.data else { return XCTFail("missing usage-limit result") }
+        XCTAssertEqual(appliedData["persisted"], .bool(true))
+        XCTAssertEqual(appliedData["dryRun"], .bool(false))
+        guard case .object(let usageLimit)? = appliedData["usageLimit"] else { return XCTFail("missing usageLimit result") }
+        XCTAssertEqual(usageLimit["fiveHourPercent"], .integer(40))
+        XCTAssertEqual(usageLimit["weeklyPercent"], .integer(90))
+        XCTAssertEqual(appliedData["pausedWindows"], .array([.string("fiveHour")]))
+        XCTAssertEqual(appliedData["pausedReason"], .string("usage_limit_reached"))
+
+        let missingWeekly = await cli.run([
+            "agent", "account", "usage-limit", "set", "beta",
+            "--five-hour", "80", "--json"
+        ])
+        XCTAssertEqual(missingWeekly.exitCode, AgentCLIExitCode.usage.rawValue)
+        XCTAssertEqual(missingWeekly.envelope.error?.code, "usage_limit_values_required")
+
+        let betaApplied = await cli.run([
+            "agent", "account", "usage-limit", "set", "beta",
+            "--five-hour", "80", "--weekly", "90", "--enable", "--json"
+        ])
+        XCTAssertEqual(betaApplied.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertEqual(betaApplied.envelope.error, nil)
+    }
+
+    func testSwitchOnCappedAccountReportsUsageLimitError() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLISwitchUsageLimit-\(UUID().uuidString)", isDirectory: true)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "alpha", accountID: "id-alpha", accessToken: "token-alpha"))
+        await store.upsert(Account(
+            alias: "beta",
+            accountID: "id-beta",
+            accessToken: "token-beta",
+            usage: [UsageWindow(label: "5h", usedPercent: 95, windowSeconds: 18_000, resetAt: nil)]
+        ))
+        _ = await store.setActive("alpha")
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+        let configured = await cli.run([
+            "agent", "account", "usage-limit", "set", "beta",
+            "--five-hour", "90", "--weekly", "90", "--enable", "--json"
+        ])
+        XCTAssertEqual(configured.exitCode, AgentCLIExitCode.ok.rawValue)
+
+        let switched = await cli.run(["agent", "account", "switch", "beta", "--json"])
+        XCTAssertEqual(switched.exitCode, AgentCLIExitCode.data.rawValue)
+        XCTAssertEqual(switched.envelope.error?.code, "usage_limit_reached")
+        let activeAlias = await store.activeAlias()
+        XCTAssertEqual(activeAlias, "alpha")
+    }
+
     func testEnvelopeUsesStableSchemaAndOmitsSecrets() throws {
         let envelope = AgentCLIEnvelope.success(
             command: "agent status",

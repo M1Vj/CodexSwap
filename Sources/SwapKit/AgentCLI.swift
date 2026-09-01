@@ -256,6 +256,8 @@ public enum AgentCLIOperation: Sendable, Equatable {
     case accountSwitch(String)
     case accountSticky(String, desired: Bool?)
     case accountRouting(String, enabled: Bool)
+    case accountUsageLimitShow(String)
+    case accountUsageLimitSet(String, fiveHour: Int?, weekly: Int?, enabled: Bool?)
     case accountRank(String, rank: Int)
     case accountArchive(String)
     case accountRestore(String)
@@ -293,6 +295,8 @@ public struct AgentCLICommand: Sendable, Equatable {
         case .accountSwitch: return "agent account switch"
         case .accountSticky: return "agent account sticky"
         case .accountRouting: return "agent account routing"
+        case .accountUsageLimitShow: return "agent account usage-limit show"
+        case .accountUsageLimitSet: return "agent account usage-limit set"
         case .accountRank: return "agent account rank"
         case .accountArchive: return "agent account archive"
         case .accountRestore: return "agent account restore"
@@ -342,18 +346,53 @@ public enum AgentCLIParser {
         var confirm = false
         var dryRun = false
         var accountMode: Bool?
+        var fiveHourPercent: Int?
+        var weeklyPercent: Int?
+        var seenFlags = Set<String>()
+        var usageLimitModeAliasUsed = false
 
-        for argument in arguments.dropFirst() {
+        var index = 1
+        while index < arguments.count {
+            let argument = arguments[index]
+            index += 1
             switch argument {
-            case "--json": json = true
-            case "--confirm": confirm = true
-            case "--dry-run": dryRun = true
+            case "--json":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
+                json = true
+            case "--confirm":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
+                confirm = true
+            case "--dry-run":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
+                dryRun = true
             case "--enable", "--on":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
                 guard accountMode == nil else { throw AgentCLIParseError.invalidFlag }
+                if argument == "--on" { usageLimitModeAliasUsed = true }
                 accountMode = true
             case "--disable", "--off":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
                 guard accountMode == nil else { throw AgentCLIParseError.invalidFlag }
+                if argument == "--off" { usageLimitModeAliasUsed = true }
                 accountMode = false
+            case "--five-hour":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
+                guard index < arguments.count else { throw AgentCLIParseError.missingArgument }
+                let rawValue = arguments[index]
+                index += 1
+                guard let value = Int(rawValue), (1...100).contains(value) else {
+                    throw AgentCLIParseError.invalidInteger
+                }
+                fiveHourPercent = value
+            case "--weekly":
+                guard seenFlags.insert(argument).inserted else { throw AgentCLIParseError.invalidFlag }
+                guard index < arguments.count else { throw AgentCLIParseError.missingArgument }
+                let rawValue = arguments[index]
+                index += 1
+                guard let value = Int(rawValue), (1...100).contains(value) else {
+                    throw AgentCLIParseError.invalidInteger
+                }
+                weeklyPercent = value
             case "--help", "-h": positional.append("help")
             case let value where value.hasPrefix("-"): throw AgentCLIParseError.invalidFlag
             default: positional.append(argument)
@@ -413,6 +452,31 @@ public enum AgentCLIParser {
                     operation = .accountRouting(rest[0], enabled: false)
                 } else {
                     throw AgentCLIParseError.invalidArgument
+                }
+            case "usage-limit":
+                guard let mode = rest.first else { throw AgentCLIParseError.missingArgument }
+                let target = Array(rest.dropFirst())
+                switch mode {
+                case "show":
+                    guard target.count == 1 else {
+                        throw target.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument
+                    }
+                    guard fiveHourPercent == nil, weeklyPercent == nil, accountMode == nil else {
+                        throw AgentCLIParseError.unsupportedFlag
+                    }
+                    operation = .accountUsageLimitShow(target[0])
+                case "set":
+                    guard target.count == 1 else {
+                        throw target.isEmpty ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument
+                    }
+                    operation = .accountUsageLimitSet(
+                        target[0],
+                        fiveHour: fiveHourPercent,
+                        weekly: weeklyPercent,
+                        enabled: accountMode
+                    )
+                default:
+                    throw AgentCLIParseError.unknownCommand
                 }
             case "rank":
                 guard rest.count == 2 else { throw rest.count < 2 ? AgentCLIParseError.missingArgument : AgentCLIParseError.invalidArgument }
@@ -479,6 +543,18 @@ public enum AgentCLIParser {
         }
 
         let options = AgentCLIOptions(json: json, confirm: confirm, dryRun: dryRun, accountMode: accountMode)
+        if fiveHourPercent != nil || weeklyPercent != nil {
+            guard case .accountUsageLimitSet = operation else {
+                throw AgentCLIParseError.unsupportedFlag
+            }
+        }
+        if usageLimitModeAliasUsed {
+            if case .accountUsageLimitSet = operation {
+                // `--on`/`--off` remain valid aliases for sticky and routing
+                // controls, but usage-limit accepts only its documented flags.
+                throw AgentCLIParseError.unsupportedFlag
+            }
+        }
         try validateOptions(options, operation: operation)
         return AgentCLICommand(operation: operation, options: options)
     }
@@ -487,7 +563,8 @@ public enum AgentCLIParser {
         let supportsConfirm: Bool
         let supportsDryRun: Bool
         switch operation {
-        case .accountArchive, .accountRemove, .resetUse, .warmupAll, .warmupAccount, .accountsReconcile:
+        case .accountArchive, .accountRemove, .resetUse, .warmupAll, .warmupAccount, .accountsReconcile,
+             .accountUsageLimitSet:
             supportsConfirm = true
             supportsDryRun = true
         case .accountSwitch, .accountSticky, .accountRouting, .accountRank, .accountRestore,
@@ -502,7 +579,7 @@ public enum AgentCLIParser {
         if options.dryRun && !supportsDryRun { throw AgentCLIParseError.unsupportedFlag }
         if options.accountMode != nil {
             switch operation {
-            case .accountSticky, .accountRouting: break
+            case .accountSticky, .accountRouting, .accountUsageLimitSet: break
             default: throw AgentCLIParseError.unsupportedFlag
             }
         }
@@ -650,7 +727,9 @@ public struct AgentCLI: Sendable {
     agent — safe machine-readable CodexSwap control
       status --json
       accounts list|show <alias-or-ref>|import|reconcile --json
-      account switch|sticky|routing|rank|archive|restore|remove ... [--json]
+      account switch|sticky|routing|usage-limit|rank|archive|restore|remove ... [--json]
+      account usage-limit show <alias-or-ref> --json
+      account usage-limit set <alias-or-ref> --five-hour N --weekly N [--enable|--disable] [--confirm|--dry-run] --json
       quota report --json
       warmup all --json --confirm
       warmup account <alias-or-ref> --json --confirm
@@ -679,6 +758,16 @@ public struct AgentCLI: Sendable {
             return await accountSticky(target: target, desired: desired, command: command)
         case .accountRouting(let target, let enabled):
             return await accountRouting(target: target, enabled: enabled, command: command)
+        case .accountUsageLimitShow(let target):
+            return await accountUsageLimitShow(target: target, command: command)
+        case .accountUsageLimitSet(let target, let fiveHour, let weekly, let enabled):
+            return await accountUsageLimitSet(
+                target: target,
+                fiveHour: fiveHour,
+                weekly: weekly,
+                enabled: enabled,
+                command: command
+            )
         case .accountRank(let target, let rank):
             return await accountRank(target: target, rank: rank, command: command)
         case .accountArchive(let target):
@@ -1058,12 +1147,162 @@ public struct AgentCLI: Sendable {
     private func accountSwitch(target: String, command: AgentCLICommand) async -> AgentCLIResult {
         let accountRoster = await roster()
         guard let entry = accountRoster.resolve(target), !entry.account.isArchived, entry.account.routingEnabled else { return missingAccount(command: command.canonicalName) }
+        guard !entry.account.isUsageLimitReached else {
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "usage_limit_reached",
+                    message: "account usage limit reached"
+                ),
+                exitCode: .data
+            )
+        }
         if command.options.dryRun {
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["wouldSwitchTo": .string(entry.reference)])), exitCode: .ok)
         }
         await engine.switchTo(entry.account.alias)
+        guard await store.activeAlias() == entry.account.alias else {
+            let latest = await store.account(entry.account.alias)
+            if latest?.isUsageLimitReached == true {
+                return AgentCLIResult(
+                    envelope: .failure(
+                        command: command.canonicalName,
+                        code: "usage_limit_reached",
+                        message: "account usage limit reached"
+                    ),
+                    exitCode: .data
+                )
+            }
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "account_not_eligible",
+                    message: "account could not become active"
+                ),
+                exitCode: .data
+            )
+        }
         let data = accountView((await roster()).entries.first(where: { $0.account.alias == entry.account.alias }) ?? entry, activeAlias: await store.activeAlias(), stickyAlias: await store.stickyAlias(), draining: await store.currentDrainingAliases())
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
+    }
+
+    private func accountUsageLimitShow(target: String, command: AgentCLICommand) async -> AgentCLIResult {
+        let accountRoster = await roster()
+        guard let entry = accountRoster.resolve(target) else { return missingAccount(command: command.canonicalName) }
+        let data = usageLimitView(for: entry.account, reference: entry.reference)
+        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
+    }
+
+    private func accountUsageLimitSet(
+        target: String,
+        fiveHour: Int?,
+        weekly: Int?,
+        enabled: Bool?,
+        command: AgentCLICommand
+    ) async -> AgentCLIResult {
+        let accountRoster = await roster()
+        guard let entry = accountRoster.resolve(target), !entry.account.isArchived else {
+            return missingAccount(command: command.canonicalName)
+        }
+
+        let existing = entry.account.usageLimitSettings
+        let proposedEnabled = enabled ?? existing.enabled
+        let isNewSet = !existing.enabled && (fiveHour != nil || weekly != nil)
+        if (enabled == true || isNewSet) && (fiveHour == nil || weekly == nil) {
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "usage_limit_values_required",
+                    message: "both --five-hour and --weekly are required when enabling a usage limit"
+                ),
+                exitCode: .usage
+            )
+        }
+
+        let proposed = AccountUsageLimitSettings(
+            enabled: proposedEnabled,
+            fiveHourPercent: fiveHour ?? existing.fiveHourPercent,
+            weeklyPercent: weekly ?? existing.weeklyPercent
+        )
+        var projected = entry.account
+        projected.usageLimitSettings = proposed
+        let stickyAlias = await store.stickyAlias()
+        let stickyLimitOverride = await store.stickyUsageLimitOverride()
+        let stickyOverride = stickyAlias == entry.account.alias && stickyLimitOverride
+        let activeAlias = await store.activeAlias()
+        let immediatelyPausesCurrent = activeAlias == entry.account.alias
+            && !stickyOverride
+            && !entry.account.isUsageLimitReached
+            && projected.isUsageLimitReached
+
+        if command.options.dryRun {
+            return AgentCLIResult(
+                envelope: .success(
+                    command: command.canonicalName,
+                    data: usageLimitView(
+                        for: projected,
+                        reference: entry.reference,
+                        persisted: false,
+                        dryRun: true,
+                        confirmationRequired: immediatelyPausesCurrent
+                    )
+                ),
+                exitCode: .ok
+            )
+        }
+        if immediatelyPausesCurrent && !command.options.confirm {
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "confirmation_required",
+                    message: "--confirm is required to apply a usage limit that pauses the active account"
+                ),
+                exitCode: .usage
+            )
+        }
+
+        guard let updated = await store.setUsageLimitSettings(entry.account.alias, settings: proposed) else {
+            return missingAccount(command: command.canonicalName)
+        }
+        return AgentCLIResult(
+            envelope: .success(
+                command: command.canonicalName,
+                data: usageLimitView(
+                    for: updated,
+                    reference: entry.reference,
+                    persisted: true,
+                    dryRun: false,
+                    confirmationRequired: false
+                )
+            ),
+            exitCode: .ok
+        )
+    }
+
+    private func usageLimitView(
+        for account: Account,
+        reference: String,
+        persisted: Bool? = nil,
+        dryRun: Bool? = nil,
+        confirmationRequired: Bool? = nil
+    ) -> AgentCLIJSONValue {
+        var value: [String: AgentCLIJSONValue] = [
+            "ref": .string(reference),
+            "usageLimit": .object([
+                "enabled": .bool(account.usageLimitSettings.enabled),
+                "fiveHourPercent": .integer(account.usageLimitSettings.fiveHourPercent),
+                "weeklyPercent": .integer(account.usageLimitSettings.weeklyPercent),
+            ]),
+        ]
+        let reached = [AccountUsageLimitWindow.fiveHour, .weekly].filter {
+            account.usageLimitReachedWindows.contains($0)
+        }
+        value["pausedWindows"] = .array(reached.map { .string($0.rawValue) })
+        value["pausedReason"] = reached.isEmpty ? .null : .string("usage_limit_reached")
+        if let persisted { value["persisted"] = .bool(persisted) }
+        if let dryRun { value["dryRun"] = .bool(dryRun) }
+        if let confirmationRequired { value["confirmationRequired"] = .bool(confirmationRequired) }
+        return .object(value)
     }
 
     private func accountSticky(target: String, desired: Bool?, command: AgentCLICommand) async -> AgentCLIResult {
