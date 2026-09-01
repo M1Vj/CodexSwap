@@ -24,6 +24,7 @@ SPEC.loader.exec_module(monitor)
 
 
 REF = "acct-0123456789abcdef"
+USED_REF = "acct-fedcba9876543210"
 
 
 def instant(value: str) -> dt.datetime:
@@ -41,29 +42,44 @@ def envelope(command: str, data: object, *, ok: bool = True) -> dict[str, object
     }
 
 
-def quota_report(*, used: int, reset_at: str, fetched_at: str = "2026-08-30T23:00:00Z") -> dict[str, object]:
+def quota_report(
+    *,
+    used: int,
+    reset_at: str | None,
+    fetched_at: str = "2026-08-30T23:00:00Z",
+    usage_status: str = "ok",
+    state: str = "available",
+    include_window: bool = True,
+    extra_accounts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    windows: list[dict[str, object]] = []
+    if include_window:
+        windows.append(
+            {
+                "label": "5h",
+                "usedPercent": used,
+                "remainingPercent": 100 - used,
+                "resetAt": reset_at,
+            }
+        )
+    accounts: list[dict[str, object]] = [
+        {
+            "alias": "Account 1",
+            "ref": REF,
+            "state": state,
+            "usageStatus": usage_status,
+            "resetCreditStatus": "noCredit",
+            "windows": windows,
+        }
+    ]
+    if extra_accounts:
+        accounts.extend(extra_accounts)
     return envelope(
         "agent quota report",
         {
             "schemaVersion": 1,
             "fetchedAt": fetched_at,
-            "accounts": [
-                {
-                    "alias": "Account 1",
-                    "ref": REF,
-                    "state": "available",
-                    "usageStatus": "ok",
-                    "resetCreditStatus": "noCredit",
-                    "windows": [
-                        {
-                            "label": "5h",
-                            "usedPercent": used,
-                            "remainingPercent": 100 - used,
-                            "resetAt": reset_at,
-                        }
-                    ],
-                }
-            ],
+            "accounts": accounts,
         },
     )
 
@@ -159,6 +175,8 @@ elif arguments == ['agent', 'status', '--json']:
     state = PROXY.read_text(encoding='utf-8').strip()
     print((FIXTURES / ('status-' + state + '.json')).read_text(encoding='utf-8'), end='')
 elif len(arguments) == 6 and arguments[:3] == ['agent', 'warmup', 'account'] and arguments[4:] == ['--confirm', '--json']:
+    if PHASE.read_text(encoding='utf-8').strip() == 'warm-fail':
+        raise SystemExit(75)
     payload = json.loads((FIXTURES / 'warm.json').read_text(encoding='utf-8'))
     payload['data']['ref'] = arguments[3]
     print(json.dumps(payload, separators=(',', ':')), end='')
@@ -166,11 +184,31 @@ else:
     raise SystemExit(64)
 """
 
-    def write_phase(self, name: str, *, used: int, reset_at: str) -> None:
+    def write_phase(
+        self,
+        name: str,
+        *,
+        used: int,
+        reset_at: str | None,
+        usage_status: str = "ok",
+        state: str = "available",
+        include_window: bool = True,
+        extra_accounts: list[dict[str, object]] | None = None,
+    ) -> None:
         self.phase_file.write_text(name, encoding="utf-8")
         self.fixtures.mkdir(parents=True, exist_ok=True)
         self.fixtures.joinpath(f"{name}.quota.json").write_text(
-            json.dumps(quota_report(used=used, reset_at=reset_at), separators=(",", ":")),
+            json.dumps(
+                quota_report(
+                    used=used,
+                    reset_at=reset_at,
+                    usage_status=usage_status,
+                    state=state,
+                    include_window=include_window,
+                    extra_accounts=extra_accounts,
+                ),
+                separators=(",", ":"),
+            ),
             encoding="utf-8",
         )
         self.fixtures.joinpath("warm.json").write_text(
@@ -224,14 +262,43 @@ else:
         self.assertEqual(result["status"], "noReset")
         self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
 
-    def test_lower_usage_with_same_reset_is_a_reset_signal(self) -> None:
+    def test_reset_past_while_quota_is_offline_is_retried_after_reconnect(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        # The reset elapses while the provider is unreachable. The local
+        # report still arrives from swapd, but it carries no usable window.
+        self.write_phase(
+            "offline",
+            used=0,
+            reset_at=None,
+            usage_status="network",
+            include_window=False,
+        )
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+        saved_offline = json.loads((self.state_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_offline["accounts"][REF]["resetAt"], "2026-08-31T00:10:00Z")
+
+        # Once connectivity returns, the new zero-usage/future-reset reading
+        # proves the missed transition and is warmed exactly once.
+        self.write_phase("reconnected", used=0, reset_at="2026-08-31T05:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:21:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(
+            sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]),
+            1,
+        )
+
+    def test_lower_usage_with_same_reset_does_not_target_used_account(self) -> None:
         self.write_phase("baseline", used=80, reset_at="2026-08-31T02:00:00Z")
         monitor.monitor_once(self.config, now=instant("2026-08-31T00:00:00Z"))
         self.write_phase("lower", used=10, reset_at="2026-08-31T02:00:00Z")
 
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:10:00Z"))
         self.assertEqual(code, monitor.EXIT_OK)
-        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(result["status"], "resetObserved")
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 0)
 
         # A later lower reading with the same reset fingerprint is not a new
         # cycle and must not issue another whole-account warm-up.
@@ -239,7 +306,7 @@ else:
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:11:00Z"))
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "noReset")
-        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 0)
 
     def test_future_deadline_move_without_lower_usage_does_not_warm(self) -> None:
         self.write_phase("baseline", used=40, reset_at="2026-08-31T02:00:00Z")
@@ -251,7 +318,7 @@ else:
         self.assertEqual(result["status"], "noReset")
         self.assertEqual(self.calls(), [["agent", "quota", "report", "--json"], ["agent", "quota", "report", "--json"]])
 
-    def test_unavailable_proxy_does_not_warm_and_retries_after_cooldown(self) -> None:
+    def test_unavailable_proxy_does_not_warm_and_retries_on_reconnect(self) -> None:
         monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
         self.write_phase("reset", used=0, reset_at="2026-08-31T01:00:00Z")
         self.proxy_file.write_text("unavailable", encoding="utf-8")
@@ -264,12 +331,98 @@ else:
         self.proxy_file.write_text("available", encoding="utf-8")
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:30Z"))
         self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+
+    def test_app_open_catches_up_pending_reset_after_monitor_relaunch(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("reset", used=0, reset_at="2026-08-31T01:00:00Z")
+        self.proxy_file.write_text("unavailable", encoding="utf-8")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+        self.assertEqual(code, monitor.EXIT_UNAVAILABLE)
+        self.assertEqual(result["status"], "proxyUnavailable")
+
+        # App relaunch creates a new monitor instance. The pending reset must
+        # survive that boundary and be consumed once when the proxy is ready.
+        replacement = monitor.MonitorConfig(
+            binary=self.binary,
+            state_dir=self.state_dir,
+            cooldown_seconds=900,
+            command_timeout_seconds=5,
+            warmup_timeout_seconds=5,
+            script_path=SCRIPT,
+        )
+        self.proxy_file.write_text("available", encoding="utf-8")
+        code, result = monitor.monitor_once(replacement, now=instant("2026-08-31T00:20:30Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
+
+    def test_failed_warm_retries_on_timer_after_bounded_backoff(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("warm-fail", used=0, reset_at="2026-08-31T01:00:00Z")
+
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+        self.assertEqual(code, monitor.EXIT_TEMPORARY)
+        self.assertEqual(result["status"], "warmFailed")
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
+
+        self.write_phase("reset", used=0, reset_at="2026-08-31T01:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:30Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "cooldown")
-        self.assertFalse(any(call[:2] == ["agent", "warmup"] for call in self.calls()))
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 1)
 
         code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:36:00Z"))
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "warmed")
+        self.assertEqual(sum(1 for call in self.calls() if call[:3] == ["agent", "warmup", "account"]), 2)
+
+    def test_used_account_is_not_targeted_by_reset_warmup(self) -> None:
+        used_account_baseline = {
+            "alias": "Account 2",
+            "ref": USED_REF,
+            "state": "available",
+            "usageStatus": "ok",
+            "resetCreditStatus": "noCredit",
+            "windows": [
+                {
+                    "label": "5h",
+                    "usedPercent": 80,
+                    "remainingPercent": 20,
+                    "resetAt": "2026-08-31T00:10:00Z",
+                }
+            ],
+        }
+        self.write_phase(
+            "baseline-two",
+            used=80,
+            reset_at="2026-08-31T00:10:00Z",
+            extra_accounts=[used_account_baseline],
+        )
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        used_account_after_reset = {
+            **used_account_baseline,
+            "windows": [
+                {
+                    "label": "5h",
+                    "usedPercent": 12,
+                    "remainingPercent": 88,
+                    "resetAt": "2026-08-31T01:00:00Z",
+                }
+            ],
+        }
+        self.write_phase(
+            "reset-two",
+            used=0,
+            reset_at="2026-08-31T01:00:00Z",
+            extra_accounts=[used_account_after_reset],
+        )
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        warm_calls = [call for call in self.calls() if call[:3] == ["agent", "warmup", "account"]]
+        self.assertEqual(len(warm_calls), 1)
+        self.assertEqual(warm_calls[0][3], REF)
 
     def test_concurrent_monitor_is_locked(self) -> None:
         self.state_dir.mkdir(parents=True)

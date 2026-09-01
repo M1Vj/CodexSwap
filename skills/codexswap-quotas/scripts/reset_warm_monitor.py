@@ -686,8 +686,23 @@ def _pending_refs(state: Mapping[str, Any], snapshots: Iterable[AccountSnapshot]
         if current is None or current.window is None or current.window.reset_at is None:
             continue
         if current.state in {"active", "available"} and current.usage_status == "ok":
+            # The warm-up command is quota-consuming. A reset transition can
+            # be visible while an account is already serving traffic; keep the
+            # marker for a later zero-usage reading, but never target a used
+            # account (or fall back to a roster-wide warm-up).
+            if current.window.used_percent != 0:
+                continue
             refs.append(ref)
     return sorted(refs)
+
+
+def _usable_snapshot(snapshot: AccountSnapshot) -> bool:
+    return (
+        snapshot.state in {"active", "available"}
+        and snapshot.usage_status == "ok"
+        and snapshot.window is not None
+        and snapshot.window.reset_at is not None
+    )
 
 
 def _apply_observations(
@@ -710,22 +725,30 @@ def _apply_observations(
             # while still reporting an otherwise healthy account. Preserve
             # the last baseline so the next complete report can still prove a
             # reset instead of silently re-arming from an empty baseline.
-            if (
-                snapshot.state in {"active", "available"}
-                and snapshot.usage_status == "ok"
-                and (snapshot.window is None or snapshot.window.reset_at is None)
-            ):
+            # A network/timeout/error report is still a local observation, not
+            # a new baseline. Preserve the last usable reset and percentage so
+            # a reset that elapsed during the outage can be detected when the
+            # next healthy report returns. The same preservation applies to a
+            # healthy report whose reset timestamp is transiently missing.
+            if not _usable_snapshot(snapshot):
                 record["label"] = previous.get("label")
                 record["resetAt"] = previous.get("resetAt")
-                if snapshot.window is None:
-                    record["usedPercent"] = previous.get("usedPercent")
+                record["usedPercent"] = previous.get("usedPercent")
         if observe_reset(previous, snapshot, now):
             fingerprint = reset_fingerprint(snapshot)
-            if fingerprint is not None and fingerprint != (previous or {}).get("lastWarmFingerprint"):
+            if fingerprint is not None and fingerprint not in {
+                (previous or {}).get("lastWarmFingerprint"),
+                (previous or {}).get("pendingFingerprint"),
+            }:
                 record["pendingFingerprint"] = fingerprint
                 record["pendingObservedAt"] = timestamp_string(now)
                 observed_count += 1
-        elif previous is not None and record["pendingFingerprint"] and record["pendingFingerprint"] != reset_fingerprint(snapshot):
+        elif (
+            previous is not None
+            and _usable_snapshot(snapshot)
+            and record["pendingFingerprint"]
+            and record["pendingFingerprint"] != reset_fingerprint(snapshot)
+        ):
             # A later, non-reset observation supersedes stale pending work. A
             # genuine new reset will set a fresh pending fingerprint above.
             record["pendingFingerprint"] = None
@@ -822,19 +845,6 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
                 "pendingCount": len(pending),
             }
 
-        # Persist the cooldown before starting the real request. If this
-        # process is interrupted after CodexSwap accepts the warm-up but
-        # before the response is persisted, a relaunch cannot immediately
-        # replay the same reset-triggered request.
-        state["nextAttemptAfter"] = timestamp_string(
-            now + _datetime.timedelta(seconds=config.cooldown_seconds)
-        )
-        try:
-            save_state(state_file, state)
-        except MonitorError as error:
-            append_log(log_path(config.state_dir), "state_write_failed", code=error.code)
-            return EXIT_DATA, {"status": "stateWriteFailed", "pendingCount": len(pending)}
-
         status_response = run_command(binary, ["agent", "status", "--json"], config.command_timeout_seconds)
         if status_response.payload is None:
             append_log(log_path(config.state_dir), "proxy_unavailable", code=status_response.failure or "unknown")
@@ -865,6 +875,19 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
                 "observedResetCount": observed,
                 "pendingCount": len(pending),
             }
+
+        # Persist the cooldown only once the loopback service is confirmed
+        # available and immediately before the first targeted request. An
+        # unavailable app/proxy is not a warm-up attempt; retaining a cooldown
+        # in that case would make an app-open or reconnect poll wait needlessly.
+        state["nextAttemptAfter"] = timestamp_string(
+            now + _datetime.timedelta(seconds=config.cooldown_seconds)
+        )
+        try:
+            save_state(state_file, state)
+        except MonitorError as error:
+            append_log(log_path(config.state_dir), "state_write_failed", code=error.code)
+            return EXIT_DATA, {"status": "stateWriteFailed", "pendingCount": len(pending)}
 
         append_log(log_path(config.state_dir), "warm_requested", pending=len(pending))
         # A reset marker identifies one account.  Keep each request targeted so
