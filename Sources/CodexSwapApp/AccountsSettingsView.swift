@@ -541,8 +541,7 @@ private struct AccountCard: View {
     private var activationControl: some View {
         if !AccountRoutingPresentation.canMakeActive(
             routingEnabled: account.routingEnabled,
-            usageLimitReached: account.isPausedByUsageLimit,
-            stickyOverride: account.isSticky
+            usageLimitReached: account.isPausedByUsageLimit
         ) {
             if account.isPausedByUsageLimit {
                 Label("Paused by usage cap", systemImage: "pause.circle.fill")

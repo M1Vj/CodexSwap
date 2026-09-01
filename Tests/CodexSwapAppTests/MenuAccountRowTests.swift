@@ -98,13 +98,13 @@ final class MenuAccountRowTests: XCTestCase {
         XCTAssertEqual(doubleClicks, 1)
     }
 
-    func testCappedAccountMayBeActivatedOnlyWhenStickyOverrideIsPresent() {
+    func testCappedAccountCannotBeActivatedEvenWhenStickyOverrideIsPresent() {
         XCTAssertFalse(AccountRoutingPresentation.canMakeActive(
             routingEnabled: true,
             usageLimitReached: true,
             stickyOverride: false
         ))
-        XCTAssertTrue(AccountRoutingPresentation.canMakeActive(
+        XCTAssertFalse(AccountRoutingPresentation.canMakeActive(
             routingEnabled: true,
             usageLimitReached: true,
             stickyOverride: true
@@ -116,8 +116,9 @@ final class MenuAccountRowTests: XCTestCase {
         ))
     }
 
-    func testStickyCapRowRetainsSingleClickSelection() throws {
+    func testStickyCapRowBlocksSingleClickButKeepsDoubleClickOverride() throws {
         var singleClicks = 0
+        var doubleClicks = 0
         let row = MenuAccountRow(
             rank: 1,
             alias: "pinned-cap",
@@ -135,7 +136,8 @@ final class MenuAccountRowTests: XCTestCase {
             row: row,
             width: 340,
             isEnabled: true,
-            onSelect: { singleClicks += 1 }
+            onSelect: { singleClicks += 1 },
+            onDoubleClick: { doubleClicks += 1 }
         )
         let event = try XCTUnwrap(NSEvent.mouseEvent(
             with: .leftMouseDown,
@@ -148,9 +150,22 @@ final class MenuAccountRowTests: XCTestCase {
             clickCount: 1,
             pressure: 0
         ))
+        let doubleClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 4,
+            clickCount: 2,
+            pressure: 0
+        ))
 
         container.mouseDown(with: event)
+        container.mouseDown(with: doubleClick)
 
-        XCTAssertEqual(singleClicks, 1)
+        XCTAssertEqual(singleClicks, 0)
+        XCTAssertEqual(doubleClicks, 1)
     }
 }

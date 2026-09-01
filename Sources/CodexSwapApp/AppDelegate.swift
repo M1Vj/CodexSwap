@@ -1049,7 +1049,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func activateAccount(_ alias: String) {
-        Task { await engine.switchTo(alias); await refreshSnapshot() }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // The menu can remain open while usage refreshes in the engine.
+            // Re-read the account immediately before switching so a newly
+            // capped account cannot be activated through stale menu state.
+            let freshSnapshot = await engine.snapshot()
+            switch AccountActivationGuard.evaluate(snapshot: freshSnapshot, alias: alias) {
+            case .allowed:
+                await engine.switchTo(alias)
+            case .usageLimitReached:
+                presentMessage("\(alias) is paused by a usage cap. Double-click its menu row to pin a manual override.")
+            case .routingDisabled:
+                presentMessage("\(alias) has routing disabled.")
+            case .unavailable:
+                presentMessage("\(alias) is unavailable.")
+            }
+            await refreshSnapshot()
+        }
     }
 
     @objc private func enableRoutingFromMenu(_ sender: NSMenuItem) {

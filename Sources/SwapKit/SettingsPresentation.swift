@@ -49,14 +49,48 @@ public enum AccountRoutingPresentation {
     public static func canMakeActive(routingEnabled: Bool) -> Bool { routingEnabled }
 
     /// Usage-cap pauses are distinct from a manual routing pause. A capped
-    /// account is only activatable when the owner has explicitly pinned it as
-    /// a sticky override (double-click in the menu).
+    /// account is never activated by the regular Make Active/single-click
+    /// path; the menu's explicit double-click action is the only post-cap
+    /// manual override path.
+    public static func canMakeActive(
+        routingEnabled: Bool,
+        usageLimitReached: Bool
+    ) -> Bool {
+        routingEnabled && !usageLimitReached
+    }
+
+    /// Compatibility overload for callers that also carry the sticky state.
+    /// Sticky state is intentionally ignored here: it must not make the
+    /// regular activation control available after a cap is reached.
     public static func canMakeActive(
         routingEnabled: Bool,
         usageLimitReached: Bool,
         stickyOverride: Bool
     ) -> Bool {
-        routingEnabled && (!usageLimitReached || stickyOverride)
+        _ = stickyOverride
+        return canMakeActive(routingEnabled: routingEnabled, usageLimitReached: usageLimitReached)
+    }
+}
+
+/// Fresh-snapshot decision used by activation entry points (settings and the
+/// status-menu row). Keeping this pure makes the stale-menu race testable:
+/// callers evaluate the account returned by the latest engine snapshot before
+/// attempting a switch.
+public enum AccountActivationGuard: Sendable, Equatable {
+    case allowed
+    case usageLimitReached
+    case routingDisabled
+    case unavailable
+
+    public static func evaluate(account: Account?) -> Self {
+        guard let account, !account.isArchived else { return .unavailable }
+        if account.isUsageLimitReached { return .usageLimitReached }
+        if !account.routingEnabled { return .routingDisabled }
+        return .allowed
+    }
+
+    public static func evaluate(snapshot: EngineSnapshot, alias: String) -> Self {
+        evaluate(account: snapshot.accounts.first { $0.alias == alias })
     }
 }
 

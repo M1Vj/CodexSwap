@@ -79,4 +79,28 @@ final class UsageLimitUIStateTests: XCTestCase {
         XCTAssertNil(AccountUsageLimitPresentation.validatedPercent(from: "0"))
         XCTAssertNil(AccountUsageLimitPresentation.validatedPercent(from: "101"))
     }
+
+    func testActivationGuardRejectsFreshlyCappedAccountBeforeSwitch() {
+        let capped = Account(
+            alias: "capped",
+            accountID: "capped-id",
+            accessToken: "token",
+            usage: [UsageWindow(label: "5h", usedPercent: 80, windowSeconds: 18_000, resetAt: resetAt)],
+            usageLimitSettings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        )
+        let manuallyDisabled = Account(alias: "manual", accountID: "manual-id", accessToken: "token", routingEnabled: false)
+        let freshSnapshot = EngineSnapshot(
+            accounts: [capped],
+            activeAlias: nil,
+            proxyURL: nil,
+            strategy: .priority
+        )
+
+        XCTAssertEqual(AccountActivationGuard.evaluate(account: capped), .usageLimitReached)
+        XCTAssertEqual(AccountActivationGuard.evaluate(account: manuallyDisabled), .routingDisabled)
+        XCTAssertEqual(AccountActivationGuard.evaluate(account: nil), .unavailable)
+        XCTAssertEqual(AccountActivationGuard.evaluate(account: Account(alias: "ready", accessToken: "token")), .allowed)
+        XCTAssertEqual(AccountActivationGuard.evaluate(snapshot: freshSnapshot, alias: "capped"), .usageLimitReached)
+        XCTAssertEqual(AccountActivationGuard.evaluate(snapshot: freshSnapshot, alias: "missing"), .unavailable)
+    }
 }

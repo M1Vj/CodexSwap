@@ -131,7 +131,7 @@ struct MenuAccountRow: View {
     }
 
     var allowsSingleClickSelection: Bool {
-        !isUsageLimitReached || isSticky
+        !isUsageLimitReached
     }
 
     private var isUsageLimitReached: Bool {
