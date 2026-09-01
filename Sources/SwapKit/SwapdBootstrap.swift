@@ -18,10 +18,12 @@ public enum SwapdBootstrap {
     /// Recognizes the read-only usage-limit set intent without constructing an
     /// `AccountStore` or parsing command execution state.
     public static func isUsageLimitDryRun(arguments: [String]) -> Bool {
-        guard arguments.count >= 5,
-              Array(arguments.prefix(4)) == ["agent", "account", "usage-limit", "set"] else {
+        guard let command = try? AgentCLIParser.parse(arguments), command.options.dryRun else {
             return false
         }
-        return arguments.dropFirst(4).contains("--dry-run")
+        if case .accountUsageLimitSet = command.operation {
+            return true
+        }
+        return false
     }
 }

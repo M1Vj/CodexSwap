@@ -14,6 +14,26 @@ final class SwapdBootstrapTests: XCTestCase {
         XCTAssertFalse(SwapdBootstrap.shouldArchiveDueAccounts(arguments: arguments))
     }
 
+    func testUsageLimitDryRunWithLeadingGlobalFlagsSkipsBootstrapArchiving() {
+        let arguments = [
+            "agent", "--dry-run", "account", "usage-limit", "set", "paused",
+            "--five-hour", "80", "--weekly", "90", "--enable", "--json",
+        ]
+
+        XCTAssertTrue(SwapdBootstrap.isUsageLimitDryRun(arguments: arguments))
+        XCTAssertFalse(SwapdBootstrap.shouldArchiveDueAccounts(arguments: arguments))
+    }
+
+    func testUsageLimitDryRunWithInterleavedGlobalFlagsSkipsBootstrapArchiving() {
+        let arguments = [
+            "agent", "account", "--json", "usage-limit", "set", "paused",
+            "--five-hour", "80", "--dry-run", "--weekly", "90", "--enable",
+        ]
+
+        XCTAssertTrue(SwapdBootstrap.isUsageLimitDryRun(arguments: arguments))
+        XCTAssertFalse(SwapdBootstrap.shouldArchiveDueAccounts(arguments: arguments))
+    }
+
     func testNormalUsageLimitSetRetainsBootstrapArchiving() {
         let arguments = [
             "agent", "account", "usage-limit", "set", "paused",
@@ -31,7 +51,40 @@ final class SwapdBootstrapTests: XCTestCase {
         XCTAssertTrue(SwapdBootstrap.shouldArchiveDueAccounts(arguments: arguments))
     }
 
+    func testMalformedUsageLimitDryRunRetainsBootstrapArchiving() {
+        let missingTarget = ["agent", "--dry-run", "account", "usage-limit", "set"]
+        let unknownFlag = [
+            "agent", "account", "usage-limit", "set", "paused", "--dry-run", "--unknown",
+        ]
+
+        XCTAssertFalse(SwapdBootstrap.isUsageLimitDryRun(arguments: missingTarget))
+        XCTAssertTrue(SwapdBootstrap.shouldArchiveDueAccounts(arguments: missingTarget))
+        XCTAssertFalse(SwapdBootstrap.isUsageLimitDryRun(arguments: unknownFlag))
+        XCTAssertTrue(SwapdBootstrap.shouldArchiveDueAccounts(arguments: unknownFlag))
+    }
+
     func testUsageLimitDryRunLeavesDuePausedAccountBytesUnchanged() throws {
+        try assertDryRunLeavesDuePausedAccountBytesUnchanged(arguments: [
+            "agent", "account", "usage-limit", "set", "paused",
+            "--five-hour", "80", "--weekly", "90", "--enable", "--dry-run", "--json",
+        ])
+    }
+
+    func testLeadingGlobalFlagsLeaveDuePausedAccountBytesUnchanged() throws {
+        try assertDryRunLeavesDuePausedAccountBytesUnchanged(arguments: [
+            "agent", "--dry-run", "account", "usage-limit", "set", "paused",
+            "--five-hour", "80", "--weekly", "90", "--enable", "--json",
+        ])
+    }
+
+    func testInterleavedGlobalFlagsLeaveDuePausedAccountBytesUnchanged() throws {
+        try assertDryRunLeavesDuePausedAccountBytesUnchanged(arguments: [
+            "agent", "account", "--json", "usage-limit", "set", "paused",
+            "--five-hour", "80", "--dry-run", "--weekly", "90", "--enable",
+        ])
+    }
+
+    private func assertDryRunLeavesDuePausedAccountBytesUnchanged(arguments: [String]) throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("swapd-dry-run-" + UUID().uuidString, isDirectory: true)
         let supportDir = home
@@ -58,10 +111,7 @@ final class SwapdBootstrapTests: XCTestCase {
         let process = Process()
         process.executableURL = try swapdExecutable()
         process.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-        process.arguments = [
-            "agent", "account", "usage-limit", "set", "paused",
-            "--five-hour", "80", "--weekly", "90", "--enable", "--dry-run", "--json",
-        ]
+        process.arguments = arguments
         let output = Pipe()
         let error = Pipe()
         process.standardOutput = output
