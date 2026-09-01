@@ -17,7 +17,7 @@ struct MenuAccountRow: View {
     let windows: [UsageWindow]
     let costEstimate: Double?
     /// Read-only cap metadata. Settings edits remain in the Accounts pane.
-    let usageLimitSettings: AccountUsageLimitSettings = .disabled
+    var usageLimitSettings: AccountUsageLimitSettings = .disabled
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {

@@ -26,6 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private let engine = AppEngine(settingsStore: SettingsStoreBridge.shared)
+    /// The engine owns the live store internally. This app-side handle uses the
+    /// same default persistence path for settings-only writes until the engine
+    /// exposes a dedicated usage-limit action. AccountStore serializes the
+    /// write and the next engine snapshot picks it up through its external-state
+    /// refresh.
+    private let accountStore = AccountStore()
     private let alphaDelegationMCPManager = AlphaDelegationMCPManager()
     private var hasBundle: Bool { Bundle.main.bundleIdentifier != nil }
     private var statusItem: NSStatusItem!
@@ -623,7 +629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isDraining: activeAliases.contains(acc.alias) && latest.drainingAliases.contains(acc.alias),
                 cooldownUntil: acc.cooldownUntil(now: Date()),
                 windows: acc.usage,
-                costEstimate: acc.usageStats.map { UsageAnalytics.estimatedCost($0) }
+                costEstimate: acc.usageStats.map { UsageAnalytics.estimatedCost($0) },
+                usageLimitSettings: acc.usageLimitSettings
             )
             let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
             let alias = acc.alias
@@ -747,6 +754,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     await self.engine.setAccountRouting(alias, enabled: enabled)
+                    await self.refreshSnapshot()
+                }
+            },
+            setUsageLimitSettings: { [weak self] alias, usageLimitSettings in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard await self.accountStore.setUsageLimitSettings(alias, settings: usageLimitSettings) != nil else {
+                        self.presentMessage("Could not update usage limits for \(alias).")
+                        return
+                    }
                     await self.refreshSnapshot()
                 }
             },

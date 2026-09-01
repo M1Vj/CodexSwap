@@ -17,7 +17,7 @@ struct SettingsActions {
     /// Persists user-owned per-account quota caps. The default keeps existing
     /// action construction source-compatible until the app delegate wires its
     /// AccountStore/AppEngine bridge.
-    let setUsageLimitSettings: (String, AccountUsageLimitSettings) -> Void = { _, _ in }
+    var setUsageLimitSettings: (String, AccountUsageLimitSettings) -> Void = { _, _ in }
     let setAutomaticResetProtection: (String, Bool) -> Void
     let useResetCredit: (String, Date?) -> Void
     let archiveAccount: (String) -> Void
