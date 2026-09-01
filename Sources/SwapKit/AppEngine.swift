@@ -1139,6 +1139,7 @@ public actor AppEngine {
     static func quotaWarmupEligible(_ account: Account, settings: Settings) -> Bool {
         !account.isArchived
             && account.routingEnabled
+            && !account.isUsageLimitReached
             && !settings.warmupExcludedAccounts.contains(account.id)
             && !settings.warmupExcludedAccounts.contains(account.alias)
     }

@@ -184,6 +184,12 @@ final class UsageLimitTests: XCTestCase {
             account("first", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings),
             settings: .default
         ))
+        XCTAssertFalse(QuotaWarmupService.usageAllowsWarmup(
+            account("first", priority: 2, usage: [
+                window("5h", 0, seconds: 18_000),
+                window("Weekly", 90, seconds: 604_800)
+            ], limits: settings)
+        ))
     }
 
     func testUsageLimitSettingsMergeAcrossWritersForDifferentAccounts() async throws {

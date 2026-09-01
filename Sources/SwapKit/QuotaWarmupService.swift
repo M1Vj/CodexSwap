@@ -262,6 +262,7 @@ public actor QuotaWarmupService {
 
     private func skipReason(_ account: Account, now: Date) -> String? {
         if account.isArchived { return "archived" }
+        if account.isUsageLimitReached { return "account usage cap reached" }
         if account.needsLogin { return "needs login" }
         if account.accessToken.isEmpty && account.refreshToken.isEmpty { return "missing credentials" }
         if account.cooldownUntil(now: now) != nil { return "usage limited" }
@@ -275,6 +276,7 @@ public actor QuotaWarmupService {
     /// non-zero short-window readings fail closed. Weekly usage does not block
     /// restarting a fresh short window.
     public nonisolated static func usageAllowsWarmup(_ account: Account) -> Bool {
+        guard !account.isUsageLimitReached else { return false }
         let shortWindows = account.usage.filter { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
         guard !shortWindows.isEmpty else { return false }
         return shortWindows.allSatisfy { $0.usedPercent == 0 }

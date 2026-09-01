@@ -1059,7 +1059,7 @@ public actor AccountStore {
         if window.windowSeconds == 18_000 || normalized == "5h" || normalized == "5-hour" || normalized == "5 hour" {
             return "5h"
         }
-        if window.windowSeconds >= 604_800 || normalized == "weekly" || normalized == "7d" || normalized == "7-day" || normalized == "7 day" {
+        if window.windowSeconds == 604_800 || normalized == "weekly" || normalized == "7d" || normalized == "7-day" || normalized == "7 day" {
             return "weekly"
         }
         return window.windowSeconds > 0 ? "seconds:\(window.windowSeconds)" : "label:\(normalized)"

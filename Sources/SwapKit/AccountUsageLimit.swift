@@ -5,8 +5,12 @@ import Foundation
 /// usage reading is below every enabled cap.
 public struct AccountUsageLimitSettings: Codable, Sendable, Equatable {
     public var enabled: Bool
-    public var fiveHourPercent: Int
-    public var weeklyPercent: Int
+    public var fiveHourPercent: Int {
+        didSet { fiveHourPercent = Self.clamp(fiveHourPercent) }
+    }
+    public var weeklyPercent: Int {
+        didSet { weeklyPercent = Self.clamp(weeklyPercent) }
+    }
 
     public static let disabled = AccountUsageLimitSettings(enabled: false)
 
@@ -78,7 +82,7 @@ private extension UsageWindow {
     }
 
     var isWeeklyUsageWindow: Bool {
-        if windowSeconds >= 604_800 { return true }
+        if windowSeconds == 604_800 { return true }
         let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return normalized == "weekly" || normalized == "7d" || normalized == "7-day" || normalized == "7 day"
     }
