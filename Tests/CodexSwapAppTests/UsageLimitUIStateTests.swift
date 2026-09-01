@@ -51,6 +51,7 @@ final class UsageLimitUIStateTests: XCTestCase {
         let snapshot = EngineSnapshot(
             accounts: [capped, manuallyDisabled],
             activeAlias: nil,
+            stickyAlias: "capped",
             proxyURL: nil,
             strategy: .priority
         )
@@ -58,6 +59,7 @@ final class UsageLimitUIStateTests: XCTestCase {
         let rows = Dictionary(uniqueKeysWithValues: SettingsPresentation(snapshot: snapshot).accounts.map { ($0.alias, $0) })
 
         XCTAssertTrue(rows["capped"]?.isPausedByUsageLimit == true)
+        XCTAssertTrue(rows["capped"]?.isSticky == true)
         XCTAssertFalse(rows["capped"]?.isManuallyRoutingDisabled == true)
         XCTAssertFalse(rows["manual"]?.isPausedByUsageLimit == true)
         XCTAssertTrue(rows["manual"]?.isManuallyRoutingDisabled == true)

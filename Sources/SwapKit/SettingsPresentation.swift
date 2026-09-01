@@ -47,6 +47,17 @@ public enum AccountRoutingPresentation {
     }
 
     public static func canMakeActive(routingEnabled: Bool) -> Bool { routingEnabled }
+
+    /// Usage-cap pauses are distinct from a manual routing pause. A capped
+    /// account is only activatable when the owner has explicitly pinned it as
+    /// a sticky override (double-click in the menu).
+    public static func canMakeActive(
+        routingEnabled: Bool,
+        usageLimitReached: Bool,
+        stickyOverride: Bool
+    ) -> Bool {
+        routingEnabled && (!usageLimitReached || stickyOverride)
+    }
 }
 
 /// Presentation helpers shared by the settings card and its validation states.
@@ -122,6 +133,9 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let rankCount: Int
     public let ownership: AccountOwnership
     public let isActive: Bool
+    /// The account is currently held by the menu's sticky selection. When a
+    /// cap is reached, this is the explicit manual-override affordance.
+    public let isSticky: Bool
     public let needsLogin: Bool
     public let routingEnabled: Bool
     public let isDraining: Bool
@@ -173,6 +187,7 @@ public struct SettingsPresentation: Sendable, Equatable {
                 rankCount: rankCount,
                 ownership: AccountOwnership.classify(account: account),
                 isActive: account.alias == snapshot.activeAlias,
+                isSticky: account.alias == snapshot.stickyAlias,
                 needsLogin: account.needsLogin,
                 routingEnabled: account.routingEnabled,
                 isDraining: snapshot.drainingAliases.contains(account.alias),

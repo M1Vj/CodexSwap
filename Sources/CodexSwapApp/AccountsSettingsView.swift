@@ -539,8 +539,20 @@ private struct AccountCard: View {
 
     @ViewBuilder
     private var activationControl: some View {
-        if !AccountRoutingPresentation.canMakeActive(routingEnabled: account.routingEnabled) {
-            EmptyView()
+        if !AccountRoutingPresentation.canMakeActive(
+            routingEnabled: account.routingEnabled,
+            usageLimitReached: account.isPausedByUsageLimit,
+            stickyOverride: account.isSticky
+        ) {
+            if account.isPausedByUsageLimit {
+                Label("Paused by usage cap", systemImage: "pause.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .help("This account reached a configured usage cap. Double-click it in the menu to pin a manual override.")
+                    .accessibilityHint("Double-click this account in the menu to pin a manual override.")
+            } else {
+                EmptyView()
+            }
         } else if !account.isActive {
             Button("Make Active") { model.actions.switchAccount(account.alias) }
                 .accessibilityLabel("Make \(account.alias) active")

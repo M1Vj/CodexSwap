@@ -96,7 +96,10 @@ struct MenuAccountRow: View {
         parts += windows.map { "\($0.label) \($0.usedPercent)% used" }
         if usageLimitSettings.enabled {
             parts.append("usage caps \(usageLimitSettings.fiveHourPercent)% 5-hour and \(usageLimitSettings.weeklyPercent)% weekly")
-            if isUsageLimitReached { parts.append("paused by usage cap") }
+            if isUsageLimitReached {
+                parts.append("paused by usage cap")
+                parts.append(isSticky ? "sticky manual override" : "single-click disabled; double-click to pin a manual override")
+            }
         }
         if needsLogin { parts.append("needs sign-in") }
         if isDraining { parts.append("draining from other users") }
@@ -120,7 +123,15 @@ struct MenuAccountRow: View {
 
     private var usageLimitBadgeHelp: String {
         let cap = "5-hour \(usageLimitSettings.fiveHourPercent)% · weekly \(usageLimitSettings.weeklyPercent)%"
-        return isUsageLimitReached ? "Paused by usage cap (\(cap))" : "Usage caps enabled (\(cap))"
+        guard isUsageLimitReached else { return "Usage caps enabled (\(cap))" }
+        if isSticky {
+            return "Paused by usage cap (\(cap)); double-click to release the manual override"
+        }
+        return "Paused by usage cap (\(cap)); single-click disabled, double-click to pin a manual override"
+    }
+
+    var allowsSingleClickSelection: Bool {
+        !isUsageLimitReached || isSticky
     }
 
     private var isUsageLimitReached: Bool {
@@ -188,6 +199,7 @@ final class MenuRowContainer: NSView {
     private var onSelect: (() -> Void)?
     private var onDoubleClick: (() -> Void)?
     private let rowIsEnabled: Bool
+    private let rowAllowsSingleClickSelection: Bool
     private var hovering = false {
         didSet { layer?.backgroundColor = hovering && rowIsEnabled ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.35).cgColor : nil }
     }
@@ -196,6 +208,7 @@ final class MenuRowContainer: NSView {
         self.onSelect = onSelect
         self.onDoubleClick = onDoubleClick
         self.rowIsEnabled = isEnabled
+        self.rowAllowsSingleClickSelection = row.allowsSingleClickSelection
         let hosting = NSHostingView(rootView: row)
         // Rows flex to fill; pick a compact fixed width so the menu has no dead space.
         let height = max(36, ceil(hosting.fittingSize.height))
@@ -231,7 +244,7 @@ final class MenuRowContainer: NSView {
         guard rowIsEnabled else { return }
         if event.clickCount >= 2 {
             onDoubleClick?()
-        } else {
+        } else if rowAllowsSingleClickSelection {
             onSelect?()
         }
     }
