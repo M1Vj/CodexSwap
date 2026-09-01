@@ -647,6 +647,9 @@ public struct AgentCLI: Sendable {
     private let supportDir: URL
     private let engine: AppEngine
     private let runtimeURLProvider: @Sendable () -> URL?
+    /// Test-only interleaving seam used to model another store/process changing
+    /// state after the initial CLI projection but before the write-time check.
+    private let beforeUsageLimitWrite: (@Sendable () async -> Void)?
 
     public init(
         store: AccountStore = AccountStore(),
@@ -658,6 +661,32 @@ public struct AgentCLI: Sendable {
         supportDir: URL = AppPaths.supportDir(),
         runtimeURLProvider: @escaping @Sendable () -> URL? = RuntimeHandoff.readProxyURL
     ) {
+        self.init(
+            store: store,
+            settingsStore: settingsStore,
+            usageService: usageService,
+            resetService: resetService,
+            warmupService: warmupService,
+            configManager: configManager,
+            supportDir: supportDir,
+            runtimeURLProvider: runtimeURLProvider,
+            beforeUsageLimitWrite: nil
+        )
+    }
+
+    /// Internal initializer reserved for deterministic interleaving tests.
+    /// Production callers use the public initializer above, which has no hook.
+    init(
+        store: AccountStore = AccountStore(),
+        settingsStore: SettingsStore = SettingsStore(),
+        usageService: any UsageFetching = UsageClient(),
+        resetService: any QuotaResetServing = QuotaResetClient(),
+        warmupService: QuotaWarmupService = QuotaWarmupService(),
+        configManager: CodexConfigManager = CodexConfigManager(),
+        supportDir: URL = AppPaths.supportDir(),
+        runtimeURLProvider: @escaping @Sendable () -> URL? = RuntimeHandoff.readProxyURL,
+        beforeUsageLimitWrite: (@Sendable () async -> Void)?
+    ) {
         self.store = store
         self.settingsStore = settingsStore
         self.usageService = usageService
@@ -666,6 +695,7 @@ public struct AgentCLI: Sendable {
         self.configManager = configManager
         self.supportDir = supportDir
         self.runtimeURLProvider = runtimeURLProvider
+        self.beforeUsageLimitWrite = beforeUsageLimitWrite
         let coordinator = QuotaResetCoordinator(
             accountStore: store,
             settings: { await settingsStore.get() },
@@ -1261,22 +1291,47 @@ public struct AgentCLI: Sendable {
             )
         }
 
-        guard let updated = await store.setUsageLimitSettings(entry.account.alias, settings: proposed) else {
+        await beforeUsageLimitWrite?()
+        switch await store.setUsageLimitSettingsAtomically(
+            entry.account.alias,
+            settings: proposed,
+            confirming: command.options.confirm
+        ) {
+        case .updated(let updated):
+            return AgentCLIResult(
+                envelope: .success(
+                    command: command.canonicalName,
+                    data: usageLimitView(
+                        for: updated,
+                        reference: entry.reference,
+                        persisted: true,
+                        dryRun: false,
+                        confirmationRequired: false
+                    )
+                ),
+                exitCode: .ok
+            )
+        case .confirmationRequired:
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "confirmation_required",
+                    message: "--confirm is required to apply a usage limit that pauses the active account"
+                ),
+                exitCode: .usage
+            )
+        case .accountNotFound:
             return missingAccount(command: command.canonicalName)
+        case .persistenceFailed:
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "account_write_failed",
+                    message: "account usage limit could not be persisted"
+                ),
+                exitCode: .software
+            )
         }
-        return AgentCLIResult(
-            envelope: .success(
-                command: command.canonicalName,
-                data: usageLimitView(
-                    for: updated,
-                    reference: entry.reference,
-                    persisted: true,
-                    dryRun: false,
-                    confirmationRequired: false
-                )
-            ),
-            exitCode: .ok
-        )
     }
 
     private func usageLimitView(

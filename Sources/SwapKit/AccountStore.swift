@@ -61,6 +61,16 @@ public struct RotationResult: Sendable {
     public let rotated: Bool
 }
 
+/// Result of a usage-limit write that validates its confirmation requirement
+/// against the latest persisted control-plane state while holding the store
+/// lock. The CLI maps these cases to its stable, sanitized envelope.
+public enum AccountUsageLimitWriteResult: Sendable {
+    case updated(Account)
+    case confirmationRequired(Account)
+    case accountNotFound
+    case persistenceFailed
+}
+
 public actor AccountStore {
     private let url: URL
     private let clock: @Sendable () -> Date
@@ -363,6 +373,67 @@ public actor AccountStore {
             changedUsageLimitAliases: [alias]
         )
         return data.accounts[i]
+    }
+
+    /// Validates and persists a usage-limit update as one interprocess
+    /// transaction. The latest account usage, active alias, and coupled sticky
+    /// override are loaded only after acquiring the shared lock, so a CLI
+    /// snapshot cannot bypass the confirmation requirement when another store
+    /// changes state between projection and write.
+    @discardableResult
+    public func setUsageLimitSettingsAtomically(
+        _ alias: String,
+        settings: AccountUsageLimitSettings,
+        confirming: Bool
+    ) -> AccountUsageLimitWriteResult {
+        var result: AccountUsageLimitWriteResult = .persistenceFailed
+        let didLock = Self.withStoreLock(url) {
+            guard var latest = Self.loadFrom(url) else {
+                result = .accountNotFound
+                return
+            }
+            guard let index = latest.accounts.firstIndex(where: { $0.alias == alias }) else {
+                result = .accountNotFound
+                return
+            }
+
+            let existing = latest.accounts[index]
+            var projected = existing
+            projected.usageLimitSettings = settings
+            let hasStickyUsageLimitOverride = latest.stickyAlias == alias
+                && latest.stickyUsageLimitOverride
+            let immediatelyPausesCurrent = latest.activeAlias == alias
+                && !hasStickyUsageLimitOverride
+                && !existing.isUsageLimitReached
+                && projected.isUsageLimitReached
+            guard confirming || !immediatelyPausesCurrent else {
+                data = latest
+                persistedModificationDate = Self.modificationDate(for: url)
+                stickyAliasRuntime = latest.stickyAlias
+                stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride && latest.stickyAlias != nil
+                result = .confirmationRequired(projected)
+                return
+            }
+
+            latest.accounts[index] = projected
+            if latest.stickyAlias == alias,
+               !latest.stickyUsageLimitOverride,
+               projected.isUsageLimitReached {
+                latest.stickyAlias = nil
+                latest.stickyUsageLimitOverride = false
+            }
+            guard let raw = try? JSONEncoder.codex.encode(latest) else {
+                result = .persistenceFailed
+                return
+            }
+            Self.persistUnlocked(raw, to: url)
+            data = latest
+            persistedModificationDate = Self.modificationDate(for: url)
+            stickyAliasRuntime = latest.stickyAlias
+            stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride && latest.stickyAlias != nil
+            result = .updated(projected)
+        }
+        return didLock ? result : .persistenceFailed
     }
 
     /// Toggles the menu hold. A held account remains selected while it is

@@ -164,6 +164,104 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(betaApplied.envelope.error, nil)
     }
 
+    func testUsageLimitSetRechecksUsageAtAtomicWriteTimeBeforeRequiringConfirmation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIUsageLimitTOCTOUUsage-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("accounts.json")
+        let store = AccountStore(url: url)
+        await store.upsert(Account(
+            alias: "alpha",
+            accountID: "id-alpha",
+            accessToken: "token-alpha",
+            usage: [
+                UsageWindow(label: "5h", usedPercent: 20, windowSeconds: 18_000, resetAt: nil),
+                UsageWindow(label: "Weekly", usedPercent: 20, windowSeconds: 604_800, resetAt: nil),
+            ]
+        ))
+        _ = await store.setActive("alpha")
+        let concurrentStore = AccountStore(url: url)
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil },
+            beforeUsageLimitWrite: {
+                await concurrentStore.updateUsage("alpha", windows: [
+                    UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: nil),
+                    UsageWindow(label: "Weekly", usedPercent: 20, windowSeconds: 604_800, resetAt: nil),
+                ])
+            }
+        )
+
+        let result = await cli.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "40", "--weekly", "90", "--enable", "--json"
+        ])
+
+        XCTAssertEqual(result.exitCode, AgentCLIExitCode.usage.rawValue)
+        XCTAssertEqual(result.envelope.error?.code, "confirmation_required")
+        let activeAfterInterleaving = await store.activeAlias()
+        XCTAssertEqual(activeAfterInterleaving, "alpha")
+        let unchanged = await store.account("alpha")
+        XCTAssertFalse(unchanged?.usageLimitSettings.enabled ?? true)
+    }
+
+    func testUsageLimitSetRechecksActiveAliasAtAtomicWriteTimeAndConfirmStillApplies() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIUsageLimitTOCTOUActive-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("accounts.json")
+        let store = AccountStore(url: url)
+        await store.upsert(Account(
+            alias: "alpha",
+            accountID: "id-alpha",
+            accessToken: "token-alpha",
+            usage: [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: nil)]
+        ))
+        await store.upsert(Account(alias: "beta", accountID: "id-beta", accessToken: "token-beta"))
+        _ = await store.setActive("beta")
+        let concurrentStore = AccountStore(url: url)
+        let settingsURL = directory.appendingPathComponent("settings.json")
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: settingsURL),
+            supportDir: directory,
+            runtimeURLProvider: { nil },
+            beforeUsageLimitWrite: {
+                _ = await concurrentStore.setActive("alpha")
+            }
+        )
+
+        let rejected = await cli.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "40", "--weekly", "90", "--enable", "--json"
+        ])
+        XCTAssertEqual(rejected.exitCode, AgentCLIExitCode.usage.rawValue)
+        XCTAssertEqual(rejected.envelope.error?.code, "confirmation_required")
+        let activeAfterInterleaving = await store.activeAlias()
+        XCTAssertEqual(activeAfterInterleaving, "alpha")
+        let unchanged = await store.account("alpha")
+        XCTAssertFalse(unchanged?.usageLimitSettings.enabled ?? true)
+
+        let confirmedStore = AccountStore(url: url)
+        let confirmedConcurrentStore = AccountStore(url: url)
+        let confirmedCLI = AgentCLI(
+            store: confirmedStore,
+            settingsStore: SettingsStore(url: settingsURL),
+            supportDir: directory,
+            runtimeURLProvider: { nil },
+            beforeUsageLimitWrite: {
+                _ = await confirmedConcurrentStore.setActive("alpha")
+            }
+        )
+        let applied = await confirmedCLI.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "40", "--weekly", "90", "--enable", "--confirm", "--json"
+        ])
+        XCTAssertEqual(applied.exitCode, AgentCLIExitCode.ok.rawValue)
+        let persisted = await confirmedStore.account("alpha")
+        XCTAssertTrue(persisted?.usageLimitSettings.enabled ?? false)
+    }
+
     func testSwitchOnCappedAccountReportsUsageLimitError() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentCLISwitchUsageLimit-\(UUID().uuidString)", isDirectory: true)
