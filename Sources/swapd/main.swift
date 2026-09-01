@@ -18,9 +18,11 @@ let command = args.first ?? "help"
 
 let store = AccountStore(url: AppPaths.storeFile(), strategy: loadSettings().rotationStrategy)
 let settingsStore = SettingsStore(url: AppPaths.settingsFile())
-// Reconcile local pause deadlines before any command can perform quota or usage
-// network work. Archived records remain in the store for historical settings views.
-_ = await store.archiveDueAccounts()
+// Reconcile local pause deadlines before commands that may perform account work.
+// A usage-limit dry-run is read-only and therefore skips this write path.
+if SwapdBootstrap.shouldArchiveDueAccounts(arguments: args) {
+    _ = await store.archiveDueAccounts()
+}
 
 @Sendable func settingsProvider() async -> Settings { loadSettings() }
 let verboseEnabled = ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil
