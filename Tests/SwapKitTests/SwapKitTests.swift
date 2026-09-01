@@ -1389,6 +1389,34 @@ private actor BlockingWarmupRunner: WarmupCommandRunning {
     }
 }
 
+private actor FirstBlockingWarmupRunner: WarmupCommandRunning {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var aliases: [String] = []
+    private var blockedFirst = false
+
+    func run(alias: String, proxyURL: URL) async throws {
+        aliases.append(alias)
+        guard !blockedFirst else { return }
+        blockedFirst = true
+        startedWaiters.forEach { $0.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if blockedFirst { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func finish() {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func calls() -> [String] { aliases }
+}
+
 private actor FakeUsageFetcher: UsageFetching {
     private var accountIDs: [String] = []
 
@@ -2376,6 +2404,66 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(summary.warmed, ["ok", "bad"])
         XCTAssertEqual(summary.attempted, ["ok", "bad"])
         XCTAssertNil(summary.failed["bad"])
+    }
+
+    func testWarmupRechecksLaterAccountAgainstFreshStoreBeforeRunnerStarts() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-fresh-cap-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(18_000)
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(url: storeURL)
+        await store.upsert(Account(
+            alias: "first",
+            accountID: "id-first",
+            accessToken: freshToken(now: now),
+            priority: 2,
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        ))
+        await store.upsert(Account(
+            alias: "later",
+            accountID: "id-later",
+            accessToken: freshToken(now: now),
+            priority: 1,
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        ))
+
+        let runner = FirstBlockingWarmupRunner()
+        let usage = ScriptedUsageFetcher(windowsByAccountID: [
+            "id-first": [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: reset)]
+        ])
+        let warmup = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        )
+        let engine = AppEngine(
+            store: store,
+            usage: usage,
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: warmup
+        )
+        let proxy = URL(string: "http://127.0.0.1:58432")!
+
+        let warmupTask = Task { await engine.warmAllAccountsNow(proxyURL: proxy) }
+        await runner.waitUntilStarted()
+
+        let writer = AccountStore(url: storeURL)
+        _ = await writer.setUsageLimitSettings(
+            "later",
+            settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 1, weeklyPercent: 100)
+        )
+        await writer.updateUsage(
+            "later",
+            windows: [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: reset)]
+        )
+
+        await runner.finish()
+        let summary = await warmupTask.value
+        let runnerCalls = await runner.calls()
+
+        XCTAssertEqual(runnerCalls, ["first"])
+        XCTAssertEqual(summary.attempted, ["first"])
+        XCTAssertEqual(summary.skipped["later"], "account usage cap reached")
     }
 
     func testSuccessfulWarmupWithMissingResetRemainsUnverifiedInEngineSummary() async throws {

@@ -19,6 +19,11 @@ public enum WarmupCommandError: LocalizedError, Sendable {
 }
 
 public actor QuotaWarmupService {
+    /// Rechecks a captured account immediately before a warm-up attempt. A nil
+    /// result permits the attempt; a non-nil value is recorded as the skip
+    /// reason without invoking the runner.
+    public typealias AccountRecheck = @Sendable (_ account: Account) async -> String?
+
     private let runner: any WarmupCommandRunning
     private let ledger: WarmupLedgerStore
     private let failureRetrySeconds: TimeInterval
@@ -40,7 +45,13 @@ public actor QuotaWarmupService {
         self.lockURL = lockURL
     }
 
-    public func run(accounts: [Account], proxyURL: URL, force: Bool = false, now: Date = Date()) async -> WarmupSummary {
+    public func run(
+        accounts: [Account],
+        proxyURL: URL,
+        force: Bool = false,
+        now: Date = Date(),
+        recheck: AccountRecheck? = nil
+    ) async -> WarmupSummary {
         guard !isRunning else {
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         }
@@ -58,7 +69,7 @@ public actor QuotaWarmupService {
 
         var summary = WarmupSummary(startedAt: now, finishedAt: now)
         for account in accounts {
-            if let reason = skipReason(account, now: now) {
+            if let reason = Self.skipReason(account, now: now) {
                 summary.skipped[account.alias] = reason
                 continue
             }
@@ -67,7 +78,6 @@ public actor QuotaWarmupService {
                 summary.skipped[account.alias] = "already warmed for this cycle"
                 continue
             }
-
             // A successful process exit only proves that the command completed. Keep the
             // account unverified until a fresh usage observation anchors the reset lineage.
             // Persist this before launching so a crash or cancellation cannot immediately
@@ -81,6 +91,10 @@ public actor QuotaWarmupService {
                 attemptedAt: now
             )
             await ledger.setRecord(pendingRecord, for: key)
+            if let recheck, let reason = await recheck(account) {
+                summary.skipped[account.alias] = reason
+                continue
+            }
             summary.attempted.append(account.alias)
 
             do {
@@ -133,7 +147,7 @@ public actor QuotaWarmupService {
     }
 
     public func hasDueAccount(in accounts: [Account], now: Date = Date()) async -> Bool {
-        for account in accounts where skipReason(account, now: now) == nil {
+        for account in accounts where Self.skipReason(account, now: now) == nil {
             guard let record = await ledger.record(for: account.id) else { return true }
             if record.isDue(at: now) { return true }
         }
@@ -260,7 +274,7 @@ public actor QuotaWarmupService {
         account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt.flatMap { $0 > now ? $0 : nil }
     }
 
-    private func skipReason(_ account: Account, now: Date) -> String? {
+    static func skipReason(_ account: Account, now: Date) -> String? {
         if account.isArchived { return "archived" }
         if account.isUsageLimitReached { return "account usage cap reached" }
         if account.needsLogin { return "needs login" }

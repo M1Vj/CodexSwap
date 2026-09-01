@@ -1237,7 +1237,28 @@ public actor AppEngine {
             Self.quotaWarmupEligible($0, settings: settings)
                 && QuotaWarmupService.usageAllowsWarmup($0)
         }
-        var summary = await warmupService.run(accounts: allowedCandidates, proxyURL: proxyURL, force: force, now: now)
+        let recheck: QuotaWarmupService.AccountRecheck = { [store, settings, now] account in
+            guard let fresh = await store.account(account.alias) else {
+                return "account unavailable"
+            }
+            if let reason = QuotaWarmupService.skipReason(fresh, now: now) {
+                return reason
+            }
+            guard Self.quotaWarmupEligible(fresh, settings: settings) else {
+                return "warm-up not eligible"
+            }
+            guard QuotaWarmupService.usageAllowsWarmup(fresh) else {
+                return "usage changed"
+            }
+            return nil
+        }
+        var summary = await warmupService.run(
+            accounts: allowedCandidates,
+            proxyURL: proxyURL,
+            force: force,
+            now: now,
+            recheck: recheck
+        )
         // Refresh every command attempt, including failures. `warmed` is deliberately
         // not used as the target set because a zero exit is only an unverified attempt.
         let attemptedAliases = Set(summary.attempted)
