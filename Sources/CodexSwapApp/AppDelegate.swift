@@ -1111,12 +1111,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func addStandaloneAccount() {
         guard let codex = CodexLauncher.resolveCodexBinary() else {
-            presentMessage("Codex executable not found. Install the Codex CLI, then try again.")
+            presentMessage(CodexLoginLaunchError.binaryNotFound.userMessage)
             return
         }
-        let script = "tell application \"Terminal\" to do script \"\(codex) login\""
-        guard runAppleScript(script) else {
-            presentMessage("Could not open Terminal for codex login. Allow CodexSwap to control Terminal in System Settings → Privacy & Security → Automation, then try again.")
+
+        do {
+            let commandFile = try CodexLoginLauncher.writeCommandFile(
+                codexPath: codex,
+                directory: AppPaths.supportDir()
+            )
+            guard NSWorkspace.shared.open(commandFile) else {
+                // Keep the exact command file so the user can double-click it if
+                // Launch Services declines to open it automatically.
+                throw CodexLoginLaunchError.terminalOpenFailed(path: commandFile.path)
+            }
+        } catch let error as CodexLoginLaunchError {
+            presentMessage(error.userMessage)
+            return
+        } catch {
+            // `writeCommandFile` classifies its own failures, but retain a safe
+            // fallback if that implementation ever gains another error source.
+            presentMessage("Could not prepare the standalone login command. Try again.")
             return
         }
         presentMessage("Complete the standalone login in Terminal, then select Rescan Accounts.")
@@ -1317,13 +1332,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 intentIdentifiers: []
             ),
         ])
-    }
-
-    private func runAppleScript(_ source: String) -> Bool {
-        guard let script = NSAppleScript(source: source) else { return false }
-        var error: NSDictionary?
-        script.executeAndReturnError(&error)
-        return error == nil
     }
 
     static func shortTime(_ date: Date) -> String {
