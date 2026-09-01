@@ -74,6 +74,31 @@ final class UsageLimitTests: XCTestCase {
         XCTAssertFalse(retained.isEligible(now: now))
     }
 
+    func testFreshHeadroomClearsProviderCooldownButRetainsConfiguredCap() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let url = storeURL("headroom-cooldown-cap")
+        let store = AccountStore(url: url)
+        let staleCooldown = now.addingTimeInterval(5 * 86_400)
+        var limited = account(
+            "limited",
+            priority: 2,
+            usage: [window("5h", 80, seconds: 18_000), window("Weekly", 30, seconds: 604_800)],
+            limits: settings
+        )
+        limited.disabledUntil = ["5h": staleCooldown]
+        await store.upsert(limited)
+
+        // The fresh report only includes the weekly window. Its headroom clears
+        // the stale provider cooldown while the retained five-hour cap remains.
+        await store.updateUsage("limited", windows: [window("Weekly", 35, seconds: 604_800)])
+
+        let refreshedValue = await store.account("limited")
+        let refreshed = try XCTUnwrap(refreshedValue)
+        XCTAssertTrue(refreshed.disabledUntil.isEmpty)
+        XCTAssertEqual(refreshed.usage.first(where: { $0.windowSeconds == 18_000 })?.usedPercent, 80)
+        XCTAssertFalse(refreshed.isEligible(now: now))
+    }
+
     func testPreCapStickyClearsAtCapAndFallsBackWhileInFlightLeaseRemainsHeld() async throws {
         let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 95)
         let store = AccountStore(url: storeURL("sticky-clear"))
