@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "reset_warm_monitor.py"
@@ -447,8 +448,147 @@ else:
         self.assertTrue(log_lines)
         for line in log_lines:
             event = json.loads(line)
-            self.assertEqual(set(event), {"schemaVersion", "at", "event", "observed", "pending"})
+            self.assertTrue({"schemaVersion", "at", "event", "runId"}.issubset(event))
+            self.assertEqual(event["schemaVersion"], monitor.LOG_SCHEMA_VERSION)
+            self.assertRegex(event["runId"], r"^[0-9a-f]{32}$")
+            self.assertIn(event["event"], monitor.LOG_EVENT_FIELDS)
+            self.assertTrue(
+                set(event) <= {"schemaVersion", "at", "event", "runId"} | monitor.LOG_EVENT_FIELDS[event["event"]]
+            )
             self.assertNotRegex(line.lower(), r"email|token|authorization|account.?id|credit.?id")
+
+    def test_log_boundary_allows_only_safe_event_fields_and_redacts_values(self) -> None:
+        path = self.state_dir / "events.jsonl"
+        monitor.append_log(
+            path,
+            "warm_attempt_started",
+            run_id="a" * 32,
+            accountRef=REF,
+            alias="private alias",
+            email="owner@example.test",
+            token="secret-token",
+            stderr="raw upstream response",
+            reason="raw upstream response",
+        )
+
+        event = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(set(event), {"schemaVersion", "at", "event", "runId", "accountRef"})
+        self.assertEqual(event["runId"], "a" * 32)
+        self.assertEqual(event["accountRef"], REF)
+        self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"email|token|authorization|private alias|raw upstream")
+
+    def test_offline_and_reconnect_events_share_per_run_correlation(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("offline", used=0, reset_at=None, usage_status="network", include_window=False)
+        monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+        self.write_phase("reconnected", used=0, reset_at="2026-08-31T05:00:00Z")
+        monitor.monitor_once(self.config, now=instant("2026-08-31T00:21:00Z"))
+
+        events = [json.loads(line) for line in (self.state_dir / "monitor.log").read_text(encoding="utf-8").splitlines()]
+        offline_runs = {
+            event["runId"]
+            for event in events
+            if event["event"] == "quota_poll_succeeded" and event.get("networkCount") == 1
+        }
+        self.assertEqual(len(offline_runs), 1)
+        reconnect_runs = {
+            event["runId"]
+            for event in events
+            if event["event"] == "warm_attempt_succeeded"
+        }
+        self.assertEqual(len(reconnect_runs), 1)
+        self.assertNotEqual(offline_runs, reconnect_runs)
+        self.assertTrue(
+            any(event["event"] == "reset_detected" and event["accountRef"] == REF for event in events)
+        )
+
+    def test_nonzero_usage_after_reset_is_logged_as_safe_skip(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("reset-used", used=10, reset_at="2026-08-31T01:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "resetObserved")
+        events = [json.loads(line) for line in (self.state_dir / "monitor.log").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(
+            any(
+                event["event"] == "warm_skipped"
+                and event.get("accountRef") == REF
+                and event.get("reason") == "usage_nonzero"
+                for event in events
+            )
+        )
+        self.assertFalse(any(event["event"] == "warm_attempt_started" for event in events))
+
+    def test_zero_usage_without_reset_is_logged_as_safe_skip(self) -> None:
+        self.write_phase("zero-before-reset", used=0, reset_at="2026-08-31T01:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+        events = [json.loads(line) for line in (self.state_dir / "monitor.log").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(
+            any(
+                event["event"] == "warm_skipped"
+                and event.get("accountRef") == REF
+                and event.get("reason") == "reset_not_observed"
+                and event.get("usedPercent") == 0
+                for event in events
+            )
+        )
+        self.assertFalse(any(event["event"] == "warm_attempt_started" for event in events))
+
+    def test_success_and_failure_attempts_emit_safe_outcomes_and_retry(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("reset", used=0, reset_at="2026-08-31T01:00:00Z")
+        monitor.monitor_once(self.config, now=instant("2026-08-31T00:20:00Z"))
+        self.write_phase("warm-fail", used=0, reset_at="2026-08-31T02:00:00Z")
+        monitor.monitor_once(self.config, now=instant("2026-08-31T01:20:00Z"))
+
+        events = [json.loads(line) for line in (self.state_dir / "monitor.log").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(
+            any(event["event"] == "warm_attempt_succeeded" and event.get("outcome") == "warmed" for event in events)
+        )
+        failed = [event for event in events if event["event"] == "warm_attempt_failed"]
+        self.assertTrue(failed)
+        self.assertTrue(all(event.get("accountRef") == REF for event in failed))
+        completed = [event for event in events if event["event"] == "warm_completed"]
+        self.assertTrue(any(event.get("failedCount") == 1 and event.get("retryAt") for event in completed))
+
+    def test_duplicate_lock_is_correlated_and_reports_safe_reason(self) -> None:
+        self.state_dir.mkdir(parents=True)
+        lock_path = self.state_dir / "monitor.lock"
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            code, result = monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(code, monitor.EXIT_TEMPORARY)
+        self.assertEqual(result["status"], "locked")
+        event = json.loads((self.state_dir / "monitor.log").read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(event["event"], "monitor_completed")
+        self.assertEqual(event["status"], "locked")
+        self.assertEqual(event["reason"], "duplicate_run")
+        self.assertRegex(event["runId"], r"^[0-9a-f]{32}$")
+
+    def test_log_rotation_keeps_one_bounded_previous_generation(self) -> None:
+        path = self.state_dir / "monitor.log"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"x" * (monitor.LOG_MAX_BYTES + 1))
+
+        with mock.patch.object(monitor, "utc_now", return_value=instant("2026-08-31T00:00:00Z")):
+            monitor.append_log(path, "monitor_started", run_id="b" * 32)
+
+        rotated = path.with_suffix(path.suffix + ".1")
+        self.assertTrue(rotated.exists())
+        self.assertEqual(rotated.stat().st_size, monitor.LOG_MAX_BYTES + 1)
+        self.assertFalse(path.with_suffix(path.suffix + ".2").exists())
+        event = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(event["event"], "monitor_started")
+        self.assertLessEqual(path.stat().st_size, monitor.LOG_MAX_LINE_BYTES)
 
     def test_window_selection_uses_weekly_when_short_reset_is_missing(self) -> None:
         selected = monitor._choose_window(

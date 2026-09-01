@@ -86,3 +86,29 @@ CodexSwap. Verify the CodexSwap endpoint separately before allowing a warm-up;
 the monitor fails closed when `agent status --json` reports an unavailable
 loopback proxy. State and sanitized event logs live under
 `~/Library/Application Support/CodexSwap/reset-warm-monitor/`.
+
+### Monitor observability (read-only)
+
+Agents may inspect the durable event stream at
+`~/Library/Application Support/CodexSwap/reset-warm-monitor/monitor.log` (the
+single previous generation is `monitor.log.1`). The directory and both files
+are user-only (`0700`/`0600`). The active log rotates at 1 MiB and keeps one
+rotated generation, so retained logging is bounded. Reading this path never
+starts a poll or consumes quota, for example:
+
+```bash
+/usr/bin/tail -n 100 "$HOME/Library/Application Support/CodexSwap/reset-warm-monitor/monitor.log"
+```
+
+Every JSONL line has `schemaVersion`, UTC `at`, a stable `event`, and a
+per-poll `runId` (32 lowercase hexadecimal characters). Account-specific lines
+may include only the opaque `acct-...` `accountRef`; aliases, emails, account
+IDs, tokens, request bodies, stderr, and raw provider errors are never written.
+The event vocabulary answers the operational questions directly:
+`reset_detected` (with safe evidence such as `deadline_elapsed` or
+`usage_decreased`), `warm_eligible`/`warm_skipped` (fixed reason codes),
+`proxy_check` and `quota_poll_*` (availability/network counts),
+`warm_attempt_*`/`warm_completed` (outcome and bounded retry timestamp), and
+`lock_busy` (duplicate monitor invocation). `monitor_completed` closes every
+run, including a duplicate-lock exit. Unknown event names or fields are
+dropped at the logging boundary.

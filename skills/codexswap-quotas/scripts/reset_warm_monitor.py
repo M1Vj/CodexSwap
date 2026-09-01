@@ -6,6 +6,10 @@ the sanitized ``swapd agent`` JSON surface, remembers opaque account refs and
 reset fingerprints, and asks for a warm-up only after a reset transition has
 been observed.  It is safe to invoke once from launchd (the default) or to
 run continuously with ``--watch``.
+
+Each poll writes a bounded JSONL event stream beside the durable state. Events
+carry one run correlation ID and only fixed, safe reason/status fields; command
+output and account identity data never enter the stream.
 """
 
 from __future__ import annotations
@@ -24,12 +28,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 
 SCHEMA_VERSION = 1
+LOG_SCHEMA_VERSION = 1
 MAX_JSON_BYTES = 1_000_000
+LOG_MAX_BYTES = 1_000_000
+LOG_MAX_LINE_BYTES = 8_192
 DEFAULT_INTERVAL_SECONDS = 60.0
 DEFAULT_COOLDOWN_SECONDS = 900.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
@@ -42,6 +50,7 @@ EXIT_UNAVAILABLE = 69
 EXIT_TEMPORARY = 75
 
 REF_PATTERN = re.compile(r"^acct-[0-9a-f]{16}$")
+RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 WINDOW_PATTERN = re.compile(r"^Window [1-9][0-9]{0,2}$")
 EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 SENSITIVE_KEY_PATTERN = re.compile(
@@ -100,6 +109,82 @@ SAFE_WARM_STATUSES = {
     "skippedCooldown",
     "skippedAlreadyRunning",
     "failed",
+}
+
+# The monitor is a long-lived, user-scoped process. Keep its event vocabulary
+# deliberately small so a future call site cannot accidentally turn untrusted
+# command output into a persisted log field. These are the only fields the
+# append boundary will serialize for each event.
+LOG_EVENT_FIELDS: dict[str, set[str]] = {
+    "monitor_started": set(),
+    "lock_busy": {"reason"},
+    "binary_unavailable": {"reason"},
+    "state_invalid": {"reason"},
+    "state_write_failed": {"reason"},
+    "quota_poll_succeeded": {"accountCount", "networkCount", "signInRequiredCount", "unusableCount"},
+    "quota_poll_failed": {"reason"},
+    "quota_report_invalid": {"reason"},
+    "reset_detected": {"accountRef", "reason", "usedPercent", "resetAt"},
+    "warm_eligible": {"accountRef", "reason", "usedPercent"},
+    "warm_skipped": {"accountRef", "reason", "usedPercent"},
+    "cooldown_skipped": {"pendingCount", "retryAt"},
+    "proxy_check": {"available", "reason"},
+    "warm_attempt_started": {"accountRef"},
+    "warm_attempt_succeeded": {"accountRef", "outcome"},
+    "warm_attempt_failed": {"accountRef", "reason"},
+    "warm_completed": {"attemptedCount", "warmedCount", "failedCount", "retryAt"},
+    "monitor_completed": {
+        "status",
+        "reason",
+        "exitCode",
+        "observedResetCount",
+        "pendingCount",
+        "warmedCount",
+    },
+}
+
+LOG_REASON_VALUES = {
+    "duplicate_run",
+    "binary_unavailable",
+    "state_invalid",
+    "state_write_failed",
+    "command_unavailable",
+    "command_timeout",
+    "command_failed",
+    "report_invalid",
+    "quota_unavailable",
+    "network_unavailable",
+    "sign_in_required",
+    "account_inactive",
+    "usage_unavailable",
+    "reset_unavailable",
+    "reset_not_observed",
+    "deadline_elapsed",
+    "usage_decreased",
+    "usage_nonzero",
+    "reset_observed_zero_usage",
+    "cooldown",
+    "proxy_unavailable",
+    "proxy_report_invalid",
+    "provider_rejected",
+    "invalid_response",
+    "unknown",
+}
+LOG_OUTCOME_VALUES = {"warmed", "skipped"}
+LOG_STATUS_VALUES = {
+    "locked",
+    "binaryUnavailable",
+    "stateInvalid",
+    "quotaUnavailable",
+    "quotaInvalid",
+    "stateWriteFailed",
+    "resetObserved",
+    "noReset",
+    "cooldown",
+    "proxyUnavailable",
+    "warmFailed",
+    "warmed",
+    "warmSkipped",
 }
 
 
@@ -424,6 +509,40 @@ def _state_timestamp(value: Any) -> Optional[_datetime.datetime]:
     return parse_timestamp(value, required=False)
 
 
+def reset_observation_reason(
+    previous: Optional[Mapping[str, Any]],
+    current: AccountSnapshot,
+    now: _datetime.datetime,
+) -> Optional[str]:
+    """Return safe evidence explaining a reset discontinuity, if any."""
+
+    if previous is None or current.window is None or current.window.reset_at is None:
+        return None
+    if current.state not in {"active", "available"} or current.usage_status != "ok":
+        return None
+    previous_reset = _state_timestamp(previous.get("resetAt"))
+    if previous_reset is None:
+        return None
+    current_reset = current.window.reset_at
+    previous_used = previous.get("usedPercent")
+    if type(previous_used) is not int or not 0 <= previous_used <= 100:
+        return None
+
+    # A reset can be observed while the monitor was asleep: the prior deadline
+    # is now in the past and the service reports a new future deadline.
+    if previous_reset <= now < current_reset:
+        return "deadline_elapsed"
+    # A lower usage percentage is strong evidence of a new quota cycle even if
+    # the upstream rounds or briefly retains the same reset timestamp.
+    if current.window.used_percent < previous_used and current_reset >= now:
+        return "usage_decreased"
+    # A changed future deadline alone is not enough: active traffic can move a
+    # deadline forward.  Require a lower usage value or an elapsed old deadline.
+    if current_reset != previous_reset and previous_reset <= now:
+        return "deadline_elapsed"
+    return None
+
+
 def observe_reset(
     previous: Optional[Mapping[str, Any]],
     current: AccountSnapshot,
@@ -431,29 +550,7 @@ def observe_reset(
 ) -> bool:
     """Return true only for a reset discontinuity, not ordinary polling."""
 
-    if previous is None or current.window is None or current.window.reset_at is None:
-        return False
-    if current.state not in {"active", "available"} or current.usage_status != "ok":
-        return False
-    previous_reset = _state_timestamp(previous.get("resetAt"))
-    if previous_reset is None:
-        return False
-    current_reset = current.window.reset_at
-    previous_used = previous.get("usedPercent")
-    if type(previous_used) is not int or not 0 <= previous_used <= 100:
-        return False
-
-    # A reset can be observed while the monitor was asleep: the prior deadline
-    # is now in the past and the service reports a new future deadline.
-    if previous_reset <= now < current_reset:
-        return True
-    # A lower usage percentage is strong evidence of a new quota cycle even if
-    # the upstream rounds or briefly retains the same reset timestamp.
-    if current.window.used_percent < previous_used and current_reset >= now:
-        return True
-    # A changed future deadline alone is not enough: active traffic can move a
-    # deadline forward.  Require a lower usage value or an elapsed old deadline.
-    return current_reset != previous_reset and previous_reset <= now
+    return reset_observation_reason(previous, current, now) is not None
 
 
 def _default_state() -> dict[str, Any]:
@@ -565,28 +662,104 @@ def save_state(path: Path, value: Mapping[str, Any]) -> None:
                 pass
 
 
-def append_log(path: Path, event: str, **fields: Any) -> None:
-    """Append a bounded, sanitized event without command output."""
+def _safe_log_reason(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value in LOG_REASON_VALUES:
+        return value
+    return None
 
-    safe_fields: dict[str, Any] = {"schemaVersion": SCHEMA_VERSION, "at": timestamp_string(utc_now()), "event": event}
+
+def _safe_log_status(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value in LOG_STATUS_VALUES:
+        return value
+    return None
+
+
+def _safe_log_field(key: str, value: Any) -> Any:
+    """Allowlist event fields and reject unbounded or sensitive values."""
+
+    if key == "accountRef":
+        return value if isinstance(value, str) and REF_PATTERN.fullmatch(value) else None
+    if key == "runId":
+        return value if isinstance(value, str) and RUN_ID_PATTERN.fullmatch(value) else None
+    if key == "reason":
+        return _safe_log_reason(value)
+    if key == "status":
+        return _safe_log_status(value)
+    if key == "outcome":
+        return value if isinstance(value, str) and value in LOG_OUTCOME_VALUES else None
+    if key in {"resetAt", "retryAt"}:
+        if value is None:
+            return None
+        try:
+            parsed = parse_timestamp(value)
+        except MonitorError:
+            return None
+        return timestamp_string(parsed) if parsed is not None else None
+    if key in {
+        "accountCount",
+        "networkCount",
+        "signInRequiredCount",
+        "unusableCount",
+        "pendingCount",
+        "attemptedCount",
+        "warmedCount",
+        "failedCount",
+        "observedResetCount",
+        "exitCode",
+        "usedPercent",
+    }:
+        if type(value) is not int:
+            return None
+        upper_bound = 1000 if key != "exitCode" else 255
+        return value if 0 <= value <= upper_bound else None
+    if key == "available":
+        return value if type(value) is bool else None
+    return None
+
+
+def append_log(path: Path, event: str, *, run_id: Optional[str] = None, **fields: Any) -> None:
+    """Append one fixed-schema, bounded event without command output.
+
+    Logging is deliberately best effort. A malformed or unknown field is
+    omitted, and an unknown event is dropped entirely; neither can affect a
+    quota decision or leak provider/account data.
+    """
+
+    if event not in LOG_EVENT_FIELDS:
+        return
+    resolved_run_id = run_id if isinstance(run_id, str) and RUN_ID_PATTERN.fullmatch(run_id) else uuid.uuid4().hex
+    safe_fields: dict[str, Any] = {
+        "schemaVersion": LOG_SCHEMA_VERSION,
+        "at": timestamp_string(utc_now()),
+        "event": event,
+        "runId": resolved_run_id,
+    }
     for key, value in fields.items():
-        if key in {"error", "stderr", "stdout", "message", "alias", "email", "token"}:
+        if key not in LOG_EVENT_FIELDS[event]:
             continue
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            safe_fields[key] = value
+        safe_value = _safe_log_field(key, value)
+        if safe_value is not None:
+            safe_fields[key] = safe_value
     line = json.dumps(safe_fields, sort_keys=True, separators=(",", ":")) + "\n"
+    encoded = line.encode("utf-8")
+    if len(encoded) > LOG_MAX_LINE_BYTES:
+        return
     try:
         ensure_private_directory(path.parent)
-        if path.exists() and path.stat().st_size > 1_000_000:
+        current_size = path.stat().st_size if path.exists() else 0
+        if current_size and current_size + len(encoded) > LOG_MAX_BYTES:
             rotated = path.with_suffix(path.suffix + ".1")
             try:
                 os.replace(path, rotated)
+                os.chmod(rotated, stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
                 pass
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         descriptor = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
         try:
-            os.write(descriptor, line.encode("utf-8"))
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+            os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
         finally:
             os.close(descriptor)
     except OSError:
@@ -785,28 +958,143 @@ class MonitorConfig:
     script_path: Path = Path(__file__)
 
 
+def _failure_reason(value: Optional[str], *, default: str = "unknown") -> str:
+    """Map local/parser failures to a fixed, non-sensitive reason code."""
+
+    if value == "timeout":
+        return "command_timeout"
+    if value == "command_unavailable":
+        return "command_unavailable"
+    if value == "command_failed":
+        return "command_failed"
+    if value == "network":
+        return "network_unavailable"
+    if value in {
+        "malformed_json",
+        "report_too_large",
+        "report_too_deep",
+        "report_contains_sensitive_field",
+        "report_contains_sensitive_value",
+        "report_contains_control_character",
+        "duplicate_report_key",
+        "report_contains_invalid_key",
+        "invalid_report_number",
+        "unexpected_report_shape",
+        "incompatible_command",
+        "quota_report_failed",
+        "unexpected_status_shape",
+        "unexpected_warmup_shape",
+    }:
+        return "report_invalid"
+    if value == "state_invalid":
+        return "state_invalid"
+    if value in {"state_unavailable", "state_directory_unavailable"}:
+        return "state_invalid"
+    if value == "state_write_failed":
+        return "state_write_failed"
+    return default if default in LOG_REASON_VALUES else "unknown"
+
+
+def _quota_status_counts(snapshots: Iterable[AccountSnapshot]) -> dict[str, int]:
+    snapshots = list(snapshots)
+    return {
+        "accountCount": len(snapshots),
+        "networkCount": sum(item.usage_status == "network" for item in snapshots),
+        "signInRequiredCount": sum(
+            item.usage_status in {"signInRequired", "unauthorized"} or item.state == "signInRequired"
+            for item in snapshots
+        ),
+        "unusableCount": sum(not _usable_snapshot(item) for item in snapshots),
+    }
+
+
+def _pending_skip_reason(
+    record: Mapping[str, Any],
+    current: Optional[AccountSnapshot],
+) -> str:
+    """Explain why a reset marker cannot yet be targeted safely."""
+
+    if current is None:
+        return "account_inactive"
+    if current.state == "signInRequired" or current.usage_status in {"signInRequired", "unauthorized"}:
+        return "sign_in_required"
+    if current.usage_status in {"network", "timeout"}:
+        return "network_unavailable"
+    if current.usage_status != "ok":
+        return "usage_unavailable"
+    if current.state not in {"active", "available"}:
+        return "account_inactive"
+    if current.window is None or current.window.reset_at is None:
+        return "reset_unavailable"
+    if current.window.used_percent != 0:
+        return "usage_nonzero"
+    # The caller should only ask about records with a pending fingerprint. A
+    # defensive fallback avoids ever inventing a reason from untrusted data.
+    return "reset_not_observed" if not record.get("pendingFingerprint") else "unknown"
+
+
+def _pending_skip_reasons(
+    state: Mapping[str, Any],
+    snapshots: Iterable[AccountSnapshot],
+) -> list[tuple[str, str, Optional[int]]]:
+    current_by_ref = {item.ref: item for item in snapshots}
+    result: list[tuple[str, str, Optional[int]]] = []
+    for ref, record in state["accounts"].items():
+        if not record.get("pendingFingerprint"):
+            continue
+        current = current_by_ref.get(ref)
+        used = current.window.used_percent if current and current.window else None
+        reason = _pending_skip_reason(record, current)
+        if reason != "unknown":
+            result.append((ref, reason, used))
+    return result
+
+
 def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = None) -> tuple[int, dict[str, Any]]:
     now = (now or utc_now()).astimezone(_datetime.timezone.utc)
     ensure_private_directory(config.state_dir)
+    run_id = uuid.uuid4().hex
+    monitor_log = log_path(config.state_dir)
+
+    def emit(event: str, **fields: Any) -> None:
+        append_log(monitor_log, event, run_id=run_id, **fields)
+
+    def finish(code: int, result: Mapping[str, Any], *, reason: Optional[str] = None) -> tuple[int, dict[str, Any]]:
+        output = dict(result)
+        output["runId"] = run_id
+        completion_fields: dict[str, Any] = {
+            "status": output.get("status"),
+            "exitCode": code,
+            "observedResetCount": output.get("observedResetCount", 0),
+            "pendingCount": output.get("pendingCount", 0),
+            "warmedCount": output.get("warmedCount", 0),
+        }
+        if reason is not None:
+            completion_fields["reason"] = reason
+        emit("monitor_completed", **completion_fields)
+        return code, output
+
+    emit("monitor_started")
     lock_path = config.state_dir / "monitor.lock"
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            append_log(log_path(config.state_dir), "lock_busy")
-            return EXIT_TEMPORARY, {"status": "locked"}
+            emit("lock_busy", reason="duplicate_run")
+            return finish(EXIT_TEMPORARY, {"status": "locked"}, reason="duplicate_run")
 
         binary = find_binary(str(config.binary) if config.binary else None, config.script_path)
         if binary is None:
-            append_log(log_path(config.state_dir), "binary_unavailable")
-            return EXIT_UNAVAILABLE, {"status": "binaryUnavailable"}
+            emit("binary_unavailable", reason="binary_unavailable")
+            return finish(EXIT_UNAVAILABLE, {"status": "binaryUnavailable"}, reason="binary_unavailable")
         state_file = state_path(config.state_dir)
         try:
             state = load_state(state_file)
         except MonitorError as error:
-            append_log(log_path(config.state_dir), "state_invalid", code=error.code)
-            return EXIT_DATA, {"status": "stateInvalid"}
+            reason = _failure_reason(error.code, default="state_invalid")
+            emit("state_invalid", reason=reason)
+            return finish(EXIT_DATA, {"status": "stateInvalid"}, reason=reason)
 
         quota_response = run_command(
             binary,
@@ -814,67 +1102,181 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
             config.command_timeout_seconds,
         )
         if quota_response.payload is None:
-            append_log(log_path(config.state_dir), "quota_unavailable", code=quota_response.failure or "unknown")
-            return EXIT_UNAVAILABLE, {"status": "quotaUnavailable"}
+            reason = _failure_reason(quota_response.failure, default="quota_unavailable")
+            emit("quota_poll_failed", reason=reason)
+            return finish(EXIT_UNAVAILABLE, {"status": "quotaUnavailable"}, reason=reason)
         try:
             snapshots = parse_quota_report(quota_response.payload)
         except MonitorError as error:
-            append_log(log_path(config.state_dir), "quota_invalid", code=error.code)
-            return EXIT_DATA, {"status": "quotaInvalid"}
+            reason = _failure_reason(error.code, default="report_invalid")
+            emit("quota_report_invalid", reason=reason)
+            return finish(EXIT_DATA, {"status": "quotaInvalid"}, reason=reason)
+
+        emit("quota_poll_succeeded", **_quota_status_counts(snapshots))
+        previous_records = {ref: dict(record) for ref, record in state["accounts"].items()}
 
         observed = _apply_observations(state, snapshots, now)
         state["lastPollAt"] = timestamp_string(now)
+        observed_refs: list[str] = []
+        current_by_ref = {snapshot.ref: snapshot for snapshot in snapshots}
+        for ref, snapshot in current_by_ref.items():
+            before = previous_records.get(ref)
+            after = state["accounts"].get(ref)
+            if not after or not after.get("pendingFingerprint"):
+                continue
+            if before and before.get("pendingFingerprint") == after.get("pendingFingerprint"):
+                continue
+            observed_refs.append(ref)
+            reason = reset_observation_reason(before, snapshot, now) or "unknown"
+            emit(
+                "reset_detected",
+                accountRef=ref,
+                reason=reason,
+                usedPercent=snapshot.window.used_percent if snapshot.window else None,
+                resetAt=timestamp_string(snapshot.window.reset_at)
+                if snapshot.window and snapshot.window.reset_at
+                else None,
+            )
         try:
             save_state(state_file, state)
         except MonitorError as error:
-            append_log(log_path(config.state_dir), "state_write_failed", code=error.code)
-            return EXIT_DATA, {"status": "stateWriteFailed"}
+            reason = _failure_reason(error.code, default="state_write_failed")
+            emit("state_write_failed", reason=reason)
+            return finish(EXIT_DATA, {"status": "stateWriteFailed"}, reason=reason)
 
         pending = _pending_refs(state, snapshots)
+        skipped = _pending_skip_reasons(state, snapshots)
+        for ref, reason, used_percent in skipped:
+            emit("warm_skipped", accountRef=ref, reason=reason, usedPercent=used_percent)
         if not pending:
+            if not observed and not skipped:
+                for snapshot in snapshots:
+                    if snapshot.window is not None and snapshot.window.used_percent == 0:
+                        emit("warm_skipped", accountRef=snapshot.ref, reason="reset_not_observed", usedPercent=0)
+            if not skipped and not observed:
+                emit("warm_skipped", reason="reset_not_observed")
             status = "resetObserved" if observed else "noReset"
-            append_log(log_path(config.state_dir), status, observed=observed, pending=0)
-            return EXIT_OK, {"status": status, "observedResetCount": observed, "pendingCount": 0}
+            reason = "usage_nonzero" if skipped else ("reset_observed_zero_usage" if observed else "reset_not_observed")
+            return finish(
+                EXIT_OK,
+                {"status": status, "observedResetCount": observed, "pendingCount": 0},
+                reason=reason,
+            )
+
+        for ref in pending:
+            current = current_by_ref.get(ref)
+            emit(
+                "warm_eligible",
+                accountRef=ref,
+                reason="reset_observed_zero_usage",
+                usedPercent=current.window.used_percent if current and current.window else None,
+            )
 
         next_attempt = _state_timestamp(state.get("nextAttemptAfter"))
         if next_attempt is not None and next_attempt > now:
-            append_log(log_path(config.state_dir), "cooldown", pending=len(pending))
-            return EXIT_OK, {
-                "status": "cooldown",
-                "observedResetCount": observed,
-                "pendingCount": len(pending),
-            }
+            for ref in pending:
+                emit("warm_skipped", accountRef=ref, reason="cooldown", usedPercent=0)
+            emit("cooldown_skipped", pendingCount=len(pending), retryAt=timestamp_string(next_attempt))
+            return finish(
+                EXIT_OK,
+                {
+                    "status": "cooldown",
+                    "observedResetCount": observed,
+                    "pendingCount": len(pending),
+                },
+                reason="cooldown",
+            )
 
         status_response = run_command(binary, ["agent", "status", "--json"], config.command_timeout_seconds)
         if status_response.payload is None:
-            append_log(log_path(config.state_dir), "proxy_unavailable", code=status_response.failure or "unknown")
+            reason = _failure_reason(status_response.failure, default="proxy_unavailable")
+            emit("proxy_check", available=False, reason=reason)
+            for ref in pending:
+                emit("warm_skipped", accountRef=ref, reason="proxy_unavailable", usedPercent=0)
             state["lastWarmStatus"] = "proxyUnavailable"
-            save_state(state_file, state)
-            return EXIT_UNAVAILABLE, {
-                "status": "proxyUnavailable",
-                "observedResetCount": observed,
-                "pendingCount": len(pending),
-            }
+            try:
+                save_state(state_file, state)
+            except MonitorError as error:
+                write_reason = _failure_reason(error.code, default="state_write_failed")
+                emit("state_write_failed", reason=write_reason)
+                return finish(
+                    EXIT_DATA,
+                    {
+                        "status": "stateWriteFailed",
+                        "observedResetCount": observed,
+                        "pendingCount": len(pending),
+                    },
+                    reason=write_reason,
+                )
+            return finish(
+                EXIT_UNAVAILABLE,
+                {
+                    "status": "proxyUnavailable",
+                    "observedResetCount": observed,
+                    "pendingCount": len(pending),
+                },
+                reason=reason,
+            )
         try:
             proxy_available = parse_status_health(status_response.payload)
         except MonitorError as error:
-            append_log(log_path(config.state_dir), "status_invalid", code=error.code)
+            del error
+            emit("proxy_check", available=False, reason="proxy_report_invalid")
+            for ref in pending:
+                emit("warm_skipped", accountRef=ref, reason="proxy_unavailable", usedPercent=0)
             state["lastWarmStatus"] = "proxyUnavailable"
-            save_state(state_file, state)
-            return EXIT_UNAVAILABLE, {
-                "status": "proxyUnavailable",
-                "observedResetCount": observed,
-                "pendingCount": len(pending),
-            }
+            try:
+                save_state(state_file, state)
+            except MonitorError as error:
+                write_reason = _failure_reason(error.code, default="state_write_failed")
+                emit("state_write_failed", reason=write_reason)
+                return finish(
+                    EXIT_DATA,
+                    {
+                        "status": "stateWriteFailed",
+                        "observedResetCount": observed,
+                        "pendingCount": len(pending),
+                    },
+                    reason=write_reason,
+                )
+            return finish(
+                EXIT_UNAVAILABLE,
+                {
+                    "status": "proxyUnavailable",
+                    "observedResetCount": observed,
+                    "pendingCount": len(pending),
+                },
+                reason="proxy_report_invalid",
+            )
         if not proxy_available:
-            append_log(log_path(config.state_dir), "proxy_unavailable", pending=len(pending))
+            emit("proxy_check", available=False, reason="proxy_unavailable")
+            for ref in pending:
+                emit("warm_skipped", accountRef=ref, reason="proxy_unavailable", usedPercent=0)
             state["lastWarmStatus"] = "proxyUnavailable"
-            save_state(state_file, state)
-            return EXIT_UNAVAILABLE, {
-                "status": "proxyUnavailable",
-                "observedResetCount": observed,
-                "pendingCount": len(pending),
-            }
+            try:
+                save_state(state_file, state)
+            except MonitorError as error:
+                write_reason = _failure_reason(error.code, default="state_write_failed")
+                emit("state_write_failed", reason=write_reason)
+                return finish(
+                    EXIT_DATA,
+                    {
+                        "status": "stateWriteFailed",
+                        "observedResetCount": observed,
+                        "pendingCount": len(pending),
+                    },
+                    reason=write_reason,
+                )
+            return finish(
+                EXIT_UNAVAILABLE,
+                {
+                    "status": "proxyUnavailable",
+                    "observedResetCount": observed,
+                    "pendingCount": len(pending),
+                },
+                reason="proxy_unavailable",
+            )
+        emit("proxy_check", available=True)
 
         # Persist the cooldown only once the loopback service is confirmed
         # available and immediately before the first targeted request. An
@@ -886,10 +1288,10 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
         try:
             save_state(state_file, state)
         except MonitorError as error:
-            append_log(log_path(config.state_dir), "state_write_failed", code=error.code)
-            return EXIT_DATA, {"status": "stateWriteFailed", "pendingCount": len(pending)}
+            reason = _failure_reason(error.code, default="state_write_failed")
+            emit("state_write_failed", reason=reason)
+            return finish(EXIT_DATA, {"status": "stateWriteFailed", "pendingCount": len(pending)}, reason=reason)
 
-        append_log(log_path(config.state_dir), "warm_requested", pending=len(pending))
         # A reset marker identifies one account.  Keep each request targeted so
         # a reset in one account cannot spend quota or acquire a lease for the
         # rest of the roster.  Continue through the pending set so independent
@@ -899,6 +1301,7 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
         warmed_refs: set[str] = set()
         failed_refs: set[str] = set()
         for ref in pending:
+            emit("warm_attempt_started", accountRef=ref)
             warm_response = run_command(
                 binary,
                 ["agent", "warmup", "account", ref, "--confirm", "--json"],
@@ -906,20 +1309,30 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
             )
             if warm_response.payload is None:
                 failed_refs.add(ref)
-                append_log(log_path(config.state_dir), "warm_failed", code=warm_response.failure or "unknown")
+                emit(
+                    "warm_attempt_failed",
+                    accountRef=ref,
+                    reason=_failure_reason(warm_response.failure, default="command_failed"),
+                )
                 continue
             try:
                 warm_ok, warmed = parse_targeted_warmup_success(warm_response.payload, ref)
-            except MonitorError as error:
+            except MonitorError:
                 failed_refs.add(ref)
-                append_log(log_path(config.state_dir), "warm_invalid", code=error.code)
+                emit("warm_attempt_failed", accountRef=ref, reason="invalid_response")
                 continue
             if warm_ok:
                 successful_refs.add(ref)
                 if warmed:
                     warmed_refs.add(ref)
+                emit(
+                    "warm_attempt_succeeded",
+                    accountRef=ref,
+                    outcome="warmed" if warmed else "skipped",
+                )
             else:
                 failed_refs.add(ref)
+                emit("warm_attempt_failed", accountRef=ref, reason="provider_rejected")
 
         # A valid targeted response is the deduplication boundary for that ref.
         # Even a safe skip (for example a race into cooldown) must not be
@@ -933,23 +1346,57 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
             if failed_refs
             else None
         )
-        save_state(state_file, state)
+        try:
+            save_state(state_file, state)
+        except MonitorError as error:
+            write_reason = _failure_reason(error.code, default="state_write_failed")
+            emit("state_write_failed", reason=write_reason)
+            return finish(
+                EXIT_DATA,
+                {
+                    "status": "stateWriteFailed",
+                    "observedResetCount": observed,
+                    "pendingCount": len(_pending_refs(state, snapshots)),
+                    "warmedCount": len(warmed_refs),
+                },
+                reason=write_reason,
+            )
+        retry_at = state.get("nextAttemptAfter")
         if failed_refs:
-            append_log(log_path(config.state_dir), "warm_failed", failed=len(failed_refs), warmed=len(warmed_refs))
-            return EXIT_TEMPORARY, {
-                "status": "warmFailed",
+            emit(
+                "warm_completed",
+                attemptedCount=len(pending),
+                warmedCount=len(warmed_refs),
+                failedCount=len(failed_refs),
+                retryAt=retry_at,
+            )
+            return finish(
+                EXIT_TEMPORARY,
+                {
+                    "status": "warmFailed",
+                    "observedResetCount": observed,
+                    "pendingCount": len(_pending_refs(state, snapshots)),
+                    "warmedCount": len(warmed_refs),
+                },
+                reason="command_failed",
+            )
+
+        emit(
+            "warm_completed",
+            attemptedCount=len(pending),
+            warmedCount=len(warmed_refs),
+            failedCount=0,
+        )
+        return finish(
+            EXIT_OK,
+            {
+                "status": "warmed" if warmed_refs else "warmSkipped",
                 "observedResetCount": observed,
                 "pendingCount": len(_pending_refs(state, snapshots)),
                 "warmedCount": len(warmed_refs),
-            }
-
-        append_log(log_path(config.state_dir), "warm_succeeded", warmed=len(warmed_refs), pending=len(pending))
-        return EXIT_OK, {
-            "status": "warmed" if warmed_refs else "warmSkipped",
-            "observedResetCount": observed,
-            "pendingCount": len(_pending_refs(state, snapshots)),
-            "warmedCount": len(warmed_refs),
-        }
+            },
+            reason="reset_observed_zero_usage",
+        )
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
