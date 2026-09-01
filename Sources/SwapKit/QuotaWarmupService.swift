@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public protocol WarmupCommandRunning: Sendable {
     func run(alias: String, proxyURL: URL) async throws
@@ -299,11 +302,28 @@ public actor QuotaWarmupService {
 
 public struct ProcessWarmupRunner: WarmupCommandRunning {
     private let binary: String?
-    private let timeoutSeconds: UInt64
+    private let timeout: Duration
+    private let processFactory: @Sendable () -> Process
+
+    private static let terminationGrace: Duration = .milliseconds(250)
+    private static let killGrace: Duration = .milliseconds(250)
 
     public init(binary: String? = CodexLauncher.resolveWarmupBinary(), timeoutSeconds: UInt64 = 120) {
+        self.init(
+            binary: binary,
+            timeout: .seconds(Int64(clamping: timeoutSeconds)),
+            processFactory: { Process() }
+        )
+    }
+
+    init(
+        binary: String?,
+        timeout: Duration,
+        processFactory: @escaping @Sendable () -> Process
+    ) {
         self.binary = binary
-        self.timeoutSeconds = timeoutSeconds
+        self.timeout = timeout
+        self.processFactory = processFactory
     }
 
     public func run(alias: String, proxyURL: URL) async throws {
@@ -319,7 +339,7 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
 
         let errorHandle = try FileHandle(forWritingTo: errorURL)
         defer { try? errorHandle.close() }
-        let process = Process()
+        let process = processFactory()
         process.executableURL = URL(fileURLWithPath: binary)
         process.arguments = CodexLauncher.warmupArgs(proxyURL: proxyURL, alias: alias)
         process.currentDirectoryURL = work
@@ -332,15 +352,29 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
             "CODEXSWAP_WARMUP_TOKEN": "local-loopback-only",
             "NO_COLOR": "1",
         ]
-        let termination = AsyncStream<Int32> { continuation in
-            process.terminationHandler = { completed in
-                continuation.yield(completed.terminationStatus)
-                continuation.finish()
-            }
+        let processBox = WarmupProcessBox(process)
+        let termination = WarmupProcessTermination()
+        process.terminationHandler = { completed in
+            // Capture the status while Foundation still owns the completed task. Never
+            // query Process again from a cancelled async waiter or teardown path.
+            let status = completed.terminationStatus
+            termination.finish(status)
         }
         try process.run()
 
-        let status = try await wait(for: process, termination: termination)
+        let status: Int32
+        do {
+            status = try await withTaskCancellationHandler(operation: {
+                try await Self.wait(for: termination, timeout: timeout)
+            }, onCancel: {
+                processBox.requestTermination()
+                termination.requestCancellation()
+            })
+            try Task.checkCancellation()
+        } catch {
+            await Self.stopProcess(processBox: processBox, termination: termination)
+            throw error
+        }
         guard status == 0 else {
             let data = (try? Data(contentsOf: errorURL)) ?? Data()
             let bounded = String(decoding: data.prefix(4_096), as: UTF8.self)
@@ -348,25 +382,151 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
         }
     }
 
-    private func wait(for process: Process, termination: AsyncStream<Int32>) async throws -> Int32 {
-        try await withThrowingTaskGroup(of: Int32.self) { group in
-            group.addTask {
-                var iterator = termination.makeAsyncIterator()
-                return await iterator.next() ?? process.terminationStatus
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-                throw WarmupCommandError.timedOut
-            }
-            do {
-                let status = try await group.next()!
-                group.cancelAll()
-                return status
-            } catch {
-                if process.isRunning { process.terminate() }
-                group.cancelAll()
-                throw error
+    private static func wait(
+        for termination: WarmupProcessTermination,
+        timeout: Duration
+    ) async throws -> Int32 {
+        switch await termination.wait(for: timeout) {
+        case .terminated(let status):
+            return status
+        case .timedOut:
+            throw WarmupCommandError.timedOut
+        case .cancelled:
+            throw CancellationError()
+        }
+    }
+
+    private static func stopProcess(
+        processBox: WarmupProcessBox,
+        termination: WarmupProcessTermination
+    ) async {
+        processBox.requestTermination()
+        if case .terminated = await termination.wait(for: terminationGrace, observingCancellation: false) {
+            return
+        }
+        processBox.forceKill()
+        _ = await termination.wait(for: killGrace, observingCancellation: false)
+    }
+}
+
+private final class WarmupProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let process: Process
+    private var terminationRequested = false
+    private var forceKillRequested = false
+
+    init(_ process: Process) {
+        self.process = process
+    }
+
+    func requestTermination() {
+        lock.lock()
+        guard !terminationRequested else {
+            lock.unlock()
+            return
+        }
+        terminationRequested = true
+        let running = process.isRunning
+        if running {
+            process.terminate()
+        }
+        lock.unlock()
+    }
+
+    func forceKill() {
+        lock.lock()
+        guard !forceKillRequested else {
+            lock.unlock()
+            return
+        }
+        forceKillRequested = true
+        let running = process.isRunning
+        let pid = process.processIdentifier
+        lock.unlock()
+        guard running, pid > 0 else { return }
+        #if canImport(Darwin)
+        _ = Darwin.kill(pid, SIGKILL)
+        #else
+        _ = kill(pid, SIGKILL)
+        #endif
+    }
+}
+
+private enum WarmupTerminationWaitResult: Sendable {
+    case terminated(Int32)
+    case timedOut
+    case cancelled
+}
+
+private final class WarmupProcessTermination: @unchecked Sendable {
+    private let lock = NSLock()
+    private var status: Int32?
+    private var cancellationRequested = false
+    private var nextWaiterID = 0
+    private var waiters: [Int: CheckedContinuation<WarmupTerminationWaitResult, Never>] = [:]
+
+    func finish(_ status: Int32) {
+        lock.lock()
+        guard self.status == nil else {
+            lock.unlock()
+            return
+        }
+        self.status = status
+        let waiters = Array(self.waiters.values)
+        self.waiters.removeAll()
+        lock.unlock()
+        waiters.forEach { $0.resume(returning: .terminated(status)) }
+    }
+
+    func requestCancellation() {
+        lock.lock()
+        cancellationRequested = true
+        let waiters = Array(self.waiters.values)
+        self.waiters.removeAll()
+        lock.unlock()
+        waiters.forEach { $0.resume(returning: .cancelled) }
+    }
+
+    func wait(
+        for timeout: Duration?,
+        observingCancellation: Bool = true
+    ) async -> WarmupTerminationWaitResult {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let status {
+                lock.unlock()
+                continuation.resume(returning: .terminated(status))
+            } else if observingCancellation && cancellationRequested {
+                lock.unlock()
+                continuation.resume(returning: .cancelled)
+            } else {
+                let waiterID = nextWaiterID
+                nextWaiterID += 1
+                waiters[waiterID] = continuation
+                lock.unlock()
+                if let timeout {
+                    DispatchQueue.global(qos: .utility).asyncAfter(
+                        deadline: warmupDispatchDeadline(after: timeout)
+                    ) { [weak self] in
+                        self?.expire(waiterID)
+                    }
+                }
             }
         }
     }
+
+    private func expire(_ waiterID: Int) {
+        lock.lock()
+        let waiter = waiters.removeValue(forKey: waiterID)
+        lock.unlock()
+        waiter?.resume(returning: .timedOut)
+    }
+}
+
+private func warmupDispatchDeadline(after duration: Duration) -> DispatchTime {
+    let components = duration.components
+    let rawNanoseconds = Double(components.seconds) * 1_000_000_000
+        + Double(components.attoseconds) / 1_000_000_000
+    let clampedNanoseconds = min(max(rawNanoseconds, 0), Double(Int.max))
+    return .now() + .nanoseconds(Int(clampedNanoseconds))
 }

@@ -1938,6 +1938,238 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         XCTAssertLessThan(elapsed, .milliseconds(500))
     }
+
+    func testWarmupProcessNormalCompletionUsesCapturedTerminationStatus() async throws {
+        let process = WarmupProcessSpy(behavior: .completes, status: 0)
+        let runner = ProcessWarmupRunner(
+            binary: "/ignored-for-spy",
+            timeout: .seconds(1),
+            processFactory: { process }
+        )
+
+        try await runner.run(alias: "complete-spy", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+
+        XCTAssertEqual(process.terminationStatusReadCount, 1)
+        XCTAssertEqual(process.terminateCallCount, 0)
+    }
+
+    func testWarmupProcessTimeoutDoesNotTouchProcessAfterTerminationWait() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("warmup-timeout-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("sleep.sh")
+        try "#!/bin/sh\nexec /bin/sleep 30\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+        do {
+            try await ProcessWarmupRunner(binary: script.path, timeoutSeconds: 1)
+                .run(alias: "timeout", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+            XCTFail("Expected warm-up timeout")
+        } catch let error as WarmupCommandError {
+            guard case .timedOut = error else {
+                return XCTFail("Expected warm-up timeout, got \(error)")
+            }
+        }
+    }
+
+    func testWarmupProcessCancellationTerminatesIdempotently() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("warmup-cancellation-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("sleep.sh")
+        try "#!/bin/sh\nexec /bin/sleep 30\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+
+        let task = Task {
+            try await ProcessWarmupRunner(binary: script.path, timeoutSeconds: 30)
+                .run(alias: "cancel", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation remains distinguishable from command failure.
+        }
+    }
+
+    func testWarmupProcessCapturesStatusOnlyFromTerminationHandlerOnTimeout() async throws {
+        let process = WarmupProcessSpy(behavior: .blocks, status: 17)
+        let runner = ProcessWarmupRunner(
+            binary: "/ignored-for-spy",
+            timeout: .milliseconds(20),
+            processFactory: { process }
+        )
+
+        do {
+            try await runner.run(alias: "timeout-spy", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+            XCTFail("Expected warm-up timeout")
+        } catch let error as WarmupCommandError {
+            guard case .timedOut = error else {
+                return XCTFail("Expected warm-up timeout, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(process.terminationStatusReadCount, 1)
+        XCTAssertEqual(process.terminateCallCount, 1)
+    }
+
+    func testWarmupProcessCancellationDoesNotReadStatusFromCancelledWaiter() async throws {
+        let process = WarmupProcessSpy(behavior: .blocks, status: 23)
+        let runner = ProcessWarmupRunner(
+            binary: "/ignored-for-spy",
+            timeout: .seconds(5),
+            processFactory: { process }
+        )
+        let task = Task {
+            try await runner.run(alias: "cancel-spy", proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        }
+
+        while !process.hasStarted() {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation remains distinguishable from command failure.
+        }
+
+        XCTAssertEqual(process.terminationStatusReadCount, 1)
+        XCTAssertEqual(process.terminateCallCount, 1)
+    }
+}
+
+private final class WarmupProcessSpy: Process, @unchecked Sendable {
+    enum Behavior {
+        case blocks
+        case completes
+    }
+
+    private let lock = NSLock()
+    private let behavior: Behavior
+    private let status: Int32
+    private var runningState = false
+    private var started = false
+    private var terminationStatusReads = 0
+    private var terminateCalls = 0
+    private var configuredTerminationHandler: (@Sendable (Process) -> Void)?
+
+    init(behavior: Behavior, status: Int32) {
+        self.behavior = behavior
+        self.status = status
+    }
+
+    // Process' concrete implementation rejects configuration when subclassed; the
+    // spy only models lifecycle and termination, so swallow runner configuration.
+    override var executableURL: URL? {
+        get { nil }
+        set {}
+    }
+
+    override var arguments: [String]? {
+        get { nil }
+        set {}
+    }
+
+    override var currentDirectoryURL: URL? {
+        get { nil }
+        set {}
+    }
+
+    override var standardOutput: Any? {
+        get { nil }
+        set {}
+    }
+
+    override var standardError: Any? {
+        get { nil }
+        set {}
+    }
+
+    override var environment: [String: String]? {
+        get { nil }
+        set {}
+    }
+
+    override var terminationHandler: (@Sendable (Process) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return configuredTerminationHandler
+        }
+        set {
+            lock.lock()
+            configuredTerminationHandler = newValue
+            lock.unlock()
+        }
+    }
+
+    override var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return runningState
+    }
+
+    override var terminationStatus: Int32 {
+        lock.lock()
+        terminationStatusReads += 1
+        lock.unlock()
+        return status
+    }
+
+    override func run() throws {
+        lock.lock()
+        started = true
+        runningState = true
+        let completes: Bool
+        switch behavior {
+        case .blocks:
+            completes = false
+        case .completes:
+            completes = true
+        }
+        if completes {
+            runningState = false
+        }
+        lock.unlock()
+        let handler = completes ? terminationHandler : nil
+        handler?(self)
+    }
+
+    override func terminate() {
+        lock.lock()
+        terminateCalls += 1
+        let shouldNotify = runningState
+        runningState = false
+        let handler = shouldNotify ? configuredTerminationHandler : nil
+        lock.unlock()
+        handler?(self)
+    }
+
+    func hasStarted() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return started
+    }
+
+    var terminationStatusReadCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminationStatusReads
+    }
+
+    var terminateCallCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminateCalls
+    }
 }
 
 final class WarmupEngineTests: XCTestCase {
