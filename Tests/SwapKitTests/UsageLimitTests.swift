@@ -35,6 +35,12 @@ final class UsageLimitTests: XCTestCase {
         XCTAssertEqual(clamped.fiveHourPercent, 1)
         XCTAssertEqual(clamped.weeklyPercent, 100)
 
+        var mutated = AccountUsageLimitSettings(enabled: true)
+        mutated.fiveHourPercent = 0
+        mutated.weeklyPercent = 101
+        XCTAssertEqual(mutated.fiveHourPercent, 1)
+        XCTAssertEqual(mutated.weeklyPercent, 100)
+
         let legacy: [String: Any] = [
             "alias": "legacy",
             "accountID": "legacy-id",
@@ -55,6 +61,15 @@ final class UsageLimitTests: XCTestCase {
         XCTAssertFalse(fiveHour.isEligible(now: now))
         XCTAssertFalse(weekly.isEligible(now: now))
         XCTAssertTrue(fiveHour.isEligible(now: now, ignoringUsageLimit: true))
+
+        let arbitraryLargerWindow = account(
+            "arbitrary",
+            priority: 2,
+            usage: [window("14d", 100, seconds: 1_209_600)],
+            limits: settings
+        )
+        XCTAssertFalse(arbitraryLargerWindow.usageLimitReachedWindows.contains(.weekly))
+        XCTAssertTrue(arbitraryLargerWindow.isEligible(now: now))
     }
 
     func testUsageLimitGateRetainsLastKnownWindowWhenRefreshIsEmptyOrPartial() async throws {
@@ -224,13 +239,114 @@ final class UsageLimitTests: XCTestCase {
         await seed.upsert(account("second", priority: 1))
         let writerA = AccountStore(url: url)
         let writerB = AccountStore(url: url)
-        await writerA.setUsageLimitSettings("first", settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 70, weeklyPercent: 80))
-        await writerB.setUsageLimitSettings("second", settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 60, weeklyPercent: 75))
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                _ = await writerA.setUsageLimitSettings(
+                    "first",
+                    settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 70, weeklyPercent: 80)
+                )
+            }
+            group.addTask {
+                _ = await writerB.setUsageLimitSettings(
+                    "second",
+                    settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 60, weeklyPercent: 75)
+                )
+            }
+            await group.waitForAll()
+        }
 
         let reloaded = AccountStore(url: url)
         let first = await reloaded.account("first")
         let second = await reloaded.account("second")
         XCTAssertEqual(first?.usageLimitSettings.fiveHourPercent, 70)
         XCTAssertEqual(second?.usageLimitSettings.fiveHourPercent, 60)
+    }
+
+    func testExternalLimitWritesRefreshTaskAndLunaSelectorsAcrossStores() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let url = storeURL("external-refresh")
+        let seed = AccountStore(url: url)
+        await seed.upsert(account("task-primary", priority: 4, usage: [window("5h", 80, seconds: 18_000)]))
+        await seed.upsert(account("task-fallback", priority: 3, usage: [window("5h", 10, seconds: 18_000)]))
+
+        var lunaPrimary = account("luna-primary", priority: 2, usage: [window("5h", 80, seconds: 18_000)])
+        lunaPrimary.disabledUntil = ["5h": now.addingTimeInterval(600)]
+        await seed.upsert(lunaPrimary)
+        var lunaFallback = account("luna-fallback", priority: 1, usage: [window("5h", 10, seconds: 18_000)])
+        lunaFallback.disabledUntil = ["5h": now.addingTimeInterval(600)]
+        await seed.upsert(lunaFallback)
+
+        // These stores deliberately retain the pre-write snapshot.
+        let taskObserver = AccountStore(url: url)
+        let lunaObserver = AccountStore(url: url)
+        let writer = AccountStore(url: url)
+        _ = await writer.setUsageLimitSettings("task-primary", settings: settings)
+        _ = await writer.setUsageLimitSettings("luna-primary", settings: settings)
+
+        let task = await taskObserver.bestEligible(
+            among: ["task-primary", "task-fallback"],
+            now: now
+        )
+        XCTAssertEqual(task?.alias, "task-fallback")
+
+        let luna = await lunaObserver.reserveLunaOpportunity(now: now)
+        XCTAssertEqual(luna?.alias, "luna-fallback")
+    }
+
+    func testManagedHydrateRefreshesExternalLimitBeforeReturningAccount() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let url = storeURL("managed-refresh")
+        let managedHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-limit-managed-home-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: managedHome) }
+        try CodexAuth.write(
+            CodexTokens(idToken: "", accessToken: "managed-token", refreshToken: "managed-refresh", accountId: "id-managed"),
+            to: managedHome.appendingPathComponent("auth.json")
+        )
+        let seed = AccountStore(url: url)
+        var managed = account("managed", priority: 2, usage: [window("5h", 80, seconds: 18_000)])
+        managed.managedHomePath = managedHome.path
+        await seed.upsert(managed)
+
+        let staleObserver = AccountStore(url: url)
+        let writer = AccountStore(url: url)
+        _ = await writer.setUsageLimitSettings("managed", settings: settings)
+
+        let hydrated = await staleObserver.hydrateFromManagedHome("managed")
+        XCTAssertTrue(hydrated?.isUsageLimitReached == true)
+    }
+
+    func testManagedRemovalClearsStickyOverrideAndPersistsCoupledState() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let url = storeURL("managed-sticky-removal")
+        let store = AccountStore(url: url)
+        var managed = account("managed", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings)
+        managed.managedHomePath = "/managed/sticky"
+        await store.upsert(managed)
+
+        let didStick = await store.toggleStickyAlias("managed", now: now)
+        XCTAssertTrue(didStick)
+        let beforeRemovalOverride = await store.stickyUsageLimitOverride()
+        XCTAssertTrue(beforeRemovalOverride)
+
+        let result = await store.reconcileManagedWithTelemetry(present: [])
+        XCTAssertEqual(result.removedAliases, ["managed"])
+        let stickyAfterRemoval = await store.stickyAlias()
+        let overrideAfterRemoval = await store.stickyUsageLimitOverride()
+        XCTAssertNil(stickyAfterRemoval)
+        XCTAssertFalse(overrideAfterRemoval)
+
+        let persisted = try JSONDecoder.codex.decode(
+            StoreData.self,
+            from: try Data(contentsOf: url)
+        )
+        XCTAssertNil(persisted.stickyAlias)
+        XCTAssertFalse(persisted.stickyUsageLimitOverride)
+
+        let reloaded = AccountStore(url: url)
+        let reloadedSticky = await reloaded.stickyAlias()
+        let reloadedOverride = await reloaded.stickyUsageLimitOverride()
+        XCTAssertNil(reloadedSticky)
+        XCTAssertFalse(reloadedOverride)
     }
 }

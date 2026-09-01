@@ -397,6 +397,7 @@ public actor AccountStore {
     }
 
     public func reserveLunaOpportunity(excluding alias: String? = nil, now: Date = Date()) -> Account? {
+        refreshExternalStateIfNeeded()
         lunaRejectedUntil = lunaRejectedUntil.filter { $0.value > now }
         let candidates = data.accounts.filter { account in
             account.alias != alias && account.isRoutableIgnoringCooldown
@@ -596,6 +597,7 @@ public actor AccountStore {
         avoidingLeased: Bool = false,
         now: Date = Date()
     ) -> Account? {
+        refreshExternalStateIfNeeded()
         let allowed = Set(aliases)
         let eligible = data.accounts.filter { allowed.contains($0.alias) && $0.isEligible(now: now) }
         let unleased = eligible.filter { routingLeases[$0.alias, default: 0] == 0 }
@@ -695,6 +697,7 @@ public actor AccountStore {
     /// account so usage spreads evenly across all of them. Stays put if nothing else is eligible.
     @discardableResult
     public func advanceRoundRobin(now: Date = Date()) -> Account? {
+        refreshExternalStateIfNeeded()
         if let next = eligibleOrdered(now: now, excluding: data.activeAlias).first {
             activate(next.alias, now: now)
             return account(next.alias)
@@ -848,8 +851,10 @@ public actor AccountStore {
 
     /// For CodexBar-managed accounts, adopt CodexBar's token if it's fresher than ours (CodexBar owns refresh).
     public func hydrateFromManagedHome(_ alias: String) -> Account? {
-        guard let i = index(alias), let home = data.accounts[i].managedHomePath,
-              let tokens = CodexBarBridge.readTokens(home: home) else { return account(alias) }
+        refreshExternalStateIfNeeded()
+        guard let i = index(alias) else { return nil }
+        guard let home = data.accounts[i].managedHomePath,
+              let tokens = CodexBarBridge.readTokens(home: home) else { return data.accounts[i] }
         let ours = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast
         let theirs = JWT.expiry(tokens.accessToken) ?? .distantPast
         if theirs > ours {
@@ -1179,13 +1184,13 @@ public actor AccountStore {
         let removed = Set(removedAccounts.map(\.alias))
         data.accounts.removeAll { removed.contains($0.alias) }
         if let active = data.activeAlias, removed.contains(active) { data.activeAlias = nil }
-        if let stickyAliasRuntime, removed.contains(stickyAliasRuntime) {
+        let removedStickyAlias = (stickyAliasRuntime.map { removed.contains($0) } ?? false)
+            || (data.stickyAlias.map { removed.contains($0) } ?? false)
+        if removedStickyAlias {
             self.stickyAliasRuntime = nil
+            self.stickyUsageLimitOverrideRuntime = false
             data.stickyAlias = nil
-        }
-        if let stickyAlias = data.stickyAlias, removed.contains(stickyAlias) {
-            data.stickyAlias = nil
-            stickyAliasRuntime = nil
+            data.stickyUsageLimitOverride = false
         }
         if let drainingHoldAlias, removed.contains(drainingHoldAlias) { self.drainingHoldAlias = nil }
         for alias in removed { lunaRejectedUntil.removeValue(forKey: alias) }
