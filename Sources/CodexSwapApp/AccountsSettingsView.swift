@@ -168,12 +168,19 @@ private struct AccountCard: View {
     let openRankingSheet: () -> Void
     @State private var resetConfirmationPresented = false
     @State private var archiveConfirmationPresented = false
+    @State private var usageLimitsExpanded = false
+    @State private var usageLimitsEnabledDraft = false
+    @State private var fiveHourCapDraft = ""
+    @State private var weeklyCapDraft = ""
+    @State private var fiveHourValidationError: String?
+    @State private var weeklyValidationError: String?
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 header
                 usageSection
+                usageLimitsSection
                 statusLine
                 Divider()
                 controls
@@ -204,6 +211,10 @@ private struct AccountCard: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("The account will leave routing and ranking, while its CodexBar management, OAuth credentials, and historical usage remain available.")
+        }
+        .onAppear(perform: syncUsageLimitDrafts)
+        .onChange(of: account.usageLimitSettings) { _, _ in
+            syncUsageLimitDrafts()
         }
     }
 
@@ -271,6 +282,197 @@ private struct AccountCard: View {
         UsageResetPresentation().appCaption(for: window)
     }
 
+    // MARK: Usage limits
+
+    private var usageLimitsSection: some View {
+        DisclosureGroup(isExpanded: $usageLimitsExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("Enable usage limits", isOn: usageLimitsEnabledBinding)
+                    .toggleStyle(.checkbox)
+                    .accessibilityHint("When enabled, this account is paused when either configured cap is reached.")
+
+                usageLimitEditor(
+                    window: .fiveHour,
+                    draft: $fiveHourCapDraft,
+                    validationError: fiveHourValidationError
+                )
+                usageLimitEditor(
+                    window: .weekly,
+                    draft: $weeklyCapDraft,
+                    validationError: weeklyValidationError
+                )
+
+                if account.isPausedByUsageLimit {
+                    Label(usageLimitPauseDescription, systemImage: "pause.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel(usageLimitPauseDescription)
+                } else if account.usageLimitSettings.enabled {
+                    Label("Usage caps active", systemImage: "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Caps are saved per account and do not affect routing while disabled.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 8) {
+                Label("Usage limits", systemImage: "gauge.with.dots.needle.67percent")
+                    .font(.callout.weight(.medium))
+                if account.isPausedByUsageLimit {
+                    Text("Paused by cap")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.orange)
+                } else if account.usageLimitSettings.enabled {
+                    Text("Enabled")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityLabel("Usage limits")
+    }
+
+    private func usageLimitEditor(
+        window: AccountUsageLimitWindow,
+        draft: Binding<String>,
+        validationError: String?
+    ) -> some View {
+        let current = account.usageWindow(for: window)
+        let cap = AccountUsageLimitPresentation.cap(for: window, settings: account.usageLimitSettings)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(AccountUsageLimitPresentation.label(for: window))
+                    .font(.callout)
+                Spacer(minLength: 8)
+                TextField("1–100", text: draft)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 66)
+                    .accessibilityLabel("\(AccountUsageLimitPresentation.label(for: window)) cap percentage")
+                    .accessibilityValue(draft.wrappedValue)
+                    .onSubmit { commitUsageLimitDrafts() }
+                    .onChange(of: draft.wrappedValue) { _, value in
+                        setValidationError(for: window, value: value)
+                    }
+                Text("%")
+                    .foregroundStyle(.secondary)
+                Stepper(
+                    "Adjust \(AccountUsageLimitPresentation.label(for: window)) cap",
+                    value: stepperBinding(for: window),
+                    in: AccountUsageLimitPresentation.allowedPercentRange
+                )
+                .labelsHidden()
+                .controlSize(.small)
+            }
+
+            let currentText = current.map { "\($0.usedPercent)%" } ?? "—"
+            HStack(spacing: 8) {
+                Text("Current \(currentText)")
+                Text("Cap \(cap)%")
+                Text(resetDescription(for: current))
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if let validationError {
+                Label(validationError, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityLabel(validationError)
+            }
+        }
+    }
+
+    private var usageLimitsEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { usageLimitsEnabledDraft },
+            set: { enabled in
+                usageLimitsEnabledDraft = enabled
+                commitUsageLimitDrafts()
+            }
+        )
+    }
+
+    private func stepperBinding(for window: AccountUsageLimitWindow) -> Binding<Int> {
+        Binding(
+            get: {
+                let draft = draftValue(for: window)
+                return AccountUsageLimitPresentation.validatedPercent(from: draft)
+                    ?? AccountUsageLimitPresentation.cap(for: window, settings: account.usageLimitSettings)
+            },
+            set: { value in
+                setDraftValue("\(value)", for: window)
+                setValidationError(for: window, value: "\(value)")
+                commitUsageLimitDrafts()
+            }
+        )
+    }
+
+    private func syncUsageLimitDrafts() {
+        usageLimitsEnabledDraft = account.usageLimitSettings.enabled
+        fiveHourCapDraft = "\(account.usageLimitSettings.fiveHourPercent)"
+        weeklyCapDraft = "\(account.usageLimitSettings.weeklyPercent)"
+        fiveHourValidationError = nil
+        weeklyValidationError = nil
+    }
+
+    private func commitUsageLimitDrafts() {
+        let fiveHourError = AccountUsageLimitPresentation.validationError(for: fiveHourCapDraft)
+        let weeklyError = AccountUsageLimitPresentation.validationError(for: weeklyCapDraft)
+        fiveHourValidationError = fiveHourError
+        weeklyValidationError = weeklyError
+        guard let fiveHour = AccountUsageLimitPresentation.validatedPercent(from: fiveHourCapDraft),
+              let weekly = AccountUsageLimitPresentation.validatedPercent(from: weeklyCapDraft) else {
+            return
+        }
+        model.setUsageLimitSettings(
+            account.alias,
+            settings: AccountUsageLimitSettings(
+                enabled: usageLimitsEnabledDraft,
+                fiveHourPercent: fiveHour,
+                weeklyPercent: weekly
+            )
+        )
+    }
+
+    private func draftValue(for window: AccountUsageLimitWindow) -> String {
+        switch window {
+        case .fiveHour: fiveHourCapDraft
+        case .weekly: weeklyCapDraft
+        }
+    }
+
+    private func setDraftValue(_ value: String, for window: AccountUsageLimitWindow) {
+        switch window {
+        case .fiveHour: fiveHourCapDraft = value
+        case .weekly: weeklyCapDraft = value
+        }
+    }
+
+    private func setValidationError(for window: AccountUsageLimitWindow, value: String) {
+        switch window {
+        case .fiveHour: fiveHourValidationError = AccountUsageLimitPresentation.validationError(for: value)
+        case .weekly: weeklyValidationError = AccountUsageLimitPresentation.validationError(for: value)
+        }
+    }
+
+    private func resetDescription(for window: UsageWindow?) -> String {
+        guard let resetAt = window?.resetAt else { return "Reset unknown" }
+        return "Reset \(resetAt.formatted(date: .abbreviated, time: .shortened))"
+    }
+
+    private var usageLimitPauseDescription: String {
+        let windows = AccountUsageLimitWindow.allCases
+            .filter { account.usageLimitReachedWindows.contains($0) }
+            .map(AccountUsageLimitPresentation.label)
+            .joined(separator: " and ")
+        return windows.isEmpty ? "Paused by usage cap" : "Paused by usage cap (\(windows))"
+    }
+
     // MARK: Status line
 
     private var statusLine: some View {
@@ -278,8 +480,13 @@ private struct AccountCard: View {
             Label(resetCreditDescription, systemImage: resetCreditIcon)
                 .font(.caption)
                 .foregroundStyle(resetCreditColor)
-            if !account.routingEnabled {
-                Label("Routing disabled — hidden from the menu rotation", systemImage: "pause.circle")
+            if account.isPausedByUsageLimit {
+                Label(usageLimitPauseDescription, systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if account.isManuallyRoutingDisabled {
+                Label("Routing disabled manually — hidden from the menu rotation", systemImage: "pause.circle")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }

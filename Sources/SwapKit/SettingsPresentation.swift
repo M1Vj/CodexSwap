@@ -49,6 +49,69 @@ public enum AccountRoutingPresentation {
     public static func canMakeActive(routingEnabled: Bool) -> Bool { routingEnabled }
 }
 
+/// Presentation helpers shared by the settings card and its validation states.
+/// Keeping parsing here prevents the SwiftUI text fields from silently clamping
+/// malformed input before the user has a chance to correct it.
+public enum AccountUsageLimitPresentation {
+    public static let allowedPercentRange = 1...100
+
+    public static func validatedPercent(from raw: String) -> Int? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Int(trimmed), allowedPercentRange.contains(value) else { return nil }
+        return value
+    }
+
+    public static func validationError(for raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Enter a percentage from 1 to 100." }
+        guard let value = Int(trimmed) else { return "Enter a whole-number percentage from 1 to 100." }
+        guard allowedPercentRange.contains(value) else { return "Percentage must be between 1 and 100." }
+        return nil
+    }
+
+    public static func label(for window: AccountUsageLimitWindow) -> String {
+        switch window {
+        case .fiveHour: "5-hour"
+        case .weekly: "Weekly"
+        }
+    }
+
+    public static func cap(
+        for window: AccountUsageLimitWindow,
+        settings: AccountUsageLimitSettings
+    ) -> Int {
+        switch window {
+        case .fiveHour: settings.fiveHourPercent
+        case .weekly: settings.weeklyPercent
+        }
+    }
+
+    public static func usageWindow(
+        for window: AccountUsageLimitWindow,
+        in windows: [UsageWindow]
+    ) -> UsageWindow? {
+        windows.first { usageWindow in
+            switch window {
+            case .fiveHour:
+                usageWindow.windowSeconds == 18_000
+                    || normalizedLabel(usageWindow.label) == "5h"
+                    || normalizedLabel(usageWindow.label) == "5-hour"
+                    || normalizedLabel(usageWindow.label) == "5 hour"
+            case .weekly:
+                usageWindow.windowSeconds == 604_800
+                    || normalizedLabel(usageWindow.label) == "weekly"
+                    || normalizedLabel(usageWindow.label) == "7d"
+                    || normalizedLabel(usageWindow.label) == "7-day"
+                    || normalizedLabel(usageWindow.label) == "7 day"
+            }
+        }
+    }
+
+    private static func normalizedLabel(_ label: String) -> String {
+        label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+
 public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let alias: String
     public let email: String
@@ -65,9 +128,23 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     public let usageSummary: String
     /// Live window readings for usage meters in the accounts settings cards.
     public let usageWindows: [UsageWindow]
+    /// User-owned caps shown in the expandable Usage limits editor.
+    public let usageLimitSettings: AccountUsageLimitSettings
+    /// Windows at or above their configured cap. Empty when caps are disabled.
+    public let usageLimitReachedWindows: Set<AccountUsageLimitWindow>
     public let resetCreditStatus: AccountResetCreditStatus
 
     public var id: String { alias }
+
+    public var isPausedByUsageLimit: Bool { !usageLimitReachedWindows.isEmpty }
+
+    /// Manual routing disablement is intentionally independent from usage caps.
+    /// An account can have both states at once, and the UI should explain both.
+    public var isManuallyRoutingDisabled: Bool { !routingEnabled }
+
+    public func usageWindow(for window: AccountUsageLimitWindow) -> UsageWindow? {
+        AccountUsageLimitPresentation.usageWindow(for: window, in: usageWindows)
+    }
 }
 
 public struct SettingsPresentation: Sendable, Equatable {
@@ -103,6 +180,8 @@ public struct SettingsPresentation: Sendable, Equatable {
                     .map { "\($0.label) \($0.usedPercent)%" }
                     .joined(separator: " · "),
                 usageWindows: account.usage,
+                usageLimitSettings: account.usageLimitSettings,
+                usageLimitReachedWindows: account.usageLimitReachedWindows,
                 resetCreditStatus: resetCreditStatuses[account.alias] ?? .unavailable
             )
         }

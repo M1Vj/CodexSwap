@@ -16,6 +16,8 @@ struct MenuAccountRow: View {
     let cooldownUntil: Date?
     let windows: [UsageWindow]
     let costEstimate: Double?
+    /// Read-only cap metadata. Settings edits remain in the Accounts pane.
+    let usageLimitSettings: AccountUsageLimitSettings = .disabled
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
@@ -38,6 +40,13 @@ struct MenuAccountRow: View {
                             .foregroundStyle(Color.accentColor)
                             .help("Sticky until a quota error; double-click to release")
                             .accessibilityLabel("Sticky until quota error")
+                    }
+                    if usageLimitSettings.enabled {
+                        badge(
+                            usageLimitBadgeLabel,
+                            color: isUsageLimitReached ? .orange : .secondary,
+                            help: usageLimitBadgeHelp
+                        )
                     }
                     if isDraining {
                         badge("⚡︎", color: .orange, help: "Quota draining from other users")
@@ -85,6 +94,10 @@ struct MenuAccountRow: View {
         var parts = ["Rank \(rank)", alias, isActive ? "active" : "inactive"]
         if isSticky { parts.append("sticky until quota error") }
         parts += windows.map { "\($0.label) \($0.usedPercent)% used" }
+        if usageLimitSettings.enabled {
+            parts.append("usage caps \(usageLimitSettings.fiveHourPercent)% 5-hour and \(usageLimitSettings.weeklyPercent)% weekly")
+            if isUsageLimitReached { parts.append("paused by usage cap") }
+        }
         if needsLogin { parts.append("needs sign-in") }
         if isDraining { parts.append("draining from other users") }
         return parts.joined(separator: ", ")
@@ -99,6 +112,23 @@ struct MenuAccountRow: View {
             .font(.caption.weight(.bold))
             .foregroundStyle(color)
             .help(help)
+    }
+
+    private var usageLimitBadgeLabel: String {
+        isUsageLimitReached ? "⏸ cap" : "cap \(usageLimitSettings.fiveHourPercent)/\(usageLimitSettings.weeklyPercent)"
+    }
+
+    private var usageLimitBadgeHelp: String {
+        let cap = "5-hour \(usageLimitSettings.fiveHourPercent)% · weekly \(usageLimitSettings.weeklyPercent)%"
+        return isUsageLimitReached ? "Paused by usage cap (\(cap))" : "Usage caps enabled (\(cap))"
+    }
+
+    private var isUsageLimitReached: Bool {
+        guard usageLimitSettings.enabled else { return false }
+        return AccountUsageLimitWindow.allCases.contains { window in
+            guard let reading = AccountUsageLimitPresentation.usageWindow(for: window, in: windows) else { return false }
+            return reading.usedPercent >= AccountUsageLimitPresentation.cap(for: window, settings: usageLimitSettings)
+        }
     }
 }
 

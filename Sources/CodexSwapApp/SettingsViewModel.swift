@@ -14,6 +14,10 @@ struct SettingsActions {
     let reorderRank: (String, Int) -> Void
     let applyRanking: ([String]) -> Void
     let setAccountRouting: (String, Bool) -> Void
+    /// Persists user-owned per-account quota caps. The default keeps existing
+    /// action construction source-compatible until the app delegate wires its
+    /// AccountStore/AppEngine bridge.
+    let setUsageLimitSettings: (String, AccountUsageLimitSettings) -> Void = { _, _ in }
     let setAutomaticResetProtection: (String, Bool) -> Void
     let useResetCredit: (String, Date?) -> Void
     let archiveAccount: (String) -> Void
@@ -112,6 +116,15 @@ final class SettingsViewModel: ObservableObject {
 
     func showMessage(_ value: String) {
         message = value
+    }
+
+    /// Sends a validated, typed cap update to the app layer.
+    ///
+    /// Parsing remains in `AccountUsageLimitPresentation` so text-field errors
+    /// can be rendered without mutating persisted settings. Callers should only
+    /// invoke this method after both draft percentages have validated.
+    func setUsageLimitSettings(_ alias: String, settings: AccountUsageLimitSettings) {
+        actions.setUsageLimitSettings(alias, settings)
     }
 
     func showSubagentPolicyMessage(_ value: String) {
