@@ -61,6 +61,16 @@ public struct RotationResult: Sendable {
     public let rotated: Bool
 }
 
+/// Internal filesystem seam used by the atomic usage-limit transaction. The
+/// production initializer supplies AccountStore's throwing atomic writer;
+/// tests can inject a deterministic failure without changing file permissions
+/// or touching a user-owned store.
+typealias AccountStorePersistenceWriter = @Sendable (Data, URL) throws -> Void
+
+private enum AccountStorePersistenceError: Error {
+    case verificationFailed
+}
+
 /// Result of a usage-limit write that validates its confirmation requirement
 /// against the latest persisted control-plane state while holding the store
 /// lock. The CLI maps these cases to its stable, sanitized envelope.
@@ -74,6 +84,7 @@ public enum AccountUsageLimitWriteResult: Sendable {
 public actor AccountStore {
     private let url: URL
     private let clock: @Sendable () -> Date
+    private let persistenceWriter: AccountStorePersistenceWriter
     private var data: StoreData
     private var persistedModificationDate: Date?
     public private(set) var strategy: RotationStrategy
@@ -109,8 +120,27 @@ public actor AccountStore {
         strategy: RotationStrategy = .priority,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
+        self.init(
+            url: url,
+            strategy: strategy,
+            clock: clock,
+            persistenceWriter: { raw, target in
+                try Self.persistUnlockedThrowing(raw, to: target)
+            }
+        )
+    }
+
+    /// Internal initializer reserved for deterministic persistence-failure
+    /// tests. Production callers use the public initializer above.
+    init(
+        url: URL = AppPaths.storeFile(),
+        strategy: RotationStrategy = .priority,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        persistenceWriter: @escaping AccountStorePersistenceWriter
+    ) {
         self.url = url
         self.clock = clock
+        self.persistenceWriter = persistenceWriter
         self.strategy = strategy
         var loaded = AccountStore.loadFrom(url) ?? StoreData()
         let migrationDate = clock()
@@ -276,9 +306,17 @@ public actor AccountStore {
     }
 
     private static func persistUnlocked(_ raw: Data, to url: URL) {
+        try? persistUnlockedThrowing(raw, to: url)
+    }
+
+    /// Performs the same-directory temporary-file write and atomic replacement
+    /// while preserving errors for callers that need to report a failed
+    /// transaction. The legacy non-throwing path above intentionally retains
+    /// its historical best-effort behavior.
+    private static func persistUnlockedThrowing(_ raw: Data, to url: URL) throws {
         let fileManager = FileManager.default
         let dir = url.deletingLastPathComponent()
-        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let tmp = dir.appendingPathComponent(
             "." + url.lastPathComponent + ".tmp-" + UUID().uuidString
         )
@@ -290,9 +328,17 @@ public actor AccountStore {
             } else {
                 try fileManager.moveItem(at: tmp, to: url)
             }
-            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         } catch {
             try? fileManager.removeItem(at: tmp)
+            throw error
+        }
+    }
+
+    private func persistAtomically(_ raw: Data) throws {
+        try persistenceWriter(raw, url)
+        guard let persisted = try? Data(contentsOf: url), persisted == raw else {
+            throw AccountStorePersistenceError.verificationFailed
         }
     }
 
@@ -426,7 +472,12 @@ public actor AccountStore {
                 result = .persistenceFailed
                 return
             }
-            Self.persistUnlocked(raw, to: url)
+            do {
+                try persistAtomically(raw)
+            } catch {
+                result = .persistenceFailed
+                return
+            }
             data = latest
             persistedModificationDate = Self.modificationDate(for: url)
             stickyAliasRuntime = latest.stickyAlias

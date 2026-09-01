@@ -3,6 +3,10 @@ import XCTest
 @testable import SwapKit
 
 final class AgentCLITests: XCTestCase {
+    private enum InjectedPersistenceFailure: Error, Sendable {
+        case write
+    }
+
     func testParserRecognisesAgentStatusAndFlags() throws {
         let command = try AgentCLIParser.parse(["agent", "status", "--json"])
 
@@ -260,6 +264,42 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(applied.exitCode, AgentCLIExitCode.ok.rawValue)
         let persisted = await confirmedStore.account("alpha")
         XCTAssertTrue(persisted?.usageLimitSettings.enabled ?? false)
+    }
+
+    func testUsageLimitSetReportsPersistenceFailureWithoutClaimingSuccess() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIUsageLimitPersistenceFailure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("accounts.json")
+        let seed = AccountStore(url: url)
+        await seed.upsert(Account(alias: "alpha", accountID: "id-alpha", accessToken: "token-alpha"))
+        let beforeBytes = try Data(contentsOf: url)
+        let failingStore = AccountStore(
+            url: url,
+            persistenceWriter: { _, _ in throw InjectedPersistenceFailure.write }
+        )
+        let cli = AgentCLI(
+            store: failingStore,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let result = await cli.run([
+            "agent", "account", "usage-limit", "set", "alpha",
+            "--five-hour", "80", "--weekly", "90", "--enable", "--json"
+        ])
+
+        XCTAssertEqual(result.exitCode, AgentCLIExitCode.software.rawValue)
+        XCTAssertFalse(result.envelope.ok)
+        XCTAssertEqual(result.envelope.error?.code, "account_write_failed")
+        XCTAssertNil(result.envelope.data)
+        let encoded = try XCTUnwrap(String(data: result.encoded, encoding: .utf8))
+        XCTAssertFalse(encoded.contains("\"persisted\""))
+        XCTAssertFalse(encoded.contains("token-alpha"))
+        let cached = await failingStore.account("alpha")
+        XCTAssertEqual(cached?.usageLimitSettings, .disabled)
+        XCTAssertEqual(try Data(contentsOf: url), beforeBytes)
     }
 
     func testSwitchOnCappedAccountReportsUsageLimitError() async throws {

@@ -3,6 +3,10 @@ import XCTest
 @testable import SwapKit
 
 final class UsageLimitTests: XCTestCase {
+    private enum InjectedPersistenceFailure: Error, Sendable {
+        case write
+    }
+
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
     private func storeURL(_ name: String = "limits") -> URL {
@@ -260,6 +264,36 @@ final class UsageLimitTests: XCTestCase {
         let second = await reloaded.account("second")
         XCTAssertEqual(first?.usageLimitSettings.fiveHourPercent, 70)
         XCTAssertEqual(second?.usageLimitSettings.fiveHourPercent, 60)
+    }
+
+    func testAtomicUsageLimitWriteFailureLeavesMemoryAndDiskUnchanged() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-limit-persistence-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("accounts.json")
+        let seed = AccountStore(url: url)
+        await seed.upsert(account("alpha", priority: 1))
+
+        let beforeBytes = try Data(contentsOf: url)
+        let failingStore = AccountStore(
+            url: url,
+            persistenceWriter: { _, _ in throw InjectedPersistenceFailure.write }
+        )
+        let result = await failingStore.setUsageLimitSettingsAtomically(
+            "alpha",
+            settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90),
+            confirming: true
+        )
+
+        guard case .persistenceFailed = result else {
+            return XCTFail("Expected the atomic write to report persistenceFailed, got \(result)")
+        }
+        let cached = await failingStore.account("alpha")
+        XCTAssertEqual(cached?.usageLimitSettings, .disabled)
+        XCTAssertEqual(try Data(contentsOf: url), beforeBytes)
+        let reloaded = AccountStore(url: url)
+        let reloadedAccount = await reloaded.account("alpha")
+        XCTAssertEqual(reloadedAccount?.usageLimitSettings, .disabled)
     }
 
     func testExternalLimitWritesRefreshTaskAndLunaSelectorsAcrossStores() async throws {
