@@ -210,6 +210,76 @@ final class HeadlessWarmupTests: XCTestCase {
         XCTAssertEqual(calls, [])
     }
 
+    func testWarmupRechecksLaterAccountAgainstFreshStoreBeforeRunnerStarts() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("headless-warmup-fresh-cap-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = now.addingTimeInterval(18_000)
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(url: storeURL)
+        await store.upsert(Account(
+            alias: "first",
+            accountID: "id-first",
+            accessToken: "first-access",
+            priority: 2,
+            usage: warmupUsage(now: now)
+        ))
+        let later = Account(
+            alias: "later",
+            accountID: "id-later",
+            accessToken: "later-access",
+            priority: 1,
+            usage: warmupUsage(now: now)
+        )
+        await store.upsert(later)
+
+        let runner = FirstBlockingWarmupRunner()
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let laterRecord = WarmupRecord(
+            succeededAt: now.addingTimeInterval(-60),
+            primaryResetAt: now.addingTimeInterval(300),
+            secondaryResetAt: nil,
+            outcome: .verified,
+            attemptedAt: now.addingTimeInterval(-60)
+        )
+        await ledger.setRecord(laterRecord, for: later.id)
+        let laterRecordBefore = await ledger.record(for: later.id)
+        let service = QuotaWarmupService(runner: runner, ledger: ledger)
+        let proxyURL = URL(string: "http://127.0.0.1:58432")!
+
+        let warmupTask = Task {
+            await HeadlessWarmup.run(
+                proxyURL: proxyURL,
+                store: store,
+                settings: .default,
+                warmupService: service,
+                now: now
+            )
+        }
+        await runner.waitUntilStarted()
+
+        let writer = AccountStore(url: storeURL)
+        _ = await writer.setUsageLimitSettings(
+            "later",
+            settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 1, weeklyPercent: 100)
+        )
+        await writer.updateUsage(
+            "later",
+            windows: [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: reset)]
+        )
+
+        await runner.finish()
+        let report = await warmupTask.value
+        let calls = await runner.calls()
+        let laterRecordAfter = await ledger.record(for: later.id)
+
+        XCTAssertEqual(calls, ["first"])
+        XCTAssertEqual(report.account(named: "later")?.status, .skipped)
+        XCTAssertEqual(laterRecordAfter, laterRecordBefore)
+    }
+
 }
 
 private func fakeJWT(expiry: TimeInterval, signature: String) -> String {
@@ -250,4 +320,32 @@ private actor RecordingWarmupRunner: WarmupCommandRunning {
 
     func calls() -> [String] { values }
     func proxyURLs() -> [URL] { urls }
+}
+
+private actor FirstBlockingWarmupRunner: WarmupCommandRunning {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var aliases: [String] = []
+    private var blockedFirst = false
+
+    func run(alias: String, proxyURL: URL) async throws {
+        aliases.append(alias)
+        guard !blockedFirst else { return }
+        blockedFirst = true
+        startedWaiters.forEach { $0.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if blockedFirst { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func finish() {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func calls() -> [String] { aliases }
 }

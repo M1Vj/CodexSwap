@@ -116,11 +116,27 @@ public enum HeadlessWarmup {
             AppEngine.quotaWarmupEligible($0, settings: settings)
                 && QuotaWarmupService.usageAllowsWarmup($0)
         }
+        let recheck: QuotaWarmupService.AccountRecheck = { [store, settings, now] account in
+            guard let fresh = await store.account(account.alias) else {
+                return "account unavailable"
+            }
+            if let reason = QuotaWarmupService.skipReason(fresh, now: now) {
+                return reason
+            }
+            guard AppEngine.quotaWarmupEligible(fresh, settings: settings) else {
+                return "warm-up not eligible"
+            }
+            guard QuotaWarmupService.usageAllowsWarmup(fresh) else {
+                return "usage changed"
+            }
+            return nil
+        }
         let summary = await warmupService.run(
             accounts: eligible,
             proxyURL: proxyURL,
             force: true,
-            now: now
+            now: now,
+            recheck: recheck
         )
         let eligibleAliases = Set(eligible.map(\.alias))
         let reports = accounts.enumerated().map { index, account in

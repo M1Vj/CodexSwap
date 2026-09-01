@@ -4,6 +4,9 @@ public enum AccountQuotaState: String, Codable, Sendable, Equatable {
     case active
     case available
     case paused
+    /// The account is routable in principle but has reached an owner-configured
+    /// usage cap. This is deliberately distinct from a manual `.paused` state.
+    case usageLimitPaused = "usage_limit_paused"
     case signInRequired
 }
 
@@ -35,6 +38,10 @@ public struct AccountQuotaReport: Codable, Sendable, Equatable {
     public let alias: String
     public let plan: String?
     public let state: AccountQuotaState
+    /// Sanitized machine-readable reason for a derived usage-limit pause.
+    /// This remains optional so legacy reports and non-capped rows keep their
+    /// existing shape when encoded.
+    public let pausedReason: String?
     public let usageStatus: QuotaLookupStatus
     public let windows: [QuotaWindowReport]
     public let resetCreditStatus: QuotaLookupStatus
@@ -45,6 +52,7 @@ public struct AccountQuotaReport: Codable, Sendable, Equatable {
         alias: String,
         plan: String?,
         state: AccountQuotaState,
+        pausedReason: String? = nil,
         usageStatus: QuotaLookupStatus,
         windows: [QuotaWindowReport],
         resetCreditStatus: QuotaLookupStatus,
@@ -54,11 +62,45 @@ public struct AccountQuotaReport: Codable, Sendable, Equatable {
         self.alias = alias
         self.plan = plan
         self.state = state
+        self.pausedReason = pausedReason
         self.usageStatus = usageStatus
         self.windows = windows
         self.resetCreditStatus = resetCreditStatus
         self.availableResetCredits = availableResetCredits
         self.earliestResetCreditExpiry = earliestResetCreditExpiry
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case alias, plan, state, pausedReason, usageStatus, windows
+        case resetCreditStatus, availableResetCredits, earliestResetCreditExpiry
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        alias = try container.decode(String.self, forKey: .alias)
+        plan = try container.decodeIfPresent(String.self, forKey: .plan)
+        state = try container.decode(AccountQuotaState.self, forKey: .state)
+        pausedReason = try container.decodeIfPresent(String.self, forKey: .pausedReason)
+        usageStatus = try container.decode(QuotaLookupStatus.self, forKey: .usageStatus)
+        windows = try container.decode([QuotaWindowReport].self, forKey: .windows)
+        resetCreditStatus = try container.decode(QuotaLookupStatus.self, forKey: .resetCreditStatus)
+        availableResetCredits = try container.decodeIfPresent(Int.self, forKey: .availableResetCredits)
+        earliestResetCreditExpiry = try container.decodeIfPresent(Date.self, forKey: .earliestResetCreditExpiry)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(alias, forKey: .alias)
+        try container.encodeIfPresent(plan, forKey: .plan)
+        try container.encode(state, forKey: .state)
+        // Do not add a null key to every legacy/non-capped row. The field is
+        // present only when the derived pause has a sanitized reason.
+        try container.encodeIfPresent(pausedReason, forKey: .pausedReason)
+        try container.encode(usageStatus, forKey: .usageStatus)
+        try container.encode(windows, forKey: .windows)
+        try container.encode(resetCreditStatus, forKey: .resetCreditStatus)
+        try container.encodeIfPresent(availableResetCredits, forKey: .availableResetCredits)
+        try container.encodeIfPresent(earliestResetCreditExpiry, forKey: .earliestResetCreditExpiry)
     }
 }
 
@@ -321,15 +363,89 @@ public struct QuotaReportService: Sendable {
         activeAlias: String?,
         index: Int,
         activeAccountIndex: Int?,
-        hasPrefetchedAuthorization: Bool
+        hasPrefetchedAuthorization: Bool,
+        usageWindows: [UsageWindow],
+        usageStatus: QuotaLookupStatus
     ) -> AccountQuotaState {
         if !hasPrefetchedAuthorization,
            account.needsLogin || account.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .signInRequired
         }
         if !account.routingEnabled { return .paused }
+        if Self.usageLimitReached(
+            for: account,
+            reportedWindows: usageWindows,
+            usageStatus: usageStatus
+        ) {
+            return .usageLimitPaused
+        }
         if index == activeAccountIndex, normalizedAlias(account.alias) == activeAlias { return .active }
         return .available
+    }
+
+    /// Uses a fresh recognized response when one is available, otherwise falls
+    /// back to the account's retained local windows. This mirrors AccountStore's
+    /// fail-safe partial/empty usage policy without mutating the account snapshot.
+    private static func usageLimitReached(
+        for account: Account,
+        reportedWindows: [UsageWindow],
+        usageStatus: QuotaLookupStatus
+    ) -> Bool {
+        guard account.usageLimitSettings.enabled else { return false }
+
+        if usageStatus == .ok,
+           reportedWindows.contains(where: Self.isRecognizedUsageLimitWindow) {
+            return Self.usageLimitReached(
+                in: Self.mergeUsageLimitWindows(account: account, reported: reportedWindows),
+                settings: account.usageLimitSettings
+            )
+        }
+        return account.isUsageLimitReached
+    }
+
+    /// A successful provider response may contain only one recognized window.
+    /// Retain the other recognized window from the account snapshot so a partial
+    /// poll cannot make an already-capped account look available.
+    private static func mergeUsageLimitWindows(account: Account, reported: [UsageWindow]) -> [UsageWindow] {
+        var merged = account.usage
+        for window in reported {
+            guard let identity = usageLimitWindowIdentity(window) else { continue }
+            merged.removeAll { usageLimitWindowIdentity($0) == identity }
+            merged.append(window)
+        }
+        return merged
+    }
+
+    private static func usageLimitWindowIdentity(_ window: UsageWindow) -> AccountUsageLimitWindow? {
+        if isFiveHourUsageWindow(window) { return .fiveHour }
+        if isWeeklyUsageWindow(window) { return .weekly }
+        return nil
+    }
+
+    private static func isRecognizedUsageLimitWindow(_ window: UsageWindow) -> Bool {
+        isFiveHourUsageWindow(window) || isWeeklyUsageWindow(window)
+    }
+
+    private static func isFiveHourUsageWindow(_ window: UsageWindow) -> Bool {
+        if window.windowSeconds == 18_000 { return true }
+        let normalized = trimmed(window.label).lowercased()
+        return normalized == "5h" || normalized == "5-hour" || normalized == "5 hour"
+    }
+
+    private static func isWeeklyUsageWindow(_ window: UsageWindow) -> Bool {
+        if window.windowSeconds == 604_800 { return true }
+        let normalized = trimmed(window.label).lowercased()
+        return normalized == "weekly" || normalized == "7d" || normalized == "7-day" || normalized == "7 day"
+    }
+
+    private static func usageLimitReached(
+        in windows: [UsageWindow],
+        settings: AccountUsageLimitSettings
+    ) -> Bool {
+        windows.contains { window in
+            (isFiveHourUsageWindow(window) && window.usedPercent >= settings.fiveHourPercent)
+                || (isWeeklyUsageWindow(window) && window.usedPercent >= settings.weeklyPercent)
+        }
     }
 
     private static func fetchAccount(
@@ -347,13 +463,6 @@ public struct QuotaReportService: Sendable {
         let prefetchedWindows = prefetched?.windows
         let prefetchedCredits = prefetched?.resetCredits
         let hasPrefetchedAuthorization = prefetchedWindows != nil || prefetchedCredits != nil
-        let state = Self.state(
-            for: account,
-            activeAlias: activeAlias,
-            index: index,
-            activeAccountIndex: activeAccountIndex,
-            hasPrefetchedAuthorization: hasPrefetchedAuthorization
-        )
 
         async let usageResult = Self.fetchUsage(
             service: usageService,
@@ -367,6 +476,15 @@ public struct QuotaReportService: Sendable {
         )
         let (usage, credits) = try await (usageResult, creditResult)
         try Task.checkCancellation()
+        let state = Self.state(
+            for: account,
+            activeAlias: activeAlias,
+            index: index,
+            activeAccountIndex: activeAccountIndex,
+            hasPrefetchedAuthorization: hasPrefetchedAuthorization,
+            usageWindows: usage.rawWindows,
+            usageStatus: usage.status
+        )
 
         return IndexedAccountReport(
             index: index,
@@ -374,6 +492,7 @@ public struct QuotaReportService: Sendable {
                 alias: displayAlias,
                 plan: sanitizedPlan(for: account, privateContext: privateContext),
                 state: state,
+                pausedReason: state == .usageLimitPaused ? "usage_limit_reached" : nil,
                 usageStatus: usage.status,
                 windows: usage.windows,
                 resetCreditStatus: credits.status,
@@ -387,24 +506,24 @@ public struct QuotaReportService: Sendable {
         service: any UsageFetching,
         account: Account,
         prefetchedWindows: [UsageWindow]?
-    ) async throws -> (status: QuotaLookupStatus, windows: [QuotaWindowReport]) {
+    ) async throws -> (status: QuotaLookupStatus, windows: [QuotaWindowReport], rawWindows: [UsageWindow]) {
         try Task.checkCancellation()
         if let prefetchedWindows {
-            return (.ok, prefetchedWindows.map(Self.quotaWindowReport))
+            return (.ok, prefetchedWindows.map(Self.quotaWindowReport), prefetchedWindows)
         }
         guard Self.hasLocalAuthorization(for: account) else {
-            return (.signInRequired, [])
+            return (.signInRequired, [], [])
         }
         do {
-            let windows = try await service.fetch(accessToken: account.accessToken, accountID: account.accountID)
-                .map(Self.quotaWindowReport)
+            let rawWindows = try await service.fetch(accessToken: account.accessToken, accountID: account.accountID)
+            let windows = rawWindows.map(Self.quotaWindowReport)
             try Task.checkCancellation()
-            guard !windows.isEmpty else { return (.malformedResponse, []) }
-            return (.ok, windows)
+            guard !windows.isEmpty else { return (.malformedResponse, [], []) }
+            return (.ok, windows, rawWindows)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            return (usageStatus(for: error), [])
+            return (usageStatus(for: error), [], [])
         }
     }
 

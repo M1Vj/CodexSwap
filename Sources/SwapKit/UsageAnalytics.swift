@@ -867,6 +867,11 @@ public enum UsageAnalytics {
         public var accountCount: Int = 0
         public var eligibleCount: Int = 0
         public var healthyCount: Int = 0
+        /// Accounts excluded by an owner-configured usage cap. This is kept
+        /// separate from manual routing pauses and from generic health tiers.
+        public var usageLimitPausedCount: Int = 0
+        /// Sanitized reason shared by usage-limit-paused rows, when present.
+        public var usageLimitPauseReason: String? = nil
         public var drainingCount: Int = 0
         public var avgPrimaryUsedPercent: Double = 0
         public var totalRequests: Int = 0
@@ -896,10 +901,17 @@ public enum UsageAnalytics {
         var costContributors: [CostAvailability] = []
         var estimatedCosts: [Double] = []
         for account in accounts {
+            let usageLimitPaused = account.isUsageLimitReached
+            if usageLimitPaused {
+                summary.usageLimitPausedCount += 1
+                summary.usageLimitPauseReason = "usage_limit_reached"
+            }
             if let primary = account.usage.first(where: { $0.windowSeconds < 604_800 }) ?? account.usage.first {
                 primaryReadings.append(primary.usedPercent)
-                if healthTier(usedPercent: primary.usedPercent) == .healthy { summary.healthyCount += 1 }
-            } else {
+                if !usageLimitPaused, healthTier(usedPercent: primary.usedPercent) == .healthy {
+                    summary.healthyCount += 1
+                }
+            } else if !usageLimitPaused {
                 summary.healthyCount += 1
             }
             if drainingAliases.contains(account.alias) { summary.drainingCount += 1 }
