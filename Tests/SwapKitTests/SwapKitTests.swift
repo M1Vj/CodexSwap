@@ -1926,7 +1926,12 @@ final class WarmupEngineTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-paused-\(UUID().uuidString)")
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
         await store.upsert(Account(alias: "paused", accountID: "id-paused", accessToken: freshToken(), routingEnabled: false))
-        await store.upsert(Account(alias: "enabled", accountID: "id-enabled", accessToken: freshToken()))
+        await store.upsert(Account(
+            alias: "enabled",
+            accountID: "id-enabled",
+            accessToken: freshToken(),
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        ))
         let runner = FakeWarmupRunner()
         let engine = AppEngine(store: store, warmupService: QuotaWarmupService(runner: runner, ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))))
 
@@ -2294,7 +2299,8 @@ final class WarmupEngineTests: XCTestCase {
             alias: "a",
             accountID: "id-a",
             accessToken: freshToken(now: staleReference),
-            refreshToken: "refresh-only"
+            refreshToken: "refresh-only",
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
         ))
         let usage = ScriptedUsageFetcher(windowsByAccountID: [
             "id-a": [UsageWindow(
@@ -2334,8 +2340,18 @@ final class WarmupEngineTests: XCTestCase {
         let now = Date()
         let reset = now.addingTimeInterval(9_000)
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
-        await store.upsert(Account(alias: "ok", accountID: "id-ok", accessToken: freshToken()))
-        await store.upsert(Account(alias: "bad", accountID: "id-bad", accessToken: freshToken()))
+        await store.upsert(Account(
+            alias: "ok",
+            accountID: "id-ok",
+            accessToken: freshToken(),
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        ))
+        await store.upsert(Account(
+            alias: "bad",
+            accountID: "id-bad",
+            accessToken: freshToken(),
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
+        ))
         let usage = ScriptedUsageFetcher(windowsByAccountID: [
             "id-ok": [UsageWindow(label: "5h", usedPercent: 3, windowSeconds: 18_000, resetAt: reset)],
             "id-bad": [UsageWindow(label: "5h", usedPercent: 2, windowSeconds: 18_000, resetAt: reset)]
@@ -2365,7 +2381,12 @@ final class WarmupEngineTests: XCTestCase {
     func testSuccessfulWarmupWithMissingResetRemainsUnverifiedInEngineSummary() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-unverified-\(UUID().uuidString)")
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
-        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: freshToken()))
+        await store.upsert(Account(
+            alias: "a",
+            accountID: "id-a",
+            accessToken: freshToken(),
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        ))
         let usage = ScriptedUsageFetcher(windowsByAccountID: [
             "id-a": [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)]
         ])
