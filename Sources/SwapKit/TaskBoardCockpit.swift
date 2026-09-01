@@ -75,6 +75,15 @@ public enum TaskSchedulingReasonFormatter {
             if !consumeBankedWindow, !AppEngine.hasStartedWindow(account) {
                 return "\(safeAlias): banked window not started"
             }
+            if account.isUsageLimitReached {
+                let windows = AccountUsageLimitWindow.allCases
+                    .filter { account.usageLimitReachedWindows.contains($0) }
+                    .map(usageLimitLabel)
+                    .joined(separator: " and ")
+                return windows.isEmpty
+                    ? "\(safeAlias): paused by usage cap"
+                    : "\(safeAlias): paused by usage cap (\(windows))"
+            }
             if let starved = account.usage.first(where: { 100 - $0.usedPercent < minHeadroomPercent }) {
                 return "\(safeAlias): headroom<\(minHeadroomPercent)% (\(starved.label) \(starved.usedPercent)% used)"
             }
@@ -117,6 +126,13 @@ public enum TaskSchedulingReasonFormatter {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d HH:mm"
         return formatter.string(from: date)
+    }
+
+    private static func usageLimitLabel(_ window: AccountUsageLimitWindow) -> String {
+        switch window {
+        case .fiveHour: "5-hour"
+        case .weekly: "Weekly"
+        }
     }
 }
 

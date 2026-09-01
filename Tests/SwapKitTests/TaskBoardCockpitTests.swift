@@ -142,6 +142,48 @@ final class TaskBoardCockpitTests: XCTestCase {
         )
     }
 
+    func testSchedulingReasonReportsPausedByUsageCapForFiveHourWindow() {
+        let account = Account(
+            alias: "five-hour",
+            email: "owner@example.invalid",
+            accountID: "opaque-account-id",
+            accessToken: "token",
+            usage: [UsageWindow(label: "5h", usedPercent: 80, windowSeconds: 18_000, resetAt: nil)],
+            usageLimitSettings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        )
+
+        let reason = TaskSchedulingReasonFormatter.format(
+            aliases: [account.alias],
+            accounts: [account],
+            consumeBankedWindow: true,
+            minHeadroomPercent: 5,
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        XCTAssertEqual(reason, "five-hour: paused by usage cap (5-hour)")
+        XCTAssertFalse(reason.contains("owner@example.invalid"))
+        XCTAssertFalse(reason.contains("opaque-account-id"))
+    }
+
+    func testSchedulingReasonReportsPausedByUsageCapForWeeklyWindow() {
+        let account = Account(
+            alias: "weekly",
+            accessToken: "token",
+            usage: [UsageWindow(label: "Weekly", usedPercent: 90, windowSeconds: 604_800, resetAt: nil)],
+            usageLimitSettings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        )
+
+        let reason = TaskSchedulingReasonFormatter.format(
+            aliases: [account.alias],
+            accounts: [account],
+            consumeBankedWindow: true,
+            minHeadroomPercent: 5,
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        XCTAssertEqual(reason, "weekly: paused by usage cap (Weekly)")
+    }
+
     func testRetryDeadlineTakesPrecedenceOverAccountCooldown() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let retry = now.addingTimeInterval(90)
