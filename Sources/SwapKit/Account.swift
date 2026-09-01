@@ -253,6 +253,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var archivedAt: Date?
     public var routingPausedAt: Date?
     public var telemetryID: UUID
+    public var usageLimitSettings: AccountUsageLimitSettings
 
     public var isArchived: Bool { archivedAt != nil }
 
@@ -275,7 +276,8 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         routingEnabled: Bool = true,
         archivedAt: Date? = nil,
         routingPausedAt: Date? = nil,
-        telemetryID: UUID = UUID()
+        telemetryID: UUID = UUID(),
+        usageLimitSettings: AccountUsageLimitSettings = .disabled
     ) {
         self.alias = alias
         self.email = email
@@ -294,12 +296,14 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.archivedAt = archivedAt
         self.routingPausedAt = routingPausedAt
         self.telemetryID = telemetryID
+        self.usageLimitSettings = usageLimitSettings
     }
 
     private enum CodingKeys: String, CodingKey {
         case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
         case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, routingEnabled
         case usageStats, usageHistory, lastServedByUs, archivedAt, routingPausedAt, telemetryID
+        case usageLimitSettings
     }
 
     public init(from decoder: Decoder) throws {
@@ -328,6 +332,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         archivedAt = try c.decodeIfPresent(Date.self, forKey: .archivedAt)
         routingPausedAt = try c.decodeIfPresent(Date.self, forKey: .routingPausedAt)
         telemetryID = try c.decodeIfPresent(UUID.self, forKey: .telemetryID) ?? Self.missingTelemetryID
+        usageLimitSettings = try c.decodeIfPresent(AccountUsageLimitSettings.self, forKey: .usageLimitSettings) ?? .disabled
     }
 
     public var tokens: CodexTokens {
@@ -339,8 +344,9 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         disabledUntil.values.filter { $0 > now }.max()
     }
 
-    public func isEligible(now: Date) -> Bool {
+    public func isEligible(now: Date, ignoringUsageLimit: Bool = false) -> Bool {
         !isArchived && routingEnabled && !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
+            && (ignoringUsageLimit || !isUsageLimitReached)
     }
 
     /// Hard routing checks that intentionally ignore a temporary quota cooldown.

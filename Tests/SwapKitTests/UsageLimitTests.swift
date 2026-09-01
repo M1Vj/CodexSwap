@@ -1,0 +1,205 @@
+import Foundation
+import XCTest
+@testable import SwapKit
+
+final class UsageLimitTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func storeURL(_ name: String = "limits") -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-limit-\(name)-\(UUID().uuidString).json")
+    }
+
+    private func window(_ label: String, _ percent: Int, seconds: Int) -> UsageWindow {
+        UsageWindow(label: label, usedPercent: percent, windowSeconds: seconds, resetAt: now.addingTimeInterval(3_600))
+    }
+
+    private func account(
+        _ alias: String,
+        priority: Int,
+        usage: [UsageWindow] = [],
+        limits: AccountUsageLimitSettings = .disabled
+    ) -> Account {
+        Account(
+            alias: alias,
+            accountID: "id-\(alias)",
+            accessToken: "token-\(alias)",
+            priority: priority,
+            usage: usage,
+            usageLimitSettings: limits
+        )
+    }
+
+    func testUsageLimitSettingsClampAndLegacyDecodeDefaultsToDisabled() throws {
+        let clamped = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 0, weeklyPercent: 101)
+        XCTAssertEqual(clamped.fiveHourPercent, 1)
+        XCTAssertEqual(clamped.weeklyPercent, 100)
+
+        let legacy: [String: Any] = [
+            "alias": "legacy",
+            "accountID": "legacy-id",
+            "accessToken": "token"
+        ]
+        let data = try JSONSerialization.data(withJSONObject: legacy)
+        let decoded = try JSONDecoder.codex.decode(Account.self, from: data)
+        XCTAssertEqual(decoded.usageLimitSettings, .disabled)
+    }
+
+    func testAccountEligibilityStopsAtEitherConfiguredWindowCap() {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let below = account("below", priority: 2, usage: [window("5h", 79, seconds: 18_000), window("Weekly", 89, seconds: 604_800)], limits: settings)
+        let fiveHour = account("five-hour", priority: 2, usage: [window("5h", 80, seconds: 18_000), window("Weekly", 1, seconds: 604_800)], limits: settings)
+        let weekly = account("weekly", priority: 2, usage: [window("5h", 1, seconds: 18_000), window("Weekly", 90, seconds: 604_800)], limits: settings)
+
+        XCTAssertTrue(below.isEligible(now: now))
+        XCTAssertFalse(fiveHour.isEligible(now: now))
+        XCTAssertFalse(weekly.isEligible(now: now))
+        XCTAssertTrue(fiveHour.isEligible(now: now, ignoringUsageLimit: true))
+    }
+
+    func testUsageLimitGateRetainsLastKnownWindowWhenRefreshIsEmptyOrPartial() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let url = storeURL("stale")
+        let store = AccountStore(url: url)
+        await store.upsert(account("capped", priority: 2, usage: [window("5h", 80, seconds: 18_000), window("Weekly", 30, seconds: 604_800)], limits: settings))
+
+        await store.updateUsage("capped", windows: [])
+        let afterEmptyValue = await store.account("capped")
+        let afterEmpty = try XCTUnwrap(afterEmptyValue)
+        XCTAssertFalse(afterEmpty.isEligible(now: now))
+        await store.updateUsage("capped", windows: [window("Weekly", 35, seconds: 604_800)])
+        let retainedValue = await store.account("capped")
+        let retained = try XCTUnwrap(retainedValue)
+        XCTAssertEqual(retained.usage.first(where: { $0.windowSeconds == 18_000 })?.usedPercent, 80)
+        XCTAssertFalse(retained.isEligible(now: now))
+    }
+
+    func testPreCapStickyClearsAtCapAndFallsBackWhileInFlightLeaseRemainsHeld() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 95)
+        let store = AccountStore(url: storeURL("sticky-clear"))
+        await store.upsert(account("first", priority: 2, usage: [window("5h", 79, seconds: 18_000)], limits: settings))
+        await store.upsert(account("second", priority: 1, usage: [window("5h", 10, seconds: 18_000)], limits: settings))
+        let didStick = await store.toggleStickyAlias("first", now: now)
+        XCTAssertTrue(didStick)
+        let reserved = await store.reserveCurrent(now: now)
+        XCTAssertEqual(reserved?.alias, "first")
+
+        await store.updateUsage("first", windows: [window("5h", 80, seconds: 18_000)])
+        let sticky = await store.stickyAlias()
+        XCTAssertNil(sticky)
+        let current = await store.current(now: now)
+        XCTAssertEqual(current?.alias, "second")
+        let leases = await store.routingLeaseAliases()
+        XCTAssertTrue(leases.contains("first"))
+    }
+
+    func testManualStickyAfterCapOverridesOnlyWhilePinnedAndPersistsAcrossReload() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 95)
+        let url = storeURL("sticky-override")
+        let store = AccountStore(url: url)
+        await store.upsert(account("capped", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings))
+        await store.upsert(account("fallback", priority: 1, usage: [window("5h", 10, seconds: 18_000)], limits: settings))
+
+        let didStick = await store.toggleStickyAlias("capped", now: now)
+        XCTAssertTrue(didStick)
+        let override = await store.stickyUsageLimitOverride()
+        XCTAssertTrue(override)
+        let current = await store.current(now: now)
+        XCTAssertEqual(current?.alias, "capped")
+
+        let reloaded = AccountStore(url: url)
+        let reloadedCurrent = await reloaded.current(now: now)
+        XCTAssertEqual(reloadedCurrent?.alias, "capped")
+        let reloadedOverride = await reloaded.stickyUsageLimitOverride()
+        XCTAssertTrue(reloadedOverride)
+
+        let didUnstick = await reloaded.toggleStickyAlias("capped", now: now)
+        XCTAssertTrue(didUnstick)
+        let clearedAlias = await reloaded.stickyAlias()
+        XCTAssertNil(clearedAlias)
+        let clearedOverride = await reloaded.stickyUsageLimitOverride()
+        XCTAssertFalse(clearedOverride)
+        let fallback = await reloaded.current(now: now)
+        XCTAssertEqual(fallback?.alias, "fallback")
+    }
+
+    func testProviderLimitClearsStickyOverrideAndRotatesNormally() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 95)
+        let store = AccountStore(url: storeURL("provider-limit"))
+        await store.upsert(account("capped", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings))
+        await store.upsert(account("fallback", priority: 1, usage: [window("5h", 10, seconds: 18_000)], limits: settings))
+        let didStick = await store.toggleStickyAlias("capped", now: now)
+        XCTAssertTrue(didStick)
+
+        let result = await store.rotateFrom("capped", limit: "5h", resetAt: now.addingTimeInterval(60), now: now, fallbackCooldown: 60)
+        XCTAssertEqual(result.next?.alias, "fallback")
+        let sticky = await store.stickyAlias()
+        XCTAssertNil(sticky)
+        let clearedOverride = await store.stickyUsageLimitOverride()
+        XCTAssertFalse(clearedOverride)
+    }
+
+    func testResetBelowAllCapsResumesNormalEligibility() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let store = AccountStore(url: storeURL("reset"))
+        await store.upsert(account("first", priority: 2, usage: [window("5h", 80, seconds: 18_000), window("Weekly", 90, seconds: 604_800)], limits: settings))
+        await store.upsert(account("second", priority: 1, usage: [window("5h", 10, seconds: 18_000), window("Weekly", 10, seconds: 604_800)], limits: settings))
+
+        let beforeReset = await store.current(now: now)
+        XCTAssertEqual(beforeReset?.alias, "second")
+        await store.updateUsage("first", windows: [window("5h", 0, seconds: 18_000), window("Weekly", 0, seconds: 604_800)])
+        let afterReset = await store.current(now: now)
+        XCTAssertEqual(afterReset?.alias, "first")
+    }
+
+    func testCappedAccountsAreExcludedFromDrainingLunaAndTaskSelection() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let store = AccountStore(url: storeURL("paths"))
+        await store.upsert(account("capped", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings))
+        await store.upsert(account("fallback", priority: 1, usage: [window("5h", 10, seconds: 18_000)], limits: settings))
+        await store.setDrainingAliases(["capped"])
+        let current = await store.current(now: now)
+        XCTAssertEqual(current?.alias, "fallback")
+        let opportunity = await store.reserveLunaOpportunity(now: now)
+        XCTAssertNil(opportunity)
+
+        let task = await selectProxyAccount(store: store, mode: .task(allowed: ["capped", "fallback"]), now: now)
+        XCTAssertEqual(task?.alias, "fallback")
+        XCTAssertEqual(AppEngine.automationAccount(from: [
+            account("capped", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings),
+            account("fallback", priority: 1, usage: [window("5h", 10, seconds: 18_000)], limits: settings)
+        ], settings: .default, now: now)?.alias, "fallback")
+    }
+
+    func testAllCappedAccountsHaveNoEligibleFallback() async throws {
+        let settings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90)
+        let store = AccountStore(url: storeURL("all-capped"))
+        await store.upsert(account("first", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings))
+        await store.upsert(account("second", priority: 1, usage: [window("Weekly", 90, seconds: 604_800)], limits: settings))
+        let current = await store.current(now: now)
+        XCTAssertNil(current)
+        let best = await store.bestEligible(among: ["first", "second"], now: now)
+        XCTAssertNil(best)
+        XCTAssertFalse(AppEngine.quotaWarmupEligible(
+            account("first", priority: 2, usage: [window("5h", 80, seconds: 18_000)], limits: settings),
+            settings: .default
+        ))
+    }
+
+    func testUsageLimitSettingsMergeAcrossWritersForDifferentAccounts() async throws {
+        let url = storeURL("merge")
+        let seed = AccountStore(url: url)
+        await seed.upsert(account("first", priority: 2))
+        await seed.upsert(account("second", priority: 1))
+        let writerA = AccountStore(url: url)
+        let writerB = AccountStore(url: url)
+        await writerA.setUsageLimitSettings("first", settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 70, weeklyPercent: 80))
+        await writerB.setUsageLimitSettings("second", settings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 60, weeklyPercent: 75))
+
+        let reloaded = AccountStore(url: url)
+        let first = await reloaded.account("first")
+        let second = await reloaded.account("second")
+        XCTAssertEqual(first?.usageLimitSettings.fiveHourPercent, 70)
+        XCTAssertEqual(second?.usageLimitSettings.fiveHourPercent, 60)
+    }
+}

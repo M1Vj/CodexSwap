@@ -12,16 +12,26 @@ struct StoreData: Codable {
     /// value as runtime state, but persisting it lets a separate agent CLI
     /// process hand the selection to the live app safely.
     var stickyAlias: String?
+    /// True only when the sticky account was explicitly pinned after reaching a
+    /// configured usage cap. It is coupled to `stickyAlias` and cleared with it.
+    var stickyUsageLimitOverride: Bool
     var accounts: [Account] = []
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, activeAlias, stickyAlias, accounts
+        case schemaVersion, activeAlias, stickyAlias, stickyUsageLimitOverride, accounts
     }
 
-    init(schemaVersion: Int = 2, activeAlias: String? = nil, stickyAlias: String? = nil, accounts: [Account] = []) {
+    init(
+        schemaVersion: Int = 2,
+        activeAlias: String? = nil,
+        stickyAlias: String? = nil,
+        stickyUsageLimitOverride: Bool = false,
+        accounts: [Account] = []
+    ) {
         self.schemaVersion = schemaVersion
         self.activeAlias = activeAlias
         self.stickyAlias = stickyAlias
+        self.stickyUsageLimitOverride = stickyUsageLimitOverride
         self.accounts = accounts
     }
 
@@ -31,6 +41,7 @@ struct StoreData: Codable {
         schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         activeAlias = try c.decodeIfPresent(String.self, forKey: .activeAlias)
         stickyAlias = try c.decodeIfPresent(String.self, forKey: .stickyAlias)
+        stickyUsageLimitOverride = try c.decodeIfPresent(Bool.self, forKey: .stickyUsageLimitOverride) ?? false
         accounts = try c.decodeIfPresent([Account].self, forKey: .accounts) ?? []
     }
 }
@@ -64,6 +75,9 @@ public actor AccountStore {
     private var drainingObservedAt: [String: Date] = [:]
     /// Explicit user-selected runtime hold. This is deliberately not persisted.
     private var stickyAliasRuntime: String?
+    /// Coupled to the persisted sticky alias. A true value means the user
+    /// explicitly pinned an account after it crossed its usage cap.
+    private var stickyUsageLimitOverrideRuntime = false
     /// Runtime latch for the account Smart Switch identified as actively draining.
     private var drainingHoldAlias: String?
     /// Cooling accounts that already rejected a Luna probe, keyed by retry time.
@@ -129,6 +143,7 @@ public actor AccountStore {
         self.data = loaded
         self.persistedModificationDate = Self.modificationDate(for: url)
         self.stickyAliasRuntime = loaded.stickyAlias
+        self.stickyUsageLimitOverrideRuntime = loaded.stickyUsageLimitOverride && loaded.stickyAlias != nil
         if needsMigration { Self.persist(loaded, to: url) }
     }
 
@@ -147,6 +162,7 @@ public actor AccountStore {
         data = loaded
         persistedModificationDate = currentDate
         stickyAliasRuntime = loaded.stickyAlias
+        stickyUsageLimitOverrideRuntime = loaded.stickyUsageLimitOverride && loaded.stickyAlias != nil
     }
 
     private static func modificationDate(for url: URL) -> Date? {
@@ -164,7 +180,8 @@ public actor AccountStore {
         preservingRanking: Bool = true,
         preservingActiveAlias: Bool = true,
         preservingStickyAlias: Bool = true,
-        clearingActiveAliases: Set<String> = []
+        clearingActiveAliases: Set<String> = [],
+        changedUsageLimitAliases: Set<String> = []
     ) {
         let encoder = JSONEncoder.codex
         _ = Self.withStoreLock(url) {
@@ -178,7 +195,13 @@ public actor AccountStore {
                 }
                 if preservingStickyAlias {
                     snapshot.stickyAlias = latest.stickyAlias
+                    snapshot.stickyUsageLimitOverride = latest.stickyUsageLimitOverride
                 }
+                Self.mergePersistedUsageLimitSettings(
+                    into: &snapshot,
+                    from: latest,
+                    excluding: changedUsageLimitAliases
+                )
                 if !clearingActiveAliases.isEmpty {
                     snapshot.activeAlias = latest.activeAlias.flatMap { activeAlias in
                         clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
@@ -256,6 +279,27 @@ public actor AccountStore {
         }
     }
 
+    /// Preserves per-account user-owned limit settings when a different process
+    /// persists usage, tokens, ranking, or routing state from an older snapshot.
+    /// Callers changing a limit pass that alias in `excluding`; all other aliases
+    /// adopt the newest persisted setting under the same account identity.
+    private static func mergePersistedUsageLimitSettings(
+        into local: inout StoreData,
+        from latest: StoreData,
+        excluding changedAliases: Set<String>
+    ) {
+        for index in local.accounts.indices {
+            let account = local.accounts[index]
+            guard !changedAliases.contains(account.alias) else { continue }
+            let latestAccount = latest.accounts.first {
+                !account.accountID.isEmpty && !$0.accountID.isEmpty && $0.accountID == account.accountID
+            } ?? latest.accounts.first { $0.alias == account.alias }
+            if let latestAccount {
+                local.accounts[index].usageLimitSettings = latestAccount.usageLimitSettings
+            }
+        }
+    }
+
     private static func hasDenseActiveRanks(_ data: StoreData) -> Bool {
         let ranks = data.accounts
             .filter { !$0.isArchived }
@@ -270,8 +314,37 @@ public actor AccountStore {
     public func all() -> [Account] { refreshExternalStateIfNeeded(); return data.accounts }
     public func activeAlias() -> String? { refreshExternalStateIfNeeded(); return data.activeAlias }
     public func stickyAlias() -> String? { refreshExternalStateIfNeeded(); return stickyAliasRuntime }
+    public func stickyUsageLimitOverride() -> Bool {
+        refreshExternalStateIfNeeded()
+        return stickyAliasRuntime != nil && stickyUsageLimitOverrideRuntime
+    }
     public func currentDrainingHoldAlias() -> String? { refreshExternalStateIfNeeded(); return drainingHoldAlias }
     public func account(_ alias: String) -> Account? { refreshExternalStateIfNeeded(); return data.accounts.first { $0.alias == alias } }
+
+    /// Applies user-owned per-account usage caps. A currently sticky account
+    /// that becomes capped loses a pre-cap sticky selection; a sticky account
+    /// explicitly pinned after the cap remains an override until unpinned or a
+    /// provider limit error clears it.
+    @discardableResult
+    public func setUsageLimitSettings(
+        _ alias: String,
+        settings: AccountUsageLimitSettings
+    ) -> Account? {
+        refreshExternalStateIfNeeded()
+        guard let i = index(alias) else { return nil }
+        data.accounts[i].usageLimitSettings = settings
+        var stickyCleared = false
+        if stickyAliasRuntime == alias,
+           !stickyUsageLimitOverrideRuntime,
+           data.accounts[i].isUsageLimitReached {
+            stickyCleared = clearStickyIfNeeded(alias)
+        }
+        persist(
+            preservingStickyAlias: !stickyCleared,
+            changedUsageLimitAliases: [alias]
+        )
+        return data.accounts[i]
+    }
 
     /// Toggles the menu hold. A held account remains selected while it is
     /// hard-eligible, regardless of displayed usage or in-flight leases. The
@@ -282,13 +355,17 @@ public actor AccountStore {
         refreshExternalStateIfNeeded()
         if stickyAliasRuntime == alias {
             stickyAliasRuntime = nil
+            stickyUsageLimitOverrideRuntime = false
             data.stickyAlias = nil
+            data.stickyUsageLimitOverride = false
             persist(preservingStickyAlias: false)
             return true
         }
-        guard let selected = account(alias), selected.isEligible(now: now) else { return false }
+        guard let selected = account(alias), selected.isEligible(now: now, ignoringUsageLimit: true) else { return false }
         stickyAliasRuntime = alias
+        stickyUsageLimitOverrideRuntime = selected.isUsageLimitReached
         data.stickyAlias = alias
+        data.stickyUsageLimitOverride = stickyUsageLimitOverrideRuntime
         activate(alias, now: now, preservingStickyAlias: false)
         return true
     }
@@ -297,11 +374,15 @@ public actor AccountStore {
     private func clearStickyIfNeeded(_ alias: String) -> Bool {
         if stickyAliasRuntime == alias {
             stickyAliasRuntime = nil
+            stickyUsageLimitOverrideRuntime = false
             data.stickyAlias = nil
+            data.stickyUsageLimitOverride = false
             return true
         }
         if data.stickyAlias == alias {
             data.stickyAlias = nil
+            data.stickyUsageLimitOverride = false
+            stickyUsageLimitOverrideRuntime = false
             return true
         }
         return false
@@ -319,6 +400,7 @@ public actor AccountStore {
         lunaRejectedUntil = lunaRejectedUntil.filter { $0.value > now }
         let candidates = data.accounts.filter { account in
             account.alias != alias && account.isRoutableIgnoringCooldown
+                && !account.isUsageLimitReached
                 && account.cooldownUntil(now: now) != nil
                 && lunaRejectedUntil[account.alias] == nil
                 && routingLeases[account.alias, default: 0] == 0
@@ -541,12 +623,15 @@ public actor AccountStore {
     public func current(now: Date = Date(), avoidingLeased: Bool = false) -> Account? {
         refreshExternalStateIfNeeded()
         if let stickyAliasRuntime {
-            if let sticky = account(stickyAliasRuntime), sticky.isEligible(now: now) {
+            if let sticky = account(stickyAliasRuntime),
+               sticky.isEligible(now: now, ignoringUsageLimit: stickyUsageLimitOverrideRuntime) {
                 if data.activeAlias != sticky.alias { activate(sticky.alias, now: now) }
                 return sticky
             } else {
                 self.stickyAliasRuntime = nil
+                self.stickyUsageLimitOverrideRuntime = false
                 data.stickyAlias = nil
+                data.stickyUsageLimitOverride = false
                 // Clearing an invalid sticky is an explicit control-plane
                 // mutation. Do not merge a stale value from another process
                 // back into the file while persisting the clear.
@@ -682,7 +767,10 @@ public actor AccountStore {
     @discardableResult
     public func setActive(_ alias: String, now: Date = Date()) -> Account? {
         refreshExternalStateIfNeeded()
-        guard let i = index(alias), data.accounts[i].routingEnabled, !data.accounts[i].isArchived else { return nil }
+        guard let i = index(alias),
+              data.accounts[i].routingEnabled,
+              !data.accounts[i].isUsageLimitReached,
+              !data.accounts[i].isArchived else { return nil }
         data.accounts[i].disabledUntil = [:]
         data.accounts[i].needsLogin = false
         data.accounts[i].routingPausedAt = nil
@@ -794,12 +882,15 @@ public actor AccountStore {
     }
 
     public func updateUsage(_ alias: String, windows: [UsageWindow]) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         // wham/usage always reports at least one window for an entitled account; a transient
         // empty response must not wipe a real reading off the display.
         if windows.isEmpty, !data.accounts[i].usage.isEmpty { return }
         let previousWindows = data.accounts[i].usage
-        let resetLabels = Self.usageResetOrDecreaseLabels(previous: previousWindows, current: windows)
+        let previouslyCapped = data.accounts[i].isUsageLimitReached
+        let mergedWindows = Self.mergeUsageWindows(previous: previousWindows, current: windows)
+        let resetLabels = Self.usageResetOrDecreaseLabels(previous: previousWindows, current: mergedWindows)
         if !resetLabels.isEmpty {
             drainingAliases.remove(alias)
             drainingObservedAt.removeValue(forKey: alias)
@@ -807,8 +898,16 @@ public actor AccountStore {
                 !resetLabels.contains($0.label)
             }
         }
-        data.accounts[i].usage = windows
+        data.accounts[i].usage = mergedWindows
         appendHistorySamples(at: i, windows: windows)
+        let nowCapped = data.accounts[i].isUsageLimitReached
+        var stickyCleared = false
+        if !previouslyCapped,
+           nowCapped,
+           stickyAliasRuntime == alias,
+           !stickyUsageLimitOverrideRuntime {
+            stickyCleared = clearStickyIfNeeded(alias)
+        }
         // Fresh usage reporting headroom supersedes a recorded cooldown: a limit hit before
         // an early reset (or lifted upstream) must not park the account until the stale
         // resets_at. A limit that still holds re-establishes its cooldown on the next 429.
@@ -816,7 +915,7 @@ public actor AccountStore {
            !data.accounts[i].disabledUntil.isEmpty {
             data.accounts[i].disabledUntil = [:]
         }
-        persist()
+        persist(preservingStickyAlias: !stickyCleared)
     }
 
     /// Appends fresh window readings to the burn-rate history ring (newest last).
@@ -946,6 +1045,24 @@ public actor AccountStore {
             }
         }
         return changed
+    }
+
+    private static func mergeUsageWindows(previous: [UsageWindow], current: [UsageWindow]) -> [UsageWindow] {
+        guard !current.isEmpty else { return previous }
+        let currentKeys = Set(current.map(usageWindowIdentity))
+        let retained = previous.filter { !currentKeys.contains(usageWindowIdentity($0)) }
+        return current + retained
+    }
+
+    private static func usageWindowIdentity(_ window: UsageWindow) -> String {
+        let normalized = window.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if window.windowSeconds == 18_000 || normalized == "5h" || normalized == "5-hour" || normalized == "5 hour" {
+            return "5h"
+        }
+        if window.windowSeconds >= 604_800 || normalized == "weekly" || normalized == "7d" || normalized == "7-day" || normalized == "7 day" {
+            return "weekly"
+        }
+        return window.windowSeconds > 0 ? "seconds:\(window.windowSeconds)" : "label:\(normalized)"
     }
 
     /// Applies a complete ranking (top first) to the active roster. Archived accounts
@@ -1101,6 +1218,9 @@ public actor AccountStore {
             merged.telemetryID = data.accounts[i].telemetryID == Account.missingTelemetryID
                 ? UUID()
                 : data.accounts[i].telemetryID
+            // Usage limits are user-owned control-plane state. CodexBar/import
+            // snapshots do not carry this field and must never reset a cap.
+            merged.usageLimitSettings = data.accounts[i].usageLimitSettings
             merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
             // needsLogin is runtime overlay state, not import data: the periodic CodexBar
             // sync upserts every account, and imports always carry false, so copying the
