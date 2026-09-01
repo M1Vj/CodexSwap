@@ -2443,11 +2443,11 @@ final class WarmupEngineTests: XCTestCase {
         )
         await ledger.setRecord(laterRecord, for: later.id)
         let laterRecordBefore = await ledger.record(for: later.id)
-        let dueBefore = laterRecordBefore?.isDue(at: now) ?? true
         let warmup = QuotaWarmupService(
             runner: runner,
             ledger: ledger
         )
+        let dueBefore = await warmup.hasDueAccount(in: [later], now: now)
         let engine = AppEngine(
             store: store,
             usage: usage,
@@ -2473,7 +2473,7 @@ final class WarmupEngineTests: XCTestCase {
         let summary = await warmupTask.value
         let runnerCalls = await runner.calls()
         let laterRecordAfter = await ledger.record(for: later.id)
-        let dueAfter = laterRecordAfter?.isDue(at: now) ?? true
+        let dueAfter = await warmup.hasDueAccount(in: [later], now: now)
 
         XCTAssertEqual(runnerCalls, ["first"])
         XCTAssertEqual(summary.attempted, ["first"])
