@@ -349,4 +349,34 @@ final class UsageLimitTests: XCTestCase {
         XCTAssertNil(reloadedSticky)
         XCTAssertFalse(reloadedOverride)
     }
+
+    func testReloadNormalizesOrphanedStickyUsageLimitOverride() async throws {
+        let url = storeURL("orphaned-sticky-override")
+        let orphaned = StoreData(schemaVersion: 2, stickyAlias: nil, stickyUsageLimitOverride: true)
+        try JSONEncoder.codex.encode(orphaned).write(to: url)
+
+        let reloaded = AccountStore(url: url)
+        let initialSticky = await reloaded.stickyAlias()
+        let initialOverride = await reloaded.stickyUsageLimitOverride()
+        XCTAssertNil(initialSticky)
+        XCTAssertFalse(initialOverride)
+
+        let persistedAfterInit = try JSONDecoder.codex.decode(
+            StoreData.self,
+            from: try Data(contentsOf: url)
+        )
+        XCTAssertNil(persistedAfterInit.stickyAlias)
+        XCTAssertFalse(persistedAfterInit.stickyUsageLimitOverride)
+
+        // A long-lived store must repair the same legacy state if another
+        // process writes it after initialization.
+        try JSONEncoder.codex.encode(orphaned).write(to: url, options: .atomic)
+        let refreshedOverride = await reloaded.stickyUsageLimitOverride()
+        XCTAssertFalse(refreshedOverride)
+        let persistedAfterRefresh = try JSONDecoder.codex.decode(
+            StoreData.self,
+            from: try Data(contentsOf: url)
+        )
+        XCTAssertFalse(persistedAfterRefresh.stickyUsageLimitOverride)
+    }
 }

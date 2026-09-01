@@ -78,6 +78,10 @@ public actor QuotaWarmupService {
                 summary.skipped[account.alias] = "already warmed for this cycle"
                 continue
             }
+            if let recheck, let reason = await recheck(account) {
+                summary.skipped[account.alias] = reason
+                continue
+            }
             // A successful process exit only proves that the command completed. Keep the
             // account unverified until a fresh usage observation anchors the reset lineage.
             // Persist this before launching so a crash or cancellation cannot immediately
@@ -91,10 +95,6 @@ public actor QuotaWarmupService {
                 attemptedAt: now
             )
             await ledger.setRecord(pendingRecord, for: key)
-            if let recheck, let reason = await recheck(account) {
-                summary.skipped[account.alias] = reason
-                continue
-            }
             summary.attempted.append(account.alias)
 
             do {

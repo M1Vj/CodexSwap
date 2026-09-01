@@ -105,6 +105,12 @@ public actor AccountStore {
         var loaded = AccountStore.loadFrom(url) ?? StoreData()
         let migrationDate = clock()
         var needsMigration = loaded.schemaVersion < Self.currentSchemaVersion
+        if loaded.stickyAlias == nil, loaded.stickyUsageLimitOverride {
+            // Older builds could persist the override bit after removing its
+            // alias. Repair the coupled control-plane fields on reload.
+            loaded.stickyUsageLimitOverride = false
+            needsMigration = true
+        }
         loaded.accounts = loaded.accounts.map { account in
             var normalized = account
             normalized.priority = max(0, account.priority)
@@ -158,11 +164,20 @@ public actor AccountStore {
     private func refreshExternalStateIfNeeded() {
         let currentDate = Self.modificationDate(for: url)
         guard currentDate != persistedModificationDate,
-              let loaded = Self.loadFrom(url) else { return }
+              var loaded = Self.loadFrom(url) else { return }
+        let needsStickyOverrideRepair = loaded.stickyAlias == nil && loaded.stickyUsageLimitOverride
+        if needsStickyOverrideRepair {
+            loaded.stickyUsageLimitOverride = false
+        }
         data = loaded
         persistedModificationDate = currentDate
         stickyAliasRuntime = loaded.stickyAlias
         stickyUsageLimitOverrideRuntime = loaded.stickyUsageLimitOverride && loaded.stickyAlias != nil
+        if needsStickyOverrideRepair {
+            persist(repairingStickyUsageLimitOverride: true)
+            stickyAliasRuntime = data.stickyAlias
+            stickyUsageLimitOverrideRuntime = data.stickyUsageLimitOverride && data.stickyAlias != nil
+        }
     }
 
     private static func modificationDate(for url: URL) -> Date? {
@@ -181,7 +196,8 @@ public actor AccountStore {
         preservingActiveAlias: Bool = true,
         preservingStickyAlias: Bool = true,
         clearingActiveAliases: Set<String> = [],
-        changedUsageLimitAliases: Set<String> = []
+        changedUsageLimitAliases: Set<String> = [],
+        repairingStickyUsageLimitOverride: Bool = false
     ) {
         let encoder = JSONEncoder.codex
         _ = Self.withStoreLock(url) {
@@ -207,6 +223,9 @@ public actor AccountStore {
                         clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
                     }
                 }
+            }
+            if repairingStickyUsageLimitOverride, snapshot.stickyAlias == nil {
+                snapshot.stickyUsageLimitOverride = false
             }
             guard let raw = try? encoder.encode(snapshot) else { return }
             Self.persistUnlocked(raw, to: url)

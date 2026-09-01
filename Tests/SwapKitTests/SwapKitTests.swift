@@ -2420,21 +2420,33 @@ final class WarmupEngineTests: XCTestCase {
             priority: 2,
             usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
         ))
-        await store.upsert(Account(
+        let later = Account(
             alias: "later",
             accountID: "id-later",
             accessToken: freshToken(now: now),
             priority: 1,
             usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
-        ))
+        )
+        await store.upsert(later)
 
         let runner = FirstBlockingWarmupRunner()
         let usage = ScriptedUsageFetcher(windowsByAccountID: [
             "id-first": [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: reset)]
         ])
+        let ledger = WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+        let laterRecord = WarmupRecord(
+            succeededAt: now.addingTimeInterval(-60),
+            primaryResetAt: now.addingTimeInterval(300),
+            secondaryResetAt: nil,
+            outcome: .verified,
+            attemptedAt: now.addingTimeInterval(-60)
+        )
+        await ledger.setRecord(laterRecord, for: later.id)
+        let laterRecordBefore = await ledger.record(for: later.id)
+        let dueBefore = laterRecordBefore?.isDue(at: now) ?? true
         let warmup = QuotaWarmupService(
             runner: runner,
-            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json"))
+            ledger: ledger
         )
         let engine = AppEngine(
             store: store,
@@ -2460,10 +2472,14 @@ final class WarmupEngineTests: XCTestCase {
         await runner.finish()
         let summary = await warmupTask.value
         let runnerCalls = await runner.calls()
+        let laterRecordAfter = await ledger.record(for: later.id)
+        let dueAfter = laterRecordAfter?.isDue(at: now) ?? true
 
         XCTAssertEqual(runnerCalls, ["first"])
         XCTAssertEqual(summary.attempted, ["first"])
         XCTAssertEqual(summary.skipped["later"], "account usage cap reached")
+        XCTAssertEqual(laterRecordAfter, laterRecordBefore)
+        XCTAssertEqual(dueAfter, dueBefore)
     }
 
     func testSuccessfulWarmupWithMissingResetRemainsUnverifiedInEngineSummary() async throws {
