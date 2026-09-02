@@ -714,6 +714,28 @@ final class AccountStoreStaleWriterTests: XCTestCase {
         XCTAssertEqual(activeAlias, "target")
     }
 
+    func testStaleRemovalOfUnknownAliasDoesNotClearNewActiveAccount() async throws {
+        let url = temporaryStoreURL("removal-unknown-active")
+        let seed = AccountStore(url: url)
+        await seed.upsert(account("base"))
+
+        let stale = AccountStore(url: url)
+        let latest = AccountStore(url: url)
+        await latest.upsert(account("new", priority: 2))
+        _ = await latest.setActive("new", now: Self.providerDate)
+
+        // The stale actor never had this alias in its baseline, so its no-op
+        // removal must not clear the newer process's active selection.
+        let removedTelemetryID = await stale.remove("new")
+        XCTAssertNil(removedTelemetryID)
+
+        let reloaded = AccountStore(url: url)
+        let newValue = await reloaded.account("new")
+        XCTAssertNotNil(newValue)
+        let activeAlias = await reloaded.activeAlias()
+        XCTAssertEqual(activeAlias, "new")
+    }
+
     func testStaleMutationDoesNotOverwriteReplacementAccountWithReusedAlias() async throws {
         let url = temporaryStoreURL("replacement")
         try await seed(url)

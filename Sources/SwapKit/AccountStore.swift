@@ -1848,7 +1848,13 @@ public actor AccountStore {
 
     @discardableResult
     public func remove(_ alias: String) -> UUID? {
-        let removedTelemetryID = data.accounts.first(where: { $0.alias == alias })?.telemetryID
+        let removedAccounts = data.accounts.filter { $0.alias == alias }
+        // A stale actor may attempt to remove an alias that another process
+        // added after this actor's snapshot. Treat that operation as a true
+        // no-op: emitting a clearing intent here could erase the newer active
+        // selection even though this actor removed no row of its own.
+        guard !removedAccounts.isEmpty else { return nil }
+        let removedTelemetryID = removedAccounts.first?.telemetryID
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
         clearRuntimeHolds(alias)
