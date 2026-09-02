@@ -635,12 +635,14 @@ public actor AppEngine {
         let candidates = await store.activeAccounts().filter { account in
             account.alias != currentAlias
                 && (allowed?.contains(account.alias) ?? true)
-                && account.isEligible(now: Date())
+                && !account.isArchived
+                && account.routingEnabled
         }
         var verifiedAliases: [String] = []
         for candidate in candidates {
             guard let fresh = await store.hydrateFromManagedHome(candidate.alias),
                   !fresh.accessToken.isEmpty,
+                  !fresh.needsLogin,
                   let windows = try? await usage.fetch(
                     accessToken: fresh.accessToken,
                     accountID: fresh.accountID
@@ -649,7 +651,7 @@ public actor AppEngine {
             await store.updateUsage(candidate.alias, windows: windows)
             verifiedAliases.append(candidate.alias)
         }
-        return await store.reserveBestEligible(among: verifiedAliases)
+        return await store.reserveBestEligible(among: verifiedAliases, avoidingLeased: true)
     }
 
     private func sanitizedResetCreditStatuses() async -> [String: AccountResetCreditStatus] {
