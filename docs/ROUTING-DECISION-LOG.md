@@ -14,6 +14,8 @@ The directory is mode `0700` and the active and rotated files are mode `0600`.
 The active file is capped at 1 MiB. When it would exceed that cap, it is moved
 to `routing-decisions-v1.jsonl.1`; only that one rotated file is retained.
 Each append is followed by a file synchronization before the handle closes.
+The hidden `.routing-decisions-v1.jsonl.lock` file is a `0600` interprocess
+lock sentinel, not event data and not part of the retained JSONL files.
 
 ## Safe fields
 
