@@ -394,6 +394,82 @@ final class AccountStoreStaleWriterTests: XCTestCase {
         XCTAssertEqual(currentAlias, "fallback")
     }
 
+    func testMutationResultsRetainSubsecondDatesInMemory() async throws {
+        let url = temporaryStoreURL("exact-dates")
+        let store = AccountStore(url: url)
+        await store.upsert(account("target"))
+
+        let servedAt = Date(timeIntervalSince1970: 1_800_000_000.123456)
+        let resetAt = servedAt.addingTimeInterval(3_600.789)
+        await store.markServed("target", date: servedAt)
+        await store.markLimited(
+            "target",
+            limit: "5h",
+            resetAt: resetAt,
+            now: servedAt,
+            fallbackCooldown: 60
+        )
+
+        let targetValue = await store.account("target")
+        let target = try XCTUnwrap(targetValue)
+        XCTAssertEqual(target.lastServedByUs, servedAt)
+        XCTAssertEqual(target.disabledUntil["5h"], resetAt)
+    }
+
+    func testStaleRemovalKeepsLatestChangedAccountInsteadOfDroppingIt() async throws {
+        let url = temporaryStoreURL("removal-latest-change")
+        try await seed(url)
+
+        let stale = AccountStore(url: url, clock: { Self.initialDate })
+        let latest = AccountStore(url: url, clock: { Self.providerDate })
+        await latest.updateUsage(
+            "target",
+            windows: [UsageWindow(
+                label: "5h",
+                usedPercent: 40,
+                windowSeconds: 18_000,
+                resetAt: Self.providerDate.addingTimeInterval(3_600)
+            )]
+        )
+
+        _ = await stale.remove("target")
+
+        let reloaded = AccountStore(url: url)
+        let targetValue = await reloaded.account("target")
+        let target = try XCTUnwrap(targetValue)
+        XCTAssertEqual(target.usage.first?.usedPercent, 40)
+        XCTAssertEqual(target.accessToken, "old-access-target")
+        let activeAlias = await reloaded.activeAlias()
+        XCTAssertEqual(activeAlias, "target")
+    }
+
+    func testStaleRemovalDoesNotClearActiveAliasOfReplacementAccount() async throws {
+        let url = temporaryStoreURL("removal-replacement-active")
+        try await seed(url)
+
+        let stale = AccountStore(url: url, clock: { Self.initialDate })
+        let latest = AccountStore(url: url, clock: { Self.providerDate })
+        _ = await latest.remove("target")
+        await latest.upsert(Account(
+            alias: "target",
+            email: "replacement@example.com",
+            accountID: "id-replacement",
+            accessToken: "replacement-access",
+            priority: 2
+        ))
+        _ = await latest.setActive("target", now: Self.providerDate)
+
+        _ = await stale.remove("target")
+
+        let reloaded = AccountStore(url: url)
+        let replacementValue = await reloaded.account("target")
+        let replacement = try XCTUnwrap(replacementValue)
+        XCTAssertEqual(replacement.accountID, "id-replacement")
+        XCTAssertEqual(replacement.accessToken, "replacement-access")
+        let activeAlias = await reloaded.activeAlias()
+        XCTAssertEqual(activeAlias, "target")
+    }
+
     func testStaleMutationDoesNotOverwriteReplacementAccountWithReusedAlias() async throws {
         let url = temporaryStoreURL("replacement")
         try await seed(url)

@@ -263,13 +263,12 @@ public actor AccountStore {
             }
             guard let raw = try? encoder.encode(snapshot) else { return }
             // JSON's ISO-8601 encoding intentionally drops sub-second Date
-            // precision. Keep the actor's baseline in the same canonical form
-            // as the bytes on disk; otherwise an untouched usage-history or
-            // telemetry field would look changed on every subsequent write and
-            // lose every other update to a stale/latest conflict.
+            // precision. Keep only the merge baseline in the same canonical
+            // form as the bytes on disk; the actor's public in-memory snapshot
+            // must retain exact dates returned by its mutation APIs.
             let committed = (try? JSONDecoder.codex.decode(StoreData.self, from: raw)) ?? snapshot
             Self.persistUnlocked(raw, to: url)
-            data = committed
+            data = snapshot
             persistedData = committed
             persistedModificationDate = Self.modificationDate(for: url)
         }
@@ -370,9 +369,11 @@ public actor AccountStore {
             )
         }
         if !clearingActiveAliases.isEmpty {
-            merged.activeAlias = latest.activeAlias.flatMap { activeAlias in
-                clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
-            }
+            merged.activeAlias = Self.activeAliasAfterClearing(
+                latest: latest,
+                baseline: baseline,
+                clearing: clearingActiveAliases
+            )
         }
 
         if !preservingStickyAlias {
@@ -431,8 +432,15 @@ public actor AccountStore {
             if let baselineIndex = latestBaseline.firstIndex(of: latestIndex) {
                 // The local writer removed a baseline row. Keep that removal;
                 // never reintroduce an account another writer intentionally
-                // deleted from its own snapshot.
-                guard let localIndex = localBaseline[baselineIndex] else { continue }
+                // deleted from its own snapshot. If the latest writer changed
+                // the row instead of deleting it, its newer row wins over the
+                // stale removal.
+                guard let localIndex = localBaseline[baselineIndex] else {
+                    if latestAccount != baseline[baselineIndex] {
+                        result.append(latestAccount)
+                    }
+                    continue
+                }
                 consumedLocal.insert(localIndex)
                 result.append(
                     mergePersistedAccount(
@@ -471,6 +479,30 @@ public actor AccountStore {
             result.append(localAccount)
         }
         return result
+    }
+
+    /// Applies an explicit active-alias clear without clearing a newer account
+    /// that reused the same user-facing alias after the stale writer's snapshot.
+    private static func activeAliasAfterClearing(
+        latest: StoreData,
+        baseline: StoreData,
+        clearing aliases: Set<String>
+    ) -> String? {
+        guard let activeAlias = latest.activeAlias,
+              aliases.contains(activeAlias) else {
+            return latest.activeAlias
+        }
+        guard let baselineAccount = baseline.accounts.first(where: { $0.alias == activeAlias }) else {
+            return nil
+        }
+        guard let latestAccount = latest.accounts.first(where: { $0.alias == activeAlias }) else {
+            return nil
+        }
+        // A stale removal/archive may clear an active alias only when the
+        // latest row is still exactly the baseline row. If the newer writer
+        // changed or replaced that row, its active selection is newer state
+        // and must win the conflict.
+        return latestAccount == baselineAccount ? nil : activeAlias
     }
 
     /// Returns, for each reference row, the unique candidate index that
@@ -1499,7 +1531,6 @@ public actor AccountStore {
 
     @discardableResult
     public func remove(_ alias: String) -> UUID? {
-        refreshExternalStateIfNeeded()
         let removedTelemetryID = data.accounts.first(where: { $0.alias == alias })?.telemetryID
         data.accounts.removeAll { $0.alias == alias }
         if data.activeAlias == alias { data.activeAlias = nil }
