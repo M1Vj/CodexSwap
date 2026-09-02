@@ -85,6 +85,7 @@ public actor AccountStore {
     private let url: URL
     private let clock: @Sendable () -> Date
     private let persistenceWriter: AccountStorePersistenceWriter
+    private let beforeReserveBestEligibleTouch: (@Sendable (String) async -> Void)?
     private var data: StoreData
     /// The last document this actor loaded or successfully persisted. A write
     /// can be based on an older in-memory snapshot when another process has
@@ -136,17 +137,38 @@ public actor AccountStore {
         )
     }
 
+    /// Internal interleaving seam used by reservation race tests. Production
+    /// construction leaves the hook unset through the public initializer.
+    init(
+        url: URL = AppPaths.storeFile(),
+        strategy: RotationStrategy = .priority,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        beforeReserveBestEligibleTouch: @escaping @Sendable (String) async -> Void
+    ) {
+        self.init(
+            url: url,
+            strategy: strategy,
+            clock: clock,
+            persistenceWriter: { raw, target in
+                try Self.persistUnlockedThrowing(raw, to: target)
+            },
+            beforeReserveBestEligibleTouch: beforeReserveBestEligibleTouch
+        )
+    }
+
     /// Internal initializer reserved for deterministic persistence-failure
     /// tests. Production callers use the public initializer above.
     init(
         url: URL = AppPaths.storeFile(),
         strategy: RotationStrategy = .priority,
         clock: @escaping @Sendable () -> Date = { Date() },
-        persistenceWriter: @escaping AccountStorePersistenceWriter
+        persistenceWriter: @escaping AccountStorePersistenceWriter,
+        beforeReserveBestEligibleTouch: (@Sendable (String) async -> Void)? = nil
     ) {
         self.url = url
         self.clock = clock
         self.persistenceWriter = persistenceWriter
+        self.beforeReserveBestEligibleTouch = beforeReserveBestEligibleTouch
         self.strategy = strategy
         var loaded = AccountStore.loadFrom(url) ?? StoreData()
         let migrationDate = clock()
@@ -478,7 +500,63 @@ public actor AccountStore {
             }) else { continue }
             result.append(localAccount)
         }
-        return result
+        return normalizeMergedActiveRanks(result, latest: latest, preservingRanking: preservingRanking)
+    }
+
+    /// Keeps latest explicit order when a stale writer adds an account and leaves
+    /// gaps or duplicate values in the visible priorities. When the writer owns
+    /// ranking, sort the merged priorities first so its explicit reorder remains
+    /// intact.
+    private static func normalizeMergedActiveRanks(
+        _ accounts: [Account],
+        latest: [Account],
+        preservingRanking: Bool
+    ) -> [Account] {
+        guard accounts.contains(where: { !$0.isArchived }) else { return accounts }
+        guard !hasDenseActiveRanks(StoreData(accounts: accounts)) else { return accounts }
+
+        let orderedIndices: [Int]
+        if preservingRanking {
+            let latestOrder = latest.indices
+                .filter { !latest[$0].isArchived }
+                .sorted {
+                    if latest[$0].priority != latest[$1].priority {
+                        return latest[$0].priority > latest[$1].priority
+                    }
+                    return $0 < $1
+                }
+            var consumed = Set<Int>()
+            var order: [Int] = []
+            for latestIndex in latestOrder {
+                guard let resultIndex = accounts.indices.first(where: {
+                    !consumed.contains($0)
+                        && !accounts[$0].isArchived
+                        && (accountsMatch(accounts[$0], latest[latestIndex])
+                            || accounts[$0].alias == latest[latestIndex].alias)
+                }) else { continue }
+                consumed.insert(resultIndex)
+                order.append(resultIndex)
+            }
+            order.append(contentsOf: accounts.indices.filter {
+                !accounts[$0].isArchived && !consumed.contains($0)
+            })
+            orderedIndices = order
+        } else {
+            orderedIndices = accounts.indices
+                .filter { !accounts[$0].isArchived }
+                .sorted {
+                    if accounts[$0].priority != accounts[$1].priority {
+                        return accounts[$0].priority > accounts[$1].priority
+                    }
+                    return $0 < $1
+                }
+        }
+
+        var normalized = accounts
+        for (position, index) in orderedIndices.enumerated() {
+            normalized[index].priority = orderedIndices.count - position
+        }
+        return normalized
     }
 
     /// Applies an explicit active-alias clear without clearing a newer account
@@ -557,8 +635,16 @@ public actor AccountStore {
         merged.usage = mergeUsageWindows(local: local.usage, baseline: baseline.usage, latest: latest.usage)
         merged.managedHomePath = mergeValue(local.managedHomePath, baseline: baseline.managedHomePath, latest: latest.managedHomePath)
         merged.routingEnabled = mergeValue(local.routingEnabled, baseline: baseline.routingEnabled, latest: latest.routingEnabled)
-        merged.usageStats = mergeValue(local.usageStats, baseline: baseline.usageStats, latest: latest.usageStats)
-        merged.usageHistory = mergeValue(local.usageHistory, baseline: baseline.usageHistory, latest: latest.usageHistory)
+        merged.usageStats = mergeUsageStats(
+            local: local.usageStats,
+            baseline: baseline.usageStats,
+            latest: latest.usageStats
+        )
+        merged.usageHistory = mergeUsageHistory(
+            local: local.usageHistory,
+            baseline: baseline.usageHistory,
+            latest: latest.usageHistory
+        )
         merged.lastServedByUs = mergeValue(local.lastServedByUs, baseline: baseline.lastServedByUs, latest: latest.lastServedByUs)
         merged.archivedAt = mergeValue(local.archivedAt, baseline: baseline.archivedAt, latest: latest.archivedAt)
         merged.routingPausedAt = mergeValue(local.routingPausedAt, baseline: baseline.routingPausedAt, latest: latest.routingPausedAt)
@@ -585,14 +671,169 @@ public actor AccountStore {
         return merged
     }
 
+    /// Folds cumulative telemetry from concurrent writers. Each counter is
+    /// merged as a baseline-relative delta so independent model updates survive
+    /// without replacing the newest account-control fields.
+    private static func mergeUsageStats(
+        local: UsageStats?,
+        baseline: UsageStats?,
+        latest: UsageStats?
+    ) -> UsageStats? {
+        if local == baseline { return latest }
+        if latest == baseline { return local }
+        guard let local, let latest else { return latest }
+        let baseline = baseline ?? UsageStats()
+        var merged = latest
+        merged.totalRequests = mergeUsageCounter(local.totalRequests, baseline: baseline.totalRequests, latest: latest.totalRequests)
+        merged.inputTokens = mergeUsageCounter(local.inputTokens, baseline: baseline.inputTokens, latest: latest.inputTokens)
+        merged.cachedInputTokens = mergeUsageCounter(local.cachedInputTokens, baseline: baseline.cachedInputTokens, latest: latest.cachedInputTokens)
+        merged.cacheWriteInputTokens = mergeUsageCounter(local.cacheWriteInputTokens, baseline: baseline.cacheWriteInputTokens, latest: latest.cacheWriteInputTokens)
+        merged.outputTokens = mergeUsageCounter(local.outputTokens, baseline: baseline.outputTokens, latest: latest.outputTokens)
+        merged.cachedInputCompleteness = mergeUsageCompleteness(
+            local.cachedInputCompleteness,
+            baseline: baseline.cachedInputCompleteness,
+            latest: latest.cachedInputCompleteness
+        )
+        merged.cacheWriteInputCompleteness = mergeUsageCompleteness(
+            local.cacheWriteInputCompleteness,
+            baseline: baseline.cacheWriteInputCompleteness,
+            latest: latest.cacheWriteInputCompleteness
+        )
+        merged.models = mergeModelUsages(local: local.models, baseline: baseline.models, latest: latest.models)
+        merged.updatedAt = [local.updatedAt, latest.updatedAt].compactMap { $0 }.max()
+        return merged
+    }
+
+    private static func mergeUsageCounter(_ local: Int, baseline: Int, latest: Int) -> Int {
+        guard local >= baseline, latest >= baseline else { return latest }
+        return UsageSafety.saturatingAdd(latest, local - baseline)
+    }
+
+    private static func mergeUsageCompleteness(
+        _ local: TokenFieldCompleteness,
+        baseline: TokenFieldCompleteness,
+        latest: TokenFieldCompleteness
+    ) -> TokenFieldCompleteness {
+        if local == baseline { return latest }
+        if latest == baseline { return local }
+        return UsageAnalytics.combineCompleteness(latest, local, hasExistingContributor: true)
+    }
+
+    private static func mergeModelUsages(
+        local: [ModelUsage],
+        baseline: [ModelUsage],
+        latest: [ModelUsage]
+    ) -> [ModelUsage] {
+        let localByName = modelUsagesByName(local)
+        let baselineByName = modelUsagesByName(baseline)
+        let latestByName = modelUsagesByName(latest)
+        var names: [String] = []
+        for row in latest + local + baseline where !names.contains(row.model) {
+            names.append(row.model)
+        }
+        var merged: [ModelUsage] = []
+        for name in names {
+            guard let value = mergeModelUsage(
+                localByName[name],
+                baseline: baselineByName[name],
+                latest: latestByName[name]
+            ) else { continue }
+            merged.append(value)
+        }
+        return merged.sorted {
+            if $0.outputTokens != $1.outputTokens { return $0.outputTokens > $1.outputTokens }
+            return $0.model < $1.model
+        }
+    }
+
+    private static func modelUsagesByName(_ rows: [ModelUsage]) -> [String: ModelUsage] {
+        var grouped: [String: ModelUsage] = [:]
+        for row in rows { grouped[row.model] = row }
+        return grouped
+    }
+
+    private static func mergeModelUsage(
+        _ local: ModelUsage?,
+        baseline: ModelUsage?,
+        latest: ModelUsage?
+    ) -> ModelUsage? {
+        if local == baseline { return latest }
+        if latest == baseline { return local }
+        guard let local, let latest else { return latest }
+        let baseline = baseline ?? ModelUsage(model: latest.model)
+        var merged = latest
+        merged.requests = mergeUsageCounter(local.requests, baseline: baseline.requests, latest: latest.requests)
+        merged.inputTokens = mergeUsageCounter(local.inputTokens, baseline: baseline.inputTokens, latest: latest.inputTokens)
+        merged.cachedInputTokens = mergeUsageCounter(local.cachedInputTokens, baseline: baseline.cachedInputTokens, latest: latest.cachedInputTokens)
+        merged.cacheWriteInputTokens = mergeUsageCounter(local.cacheWriteInputTokens, baseline: baseline.cacheWriteInputTokens, latest: latest.cacheWriteInputTokens)
+        merged.outputTokens = mergeUsageCounter(local.outputTokens, baseline: baseline.outputTokens, latest: latest.outputTokens)
+        merged.cachedInputCompleteness = mergeUsageCompleteness(
+            local.cachedInputCompleteness,
+            baseline: baseline.cachedInputCompleteness,
+            latest: latest.cachedInputCompleteness
+        )
+        merged.cacheWriteInputCompleteness = mergeUsageCompleteness(
+            local.cacheWriteInputCompleteness,
+            baseline: baseline.cacheWriteInputCompleteness,
+            latest: latest.cacheWriteInputCompleteness
+        )
+        return merged
+    }
+
+    /// Merges history samples by event identity. Different writers' samples
+    /// are retained, while duplicate observations at one timestamp use the
+    /// same deterministic last-observation rule as usage windows.
+    private static func mergeUsageHistory(
+        local: [WindowSample]?,
+        baseline: [WindowSample]?,
+        latest: [WindowSample]?
+    ) -> [WindowSample]? {
+        if local == baseline { return latest }
+        if latest == baseline { return local }
+        guard let local, let latest else { return latest }
+        let baseline = baseline ?? []
+        let localByKey = windowSamplesByIdentity(local)
+        let baselineByKey = windowSamplesByIdentity(baseline)
+        let latestByKey = windowSamplesByIdentity(latest)
+        var keys: [String] = []
+        for sample in latest + local + baseline {
+            let key = usageHistoryIdentity(sample)
+            if !keys.contains(key) { keys.append(key) }
+        }
+        var merged: [WindowSample] = []
+        for key in keys {
+            guard let value = mergeValue(
+                localByKey[key],
+                baseline: baselineByKey[key],
+                latest: latestByKey[key]
+            ) else { continue }
+            merged.append(value)
+        }
+        merged.sort {
+            if $0.capturedAt != $1.capturedAt { return $0.capturedAt < $1.capturedAt }
+            if normalizedUsageLabel($0.label) != normalizedUsageLabel($1.label) {
+                return normalizedUsageLabel($0.label) < normalizedUsageLabel($1.label)
+            }
+            return $0.usedPercent < $1.usedPercent
+        }
+        if merged.count > historyCap { merged = Array(merged.suffix(historyCap)) }
+        return merged
+    }
+
+    private static func windowSamplesByIdentity(_ samples: [WindowSample]) -> [String: WindowSample] {
+        var grouped: [String: WindowSample] = [:]
+        for sample in samples { grouped[usageHistoryIdentity(sample)] = sample }
+        return grouped
+    }
+
     private static func mergeUsageWindows(
         local: [UsageWindow],
         baseline: [UsageWindow],
         latest: [UsageWindow]
     ) -> [UsageWindow] {
-        let localByKey = Dictionary(uniqueKeysWithValues: local.map { (usageWindowIdentity($0), $0) })
-        let baselineByKey = Dictionary(uniqueKeysWithValues: baseline.map { (usageWindowIdentity($0), $0) })
-        let latestByKey = Dictionary(uniqueKeysWithValues: latest.map { (usageWindowIdentity($0), $0) })
+        let localByKey = usageWindowsByIdentity(local)
+        let baselineByKey = usageWindowsByIdentity(baseline)
+        let latestByKey = usageWindowsByIdentity(latest)
         let keys = Set(localByKey.keys).union(baselineByKey.keys).union(latestByKey.keys)
         var selected: [String: UsageWindow] = [:]
         for key in keys {
@@ -604,6 +845,28 @@ public actor AccountStore {
         var merged = latest.compactMap { selected.removeValue(forKey: usageWindowIdentity($0)) }
         merged.append(contentsOf: local.compactMap { selected.removeValue(forKey: usageWindowIdentity($0)) })
         return merged
+    }
+
+    /// Groups usage windows by their normalized identity without trapping on
+    /// duplicate provider/legacy rows. Iterating in source order makes the
+    /// final duplicate deterministic: the last observation wins.
+    private static func usageWindowsByIdentity(_ windows: [UsageWindow]) -> [String: UsageWindow] {
+        var grouped: [String: UsageWindow] = [:]
+        for window in windows {
+            grouped[usageWindowIdentity(window)] = window
+        }
+        return grouped
+    }
+
+    private static func stableUsageWindows(_ windows: [UsageWindow]) -> [UsageWindow] {
+        var grouped: [String: UsageWindow] = [:]
+        var order: [String] = []
+        for window in windows {
+            let key = usageWindowIdentity(window)
+            if grouped[key] == nil { order.append(key) }
+            grouped[key] = window
+        }
+        return order.compactMap { grouped[$0] }
     }
 
     private static func accountsMatch(_ lhs: Account, _ rhs: Account) -> Bool {
@@ -859,17 +1122,33 @@ public actor AccountStore {
         secondaryThreshold: Int = Int.max,
         avoidingLeased: Bool = false,
         now: Date = Date()
-    ) -> Account? {
-        guard let selected = bestEligible(
-            among: aliases.filter { $0 != excludedAlias },
-            primaryThreshold: primaryThreshold,
-            secondaryThreshold: secondaryThreshold,
-            avoidingLeased: avoidingLeased,
-            now: now
-        ) else { return nil }
-        reserveLease(selected.alias)
-        touchLastUsed(selected.alias, now: now)
-        return account(selected.alias)
+    ) async -> Account? {
+        var remaining = aliases.filter { $0 != excludedAlias }
+        while !remaining.isEmpty {
+            guard let selected = bestEligible(
+                among: remaining,
+                primaryThreshold: primaryThreshold,
+                secondaryThreshold: secondaryThreshold,
+                avoidingLeased: avoidingLeased,
+                now: now
+            ) else { return nil }
+            await beforeReserveBestEligibleTouch?(selected.alias)
+            reserveLease(selected.alias)
+            // Refreshing in touchLastUsed observes an external archive, login
+            // requirement, or cooldown that landed after selection. Recheck the
+            // final leased snapshot before handing it to a routed attempt; if it
+            // became ineligible, release the provisional lease and try the next
+            // candidate instead of returning a stale account.
+            touchLastUsed(selected.alias, now: now)
+            guard let refreshed = account(selected.alias), refreshed.isEligible(now: now) else {
+                _ = consumeRoutingReservation(selected.alias)
+                releaseRoutingLease(selected.alias)
+                remaining.removeAll { $0 == selected.alias }
+                continue
+            }
+            return refreshed
+        }
+        return nil
     }
 
     private func reserveLease(_ alias: String) {
@@ -1103,7 +1382,7 @@ public actor AccountStore {
         refreshExternalStateIfNeeded()
         clearRuntimeHolds(alias)
         if let i = index(alias) {
-            let until = resetAt ?? now.addingTimeInterval(fallbackCooldown)
+            let until = Self.cooldownDeadline(resetAt: resetAt, now: now, fallbackCooldown: fallbackCooldown)
             data.accounts[i].disabledUntil[limit] = until
         }
         let next: Account?
@@ -1124,8 +1403,23 @@ public actor AccountStore {
     public func markLimited(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) {
         guard let i = index(alias) else { return }
         clearRuntimeHolds(alias)
-        data.accounts[i].disabledUntil[limit] = resetAt ?? now.addingTimeInterval(fallbackCooldown)
+        data.accounts[i].disabledUntil[limit] = Self.cooldownDeadline(
+            resetAt: resetAt,
+            now: now,
+            fallbackCooldown: fallbackCooldown
+        )
         persist(preservingStickyAlias: false)
+    }
+
+    private static func cooldownDeadline(
+        resetAt: Date?,
+        now: Date,
+        fallbackCooldown: TimeInterval
+    ) -> Date {
+        guard let resetAt, resetAt > now else {
+            return now.addingTimeInterval(fallbackCooldown)
+        }
+        return resetAt
     }
 
     public func markNeedsLoginOnly(_ alias: String) {
@@ -1429,7 +1723,8 @@ public actor AccountStore {
     }
 
     private static func usageResetOrDecreaseLabels(previous: [UsageWindow], current: [UsageWindow]) -> Set<String> {
-        let oldByLabel = Dictionary(uniqueKeysWithValues: previous.map { ($0.label, $0) })
+        var oldByLabel: [String: UsageWindow] = [:]
+        for window in previous { oldByLabel[window.label] = window }
         let currentLabels = Set(current.map(\.label))
         var changed = Set(previous.filter { !currentLabels.contains($0.label) }.map(\.label))
         for window in current {
@@ -1442,21 +1737,43 @@ public actor AccountStore {
     }
 
     private static func mergeUsageWindows(previous: [UsageWindow], current: [UsageWindow]) -> [UsageWindow] {
-        guard !current.isEmpty else { return previous }
-        let currentKeys = Set(current.map(usageWindowIdentity))
-        let retained = previous.filter { !currentKeys.contains(usageWindowIdentity($0)) }
-        return current + retained
+        let normalizedPrevious = stableUsageWindows(previous)
+        guard !current.isEmpty else { return normalizedPrevious }
+        let normalizedCurrent = stableUsageWindows(current)
+        let currentKeys = Set(normalizedCurrent.map(usageWindowIdentity))
+        let retained = normalizedPrevious.filter { !currentKeys.contains(usageWindowIdentity($0)) }
+        return normalizedCurrent + retained
     }
 
     private static func usageWindowIdentity(_ window: UsageWindow) -> String {
-        let normalized = window.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if window.windowSeconds == 18_000 || normalized == "5h" || normalized == "5-hour" || normalized == "5 hour" {
+        let normalized = normalizedUsageLabel(window.label)
+        if window.windowSeconds == 18_000 || normalized == "5h" {
             return "5h"
         }
-        if window.windowSeconds == 604_800 || normalized == "weekly" || normalized == "7d" || normalized == "7-day" || normalized == "7 day" {
+        if window.windowSeconds == 604_800 || normalized == "weekly" {
             return "weekly"
         }
         return window.windowSeconds > 0 ? "seconds:\(window.windowSeconds)" : "label:\(normalized)"
+    }
+
+    private static func normalizedUsageLabel(_ label: String) -> String {
+        let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "5-hour", "5 hour": return "5h"
+        case "7d", "7-day", "7 day": return "weekly"
+        default: return normalized
+        }
+    }
+
+    private static func usageHistoryIdentity(_ sample: WindowSample) -> String {
+        // AccountStore persists dates through JSONEncoder.iso8601, which omits
+        // fractional seconds. Use the same second-precision representation for
+        // event identity so an exact in-memory timestamp and its decoded
+        // on-disk baseline still match during a later stale-writer merge.
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let canonicalCapturedAt = formatter.string(from: sample.capturedAt)
+        return "\(canonicalCapturedAt)|\(normalizedUsageLabel(sample.label))"
     }
 
     /// Applies a complete ranking (top first) to the active roster. Archived accounts
