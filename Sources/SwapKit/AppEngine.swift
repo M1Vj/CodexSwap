@@ -267,7 +267,8 @@ public actor AppEngine {
             },
             sink: sink,
             verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil,
-            telemetry: telemetry
+            telemetry: telemetry,
+            routingLog: RoutingDecisionLog(url: supportDir.appendingPathComponent(RoutingDecisionLog.defaultFileName))
         )
         do {
             try await proxy.start()

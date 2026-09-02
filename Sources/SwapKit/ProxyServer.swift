@@ -629,7 +629,7 @@ actor UpstreamRateLimitBackoff {
 }
 
 private enum ProxyAttemptResult: Sendable {
-    case completed(outcome: UsageTelemetryRootOutcome)
+    case completed(outcome: UsageTelemetryRootOutcome, status: Int?)
     case retry(account: Account, tokenRefreshed: Bool, exhaustionHandled: Bool, finalReplay: Bool)
     case retryTransient(account: Account, retries: Int)
 }
@@ -666,6 +666,7 @@ public actor ProxyServer {
     private let exhaustionHandler: ExhaustionPolicyHandler
     private let freshAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?
     private let telemetry: UsageTelemetryStore?
+    private let routingLog: RoutingDecisionLog
     private let config: Config
     private let group: MultiThreadedEventLoopGroup
     private let httpClient: HTTPClient
@@ -723,7 +724,8 @@ public actor ProxyServer {
         freshAlternative: @escaping @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account? = { _, _ in nil },
         sink: ProxyEventSink = NullEventSink(),
         verbose: Bool = false,
-        telemetry: UsageTelemetryStore? = nil
+        telemetry: UsageTelemetryStore? = nil,
+        routingLog: RoutingDecisionLog? = nil
     ) {
         self.routingEnabledProvider = routingEnabledProvider
         self.store = store
@@ -734,6 +736,7 @@ public actor ProxyServer {
         self.freshAlternative = freshAlternative
         self.sink = sink
         self.telemetry = telemetry
+        self.routingLog = routingLog ?? RoutingDecisionLog()
         self.verbose = verbose
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         var cfg = HTTPClient.Configuration()
@@ -1142,6 +1145,14 @@ public actor ProxyServer {
         }
 
         let requestModel = telemetryModel(from: body)
+        let rootRequestID = UUID()
+        let requestCategory = telemetryCategory(for: mode)
+        await routingLog.write(RoutingDecisionLogRecord(
+            event: .requestStarted,
+            rootRequestID: rootRequestID,
+            attempt: 0,
+            reason: .requestStart
+        ))
         let interactiveKey = mode == .normal && head.method == .POST && rawPath.hasSuffix("/responses")
             ? interactiveTurnKey(headers: head.headers, body: body)
             : nil
@@ -1162,6 +1173,20 @@ public actor ProxyServer {
         }
         guard var account = reservedAccount else {
             log("\(head.method.rawValue) \(rawPath) -> no eligible account")
+            await routingLog.write(RoutingDecisionLogRecord(
+                event: .noTargetStop,
+                rootRequestID: rootRequestID,
+                attemptCount: 0,
+                routingDecision: .stop,
+                reason: .noEligibleTarget
+            ))
+            await recordRoutingTerminal(
+                rootRequestID: rootRequestID,
+                attemptCount: 0,
+                status: Int(HTTPResponseStatus.serviceUnavailable.code),
+                account: nil,
+                outcome: .failure
+            )
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
         }
@@ -1173,33 +1198,50 @@ public actor ProxyServer {
         var finalReplay = false
         var transientRateLimitRetries = 0
         var attempts = 0
-        let rootRequestID = UUID()
-        let requestCategory = telemetryCategory(for: mode)
         // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
         while attempts < 8 {
             attempts += 1
             let target = targetURL(for: rawPath, query: query)
-            let result = try await performAttempt(
-                head: head,
-                body: body,
-                outbound: outbound,
-                path: rawPath,
-                target: target,
-                account: account,
-                mode: mode,
-                settings: settings,
-                interactiveKey: interactiveKey,
-                tokenRefreshed: tokenRefreshed,
-                exhaustionHandled: exhaustionHandled,
-                finalReplay: finalReplay,
-                rootRequestID: rootRequestID,
-                attemptIndex: attempts,
-                requestCategory: requestCategory,
-                requestModel: requestModel,
-                transientRateLimitRetries: transientRateLimitRetries
-            )
+            let result: ProxyAttemptResult
+            do {
+                result = try await performAttempt(
+                    head: head,
+                    body: body,
+                    outbound: outbound,
+                    path: rawPath,
+                    target: target,
+                    account: account,
+                    mode: mode,
+                    settings: settings,
+                    interactiveKey: interactiveKey,
+                    tokenRefreshed: tokenRefreshed,
+                    exhaustionHandled: exhaustionHandled,
+                    finalReplay: finalReplay,
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attempts,
+                    requestCategory: requestCategory,
+                    requestModel: requestModel,
+                    transientRateLimitRetries: transientRateLimitRetries
+                )
+            } catch {
+                await telemetry?.recordRootTerminal(.init(
+                    rootRequestID: rootRequestID,
+                    finishedAt: Date(),
+                    category: requestCategory,
+                    outcome: .failure,
+                    attemptCount: attempts
+                ))
+                await recordRoutingTerminal(
+                    rootRequestID: rootRequestID,
+                    attemptCount: attempts,
+                    status: Int(HTTPResponseStatus.badGateway.code),
+                    account: account,
+                    outcome: .failure
+                )
+                throw error
+            }
             switch result {
-            case .completed(let outcome):
+            case .completed(let outcome, let status):
                 await telemetry?.recordRootTerminal(.init(
                     rootRequestID: rootRequestID,
                     finishedAt: Date(),
@@ -1207,6 +1249,13 @@ public actor ProxyServer {
                     outcome: outcome,
                     attemptCount: attempts
                 ))
+                await recordRoutingTerminal(
+                    rootRequestID: rootRequestID,
+                    attemptCount: attempts,
+                    status: status,
+                    account: account,
+                    outcome: outcome
+                )
                 return
             case let .retry(next, refreshed, handled, replay):
                 account = next
@@ -1227,6 +1276,13 @@ public actor ProxyServer {
             outcome: .failure,
             attemptCount: attempts
         ))
+        await recordRoutingTerminal(
+            rootRequestID: rootRequestID,
+            attemptCount: attempts,
+            status: Int(HTTPResponseStatus.badGateway.code),
+            account: account,
+            outcome: .failure
+        )
         try await writeError(outbound, status: .badGateway, message: "CodexSwap gave up after repeated upstream retries")
     }
 
@@ -1256,6 +1312,7 @@ public actor ProxyServer {
         let store = self.store
         let burn = self.burn
         let sink = self.sink
+        let routingLog = self.routingLog
         let exhaustionHandler = self.exhaustionHandler
         let freshAlternative = self.freshAlternative
         return try await withRoutingLease(
@@ -1299,7 +1356,7 @@ public actor ProxyServer {
                     errorClass: .network
                 )
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
-                return .completed(outcome: .failure)
+                return .completed(outcome: .failure, status: Int(HTTPResponseStatus.badGateway.code))
             }
 
             await self.recordTelemetryAttempt(
@@ -1320,7 +1377,10 @@ public actor ProxyServer {
             if finalReplay {
                 await self.recordActivity(account.alias)
                 try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
-                return .completed(outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure)
+                return .completed(
+                    outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure,
+                    status: Int(resp.status.code)
+                )
             }
 
             // 401 -> refresh once, then retry
@@ -1341,7 +1401,7 @@ public actor ProxyServer {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in")
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                     // A CodexBar-managed account may have lost the refresh race to CodexBar itself;
                     // adopt its rotated copy before condemning the account to needs-login.
@@ -1364,10 +1424,10 @@ public actor ProxyServer {
                                 finalReplay: finalReplay
                             )
                         }
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                     account = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
-                    if account.needsLogin { return .completed(outcome: .failure) }
+                    if account.needsLogin { return .completed(outcome: .failure, status: Int(resp.status.code)) }
                     await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                     tokenRefreshed = false
                     return .retry(
@@ -1378,7 +1438,7 @@ public actor ProxyServer {
                     )
                 } catch {
                     try await writeError(outbound, status: .unauthorized, message: "token refresh failed: \(error)")
-                    return .completed(outcome: .failure)
+                    return .completed(outcome: .failure, status: Int(resp.status.code))
                 }
             }
 
@@ -1407,13 +1467,13 @@ public actor ProxyServer {
                                 finalReplay: finalReplay
                             )
                         }
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                     if mode.isWarmup {
                         await store.markNeedsLoginOnly(account.alias)
                         await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
                         try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                     if let next = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
@@ -1426,11 +1486,11 @@ public actor ProxyServer {
                             finalReplay: finalReplay
                         )
                     }
-                    return .completed(outcome: .failure)
+                    return .completed(outcome: .failure, status: Int(resp.status.code))
                 }
                 await burn.markUnhelpful(alias: account.alias, refreshToken: account.refreshToken, now: Date())
                 try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                return .completed(outcome: .failure)
+                return .completed(outcome: .failure, status: Int(resp.status.code))
             }
 
             // 429 usage limit -> rotate
@@ -1448,14 +1508,25 @@ public actor ProxyServer {
                     && retryAfter != nil
                     && transientRateLimitRetries >= 3
                 if hasUsageLimit || genericRateLimitExhausted {
+                    await routingLog.write(RoutingDecisionLogRecord(
+                        event: hasUsageLimit ? .semanticLimit : .genericExhausted,
+                        rootRequestID: rootRequestID,
+                        attempt: attemptIndex,
+                        status: Int(resp.status.code),
+                        rateLimitKind: hasUsageLimit ? .semantic : .generic,
+                        retryAfterPresent: retryAfter != nil,
+                        retryAfterSeconds: retryAfter,
+                        reason: hasUsageLimit ? .semanticLimit : .generic429Exhausted,
+                        accountTelemetryID: account.telemetryID
+                    ))
                     let (limit, resetAt) = limitInfo(headers: resp.headers, body: classified.prefix)
                     if mode.isWarmup {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                     guard !exhaustionHandled else {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                     exhaustionHandled = true
                     await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
@@ -1489,9 +1560,34 @@ public actor ProxyServer {
                         )
                     case .switchTo:
                         guard let alternative = outcome.alternative else {
+                            await routingLog.write(RoutingDecisionLogRecord(
+                                event: .noTargetStop,
+                                rootRequestID: rootRequestID,
+                                attempt: attemptIndex,
+                                status: Int(resp.status.code),
+                                rateLimitKind: hasUsageLimit ? .semantic : .generic,
+                                retryAfterPresent: retryAfter != nil,
+                                retryAfterSeconds: retryAfter,
+                                routingDecision: .stop,
+                                reason: .noAlternative,
+                                accountTelemetryID: account.telemetryID
+                            ))
                             try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                            return .completed(outcome: .failure)
+                            return .completed(outcome: .failure, status: Int(resp.status.code))
                         }
+                        await routingLog.write(RoutingDecisionLogRecord(
+                            event: .switchReplay,
+                            rootRequestID: rootRequestID,
+                            attempt: attemptIndex,
+                            status: Int(resp.status.code),
+                            rateLimitKind: hasUsageLimit ? .semantic : .generic,
+                            retryAfterPresent: retryAfter != nil,
+                            retryAfterSeconds: retryAfter,
+                            routingDecision: .switchToAlternative,
+                            reason: .switchReplay,
+                            accountTelemetryID: account.telemetryID,
+                            targetAccountTelemetryID: alternative.telemetryID
+                        ))
                         await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
                         account = alternative
                         await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -1504,9 +1600,21 @@ public actor ProxyServer {
                             finalReplay: finalReplay
                         )
                     case .stopAndNotify:
+                        await routingLog.write(RoutingDecisionLogRecord(
+                            event: .noTargetStop,
+                            rootRequestID: rootRequestID,
+                            attempt: attemptIndex,
+                            status: Int(resp.status.code),
+                            rateLimitKind: hasUsageLimit ? .semantic : .generic,
+                            retryAfterPresent: retryAfter != nil,
+                            retryAfterSeconds: retryAfter,
+                            routingDecision: .stop,
+                            reason: .policyStop,
+                            accountTelemetryID: account.telemetryID
+                        ))
                         await sink.handle(ProxyEvent.taskScoped(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt, mode: mode))
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed(outcome: .failure)
+                        return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                 }
                 // Cloudflare may return a transient edge 429 without Codex's
@@ -1514,6 +1622,18 @@ public actor ProxyServer {
                 // inside the proxy so every Codex client does not immediately
                 // replay the same request in lockstep.
                 if let retryAfter, transientRateLimitRetries < 3 {
+                    await routingLog.write(RoutingDecisionLogRecord(
+                        event: .genericRetryCurrent,
+                        rootRequestID: rootRequestID,
+                        attempt: attemptIndex,
+                        status: Int(resp.status.code),
+                        rateLimitKind: .generic,
+                        retryAfterPresent: true,
+                        retryAfterSeconds: retryAfter,
+                        routingDecision: .retryCurrent,
+                        reason: .genericRetryAfter,
+                        accountTelemetryID: account.telemetryID
+                    ))
                     await self.upstreamRateLimitBackoff.note(retryAfter: retryAfter)
                     return .retryTransient(account: account, retries: transientRateLimitRetries + 1)
                 }
@@ -1523,7 +1643,7 @@ public actor ProxyServer {
                     headers: resp.headers,
                     classified: classified
                 )
-                return .completed(outcome: .failure)
+                return .completed(outcome: .failure, status: Int(resp.status.code))
             }
 
             // A 401 reaching here was suppressed by the burn guard; clearing would defeat it.
@@ -1545,7 +1665,10 @@ public actor ProxyServer {
                 requestKey: interactiveKey
             )
             try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
-            return .completed(outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure)
+            return .completed(
+                outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure,
+                status: Int(resp.status.code)
+            )
         }
     }
 
@@ -1576,6 +1699,24 @@ public actor ProxyServer {
             errorClass: errorClass
         )
         await telemetry.recordAttempt(event)
+    }
+
+    private func recordRoutingTerminal(
+        rootRequestID: UUID,
+        attemptCount: Int,
+        status: Int?,
+        account: Account?,
+        outcome: UsageTelemetryRootOutcome
+    ) async {
+        await routingLog.write(RoutingDecisionLogRecord(
+            event: .requestTerminal,
+            rootRequestID: rootRequestID,
+            attemptCount: attemptCount,
+            status: status,
+            routingDecision: outcome == .success ? .success : .failure,
+            reason: outcome == .success ? .terminalSuccess : .terminalFailure,
+            accountTelemetryID: account?.telemetryID
+        ))
     }
 
     private func telemetryErrorClass(for status: HTTPResponseStatus) -> UsageTelemetryErrorClass? {
