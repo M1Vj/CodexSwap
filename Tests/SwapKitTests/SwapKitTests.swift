@@ -3120,6 +3120,8 @@ actor LocalRoutingUpstream {
         case usageLimitFirst(state: String)
         case nonUsageLimitFirst(state: String)
         case transient429First(state: String, retryAfter: String)
+        case generic429ThenSuccess(state: String, retryAfter: String)
+        case generic429Always(state: String, retryAfter: String)
         case usageLimitAlways(state: String)
         case usageLimitThenUnauthorized(state: String, sessionInvalidated: Bool)
     }
@@ -3226,6 +3228,14 @@ actor LocalRoutingUpstream {
             body = requests == 1
                 ? Data(#"{"detail":"Rate limit reached"}"#.utf8)
                 : try JSONSerialization.data(withJSONObject: ["alias": alias])
+        case .generic429ThenSuccess(let value, _):
+            state = value; status = requests <= 4 ? .tooManyRequests : .ok
+            body = requests <= 4
+                ? Data(#"{"detail":"Rate limit reached"}"#.utf8)
+                : try JSONSerialization.data(withJSONObject: ["alias": alias])
+        case .generic429Always(let value, _):
+            state = value; status = .tooManyRequests
+            body = Data(#"{"detail":"Rate limit reached"}"#.utf8)
         case .usageLimitAlways(let value):
             state = value; status = .tooManyRequests
             body = Data(#"{"error":{"code":"usage_limit_reached"}}"#.utf8)
@@ -3246,8 +3256,13 @@ actor LocalRoutingUpstream {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "application/json")
         headers.add(name: "Content-Length", value: String(body.count))
-        if case .transient429First(_, let retryAfter) = behavior, requests == 1 {
+        switch behavior {
+        case .transient429First(_, let retryAfter) where requests == 1,
+             .generic429ThenSuccess(_, let retryAfter) where requests <= 4,
+             .generic429Always(_, let retryAfter):
             headers.add(name: "Retry-After", value: retryAfter)
+        default:
+            break
         }
         headers.add(name: "x-codex-turn-state", value: state)
         try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
@@ -4155,6 +4170,121 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertEqual(response.1.statusCode, 200)
         let requestCount = await upstream.requestCount()
         XCTAssertEqual(requestCount, 2)
+        await server.stop()
+        await upstream.stop()
+    }
+
+    func testProxyHTTPGeneric429RetryExhaustionFailsOverOnceAndClearsSticky() async throws {
+        let upstream = LocalRoutingUpstream(.generic429ThenSuccess(state: "generic-terminal-state", retryAfter: "0"))
+        let upstreamURL = try await upstream.start()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-generic-429-failover-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let resolverCalls = InvocationCounter()
+        let server = ProxyServer(
+            store: store,
+            config: config,
+            settingsProvider: { .default },
+            freshAlternative: { _, _ in
+                await resolverCalls.increment()
+                return await store.account("b")
+            }
+        )
+        let stickyEnabled = await store.toggleStickyAlias("a")
+        XCTAssertTrue(stickyEnabled)
+        try await server.start()
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(
+            port: port,
+            headers: ["x-codex-turn-metadata": "generic-terminal-turn"]
+        )
+        let aliases = await upstream.aliases()
+        let resolverCount = await resolverCalls.value()
+        let stickyAlias = await store.stickyAlias()
+        let limited = await store.account("a")
+
+        XCTAssertEqual(response.0, "b")
+        XCTAssertEqual(response.1.statusCode, 200)
+        XCTAssertEqual(aliases, ["a", "a", "a", "a", "b"], "three transient retries then one fresh-account replay")
+        XCTAssertEqual(resolverCount, 1, "terminal generic 429 must invoke one failover decision")
+        XCTAssertNil(stickyAlias, "provider limit must clear the sticky hold")
+        XCTAssertNotNil(limited?.disabledUntil["codex"], "terminal generic 429 must mark the account limited")
+
+        await server.stop()
+        await upstream.stop()
+    }
+
+    func testProxyHTTPGeneric429RetryExhaustionWithoutAlternativeReturnsOriginal429() async throws {
+        let upstream = LocalRoutingUpstream(.generic429ThenSuccess(state: "generic-no-fallback-state", retryAfter: "0"))
+        let upstreamURL = try await upstream.start()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-generic-429-no-fallback-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let server = ProxyServer(store: store, config: config, settingsProvider: { .default })
+        let stickyEnabled = await store.toggleStickyAlias("a")
+        XCTAssertTrue(stickyEnabled)
+        try await server.start()
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(
+            port: port,
+            headers: ["x-codex-turn-metadata": "generic-no-fallback-turn"]
+        )
+        let aliases = await upstream.aliases()
+        let stickyAlias = await store.stickyAlias()
+
+        XCTAssertEqual(response.1.statusCode, 429)
+        XCTAssertEqual(aliases, ["a", "a", "a", "a"], "terminal retry exhaustion must not manufacture a replay")
+        XCTAssertNil(stickyAlias, "a terminal provider limit clears the sticky hold even without a fallback")
+
+        await server.stop()
+        await upstream.stop()
+    }
+
+    func testProxyHTTPGeneric429Fallback429IsFinalAndCannotReplayAgain() async throws {
+        let upstream = LocalRoutingUpstream(.generic429Always(state: "generic-fallback-terminal-state", retryAfter: "0"))
+        let upstreamURL = try await upstream.start()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-generic-429-final-replay-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let resolverCalls = InvocationCounter()
+        let server = ProxyServer(
+            store: store,
+            config: config,
+            settingsProvider: { .default },
+            freshAlternative: { _, _ in
+                await resolverCalls.increment()
+                return await store.account("b")
+            }
+        )
+        let stickyEnabled = await store.toggleStickyAlias("a")
+        XCTAssertTrue(stickyEnabled)
+        try await server.start()
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(
+            port: port,
+            headers: ["x-codex-turn-metadata": "generic-final-replay-turn"]
+        )
+        let aliases = await upstream.aliases()
+        let resolverCount = await resolverCalls.value()
+
+        XCTAssertEqual(response.1.statusCode, 429)
+        XCTAssertEqual(aliases, ["a", "a", "a", "a", "b"], "the fallback response is final and must not trigger another loop")
+        XCTAssertEqual(resolverCount, 1)
+
         await server.stop()
         await upstream.stop()
     }

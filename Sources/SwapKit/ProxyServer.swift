@@ -1436,7 +1436,18 @@ public actor ProxyServer {
             // 429 usage limit -> rotate
             if resp.status == .tooManyRequests {
                 let classified = try await collectClassificationPrefix(resp.body, cap: 64 * 1024)
-                if bodyHasUsageLimit(classified.prefix) {
+                let retryAfter = retryAfterDelay(headers: resp.headers)
+                let hasUsageLimit = bodyHasUsageLimit(classified.prefix)
+                // A generic provider 429 is transient only while its bounded
+                // Retry-After retries remain. Once those retries are exhausted,
+                // apply the same single exhaustion decision used by the semantic
+                // usage-limit marker. A 429 without Retry-After remains an
+                // immediate passthrough (the provider did not give us evidence
+                // that rotating this account is safe).
+                let genericRateLimitExhausted = !hasUsageLimit
+                    && retryAfter != nil
+                    && transientRateLimitRetries >= 3
+                if hasUsageLimit || genericRateLimitExhausted {
                     let (limit, resetAt) = limitInfo(headers: resp.headers, body: classified.prefix)
                     if mode.isWarmup {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
@@ -1502,7 +1513,7 @@ public actor ProxyServer {
                 // `usage_limit_reached` marker. Honor its Retry-After and retry
                 // inside the proxy so every Codex client does not immediately
                 // replay the same request in lockstep.
-                if let retryAfter = retryAfterDelay(headers: resp.headers), transientRateLimitRetries < 3 {
+                if let retryAfter, transientRateLimitRetries < 3 {
                     await self.upstreamRateLimitBackoff.note(retryAfter: retryAfter)
                     return .retryTransient(account: account, retries: transientRateLimitRetries + 1)
                 }
