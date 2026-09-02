@@ -146,7 +146,11 @@ case "shim":
     print(RuntimeHandoff.shimScript())
 
 case "proxy":
-    let proxy = ProxyServer(store: store, settingsProvider: settingsProvider, verbose: verboseEnabled)
+    let proxy = FreshAlternativeResolver.makeProxy(
+        store: store,
+        settingsProvider: settingsProvider,
+        verbose: verboseEnabled
+    )
     try await proxy.start()
     guard let url = await proxy.proxyURL() else { print("failed to bind"); exit(1) }
     print("proxy listening at \(url)")
@@ -155,7 +159,11 @@ case "proxy":
 
 case "run":
     guard let codexBin = CodexLauncher.resolveCodexBinary() else { print("codex binary not found"); exit(1) }
-    let proxy = ProxyServer(store: store, settingsProvider: settingsProvider, verbose: verboseEnabled)
+    let proxy = FreshAlternativeResolver.makeProxy(
+        store: store,
+        settingsProvider: settingsProvider,
+        verbose: verboseEnabled
+    )
     try await proxy.start()
     guard let url = await proxy.proxyURL() else { print("failed to bind proxy"); exit(1) }
     FileHandle.standardError.write("CodexSwap proxy at \(url)\n".data(using: .utf8)!)

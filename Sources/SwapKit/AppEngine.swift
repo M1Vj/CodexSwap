@@ -631,27 +631,12 @@ public actor AppEngine {
         currentAlias: String,
         allowedAliases: [String]?
     ) async -> Account? {
-        let allowed = allowedAliases.map(Set.init)
-        let candidates = await store.activeAccounts().filter { account in
-            account.alias != currentAlias
-                && (allowed?.contains(account.alias) ?? true)
-                && !account.isArchived
-                && account.routingEnabled
-        }
-        var verifiedAliases: [String] = []
-        for candidate in candidates {
-            guard let fresh = await store.hydrateFromManagedHome(candidate.alias),
-                  !fresh.accessToken.isEmpty,
-                  !fresh.needsLogin,
-                  let windows = try? await usage.fetch(
-                    accessToken: fresh.accessToken,
-                    accountID: fresh.accountID
-                  ),
-                  !windows.isEmpty else { continue }
-            await store.updateUsage(candidate.alias, windows: windows)
-            verifiedAliases.append(candidate.alias)
-        }
-        return await store.reserveBestEligible(among: verifiedAliases, avoidingLeased: true)
+        await FreshAlternativeResolver.resolve(
+            store: store,
+            usage: usage,
+            currentAlias: currentAlias,
+            allowedAliases: allowedAliases
+        )
     }
 
     private func sanitizedResetCreditStatuses() async -> [String: AccountResetCreditStatus] {
