@@ -86,6 +86,12 @@ public actor AccountStore {
     private let clock: @Sendable () -> Date
     private let persistenceWriter: AccountStorePersistenceWriter
     private var data: StoreData
+    /// The last document this actor loaded or successfully persisted. A write
+    /// can be based on an older in-memory snapshot when another process has
+    /// updated the file, so persistence compares the current document with
+    /// this baseline and applies only fields changed by this actor to the
+    /// latest locked document.
+    private var persistedData: StoreData
     private var persistedModificationDate: Date?
     public private(set) var strategy: RotationStrategy
     /// Aliases currently assessed as draining from other users' activity (smart switch).
@@ -187,6 +193,7 @@ public actor AccountStore {
             needsMigration = true
         }
         self.data = loaded
+        self.persistedData = loaded
         self.persistedModificationDate = Self.modificationDate(for: url)
         self.stickyAliasRuntime = loaded.stickyAlias
         self.stickyUsageLimitOverrideRuntime = loaded.stickyUsageLimitOverride && loaded.stickyAlias != nil
@@ -210,6 +217,7 @@ public actor AccountStore {
             loaded.stickyUsageLimitOverride = false
         }
         data = loaded
+        persistedData = loaded
         persistedModificationDate = currentDate
         stickyAliasRuntime = loaded.stickyAlias
         stickyUsageLimitOverrideRuntime = loaded.stickyUsageLimitOverride && loaded.stickyAlias != nil
@@ -236,40 +244,33 @@ public actor AccountStore {
         preservingActiveAlias: Bool = true,
         preservingStickyAlias: Bool = true,
         clearingActiveAliases: Set<String> = [],
-        changedUsageLimitAliases: Set<String> = [],
         repairingStickyUsageLimitOverride: Bool = false
     ) {
         let encoder = JSONEncoder.codex
         _ = Self.withStoreLock(url) {
-            var snapshot = data
-            if let latest = Self.loadFrom(url) {
-                if preservingRanking {
-                    Self.mergePersistedRanking(into: &snapshot, from: latest)
-                }
-                if preservingActiveAlias {
-                    snapshot.activeAlias = latest.activeAlias
-                }
-                if preservingStickyAlias {
-                    snapshot.stickyAlias = latest.stickyAlias
-                    snapshot.stickyUsageLimitOverride = latest.stickyUsageLimitOverride
-                }
-                Self.mergePersistedUsageLimitSettings(
-                    into: &snapshot,
-                    from: latest,
-                    excluding: changedUsageLimitAliases
-                )
-                if !clearingActiveAliases.isEmpty {
-                    snapshot.activeAlias = latest.activeAlias.flatMap { activeAlias in
-                        clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
-                    }
-                }
-            }
+            let latest = Self.loadFrom(url)
+            var snapshot = Self.mergePersistedChanges(
+                local: data,
+                baseline: persistedData,
+                latest: latest,
+                preservingRanking: preservingRanking,
+                preservingActiveAlias: preservingActiveAlias,
+                preservingStickyAlias: preservingStickyAlias,
+                clearingActiveAliases: clearingActiveAliases
+            )
             if repairingStickyUsageLimitOverride, snapshot.stickyAlias == nil {
                 snapshot.stickyUsageLimitOverride = false
             }
             guard let raw = try? encoder.encode(snapshot) else { return }
+            // JSON's ISO-8601 encoding intentionally drops sub-second Date
+            // precision. Keep the actor's baseline in the same canonical form
+            // as the bytes on disk; otherwise an untouched usage-history or
+            // telemetry field would look changed on every subsequent write and
+            // lose every other update to a stale/latest conflict.
+            let committed = (try? JSONDecoder.codex.decode(StoreData.self, from: raw)) ?? snapshot
             Self.persistUnlocked(raw, to: url)
-            data = snapshot
+            data = committed
+            persistedData = committed
             persistedModificationDate = Self.modificationDate(for: url)
         }
     }
@@ -342,37 +343,249 @@ public actor AccountStore {
         }
     }
 
-    private static func mergePersistedRanking(into local: inout StoreData, from latest: StoreData) {
-        for index in local.accounts.indices {
-            let account = local.accounts[index]
-            let latestAccount = latest.accounts.first {
-                !account.accountID.isEmpty && !$0.accountID.isEmpty && $0.accountID == account.accountID
-            } ?? latest.accounts.first { $0.alias == account.alias }
-            if let latestAccount {
-                local.accounts[index].priority = latestAccount.priority
+    /// Merges a stale actor's changed fields onto the newest document while the
+    /// caller holds the store lock. The old implementation started from the
+    /// actor's whole `data` value and preserved only a few special fields,
+    /// allowing stale token/usage writes to roll back newer routing state. This
+    /// merge treats the actor's last loaded document as a three-way baseline:
+    /// unchanged local fields come from `latest`, while changed local fields
+    /// carry the actor's explicit mutation forward.
+    private static func mergePersistedChanges(
+        local: StoreData,
+        baseline: StoreData,
+        latest: StoreData?,
+        preservingRanking: Bool,
+        preservingActiveAlias: Bool,
+        preservingStickyAlias: Bool,
+        clearingActiveAliases: Set<String>
+    ) -> StoreData {
+        guard let latest else { return local }
+        var merged = latest
+
+        if !preservingActiveAlias {
+            merged.activeAlias = mergeValue(
+                local.activeAlias,
+                baseline: baseline.activeAlias,
+                latest: latest.activeAlias
+            )
+        }
+        if !clearingActiveAliases.isEmpty {
+            merged.activeAlias = latest.activeAlias.flatMap { activeAlias in
+                clearingActiveAliases.contains(activeAlias) ? nil : activeAlias
             }
+        }
+
+        if !preservingStickyAlias {
+            merged.stickyAlias = mergeValue(
+                local.stickyAlias,
+                baseline: baseline.stickyAlias,
+                latest: latest.stickyAlias
+            )
+            merged.stickyUsageLimitOverride = mergeValue(
+                local.stickyUsageLimitOverride,
+                baseline: baseline.stickyUsageLimitOverride,
+                latest: latest.stickyUsageLimitOverride
+            )
+        }
+        if merged.stickyAlias == nil {
+            // The override bit is coupled to its alias. Preserve this invariant
+            // even when a stale writer clears only one side of the pair.
+            merged.stickyUsageLimitOverride = false
+        }
+
+        merged.accounts = mergePersistedAccounts(
+            local: local.accounts,
+            baseline: baseline.accounts,
+            latest: latest.accounts,
+            preservingRanking: preservingRanking
+        )
+        return merged
+    }
+
+    /// A three-way field merge. A field changed by only one writer carries
+    /// forward; when both writers changed it, the document read under the
+    /// lock is newer and wins the conflict.
+    private static func mergeValue<Value: Equatable>(
+        _ local: Value,
+        baseline: Value,
+        latest: Value
+    ) -> Value {
+        if local == baseline { return latest }
+        if latest == baseline { return local }
+        return latest
+    }
+
+    private static func mergePersistedAccounts(
+        local: [Account],
+        baseline: [Account],
+        latest: [Account],
+        preservingRanking: Bool
+    ) -> [Account] {
+        let localBaseline = pairAccounts(baseline, with: local)
+        let latestBaseline = pairAccounts(baseline, with: latest)
+        var consumedLocal = Set<Int>()
+        var result: [Account] = []
+
+        for latestIndex in latest.indices {
+            let latestAccount = latest[latestIndex]
+            if let baselineIndex = latestBaseline.firstIndex(of: latestIndex) {
+                // The local writer removed a baseline row. Keep that removal;
+                // never reintroduce an account another writer intentionally
+                // deleted from its own snapshot.
+                guard let localIndex = localBaseline[baselineIndex] else { continue }
+                consumedLocal.insert(localIndex)
+                result.append(
+                    mergePersistedAccount(
+                        local: local[localIndex],
+                        baseline: baseline[baselineIndex],
+                        latest: latestAccount,
+                        preservingRanking: preservingRanking
+                    )
+                )
+                continue
+            }
+
+            // This row was added after the baseline. If both writers added the
+            // same stable account, keep the locked document as the winner;
+            // otherwise retain the latest writer's new row unchanged.
+            if let localIndex = local.indices.first(where: {
+                !consumedLocal.contains($0)
+                    && !localBaseline.contains($0)
+                    && accountsMatch(local[$0], latestAccount)
+            }) {
+                consumedLocal.insert(localIndex)
+            }
+            result.append(latestAccount)
+        }
+
+        // Append accounts added only by this actor. Rows that were in the
+        // baseline but disappeared from `latest` are deliberately omitted.
+        for localIndex in local.indices where !localBaseline.contains(localIndex)
+                                           && !consumedLocal.contains(localIndex) {
+            let localAccount = local[localIndex]
+            // Aliases are user-facing keys and must remain unique even when an
+            // external writer replaced an account with a new stable identity.
+            guard !latest.contains(where: {
+                accountsMatch($0, localAccount) || $0.alias == localAccount.alias
+            }) else { continue }
+            result.append(localAccount)
+        }
+        return result
+    }
+
+    /// Returns, for each reference row, the unique candidate index that
+    /// represents it, or nil when that writer removed the row.
+    private static func pairAccounts(_ reference: [Account], with candidates: [Account]) -> [Int?] {
+        var consumed = Set<Int>()
+        return reference.map { account in
+            guard let index = candidates.indices
+                .filter({ !consumed.contains($0) && accountsMatch(account, candidates[$0]) })
+                .sorted(by: { accountMatchStrength(account, candidates[$0]) > accountMatchStrength(account, candidates[$1]) })
+                .first else {
+                return nil
+            }
+            consumed.insert(index)
+            return index
         }
     }
 
-    /// Preserves per-account user-owned limit settings when a different process
-    /// persists usage, tokens, ranking, or routing state from an older snapshot.
-    /// Callers changing a limit pass that alias in `excluding`; all other aliases
-    /// adopt the newest persisted setting under the same account identity.
-    private static func mergePersistedUsageLimitSettings(
-        into local: inout StoreData,
-        from latest: StoreData,
-        excluding changedAliases: Set<String>
-    ) {
-        for index in local.accounts.indices {
-            let account = local.accounts[index]
-            guard !changedAliases.contains(account.alias) else { continue }
-            let latestAccount = latest.accounts.first {
-                !account.accountID.isEmpty && !$0.accountID.isEmpty && $0.accountID == account.accountID
-            } ?? latest.accounts.first { $0.alias == account.alias }
-            if let latestAccount {
-                local.accounts[index].usageLimitSettings = latestAccount.usageLimitSettings
-            }
+    private static func accountMatchStrength(_ lhs: Account, _ rhs: Account) -> Int {
+        if !lhs.accountID.isEmpty && !rhs.accountID.isEmpty && lhs.accountID == rhs.accountID { return 3 }
+        if lhs.telemetryID != Account.missingTelemetryID,
+           rhs.telemetryID != Account.missingTelemetryID,
+           lhs.telemetryID == rhs.telemetryID { return 2 }
+        if lhs.accountID.isEmpty || rhs.accountID.isEmpty { return lhs.alias == rhs.alias ? 1 : 0 }
+        return 0
+    }
+
+    private static func mergePersistedAccount(
+        local: Account,
+        baseline: Account,
+        latest: Account,
+        preservingRanking: Bool
+    ) -> Account {
+        var merged = latest
+        merged.alias = mergeValue(local.alias, baseline: baseline.alias, latest: latest.alias)
+        merged.email = mergeValue(local.email, baseline: baseline.email, latest: latest.email)
+        merged.accountID = mergeValue(local.accountID, baseline: baseline.accountID, latest: latest.accountID)
+        merged.planType = mergeValue(local.planType, baseline: baseline.planType, latest: latest.planType)
+        merged.accessToken = mergeValue(local.accessToken, baseline: baseline.accessToken, latest: latest.accessToken)
+        merged.refreshToken = mergeValue(local.refreshToken, baseline: baseline.refreshToken, latest: latest.refreshToken)
+        merged.idToken = mergeValue(local.idToken, baseline: baseline.idToken, latest: latest.idToken)
+        if !preservingRanking {
+            merged.priority = mergeValue(local.priority, baseline: baseline.priority, latest: latest.priority)
         }
+        merged.disabledUntil = mergeCooldowns(
+            local: local.disabledUntil,
+            baseline: baseline.disabledUntil,
+            latest: latest.disabledUntil
+        )
+        merged.needsLogin = mergeValue(local.needsLogin, baseline: baseline.needsLogin, latest: latest.needsLogin)
+        merged.lastUsedAt = mergeValue(local.lastUsedAt, baseline: baseline.lastUsedAt, latest: latest.lastUsedAt)
+        merged.usage = mergeUsageWindows(local: local.usage, baseline: baseline.usage, latest: latest.usage)
+        merged.managedHomePath = mergeValue(local.managedHomePath, baseline: baseline.managedHomePath, latest: latest.managedHomePath)
+        merged.routingEnabled = mergeValue(local.routingEnabled, baseline: baseline.routingEnabled, latest: latest.routingEnabled)
+        merged.usageStats = mergeValue(local.usageStats, baseline: baseline.usageStats, latest: latest.usageStats)
+        merged.usageHistory = mergeValue(local.usageHistory, baseline: baseline.usageHistory, latest: latest.usageHistory)
+        merged.lastServedByUs = mergeValue(local.lastServedByUs, baseline: baseline.lastServedByUs, latest: latest.lastServedByUs)
+        merged.archivedAt = mergeValue(local.archivedAt, baseline: baseline.archivedAt, latest: latest.archivedAt)
+        merged.routingPausedAt = mergeValue(local.routingPausedAt, baseline: baseline.routingPausedAt, latest: latest.routingPausedAt)
+        merged.telemetryID = mergeValue(local.telemetryID, baseline: baseline.telemetryID, latest: latest.telemetryID)
+        merged.usageLimitSettings = mergeValue(
+            local.usageLimitSettings,
+            baseline: baseline.usageLimitSettings,
+            latest: latest.usageLimitSettings
+        )
+        return merged
+    }
+
+    private static func mergeCooldowns(
+        local: [String: Date],
+        baseline: [String: Date],
+        latest: [String: Date]
+    ) -> [String: Date] {
+        let keys = Set(local.keys).union(baseline.keys).union(latest.keys)
+        var merged: [String: Date] = [:]
+        for key in keys {
+            let value = mergeValue(local[key], baseline: baseline[key], latest: latest[key])
+            if let value { merged[key] = value }
+        }
+        return merged
+    }
+
+    private static func mergeUsageWindows(
+        local: [UsageWindow],
+        baseline: [UsageWindow],
+        latest: [UsageWindow]
+    ) -> [UsageWindow] {
+        let localByKey = Dictionary(uniqueKeysWithValues: local.map { (usageWindowIdentity($0), $0) })
+        let baselineByKey = Dictionary(uniqueKeysWithValues: baseline.map { (usageWindowIdentity($0), $0) })
+        let latestByKey = Dictionary(uniqueKeysWithValues: latest.map { (usageWindowIdentity($0), $0) })
+        let keys = Set(localByKey.keys).union(baselineByKey.keys).union(latestByKey.keys)
+        var selected: [String: UsageWindow] = [:]
+        for key in keys {
+            guard let value = mergeValue(localByKey[key], baseline: baselineByKey[key], latest: latestByKey[key]) else {
+                continue
+            }
+            selected[key] = value
+        }
+        var merged = latest.compactMap { selected.removeValue(forKey: usageWindowIdentity($0)) }
+        merged.append(contentsOf: local.compactMap { selected.removeValue(forKey: usageWindowIdentity($0)) })
+        return merged
+    }
+
+    private static func accountsMatch(_ lhs: Account, _ rhs: Account) -> Bool {
+        if !lhs.accountID.isEmpty && !rhs.accountID.isEmpty {
+            if lhs.accountID == rhs.accountID { return true }
+            if lhs.telemetryID != Account.missingTelemetryID,
+               rhs.telemetryID != Account.missingTelemetryID,
+               lhs.telemetryID == rhs.telemetryID { return true }
+            return false
+        }
+        if lhs.telemetryID != Account.missingTelemetryID,
+           rhs.telemetryID != Account.missingTelemetryID,
+           lhs.telemetryID == rhs.telemetryID { return true }
+        return lhs.alias == rhs.alias
     }
 
     private static func hasDenseActiveRanks(_ data: StoreData) -> Bool {
@@ -415,8 +628,7 @@ public actor AccountStore {
             stickyCleared = clearStickyIfNeeded(alias)
         }
         persist(
-            preservingStickyAlias: !stickyCleared,
-            changedUsageLimitAliases: [alias]
+            preservingStickyAlias: !stickyCleared
         )
         return data.accounts[i]
     }
@@ -454,6 +666,7 @@ public actor AccountStore {
                 && projected.isUsageLimitReached
             guard confirming || !immediatelyPausesCurrent else {
                 data = latest
+                persistedData = latest
                 persistedModificationDate = Self.modificationDate(for: url)
                 stickyAliasRuntime = latest.stickyAlias
                 stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride && latest.stickyAlias != nil
@@ -479,6 +692,7 @@ public actor AccountStore {
                 return
             }
             data = latest
+            persistedData = latest
             persistedModificationDate = Self.modificationDate(for: url)
             stickyAliasRuntime = latest.stickyAlias
             stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride && latest.stickyAlias != nil
@@ -533,6 +747,11 @@ public actor AccountStore {
     private func clearRuntimeHolds(_ alias: String) -> Bool {
         let stickyCleared = clearStickyIfNeeded(alias)
         if drainingHoldAlias == alias { drainingHoldAlias = nil }
+        // A semantic provider invalidation supersedes a prior smart-switch
+        // observation. Leaving the alias in this runtime set would make it the
+        // first candidate again after its cooldown expires.
+        drainingAliases.remove(alias)
+        drainingObservedAt.removeValue(forKey: alias)
         lunaRejectedUntil.removeValue(forKey: alias)
         return stickyCleared
     }
@@ -871,7 +1090,6 @@ public actor AccountStore {
     }
 
     public func markLimited(_ alias: String, limit: String, resetAt: Date?, now: Date = Date(), fallbackCooldown: TimeInterval) {
-        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         clearRuntimeHolds(alias)
         data.accounts[i].disabledUntil[limit] = resetAt ?? now.addingTimeInterval(fallbackCooldown)
@@ -879,7 +1097,6 @@ public actor AccountStore {
     }
 
     public func markNeedsLoginOnly(_ alias: String) {
-        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         clearRuntimeHolds(alias)
         data.accounts[i].needsLogin = true
@@ -1028,7 +1245,6 @@ public actor AccountStore {
     }
 
     public func updateUsage(_ alias: String, windows: [UsageWindow]) {
-        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         // wham/usage always reports at least one window for an entitled account; a transient
         // empty response must not wipe a real reading off the display.
@@ -1442,7 +1658,6 @@ public actor AccountStore {
     }
 
     public func setRoutingEnabled(_ alias: String, enabled: Bool, now: Date? = nil) {
-        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         if data.accounts[i].isArchived, enabled { return }
         let wasEnabled = data.accounts[i].routingEnabled
@@ -1462,7 +1677,10 @@ public actor AccountStore {
         }
         if !enabled, data.activeAlias == alias { data.activeAlias = nil }
         if !enabled { clearRuntimeHolds(alias) }
-        persist(preservingStickyAlias: enabled)
+        // Disabling an account also clears a local active selection. Keep that
+        // intent when it does not conflict with a newer active-alias change;
+        // enabling leaves the latest active selection untouched.
+        persist(preservingActiveAlias: enabled, preservingStickyAlias: enabled)
     }
 }
 
