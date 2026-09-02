@@ -12,6 +12,22 @@ public enum FreshAlternativeResolver {
         currentAlias: String,
         allowedAliases: [String]?
     ) async -> Account? {
+        await resolve(
+            store: store,
+            usage: usage,
+            currentAlias: currentAlias,
+            allowedAliases: allowedAliases,
+            beforeHydrate: nil
+        )
+    }
+
+    static func resolve(
+        store: AccountStore,
+        usage: any UsageFetching,
+        currentAlias: String,
+        allowedAliases: [String]?,
+        beforeHydrate: (@Sendable (String) async -> Void)?
+    ) async -> Account? {
         let allowed = allowedAliases.map(Set.init)
         let candidates = await store.activeAccounts().filter { account in
             account.alias != currentAlias
@@ -21,7 +37,10 @@ public enum FreshAlternativeResolver {
         }
         var verifiedAliases: [String] = []
         for candidate in candidates {
+            await beforeHydrate?(candidate.alias)
             guard let fresh = await store.hydrateFromManagedHome(candidate.alias),
+                  !fresh.isArchived,
+                  fresh.routingEnabled,
                   !fresh.accessToken.isEmpty,
                   !fresh.needsLogin,
                   let windows = try? await usage.fetch(

@@ -125,6 +125,53 @@ final class AppEngineFreshAlternativeTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
+    func testFreshAlternativeRechecksExternalArchiveAndRoutingStateAfterSnapshot() async throws {
+        let accountStoreURL = storeURL("hydration-race")
+        let store = AccountStore(url: accountStoreURL)
+        defer { try? FileManager.default.removeItem(at: accountStoreURL) }
+
+        await store.upsert(Account(alias: "a", accountID: "id-a", accessToken: "token-a", priority: 3))
+        await store.upsert(Account(alias: "b", accountID: "id-b", accessToken: "token-b", priority: 2))
+        await store.upsert(Account(alias: "c", accountID: "id-c", accessToken: "token-c", priority: 1))
+
+        // A second store represents an external app/CLI writer. The resolver's
+        // candidate list is captured before this writer changes each candidate.
+        let externalStore = AccountStore(url: accountStoreURL)
+        let usage = FreshAlternativeUsage(values: [
+            "id-b": [window("5h", 10, seconds: 18_000)],
+            "id-c": [window("5h", 10, seconds: 18_000)]
+        ])
+
+        let selected = await FreshAlternativeResolver.resolve(
+            store: store,
+            usage: usage,
+            currentAlias: "a",
+            allowedAliases: ["a", "b", "c"],
+            beforeHydrate: { alias in
+                switch alias {
+                case "b":
+                    _ = await externalStore.archive(alias: alias)
+                case "c":
+                    await externalStore.setRoutingEnabled(alias, enabled: false)
+                default:
+                    break
+                }
+            }
+        )
+
+        XCTAssertNil(selected)
+        let calls = await usage.calls()
+        XCTAssertTrue(calls.isEmpty, "usage must not be fetched after external state changes")
+        let archivedValue = await store.account("b")
+        let archived = try XCTUnwrap(archivedValue)
+        XCTAssertTrue(archived.isArchived)
+        XCTAssertFalse(archived.routingEnabled)
+        let disabledValue = await store.account("c")
+        let disabled = try XCTUnwrap(disabledValue)
+        XCTAssertFalse(disabled.isArchived)
+        XCTAssertFalse(disabled.routingEnabled)
+    }
+
     func testFreshAlternativeAvoidsLeasedEligibleAccountButUsesLeasedFallbackWhenAllAreLeased() async throws {
         let accountStoreURL = storeURL("leases")
         let store = AccountStore(url: accountStoreURL)
