@@ -3135,8 +3135,15 @@ actor LocalRoutingUpstream {
     private var seenAliases: [String] = []
     private var requests = 0
     private var requestsByAlias: [String: Int] = [:]
+    private let onRequest: (@Sendable (String, Int) async -> Void)?
 
-    init(_ behavior: Behavior) { self.behavior = behavior }
+    init(
+        _ behavior: Behavior,
+        onRequest: (@Sendable (String, Int) async -> Void)? = nil
+    ) {
+        self.behavior = behavior
+        self.onRequest = onRequest
+    }
 
     func start() async throws -> URL {
         let channel = try await ServerBootstrap(group: group)
@@ -3211,6 +3218,7 @@ actor LocalRoutingUpstream {
         seenAliases.append(alias)
         let aliasRequest = requestsByAlias[alias, default: 0] + 1
         requestsByAlias[alias] = aliasRequest
+        await onRequest?(alias, aliasRequest)
         let state: String
         let status: HTTPResponseStatus
         let body: Data
@@ -4198,6 +4206,92 @@ final class TurnPinningTests: XCTestCase {
 
         await server.stop()
         await upstream.stop()
+    }
+
+    func testProxyHTTPGenericFailoverAdmitsNewlyEnabledCandidateAfterSnapshotBudget() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-dynamic-failover-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 2))
+        await store.upsert(account("c", priority: 1))
+        await store.setRoutingEnabled("c", enabled: false)
+
+        let upstream = LocalRoutingUpstream(
+            .generic429ForAliases(
+                state: "dynamic-generic-failover-state",
+                aliases: ["a", "b"],
+                retryAfter: "0"
+            ),
+            onRequest: { alias, aliasRequest in
+                if alias == "b", aliasRequest == 4 {
+                    await store.setRoutingEnabled("c", enabled: true)
+                }
+            }
+        )
+        let upstreamURL = try await upstream.start()
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        var settings = Settings.default
+        settings.interactiveExhaustionPolicy = .switchFirst
+        let capturedSettings = settings
+        let resolverCalls = InvocationCounter()
+        let routingLog = RoutingDecisionLog(url: root.appendingPathComponent("routing-decisions-v1.jsonl"))
+        let server = ProxyServer(
+            store: store,
+            config: config,
+            settingsProvider: { capturedSettings },
+            freshAlternative: { _, _ in
+                await resolverCalls.increment()
+                switch await resolverCalls.value() {
+                case 1: return await store.account("b")
+                case 2: return await store.account("c")
+                default: return nil
+                }
+            },
+            routingLog: routingLog
+        )
+        let stickyEnabled = await store.toggleStickyAlias("a")
+        XCTAssertTrue(stickyEnabled)
+        try await server.start()
+        defer {
+            Task {
+                await server.stop()
+                await upstream.stop()
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(
+            port: port,
+            headers: ["x-codex-turn-metadata": "dynamic-generic-failover-turn"]
+        )
+
+        XCTAssertEqual(response.0, "c")
+        XCTAssertEqual(response.1.statusCode, 200)
+        let aliases = await upstream.aliases()
+        XCTAssertEqual(aliases, [
+            "a", "a", "a", "a",
+            "b", "b", "b", "b",
+            "c"
+        ])
+        let counts = Dictionary(grouping: aliases, by: { $0 }).mapValues(\.count)
+        XCTAssertTrue(counts.values.allSatisfy { $0 <= 4 })
+        let resolverCount = await resolverCalls.value()
+        let stickyAlias = await store.stickyAlias()
+        let leases = await store.routingLeaseAliases()
+        XCTAssertEqual(resolverCount, 2)
+        XCTAssertNil(stickyAlias)
+        XCTAssertTrue(leases.isEmpty)
+
+        await server.stop()
+        await upstream.stop()
+        let records = try String(decoding: Data(contentsOf: routingLog.fileURL), as: UTF8.self)
+            .split(separator: "\n")
+            .map { try JSONDecoder().decode(RoutingDecisionLogRecord.self, from: Data($0.utf8)) }
+        XCTAssertEqual(records.last?.event, .requestTerminal)
+        XCTAssertEqual(records.last?.attemptCount, 9)
     }
 
     func testProxyHTTPGenericFailoverTriesNextAccountAfterFallbackRetryExhaustion() async throws {

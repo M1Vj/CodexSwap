@@ -639,9 +639,12 @@ private enum ProxyAttemptResult: Sendable {
 /// concurrent roots cannot exclude one another's accounts.
 private actor ProxyAttemptedAccounts {
     private var aliases: Set<String>
+    private var candidateAliases: Set<String>
 
-    init(initialAlias: String) {
+    init(initialAlias: String, candidateAliases: Set<String>) {
         aliases = [initialAlias]
+        self.candidateAliases = candidateAliases
+        self.candidateAliases.insert(initialAlias)
     }
 
     func untried(_ candidates: [String]) -> [String] {
@@ -649,7 +652,15 @@ private actor ProxyAttemptedAccounts {
     }
 
     func claim(_ alias: String) -> Bool {
-        aliases.insert(alias).inserted
+        let inserted = aliases.insert(alias).inserted
+        if inserted {
+            candidateAliases.insert(alias)
+        }
+        return inserted
+    }
+
+    func maxAttempts() -> Int {
+        max(8, candidateAliases.count * 4)
     }
 }
 
@@ -1209,7 +1220,6 @@ public actor ProxyServer {
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
         }
-        let attemptedAccounts = ProxyAttemptedAccounts(initialAlias: account.alias)
         await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
@@ -1218,11 +1228,13 @@ public actor ProxyServer {
         var finalReplay = false
         var transientRateLimitRetries = 0
         var attempts = 0
-        // Bound root work by the active roster: a numeric Retry-After 429 can
-        // consume one initial dispatch plus three retries per account, while
-        // the per-root tracker prevents revisiting an account. Keep the
-        // historical minimum for small rosters so stale 401/429 state remains
-        // bounded even when no alternative exists.
+        // Bound root work by the finite active roster: a numeric Retry-After
+        // 429 can consume one initial dispatch plus three retries per account,
+        // while the per-root tracker prevents revisiting an account. Newly
+        // validated candidates are added to that roster by the tracker and
+        // receive the same four-attempt budget. Keep the historical minimum
+        // for small rosters so stale 401/429 state remains bounded even when
+        // no alternative exists.
         let activeRoutingCandidates = await store.activeAccounts().filter { candidate in
             guard candidate.routingEnabled else { return false }
             if case .task(let allowed, _) = mode { return allowed.contains(candidate.alias) }
@@ -1230,8 +1242,13 @@ public actor ProxyServer {
         }
         var rootCandidateAliases = Set(activeRoutingCandidates.map(\.alias))
         rootCandidateAliases.insert(account.alias)
-        let maxAttempts = max(8, rootCandidateAliases.count * 4)
-        while attempts < maxAttempts {
+        let attemptedAccounts = ProxyAttemptedAccounts(
+            initialAlias: account.alias,
+            candidateAliases: rootCandidateAliases
+        )
+        while true {
+            let maxAttempts = await attemptedAccounts.maxAttempts()
+            guard attempts < maxAttempts else { break }
             attempts += 1
             let target = targetURL(for: rawPath, query: query)
             let result: ProxyAttemptResult
@@ -1354,16 +1371,24 @@ public actor ProxyServer {
         let resolveAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account? = { currentAlias, allowedAliases in
             let candidates: [String]
             if let allowedAliases {
-                candidates = allowedAliases
+                let allowed = Set(allowedAliases)
+                candidates = await store.activeAccounts()
+                    .filter { $0.routingEnabled && allowed.contains($0.alias) }
+                    .map(\.alias)
             } else {
-                candidates = await store.activeAccounts().map(\.alias)
+                candidates = await store.activeAccounts()
+                    .filter(\.routingEnabled)
+                    .map(\.alias)
             }
             let untried = await attemptedAccounts.untried(candidates.filter { $0 != currentAlias })
             guard !untried.isEmpty,
                   let alternative = await freshAlternative(currentAlias, untried) else {
                 return nil
             }
-            guard await attemptedAccounts.claim(alternative.alias) else { return nil }
+            guard untried.contains(alternative.alias),
+                  await attemptedAccounts.claim(alternative.alias) else {
+                return nil
+            }
             return alternative
         }
         return try await withRoutingLease(
