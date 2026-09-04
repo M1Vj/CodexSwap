@@ -634,6 +634,25 @@ private enum ProxyAttemptResult: Sendable {
     case retryTransient(account: Account, retries: Int)
 }
 
+/// Tracks account aliases already attempted by one root request. The tracker is
+/// intentionally scoped to `serveRequest`, rather than the proxy actor, so
+/// concurrent roots cannot exclude one another's accounts.
+private actor ProxyAttemptedAccounts {
+    private var aliases: Set<String>
+
+    init(initialAlias: String) {
+        aliases = [initialAlias]
+    }
+
+    func untried(_ candidates: [String]) -> [String] {
+        candidates.filter { !aliases.contains($0) }
+    }
+
+    func claim(_ alias: String) -> Bool {
+        aliases.insert(alias).inserted
+    }
+}
+
 public actor ProxyServer {
     enum LifecycleError: Error {
         case alreadyStopped
@@ -1190,6 +1209,7 @@ public actor ProxyServer {
             try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
             return
         }
+        let attemptedAccounts = ProxyAttemptedAccounts(initialAlias: account.alias)
         await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
@@ -1198,8 +1218,20 @@ public actor ProxyServer {
         var finalReplay = false
         var transientRateLimitRetries = 0
         var attempts = 0
-        // Bounded so stale reset timestamps or repeated upstream 401/429s can never rotate forever.
-        while attempts < 8 {
+        // Bound root work by the active roster: a numeric Retry-After 429 can
+        // consume one initial dispatch plus three retries per account, while
+        // the per-root tracker prevents revisiting an account. Keep the
+        // historical minimum for small rosters so stale 401/429 state remains
+        // bounded even when no alternative exists.
+        let activeRoutingCandidates = await store.activeAccounts().filter { candidate in
+            guard candidate.routingEnabled else { return false }
+            if case .task(let allowed, _) = mode { return allowed.contains(candidate.alias) }
+            return true
+        }
+        var rootCandidateAliases = Set(activeRoutingCandidates.map(\.alias))
+        rootCandidateAliases.insert(account.alias)
+        let maxAttempts = max(8, rootCandidateAliases.count * 4)
+        while attempts < maxAttempts {
             attempts += 1
             let target = targetURL(for: rawPath, query: query)
             let result: ProxyAttemptResult
@@ -1221,7 +1253,8 @@ public actor ProxyServer {
                     attemptIndex: attempts,
                     requestCategory: requestCategory,
                     requestModel: requestModel,
-                    transientRateLimitRetries: transientRateLimitRetries
+                    transientRateLimitRetries: transientRateLimitRetries,
+                    attemptedAccounts: attemptedAccounts
                 )
             } catch {
                 await telemetry?.recordRootTerminal(.init(
@@ -1258,11 +1291,13 @@ public actor ProxyServer {
                 )
                 return
             case let .retry(next, refreshed, handled, replay):
+                _ = await attemptedAccounts.claim(next.alias)
                 account = next
                 tokenRefreshed = refreshed
                 exhaustionHandled = handled
                 finalReplay = replay
             case let .retryTransient(next, retries):
+                _ = await attemptedAccounts.claim(next.alias)
                 account = next
                 tokenRefreshed = false
                 finalReplay = false
@@ -1303,7 +1338,8 @@ public actor ProxyServer {
         attemptIndex: Int,
         requestCategory: UsageTelemetryRequestCategory,
         requestModel: String,
-        transientRateLimitRetries initialTransientRateLimitRetries: Int
+        transientRateLimitRetries initialTransientRateLimitRetries: Int,
+        attemptedAccounts: ProxyAttemptedAccounts
     ) async throws -> ProxyAttemptResult {
         // Capture the sendable collaborators before handing the attempt to the
         // nonisolated lease wrapper. Actor methods below are called explicitly
@@ -1315,6 +1351,30 @@ public actor ProxyServer {
         let routingLog = self.routingLog
         let exhaustionHandler = self.exhaustionHandler
         let freshAlternative = self.freshAlternative
+        let resolveAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account? = { currentAlias, allowedAliases in
+            let candidates: [String]
+            if let allowedAliases {
+                candidates = allowedAliases
+            } else {
+                candidates = await store.activeAccounts().map(\.alias)
+            }
+            let untried = await attemptedAccounts.untried(candidates.filter { $0 != currentAlias })
+            guard !untried.isEmpty,
+                  let alternative = await freshAlternative(currentAlias, untried) else {
+                return nil
+            }
+            guard await attemptedAccounts.claim(alternative.alias) else {
+                // FreshAlternativeResolver reserves its return before handing it
+                // back. Release that provisional lease if a custom resolver (or
+                // a stale race) returned an alias this root already attempted;
+                // never touch a lease owned by another request.
+                if await store.consumeRoutingReservation(alternative.alias) {
+                    await store.releaseRoutingLease(alternative.alias)
+                }
+                return nil
+            }
+            return alternative
+        }
         return try await withRoutingLease(
             store: store,
             alias: initialAccount.alias
@@ -1372,8 +1432,9 @@ public actor ProxyServer {
                 errorClass: self.telemetryErrorClass(for: resp.status)
             )
 
-            // A quota decision permits exactly one replay. Its response is final: do
-            // not refresh, fail over, or make another exhaustion decision from it.
+            // A quota reset decision permits exactly one replay. Its response is
+            // final; alternative-account replays remain eligible for the bounded
+            // failover path below.
             if finalReplay {
                 await self.recordActivity(account.alias)
                 try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
@@ -1524,10 +1585,67 @@ public actor ProxyServer {
                         try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
                         return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
-                    guard !exhaustionHandled else {
-                        try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
-                        return .completed(outcome: .failure, status: Int(resp.status.code))
+
+                    // A fallback account can be exhausted independently of the
+                    // root account. Continue failover with the next untried
+                    // candidate, while preserving the final replay guard for a
+                    // successful quota reset.
+                    if exhaustionHandled {
+                        guard !finalReplay else {
+                            try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                            return .completed(outcome: .failure, status: Int(resp.status.code))
+                        }
+                        await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
+                        if requestModel == "gpt-5.6-luna" {
+                            await store.recordLunaRejection(
+                                account.alias,
+                                until: resetAt ?? Date().addingTimeInterval(TimeInterval(settings.defaultCooldownSeconds))
+                            )
+                        }
+                        let currentAlias = account.alias
+                        let allowedAliases: [String]?
+                        if case .task(let allowed, _) = mode { allowedAliases = allowed }
+                        else { allowedAliases = nil }
+                        guard let alternative = await resolveAlternative(currentAlias, allowedAliases) else {
+                            await routingLog.write(RoutingDecisionLogRecord(
+                                event: .noTargetStop,
+                                rootRequestID: rootRequestID,
+                                attempt: attemptIndex,
+                                status: Int(resp.status.code),
+                                rateLimitKind: hasUsageLimit ? .semantic : .generic,
+                                retryAfterPresent: retryAfter != nil,
+                                retryAfterSeconds: retryAfter,
+                                routingDecision: .stop,
+                                reason: .noAlternative,
+                                accountTelemetryID: account.telemetryID
+                            ))
+                            try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                            return .completed(outcome: .failure, status: Int(resp.status.code))
+                        }
+                        await routingLog.write(RoutingDecisionLogRecord(
+                            event: .switchReplay,
+                            rootRequestID: rootRequestID,
+                            attempt: attemptIndex,
+                            status: Int(resp.status.code),
+                            rateLimitKind: hasUsageLimit ? .semantic : .generic,
+                            retryAfterPresent: retryAfter != nil,
+                            retryAfterSeconds: retryAfter,
+                            routingDecision: .switchToAlternative,
+                            reason: .switchReplay,
+                            accountTelemetryID: account.telemetryID,
+                            targetAccountTelemetryID: alternative.telemetryID
+                        ))
+                        await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
+                        account = alternative
+                        await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
+                        tokenRefreshed = false
+                        finalReplay = false
+                        return .retryTransient(
+                            account: account,
+                            retries: 0
+                        )
                     }
+
                     exhaustionHandled = true
                     await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
                     if requestModel == "gpt-5.6-luna" {
@@ -1544,8 +1662,8 @@ public actor ProxyServer {
                         settings: settings,
                         mode: mode,
                         currentAlias: currentAlias,
-                        resolveAlternative: { [freshAlternative] in
-                            await freshAlternative(currentAlias, allowedAliases)
+                        resolveAlternative: { [resolveAlternative] in
+                            await resolveAlternative(currentAlias, allowedAliases)
                         }
                     )
                     switch outcome.decision {
@@ -1592,12 +1710,10 @@ public actor ProxyServer {
                         account = alternative
                         await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                         tokenRefreshed = false
-                        finalReplay = true
-                        return .retry(
+                        finalReplay = false
+                        return .retryTransient(
                             account: account,
-                            tokenRefreshed: tokenRefreshed,
-                            exhaustionHandled: exhaustionHandled,
-                            finalReplay: finalReplay
+                            retries: 0
                         )
                     case .stopAndNotify:
                         await routingLog.write(RoutingDecisionLogRecord(
