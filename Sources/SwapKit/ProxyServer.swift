@@ -1363,16 +1363,7 @@ public actor ProxyServer {
                   let alternative = await freshAlternative(currentAlias, untried) else {
                 return nil
             }
-            guard await attemptedAccounts.claim(alternative.alias) else {
-                // FreshAlternativeResolver reserves its return before handing it
-                // back. Release that provisional lease if a custom resolver (or
-                // a stale race) returned an alias this root already attempted;
-                // never touch a lease owned by another request.
-                if await store.consumeRoutingReservation(alternative.alias) {
-                    await store.releaseRoutingLease(alternative.alias)
-                }
-                return nil
-            }
+            guard await attemptedAccounts.claim(alternative.alias) else { return nil }
             return alternative
         }
         return try await withRoutingLease(
