@@ -133,6 +133,8 @@ private enum ManagedAuthScenarioKind: Sendable {
     case success
     case ownerUpdate
     case invalidation
+    case revoked
+    case genericUnauthorized
     case expectsAccessToken(String)
 }
 
@@ -183,6 +185,10 @@ private actor ManagedAuthScenario {
             return accessToken == newerTokens?.accessToken ? Self.success() : Self.invalidated()
         case .invalidation:
             return Self.invalidated()
+        case .revoked:
+            return Self.response(status: 401, body: #"{"error":{"code":"token_revoked"}}"#)
+        case .genericUnauthorized:
+            return Self.response(status: 401, body: #"{"error":{"message":"unauthorized"}}"#)
         case .expectsAccessToken(let expected):
             return accessToken == expected ? Self.success() : Self.invalidated()
         }
@@ -269,7 +275,8 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         store: AccountStore,
         endpoint: URL,
         root: URL,
-        freshAlternative: @escaping @Sendable (String, [String]?) async -> Account? = { _, _ in nil }
+        freshAlternative: @escaping @Sendable (String, [String]?) async -> Account? = { _, _ in nil },
+        routingLog: RoutingDecisionLog? = nil
     ) -> ProxyServer {
         var config = ProxyServer.Config()
         config.upstream = endpoint
@@ -280,8 +287,30 @@ final class ManagedAuthRecoveryTests: XCTestCase {
             config: config,
             settingsProvider: { .default },
             freshAlternative: freshAlternative,
-            routingLog: RoutingDecisionLog(url: root.appendingPathComponent("routing-\(UUID().uuidString).jsonl"))
+            routingLog: routingLog ?? RoutingDecisionLog(url: root.appendingPathComponent("routing-\(UUID().uuidString).jsonl"))
         )
+    }
+
+    private func routingObjects(at url: URL) throws -> [[String: Any]] {
+        let data = try Data(contentsOf: url)
+        return try String(decoding: data, as: UTF8.self)
+            .split(separator: "\n")
+            .map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
+    }
+
+    private func routingObjectsEventually(at url: URL, minimumCount: Int) async throws -> [[String: Any]] {
+        for _ in 0..<100 {
+            if let objects = try? routingObjects(at: url), objects.count >= minimumCount {
+                return objects
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let objects = try routingObjects(at: url)
+        guard objects.count >= minimumCount else {
+            XCTFail("Expected at least \(minimumCount) routing records, found \(objects.count)")
+            throw CocoaError(.fileReadUnknown)
+        }
+        return objects
     }
 
     private func proxyRequest(
@@ -327,6 +356,48 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         XCTAssertEqual(upstreamCount, 0)
         XCTAssertEqual(try Data(contentsOf: authPath), before)
         XCTAssertFalse(try XCTUnwrap(account).needsLogin)
+    }
+
+    func testExpiredManagedAccountLogsExpiryAndRenewalRequiredCause() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-log-expired-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("expired-log", expiry: Date().addingTimeInterval(-60))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed-secret-alias", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .success, managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let logURL = root.appendingPathComponent("routing-decisions-v1.jsonl")
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            routingLog: RoutingDecisionLog(url: logURL)
+        )
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 503)
+
+        let objects = try await routingObjectsEventually(at: logURL, minimumCount: 4)
+        XCTAssertEqual(objects.compactMap { $0["event"] as? String }, ["request_started", "auth_failure", "auth_failure", "request_terminal"])
+        XCTAssertEqual(objects[1]["reason"] as? String, "expired_access_token")
+        XCTAssertNil(objects[1]["status"])
+        XCTAssertEqual(objects[2]["reason"] as? String, "renewal_required")
+        XCTAssertEqual(objects[2]["status"] as? Int, 503)
+        XCTAssertEqual(objects[1]["accountTelemetryID"] as? String, objects[2]["accountTelemetryID"] as? String)
+        let serialized = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("managed-secret-alias"))
+        XCTAssertFalse(serialized.contains(initial.accessToken))
+        XCTAssertFalse(serialized.contains(home.path))
     }
 
     func testStillValidNearExpiryManagedTokenForwardsWithoutOAuth() async throws {
@@ -386,6 +457,51 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         XCTAssertEqual(account?.accessToken, newer.accessToken)
     }
 
+    func testOwnerUpdateAfterUnauthorizedLogsIntermediateCauseAndRecovery() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-log-owner-update-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("owner-log-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("owner-log-newer", expiry: Date().addingTimeInterval(7_200))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed-secret-alias", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .ownerUpdate, managedHome: home, newerTokens: newer)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let logURL = root.appendingPathComponent("routing-decisions-v1.jsonl")
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            routingLog: RoutingDecisionLog(url: logURL)
+        )
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 200)
+
+        let objects = try await routingObjectsEventually(at: logURL, minimumCount: 4)
+        XCTAssertEqual(objects.compactMap { $0["event"] as? String }, ["request_started", "auth_failure", "auth_recovery", "request_terminal"])
+        XCTAssertEqual(objects[1]["reason"] as? String, "upstream_unauthorized")
+        XCTAssertEqual(objects[1]["status"] as? Int, 401)
+        XCTAssertEqual(objects[2]["reason"] as? String, "owner_recovered")
+        XCTAssertEqual(objects[2]["status"] as? Int, 401)
+        XCTAssertEqual(objects[1]["accountTelemetryID"] as? String, objects[2]["accountTelemetryID"] as? String)
+        XCTAssertEqual(objects.last?["status"] as? Int, 200)
+        let serialized = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("managed-secret-alias"))
+        XCTAssertFalse(serialized.contains(initial.accessToken))
+        XCTAssertFalse(serialized.contains(newer.accessToken))
+        XCTAssertFalse(serialized.contains(home.path))
+    }
+
     func testExplicitInvalidationStillMarksNeedsLoginWithoutOAuth() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-invalidated-\(UUID().uuidString)")
         let home = root.appendingPathComponent("managed-home", isDirectory: true)
@@ -411,6 +527,91 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         let account = await store.account("managed")
         XCTAssertEqual(refreshCount, 0)
         XCTAssertTrue(try XCTUnwrap(account).needsLogin)
+    }
+
+    func testExplicitRevocationLogsClosedTokenReason() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-log-revoked-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("revoked-log", expiry: Date().addingTimeInterval(3_600))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed-secret-alias", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .revoked, managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let logURL = root.appendingPathComponent("routing-decisions-v1.jsonl")
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            routingLog: RoutingDecisionLog(url: logURL)
+        )
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 401)
+
+        let objects = try await routingObjectsEventually(at: logURL, minimumCount: 4)
+        XCTAssertEqual(objects.compactMap { $0["event"] as? String }, ["request_started", "auth_failure", "auth_failure", "request_terminal"])
+        XCTAssertEqual(objects[1]["reason"] as? String, "upstream_unauthorized")
+        XCTAssertEqual(objects[1]["status"] as? Int, 401)
+        XCTAssertEqual(objects[2]["reason"] as? String, "token_revoked")
+        XCTAssertEqual(objects[2]["status"] as? Int, 401)
+        XCTAssertEqual(objects.last?["status"] as? Int, 401)
+        let serialized = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("managed-secret-alias"))
+        XCTAssertFalse(serialized.contains(initial.accessToken))
+        XCTAssertFalse(serialized.contains(home.path))
+    }
+
+    func testGenericUnauthorizedLogsUpstreamCauseAndRenewalRequired() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-log-generic-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("generic-log", expiry: Date().addingTimeInterval(3_600))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed-secret-alias", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .genericUnauthorized, managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let logURL = root.appendingPathComponent("routing-decisions-v1.jsonl")
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            routingLog: RoutingDecisionLog(url: logURL)
+        )
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 503)
+
+        let objects = try await routingObjectsEventually(at: logURL, minimumCount: 4)
+        XCTAssertEqual(objects.compactMap { $0["event"] as? String }, ["request_started", "auth_failure", "auth_failure", "request_terminal"])
+        XCTAssertEqual(objects[1]["reason"] as? String, "upstream_unauthorized")
+        XCTAssertEqual(objects[1]["status"] as? Int, 401)
+        XCTAssertEqual(objects[2]["reason"] as? String, "renewal_required")
+        XCTAssertEqual(objects[2]["status"] as? Int, 503)
+        XCTAssertNil(objects.first { ($0["reason"] as? String) == "token_invalidated" })
+        XCTAssertNil(objects.first { ($0["reason"] as? String) == "token_revoked" })
+        let serialized = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("managed-secret-alias"))
+        XCTAssertFalse(serialized.contains(initial.accessToken))
+        XCTAssertFalse(serialized.contains(home.path))
     }
 
     func testUnknownExpiredAccountReturnsRenewalRequiredWithoutOAuth() async throws {

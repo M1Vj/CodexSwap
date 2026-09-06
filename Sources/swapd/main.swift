@@ -48,12 +48,7 @@ case "import":
         print("imported CodexBar-managed account: \(acc.alias) <\(acc.email)> plan=\(acc.planType ?? "?")")
         added += 1
     }
-    if let current = importer.currentCodexAccount() {
-        await store.upsert(current)
-        print("imported active codex login: \(current.alias) <\(current.email)> plan=\(current.planType ?? "?")")
-        added += 1
-    }
-    for acc in importer.existingCodexAuthAccounts() {
+    for acc in importer.newestCodexAuthAccounts(supportDirectory: AppPaths.supportDir()) {
         await store.upsert(acc)
         print("imported existing account: \(acc.alias) <\(acc.email)>")
         added += 1

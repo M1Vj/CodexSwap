@@ -17,6 +17,8 @@ public enum RoutingDecisionLogEvent: String, Codable, Sendable, CaseIterable {
     case semanticLimit = "semantic_limit"
     case switchReplay = "switch_replay"
     case noTargetStop = "no_target_stop"
+    case authFailure = "auth_failure"
+    case authRecovery = "auth_recovery"
 }
 
 /// The only distinction retained for an upstream 429.
@@ -47,6 +49,12 @@ public enum RoutingDecisionLogReason: String, Codable, Sendable, CaseIterable {
     case policyStop = "policy_stop"
     case terminalSuccess = "terminal_success"
     case terminalFailure = "terminal_failure"
+    case expiredAccessToken = "expired_access_token"
+    case renewalRequired = "renewal_required"
+    case upstreamUnauthorized = "upstream_unauthorized"
+    case tokenInvalidated = "token_invalidated"
+    case tokenRevoked = "token_revoked"
+    case ownerRecovered = "owner_recovered"
 }
 
 /// One privacy-safe routing decision record. This is a closed allowlist: adding

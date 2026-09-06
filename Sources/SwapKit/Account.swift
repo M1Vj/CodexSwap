@@ -274,6 +274,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var routingPausedAt: Date?
     public var telemetryID: UUID
     public var usageLimitSettings: AccountUsageLimitSettings
+    public var authGeneration: UUID?
 
     public var isArchived: Bool { archivedAt != nil }
 
@@ -298,7 +299,8 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         archivedAt: Date? = nil,
         routingPausedAt: Date? = nil,
         telemetryID: UUID = UUID(),
-        usageLimitSettings: AccountUsageLimitSettings = .disabled
+        usageLimitSettings: AccountUsageLimitSettings = .disabled,
+        authGeneration: UUID? = nil
     ) {
         self.alias = alias
         self.email = email
@@ -323,13 +325,14 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.routingPausedAt = routingPausedAt
         self.telemetryID = telemetryID
         self.usageLimitSettings = usageLimitSettings
+        self.authGeneration = authGeneration
     }
 
     private enum CodingKeys: String, CodingKey {
         case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
         case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, credentialSource, routingEnabled
         case usageStats, usageHistory, lastServedByUs, archivedAt, routingPausedAt, telemetryID
-        case usageLimitSettings
+        case usageLimitSettings, authGeneration
     }
 
     public init(from decoder: Decoder) throws {
@@ -363,6 +366,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         routingPausedAt = try c.decodeIfPresent(Date.self, forKey: .routingPausedAt)
         telemetryID = try c.decodeIfPresent(UUID.self, forKey: .telemetryID) ?? Self.missingTelemetryID
         usageLimitSettings = try c.decodeIfPresent(AccountUsageLimitSettings.self, forKey: .usageLimitSettings) ?? .disabled
+        authGeneration = try c.decodeIfPresent(UUID.self, forKey: .authGeneration)
     }
 
     public var tokens: CodexTokens {

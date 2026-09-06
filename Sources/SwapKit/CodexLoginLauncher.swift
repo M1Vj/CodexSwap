@@ -26,36 +26,116 @@ public enum CodexLoginLaunchError: Error, Equatable, LocalizedError, Sendable {
     }
 }
 
+public struct CodexStandaloneLoginLaunch: Sendable, Equatable {
+    public let commandFile: URL
+    public let homePath: URL
+    public let successMarker: URL
+
+    public init(commandFile: URL, homePath: URL, successMarker: URL) {
+        self.commandFile = commandFile
+        self.homePath = homePath
+        self.successMarker = successMarker
+    }
+}
+
 /// Builds and materializes the Terminal command used by standalone account onboarding.
 public enum CodexLoginLauncher {
     private static let commandFilePrefix = "codex-login-"
+    public static let standaloneHomesDirectoryName = "standalone-homes"
+    public static let successMarkerName = ".codexswap-login-success"
 
-    /// A standalone login script suitable for opening through Launch Services.
-    ///
-    /// The path is single-quoted with embedded quotes escaped for POSIX shells. The
-    /// script keeps the Terminal window available long enough for the user to see
-    /// the result and removes its own exact command file when it exits.
-    public static func commandScript(codexPath: String) -> String {
-        let quotedPath = shellQuote(codexPath)
+    public static func commandScript(codexPath: String, homePath: String) -> String {
+        let quotedCodexPath = shellQuote(codexPath)
+        let quotedHomePath = shellQuote(homePath)
+        let homeURL = URL(fileURLWithPath: homePath, isDirectory: true)
+        let quotedMarkerPath = shellQuote(homeURL.appendingPathComponent(successMarkerName).path)
+        let quotedAuthPath = shellQuote(homeURL.appendingPathComponent("auth.json").path)
         return """
         #!/usr/bin/env bash
         set -u
         SCRIPT_PATH="$0"
         trap 'rm -f -- "$SCRIPT_PATH"' EXIT
 
-        \(quotedPath) login
+        CODEX_HOME=\(quotedHomePath)
+        export CODEX_HOME
+        unset OPENAI_API_KEY
+        umask 077
+        cd -- "$CODEX_HOME" || {
+            printf '\nCodex login could not enter its private home: %s. No account was imported.\n' "$CODEX_HOME"
+            exit 1
+        }
+
+        \(quotedCodexPath) login -c 'cli_auth_credentials_store="file"'
         status=$?
-        printf '\\nCodex login exited with status %s. Return to CodexSwap and choose Rescan Accounts.\\n' "$status"
+        if [ "$status" -eq 0 ] && [ -f \(quotedAuthPath) ] && [ ! -L \(quotedAuthPath) ]; then
+            if ! (umask 077; printf 'completed\n' > \(quotedMarkerPath) && chmod 600 \(quotedMarkerPath)); then
+                status=1
+                printf '\nCodex login completed but its success marker could not be written. No account was imported.\n'
+            else
+                printf '\nCodex login succeeded. Standalone credentials are stored in %s. Return to CodexSwap and choose Rescan Accounts.\n' "$CODEX_HOME"
+            fi
+        elif [ "$status" -eq 0 ]; then
+            status=1
+            printf '\nCodex login finished without an auth bundle. No account was imported; retry and choose Rescan Accounts.\n'
+        else
+            printf '\nCodex login exited with status %s. Its private home was preserved, but no account was imported. Return to CodexSwap and choose Rescan Accounts after retrying.\n' "$status"
+        fi
         read -r -p "Press Return to close this window. " _
         exit "$status"
         """
     }
 
-    /// Writes an executable `.command` file and returns its exact path.
-    ///
-    /// The destination directory is created with user-only permissions. Callers
-    /// can pass a temporary directory in tests; the app uses its support directory
-    /// so a failed Launch Services open has a stable manual fallback path.
+    public static func prepareStandaloneLogin(
+        codexPath: String,
+        supportDirectory: URL,
+        identifier: String = UUID().uuidString,
+        fileManager: FileManager = .default
+    ) throws -> CodexStandaloneLoginLaunch {
+        let trustedSupportDirectory = supportDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let homesDirectory = trustedSupportDirectory.appendingPathComponent(standaloneHomesDirectoryName, isDirectory: true)
+        do {
+            try ensureDirectory(trustedSupportDirectory, permissions: 0o700, fileManager: fileManager)
+            try ensureDirectory(homesDirectory, permissions: 0o700, fileManager: fileManager)
+
+            var homePath: URL?
+            for _ in 0..<32 {
+                let candidate = homesDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                guard !fileManager.fileExists(atPath: candidate.path) else { continue }
+                do {
+                    try fileManager.createDirectory(
+                        at: candidate,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                    guard !isSymbolicLink(candidate) else {
+                        try? fileManager.removeItem(at: candidate)
+                        continue
+                    }
+                    try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: candidate.path)
+                    homePath = candidate
+                    break
+                } catch {
+                    if fileManager.fileExists(atPath: candidate.path) { continue }
+                    throw error
+                }
+            }
+            guard let homePath else { throw CocoaError(.fileWriteUnknown) }
+
+            let safeIdentifier = identifier.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+            let filename = commandFilePrefix + (safeIdentifier.isEmpty ? "login" : safeIdentifier) + "-" + UUID().uuidString + ".command"
+            let commandFile = trustedSupportDirectory.appendingPathComponent(filename, isDirectory: false)
+            let successMarker = homePath.appendingPathComponent(successMarkerName, isDirectory: false)
+            try Data(commandScript(codexPath: codexPath, homePath: homePath.path).utf8).write(to: commandFile, options: .atomic)
+            guard !isSymbolicLink(commandFile) else { throw CocoaError(.fileNoSuchFile) }
+            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: commandFile.path)
+            return CodexStandaloneLoginLaunch(commandFile: commandFile, homePath: homePath, successMarker: successMarker)
+        } catch let error as CodexLoginLaunchError {
+            throw error
+        } catch {
+            throw CodexLoginLaunchError.commandFileWriteFailed(path: supportDirectory.path)
+        }
+    }
+
     @discardableResult
     public static func writeCommandFile(
         codexPath: String,
@@ -63,27 +143,37 @@ public enum CodexLoginLauncher {
         identifier: String = UUID().uuidString,
         fileManager: FileManager = .default
     ) throws -> URL {
-        let safeIdentifier = identifier.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-        let filename = commandFilePrefix + (safeIdentifier.isEmpty ? UUID().uuidString : safeIdentifier) + ".command"
-        let url = directory.appendingPathComponent(filename, isDirectory: false)
-
-        do {
-            try fileManager.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-            try Data(commandScript(codexPath: codexPath).utf8).write(to: url, options: .atomic)
-            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-            return url
-        } catch {
-            try? fileManager.removeItem(at: url)
-            throw CodexLoginLaunchError.commandFileWriteFailed(path: url.path)
-        }
+        try prepareStandaloneLogin(
+            codexPath: codexPath,
+            supportDirectory: directory,
+            identifier: identifier,
+            fileManager: fileManager
+        ).commandFile
     }
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
+
+    private static func ensureDirectory(_ url: URL, permissions: Int, fileManager: FileManager) throws {
+        guard !isSymbolicLink(url) else { throw CocoaError(.fileNoSuchFile) }
+        if !fileManager.fileExists(atPath: url.path) {
+            try fileManager.createDirectory(
+                at: url,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: permissions]
+            )
+        }
+        guard !isSymbolicLink(url),
+              let values = try? url.resourceValues(forKeys: [.isDirectoryKey]),
+              values.isDirectory == true else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+    }
+
+    private static func isSymbolicLink(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+    }
+
 }

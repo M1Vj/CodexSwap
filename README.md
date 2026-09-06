@@ -83,7 +83,7 @@ The source build is ad-hoc signed locally. `build-universal.sh` produces a unive
 
 1. Open CodexSwap. It appears in the macOS menu bar, not the Dock.
 2. Open **Settings…** (`⌘,`).
-3. In **Accounts**, choose **Add in CodexBar…**. If you do not use CodexBar, choose **Add Standalone…** and complete the standard `codex login` flow.
+3. In **Accounts**, choose **Add in CodexBar…**. If you do not use CodexBar, choose **Add Standalone…** and complete the Terminal login in its fresh, private Codex home. This does not replace your normal Codex login.
 4. Choose **Rescan Accounts** if the new account does not appear immediately.
 5. In **General**, enable **Route Codex through CodexSwap**.
 6. Restart existing Codex CLI or desktop sessions once so they load the new route.
@@ -234,7 +234,7 @@ No. A new thread or run selects an account, then stays pinned when stable thread
 <details>
 <summary><strong>Do I need CodexBar?</strong></summary>
 
-No. CodexBar is the easiest onboarding path for accounts it already manages. Standalone accounts created with the normal `codex login` flow are also supported.
+No. CodexBar remains the login owner for accounts it already manages. **Add Standalone…** creates a separate native login without replacing your normal Codex home. Existing default-home accounts remain importable. Standalone isolation does not provide unattended credential renewal or prevent provider-side revocation; do not migrate existing accounts merely to work around an unexplained sign-out. See [authentication troubleshooting](docs/TROUBLESHOOTING.md#an-account-says-sign-in-is-required).
 </details>
 
 <details>

@@ -444,7 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // The engine dedupes to one event per logged-out episode; this gate lets the
             // user silence even that single reminder.
             if settings.notifyOnNeedsLogin {
-                notify(title: "Account needs sign-in", body: "\(alias) was signed out. Re-add it via Add account…")
+                notify(title: "Account needs authentication", body: "\(alias) requires authentication attention. Open its owning login source, then rescan accounts.")
             }
         case let .windowReset(alias):
             if settings.notifyOnWindowReset {
@@ -1156,14 +1156,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            let commandFile = try CodexLoginLauncher.writeCommandFile(
+            let launch = try CodexLoginLauncher.prepareStandaloneLogin(
                 codexPath: codex,
-                directory: AppPaths.supportDir()
+                supportDirectory: AppPaths.supportDir()
             )
-            guard NSWorkspace.shared.open(commandFile) else {
+            guard NSWorkspace.shared.open(launch.commandFile) else {
                 // Keep the exact command file so the user can double-click it if
                 // Launch Services declines to open it automatically.
-                throw CodexLoginLaunchError.terminalOpenFailed(path: commandFile.path)
+                throw CodexLoginLaunchError.terminalOpenFailed(path: launch.commandFile.path)
             }
         } catch let error as CodexLoginLaunchError {
             presentMessage(error.userMessage)

@@ -186,6 +186,31 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(events.value(), 4)
     }
 
+    func testUnreadableManagedSnapshotPreservesAccountUntilVerifiedEmptyRoster() async throws {
+        let fixture = try await makeFixture(availableCount: 1)
+        let managed = Account(
+            alias: "managed",
+            accountID: "managed-id",
+            accessToken: "managed-token",
+            managedHomePath: "/synthetic/missing-managed-home"
+        )
+        await fixture.engine.reconcileManagedAccounts([managed], presentAccountIDs: ["managed-id"])
+
+        await fixture.engine.syncCodexBar(snapshot: .failure(.malformed))
+        let afterFailure = await fixture.engine.snapshot()
+        XCTAssertTrue(afterFailure.accounts.contains { $0.alias == "managed" })
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("roster.json")
+        try Data(#"{"accounts":[]}"#.utf8).write(to: source)
+        await fixture.engine.syncCodexBar(snapshot: CodexBarBridge.readManagedAccountsSnapshot(from: source))
+        let afterEmpty = await fixture.engine.snapshot()
+        XCTAssertFalse(afterEmpty.accounts.contains { $0.alias == "managed" })
+        XCTAssertTrue(afterEmpty.accounts.contains { $0.alias == "alpha" })
+    }
+
     func testSettingsChangePublishesPersistedValueBeforeRefreshIsScheduled() async throws {
         let fixture = try await makeFixture(availableCount: 1)
         let ordering = ResetSettingsOrderingRecorder()

@@ -1465,8 +1465,12 @@ public actor ProxyServer {
             // Read the selected external source before judging its token.
             if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
             if accessTokenExpired(account.accessToken) {
+                await self.recordAuthDecision(.authFailure, reason: .expiredAccessToken, account: account,
+                                              rootRequestID: rootRequestID, attemptIndex: attemptIndex)
                 return try await self.renewalRequired(
                     account: account,
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
                     mode: mode,
                     outbound: outbound,
                     resolveAlternative: resolveAlternative,
@@ -1532,7 +1536,11 @@ public actor ProxyServer {
 
             if resp.status == .unauthorized, !tokenRefreshed {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
+                await self.recordAuthDecision(.authFailure, reason: .upstreamUnauthorized, account: account,
+                                              rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
                 if let recovered = await self.recoverManagedAccount(account, store: store) {
+                    await self.recordAuthDecision(.authRecovery, reason: .ownerRecovered, account: recovered,
+                                                  rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
                     return .retry(
                         account: recovered,
                         tokenRefreshed: false,
@@ -1541,6 +1549,10 @@ public actor ProxyServer {
                     )
                 }
                 if isSessionInvalidated(errBody) {
+                    if let reason = sessionInvalidationReason(errBody) {
+                        await self.recordAuthDecision(.authFailure, reason: reason, account: account,
+                                                      rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
+                    }
                     await burn.clear(alias: account.alias)
                     if mode.isTask {
                         if let next = try await self.taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
@@ -1574,6 +1586,8 @@ public actor ProxyServer {
                 }
                 return try await self.renewalRequired(
                     account: account,
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
                     mode: mode,
                     outbound: outbound,
                     resolveAlternative: resolveAlternative,
@@ -1825,12 +1839,16 @@ public actor ProxyServer {
 
     private func renewalRequired(
         account: Account,
+        rootRequestID: UUID,
+        attemptIndex: Int,
         mode: ProxyRequestMode,
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         resolveAlternative: @escaping @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?,
         exhaustionHandled: Bool,
         finalReplay: Bool
     ) async throws -> ProxyAttemptResult {
+        await recordAuthDecision(.authFailure, reason: .renewalRequired, account: account,
+                                 rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 503)
         guard !mode.isWarmup else {
             try await writeError(
                 outbound,
@@ -1856,6 +1874,20 @@ public actor ProxyServer {
             message: "CodexSwap account \(account.alias) requires renewal by its credential owner"
         )
         return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
+    }
+
+    private func recordAuthDecision(
+        _ event: RoutingDecisionLogEvent,
+        reason: RoutingDecisionLogReason,
+        account: Account,
+        rootRequestID: UUID,
+        attemptIndex: Int,
+        status: Int? = nil
+    ) async {
+        await routingLog.write(RoutingDecisionLogRecord(
+            event: event, rootRequestID: rootRequestID, attempt: attemptIndex,
+            status: status, reason: reason, accountTelemetryID: account.telemetryID
+        ))
     }
 
     private func recordTelemetryAttempt(
@@ -2264,9 +2296,17 @@ func retryAfterDelay(headers: HTTPHeaders) -> TimeInterval? {
 }
 
 func isSessionInvalidated(_ buffer: ByteBuffer) -> Bool {
+    sessionInvalidationReason(buffer) != nil
+}
+
+private func sessionInvalidationReason(_ buffer: ByteBuffer) -> RoutingDecisionLogReason? {
     guard let obj = try? JSONSerialization.jsonObject(with: Data(buffer.readableBytesView)) as? [String: Any],
-          let err = obj["error"] as? [String: Any], let code = err["code"] as? String else { return false }
-    return code == "token_invalidated" || code == "token_revoked"
+          let err = obj["error"] as? [String: Any], let code = err["code"] as? String else { return nil }
+    switch code {
+    case "token_invalidated": return .tokenInvalidated
+    case "token_revoked": return .tokenRevoked
+    default: return nil
+    }
 }
 
 func limitInfo(headers: HTTPHeaders, body: ByteBuffer) -> (String, Date?) {

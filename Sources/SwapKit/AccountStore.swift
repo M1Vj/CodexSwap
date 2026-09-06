@@ -619,9 +619,16 @@ public actor AccountStore {
         merged.email = mergeValue(local.email, baseline: baseline.email, latest: latest.email)
         merged.accountID = mergeValue(local.accountID, baseline: baseline.accountID, latest: latest.accountID)
         merged.planType = mergeValue(local.planType, baseline: baseline.planType, latest: latest.planType)
-        merged.accessToken = mergeValue(local.accessToken, baseline: baseline.accessToken, latest: latest.accessToken)
-        merged.refreshToken = mergeValue(local.refreshToken, baseline: baseline.refreshToken, latest: latest.refreshToken)
-        merged.idToken = mergeValue(local.idToken, baseline: baseline.idToken, latest: latest.idToken)
+        let credentialsChanged = local.accessToken != baseline.accessToken
+            || local.refreshToken != baseline.refreshToken || local.idToken != baseline.idToken
+            || local.managedHomePath != baseline.managedHomePath || local.credentialSource != baseline.credentialSource
+        let latestCredentialsChanged = latest.accessToken != baseline.accessToken
+            || latest.refreshToken != baseline.refreshToken || latest.idToken != baseline.idToken
+            || latest.managedHomePath != baseline.managedHomePath || latest.credentialSource != baseline.credentialSource
+        let credentials = credentialsChanged && !latestCredentialsChanged ? local : latest
+        merged.accessToken = credentials.accessToken
+        merged.refreshToken = credentials.refreshToken
+        merged.idToken = credentials.idToken
         if !preservingRanking {
             merged.priority = mergeValue(local.priority, baseline: baseline.priority, latest: latest.priority)
         }
@@ -633,8 +640,8 @@ public actor AccountStore {
         merged.needsLogin = mergeValue(local.needsLogin, baseline: baseline.needsLogin, latest: latest.needsLogin)
         merged.lastUsedAt = mergeValue(local.lastUsedAt, baseline: baseline.lastUsedAt, latest: latest.lastUsedAt)
         merged.usage = mergeUsageWindows(local: local.usage, baseline: baseline.usage, latest: latest.usage)
-        merged.managedHomePath = mergeValue(local.managedHomePath, baseline: baseline.managedHomePath, latest: latest.managedHomePath)
-        merged.credentialSource = mergeValue(local.credentialSource, baseline: baseline.credentialSource, latest: latest.credentialSource)
+        merged.managedHomePath = credentials.managedHomePath
+        merged.credentialSource = credentials.credentialSource
         if let managedHomePath = merged.managedHomePath {
             merged.credentialSource = AccountCredentialSource(kind: .managedHome, path: managedHomePath)
         }
@@ -658,6 +665,14 @@ public actor AccountStore {
             baseline: baseline.usageLimitSettings,
             latest: latest.usageLimitSettings
         )
+        merged.authGeneration = mergeValue(
+            local.authGeneration,
+            baseline: baseline.authGeneration,
+            latest: latest.authGeneration
+        )
+        if local.authGeneration != baseline.authGeneration, local.needsLogin {
+            merged.needsLogin = true
+        }
         return merged
     }
 
@@ -1239,6 +1254,70 @@ public actor AccountStore {
 
     private func index(_ alias: String) -> Int? { data.accounts.firstIndex { $0.alias == alias } }
 
+    private func advanceAuthGeneration(at index: Int) {
+        data.accounts[index].authGeneration = UUID()
+    }
+
+    func commitVerifiedAuthentication(snapshot: Account, candidate: Account,
+                                      windows: [UsageWindow]) -> AuthenticationRecovery.RecoveryResult {
+        var result = AuthenticationRecovery.RecoveryResult.staleSnapshot
+        let locked = Self.withStoreLock(url) {
+            guard var latest = Self.loadFrom(url),
+                  let position = latest.accounts.firstIndex(where: { $0.telemetryID == snapshot.telemetryID }),
+                  !windows.isEmpty else { return }
+            let current = latest.accounts[position]
+            guard current.alias == snapshot.alias, current.accountID == snapshot.accountID,
+                  current.authGeneration == snapshot.authGeneration,
+                  current.accessToken == snapshot.accessToken,
+                  current.refreshToken == snapshot.refreshToken, current.idToken == snapshot.idToken,
+                  AuthenticationRecovery.source(for: current) == AuthenticationRecovery.source(for: snapshot),
+                  AuthenticationRecovery.accepts(candidate, for: current, now: clock()) else { return }
+            latest.accounts[position].accessToken = candidate.accessToken
+            latest.accounts[position].refreshToken = candidate.refreshToken
+            latest.accounts[position].idToken = candidate.idToken
+            latest.accounts[position].needsLogin = false
+            latest.accounts[position].usage = windows
+            latest.accounts[position].authGeneration = UUID()
+            do {
+                let raw = try JSONEncoder.codex.encode(latest)
+                try persistAtomically(raw)
+                data = latest
+                persistedData = try JSONDecoder.codex.decode(StoreData.self, from: raw)
+                persistedModificationDate = Self.modificationDate(for: url)
+                stickyAliasRuntime = latest.stickyAlias
+                stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride
+                result = .committed
+            } catch { result = .persistenceFailed }
+        }
+        return locked ? result : .persistenceFailed
+    }
+
+    private static func credentialSource(for account: Account) -> AccountCredentialSource? {
+        if let managedHomePath = account.managedHomePath, !managedHomePath.isEmpty {
+            return AccountCredentialSource(kind: .managedHome, path: managedHomePath)
+        }
+        guard let source = account.credentialSource,
+              source.kind != .unknown,
+              let path = source.path,
+              !path.isEmpty else { return nil }
+        return source
+    }
+
+    private static func incomingSourceMayReplaceManagedOwner(
+        existing: Account,
+        incoming: Account
+    ) -> Bool {
+        guard let existingManagedPath = existing.managedHomePath, !existingManagedPath.isEmpty else {
+            return true
+        }
+        guard let incomingSource = credentialSource(for: incoming),
+              incomingSource.kind == .managedHome,
+              let incomingPath = incomingSource.path else {
+            return false
+        }
+        return incomingPath == existingManagedPath
+    }
+
     /// Shared ordering for picking the next account: priority strategy ranks by priority
     /// first, round-robin spreads by least-recently-used; both tiebreak LRU then alias.
     static func selectionOrder(_ a: Account, _ b: Account, strategy: RotationStrategy) -> Bool {
@@ -1427,7 +1506,9 @@ public actor AccountStore {
     }
 
     public func markNeedsLoginOnly(_ alias: String) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
+        advanceAuthGeneration(at: i)
         clearRuntimeHolds(alias)
         data.accounts[i].needsLogin = true
         drainingAliases.remove(alias)
@@ -1438,7 +1519,10 @@ public actor AccountStore {
     public func markNeedsLogin(_ alias: String, now: Date = Date()) -> RotationResult {
         refreshExternalStateIfNeeded()
         clearRuntimeHolds(alias)
-        if let i = index(alias) { data.accounts[i].needsLogin = true }
+        if let i = index(alias) {
+            advanceAuthGeneration(at: i)
+            data.accounts[i].needsLogin = true
+        }
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
         let next: Account?
@@ -1462,6 +1546,7 @@ public actor AccountStore {
               data.accounts[i].routingEnabled,
               !data.accounts[i].isUsageLimitReached,
               !data.accounts[i].isArchived else { return nil }
+        advanceAuthGeneration(at: i)
         data.accounts[i].disabledUntil = [:]
         data.accounts[i].needsLogin = false
         data.accounts[i].routingPausedAt = nil
@@ -1506,6 +1591,7 @@ public actor AccountStore {
         if drainingAliases.remove(alias) != nil { changed = true }
         if drainingObservedAt.removeValue(forKey: alias) != nil { changed = true }
         if changed || stickyCleared {
+            if changed { advanceAuthGeneration(at: i) }
             renumberRanks()
             persist(preservingRanking: false, preservingStickyAlias: false, clearingActiveAliases: [alias])
         }
@@ -1524,6 +1610,7 @@ public actor AccountStore {
         data.accounts[i].archivedAt = nil
         data.accounts[i].routingEnabled = false
         data.accounts[i].routingPausedAt = timestamp
+        advanceAuthGeneration(at: i)
         drainingAliases.remove(alias)
         drainingObservedAt.removeValue(forKey: alias)
 
@@ -1581,6 +1668,7 @@ public actor AccountStore {
             data.accounts[i].idToken = tokens.idToken
             data.accounts[i].accessToken = tokens.accessToken
             data.accounts[i].refreshToken = tokens.refreshToken
+            advanceAuthGeneration(at: i)
             data.accounts[i].needsLogin = false
             drainingAliases.remove(alias)
             drainingObservedAt.removeValue(forKey: alias)
@@ -1593,6 +1681,7 @@ public actor AccountStore {
 
     public func updateTokens(_ alias: String, tokens: CodexTokens, clearNeedsLogin: Bool = true) {
         guard let i = index(alias) else { return }
+        advanceAuthGeneration(at: i)
         data.accounts[i].idToken = tokens.idToken
         data.accounts[i].accessToken = tokens.accessToken
         data.accounts[i].refreshToken = tokens.refreshToken
@@ -1955,6 +2044,9 @@ public actor AccountStore {
     public func upsert(_ account: Account) -> Account {
         refreshExternalStateIfNeeded()
         var account = account
+        if let source = account.credentialSource, source.kind == .managedHome {
+            account.managedHomePath = source.path
+        }
         account.priority = AccountPriority.normalize(account.priority)
         let matchingAccountID = data.accounts.firstIndex {
             !$0.accountID.isEmpty && !account.accountID.isEmpty && $0.accountID == account.accountID
@@ -1965,40 +2057,49 @@ public actor AccountStore {
             return index
         }
         if let i = matchingIndex {
+            let existing = data.accounts[i]
             var merged = account
-            merged.priority = data.accounts[i].priority
-            merged.alias = data.accounts[i].alias
-            merged.disabledUntil = data.accounts[i].disabledUntil
-            merged.routingEnabled = data.accounts[i].routingEnabled
-            merged.lastUsedAt = data.accounts[i].lastUsedAt
-            merged.archivedAt = data.accounts[i].archivedAt
-            merged.routingPausedAt = data.accounts[i].routingPausedAt
-            merged.telemetryID = data.accounts[i].telemetryID == Account.missingTelemetryID
+            merged.priority = existing.priority
+            merged.alias = existing.alias
+            merged.disabledUntil = existing.disabledUntil
+            merged.routingEnabled = existing.routingEnabled
+            merged.lastUsedAt = existing.lastUsedAt
+            merged.archivedAt = existing.archivedAt
+            merged.routingPausedAt = existing.routingPausedAt
+            merged.telemetryID = existing.telemetryID == Account.missingTelemetryID
                 ? UUID()
-                : data.accounts[i].telemetryID
+                : existing.telemetryID
             // Usage limits are user-owned control-plane state. CodexBar/import
             // snapshots do not carry this field and must never reset a cap.
-            merged.usageLimitSettings = data.accounts[i].usageLimitSettings
-            merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
-            merged.credentialSource = account.credentialSource ?? data.accounts[i].credentialSource
+            merged.usageLimitSettings = existing.usageLimitSettings
+            merged.managedHomePath = account.managedHomePath ?? existing.managedHomePath
+            merged.credentialSource = account.credentialSource ?? existing.credentialSource
             if let managedHomePath = merged.managedHomePath {
                 merged.credentialSource = AccountCredentialSource(kind: .managedHome, path: managedHomePath)
+            }
+            let incomingMayReplaceManagedOwner = Self.incomingSourceMayReplaceManagedOwner(
+                existing: existing,
+                incoming: account
+            )
+            if !incomingMayReplaceManagedOwner {
+                merged.managedHomePath = existing.managedHomePath
+                merged.credentialSource = existing.credentialSource
             }
             // needsLogin is runtime overlay state, not import data: the periodic CodexBar
             // sync upserts every account, and imports always carry false, so copying the
             // incoming value here silently re-arms a logged-out account every poll cycle.
-            merged.needsLogin = data.accounts[i].needsLogin
+            merged.needsLogin = existing.needsLogin
             // Imported records never carry usage; the periodic CodexBar sync upserts every
             // account, so dropping the stored windows here blanks the display (and the
             // banked-window gate's input) for up to a poll interval each minute.
-            if merged.usage.isEmpty { merged.usage = data.accounts[i].usage }
+            if merged.usage.isEmpty { merged.usage = existing.usage }
             // Same preservation for locally observed telemetry: imports never carry it.
-            if merged.usageStats == nil { merged.usageStats = data.accounts[i].usageStats }
-            if (merged.usageHistory ?? []).isEmpty { merged.usageHistory = data.accounts[i].usageHistory }
-            if merged.lastServedByUs == nil { merged.lastServedByUs = data.accounts[i].lastServedByUs }
+            if merged.usageStats == nil { merged.usageStats = existing.usageStats }
+            if (merged.usageHistory ?? []).isEmpty { merged.usageHistory = existing.usageHistory }
+            if merged.lastServedByUs == nil { merged.lastServedByUs = existing.lastServedByUs }
             // Keep whichever token bundle expires later so a stale on-disk copy never
             // clobbers a fresher one, independent of import order.
-            let existingExp = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast
+            let existingExp = JWT.expiry(existing.accessToken) ?? .distantPast
             let incomingExp = JWT.expiry(account.accessToken) ?? .distantPast
             let sourceIsKnown = account.credentialSource.map {
                 $0.kind != .unknown && ($0.path?.isEmpty == false)
@@ -2011,13 +2112,25 @@ public actor AccountStore {
                 && account.accountID == data.accounts[i].accountID
                 && incomingIdentity == data.accounts[i].accountID
                 && (account.tokens.accountId.isEmpty || account.tokens.accountId == data.accounts[i].accountID)
+                && incomingMayReplaceManagedOwner
             if verifiedSourceUpdate {
                 merged.needsLogin = false
             }
-            if existingExp > incomingExp {
-                merged.accessToken = data.accounts[i].accessToken
-                merged.refreshToken = data.accounts[i].refreshToken
-                merged.idToken = data.accounts[i].idToken
+            if !incomingMayReplaceManagedOwner || existingExp > incomingExp {
+                merged.accessToken = existing.accessToken
+                merged.refreshToken = existing.refreshToken
+                merged.idToken = existing.idToken
+                merged.managedHomePath = existing.managedHomePath
+                merged.credentialSource = existing.credentialSource
+            }
+            merged.authGeneration = existing.authGeneration
+            if merged.accessToken != existing.accessToken
+                || merged.refreshToken != existing.refreshToken
+                || merged.idToken != existing.idToken
+                || merged.managedHomePath != existing.managedHomePath
+                || merged.credentialSource != existing.credentialSource
+                || merged.needsLogin != existing.needsLogin {
+                merged.authGeneration = UUID()
             }
             let usageResetLabels = Self.usageResetOrDecreaseLabels(
                 previous: data.accounts[i].usage,
@@ -2085,9 +2198,11 @@ public actor AccountStore {
     }
 
     public func setRoutingEnabled(_ alias: String, enabled: Bool, now: Date? = nil) {
+        refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return }
         if data.accounts[i].isArchived, enabled { return }
         let wasEnabled = data.accounts[i].routingEnabled
+        let previousPausedAt = data.accounts[i].routingPausedAt
         data.accounts[i].routingEnabled = enabled
         if enabled {
             data.accounts[i].routingPausedAt = nil
@@ -2104,6 +2219,9 @@ public actor AccountStore {
         }
         if !enabled, data.activeAlias == alias { data.activeAlias = nil }
         if !enabled { clearRuntimeHolds(alias) }
+        if wasEnabled != data.accounts[i].routingEnabled || previousPausedAt != data.accounts[i].routingPausedAt {
+            advanceAuthGeneration(at: i)
+        }
         // Disabling an account also clears a local active selection. Keep that
         // intent when it does not conflict with a newer active-alias change;
         // enabling leaves the latest active selection untouched.

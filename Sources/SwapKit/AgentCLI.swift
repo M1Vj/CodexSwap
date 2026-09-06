@@ -1102,19 +1102,32 @@ public struct AgentCLI: Sendable {
     private func accountsReconcile(_ command: AgentCLICommand) async -> AgentCLIResult {
         let beforeRoster = await roster()
         let before = beforeRoster.entries.count
-        let available = CodexBarBridge.isPresent()
+        let source = CodexBarBridge.readManagedAccountsSnapshot()
+        let snapshot: CodexBarBridge.ManagedAccountsSnapshot?
+        let sourceWarnings: [String]
+        switch source {
+        case .success(let verified):
+            snapshot = verified
+            sourceWarnings = []
+        case .failure(.absent):
+            snapshot = nil
+            sourceWarnings = ["codexbar_unavailable"]
+        case .failure:
+            snapshot = nil
+            sourceWarnings = ["codexbar_roster_unreadable"]
+        }
         if !command.options.confirm && !command.options.dryRun {
             return confirmationRequired(command: command.canonicalName, action: "reconcile managed accounts")
         }
         if command.options.dryRun {
-            var warnings: [String] = []
+            var warnings = sourceWarnings
             var affectedRefs: [String] = []
             var projectedAfter = before
             var impactKnown = true
-            if available {
+            if let snapshot {
                 // Reconcile only removes managed records whose provider ID has
                 // disappeared. Those refs are already stable and safe to show.
-                let presentIDs = CodexBarBridge.rosterAccountIDs()
+                let presentIDs = snapshot.accountIDs
                 let removed = beforeRoster.entries.filter { entry in
                     entry.account.managedHomePath != nil && !presentIDs.contains(entry.account.accountID)
                 }
@@ -1126,7 +1139,7 @@ public struct AgentCLI: Sendable {
                 // predicted without mutating the store. Do not claim an empty
                 // impact list in that case; require confirmation on apply.
                 let knownAccountIDs = Set(beforeRoster.entries.map(\.account.accountID).filter { !$0.isEmpty })
-                let imported = AccountImporter.codexBarAccounts()
+                let imported = AccountImporter.codexBarAccounts(snapshot.accounts)
                 let unknownAdds = imported.filter { account in
                     account.accountID.isEmpty || !knownAccountIDs.contains(account.accountID)
                 }
@@ -1135,10 +1148,6 @@ public struct AgentCLI: Sendable {
                     impactKnown = false
                     warnings.append("reconcile_impact_unknown")
                 }
-            } else {
-                // syncCodexBar() is a documented no-op when CodexBar is absent,
-                // so this preview is known to leave the roster unchanged.
-                warnings.append("codexbar_unavailable")
             }
             let data: AgentCLIJSONValue = .object([
                 "before": .integer(before),
@@ -1151,13 +1160,12 @@ public struct AgentCLI: Sendable {
             ])
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data, warnings: warnings), exitCode: .ok)
         }
-        await engine.syncCodexBar()
+        await engine.syncCodexBar(snapshot: source)
         let after = (await store.all()).count
         let afterRefs = Set((await roster()).entries.map(\.reference))
         let beforeRefs = Set(beforeRoster.entries.map(\.reference))
         let affectedRefs = (beforeRefs.symmetricDifference(afterRefs)).sorted()
-        var warnings: [String] = []
-        if !available { warnings.append("codexbar_unavailable") }
+        let warnings = sourceWarnings
         let data: AgentCLIJSONValue = .object([
             "before": .integer(before),
             "after": .integer(after),

@@ -40,11 +40,17 @@ These files may contain displaced Codex configuration and should not be shared p
 
 For CodexBar-managed accounts, open CodexBar and use **Add Account** there. Return to **Settings → Accounts** in CodexSwap; the roster is watched automatically. Choose **Rescan Accounts** if the account does not appear.
 
-Without CodexBar, choose **Add Standalone…**, finish the standard `codex login` flow, then rescan. Do not copy an `auth.json` file into an issue or support message.
+Without CodexBar, choose **Add Standalone…**, finish the Terminal login, then rescan. Each attempt uses a fresh private home; only a successful login with a valid account credential is imported. Keep the home shown by the launcher for that account's native lifecycle. Do not copy an `auth.json` file into an issue or support message.
+
+An unreadable or malformed CodexBar roster is not treated as an empty account list. CodexSwap preserves its existing managed accounts until it can read a valid snapshot. An explicitly valid empty roster still reflects removal through CodexBar.
 
 ## An account says sign-in is required
 
-Refresh or sign in through the application that owns the account. For a CodexBar-managed account, use CodexBar. For a standalone account, run the standard Codex login flow and rescan. Removing an account from CodexSwap does not revoke its OpenAI session.
+Check the error in the application that owns the account. For a CodexBar-managed account, use CodexBar. A stored authentication flag alone does not prove a fresh provider revocation. For an isolated standalone account, use its exact Codex home, or explicitly complete a new **Add Standalone…** login and rescan. An unscoped `codex login` targets the normal native home instead. Removing an account from CodexSwap does not revoke its OpenAI session.
+
+Do not migrate existing CodexBar accounts to standalone login expecting a guaranteed cure. Separate homes prevent shared-login replacement but do not implement background renewal. Re-adding an identity already managed by CodexBar does not silently transfer its ownership to CodexSwap.
+
+If the account still works through its owner, choose **Rescan Accounts**. CodexSwap verifies blocked accounts against the read-only usage endpoint using that same source. A successful check can clear a stale sign-in flag even when the token's expiry has not increased. A failed check leaves the flag intact; a concurrent sign-out, pause, removal, or credential change prevents an older check from re-enabling the account. This does not refresh or repair a revoked session.
 
 ## A request reports credential renewal is required
 
@@ -55,6 +61,8 @@ If the owner has not supplied a usable update, the proxy may use an eligible alt
 Open the account through its existing owner so native Codex can renew it. Use **Rescan Accounts** to update older imports with source information. If the owner itself reports a revoked session, sign in there once and rescan. Do not copy auth files between homes, repeatedly force refresh, or start extra Codex processes against the same home as a workaround.
 
 Automatic renewal still belongs to the owner; the proxy does not create a background login process. See [the credential ownership investigation](AUTH-OWNERSHIP-INVESTIGATION.md) for the verified defect, upstream evidence, and remaining limits.
+
+For future incidents, the bounded privacy-safe routing log records authentication categories, account correlation IDs, and timestamps. Expired access tokens, generic unauthorized responses, explicit invalidation codes, owner recovery, and unavailable renewal are distinguishable; raw tokens, response bodies, and account aliases are not recorded. Native/CodexBar errors that bypass the proxy still require the owner's error message. Never paste an auth file into a report.
 
 ## An account says Routing Disabled
 

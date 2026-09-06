@@ -285,7 +285,9 @@ public actor AppEngine {
         // paused accounts before any periodic quota/reset/warm-up network work.
         _ = await archiveDueAccounts()
         await syncCodexBar()
-        if let current = AccountImporter.currentCodexAccount() { await store.upsert(current) }
+        await reconcileImportedAccounts(
+            AccountImporter.newestCodexAuthAccounts(supportDirectory: supportDir, includeLegacy: false)
+        )
 
         if CodexBarBridge.isPresent() {
             let watcher = CodexBarWatcher { [weak self] in
@@ -369,10 +371,14 @@ public actor AppEngine {
 
     /// Reconcile our roster with CodexBar's live account list: add new, drop removed, keep our overlay.
     public func syncCodexBar() async {
-        guard CodexBarBridge.isPresent() else { return }
+        await syncCodexBar(snapshot: CodexBarBridge.readManagedAccountsSnapshot())
+    }
+
+    func syncCodexBar(snapshot: Result<CodexBarBridge.ManagedAccountsSnapshot, CodexBarBridge.RosterReadError>) async {
+        guard case .success(let snapshot) = snapshot else { return }
         await reconcileManagedAccounts(
-            AccountImporter.codexBarAccounts(),
-            presentAccountIDs: CodexBarBridge.rosterAccountIDs()
+            AccountImporter.codexBarAccounts(snapshot.accounts),
+            presentAccountIDs: snapshot.accountIDs
         )
     }
 
@@ -1276,9 +1282,20 @@ public actor AppEngine {
 
     public func importAccounts() async {
         await syncCodexBar()
-        var imported = AccountImporter.existingCodexAuthAccounts()
-        if let current = AccountImporter.currentCodexAccount() { imported.append(current) }
-        await reconcileImportedAccounts(imported)
+        await reconcileImportedAccounts(
+            AccountImporter.newestCodexAuthAccounts(supportDirectory: supportDir)
+        )
+        await recoverBlockedAuthentication()
+    }
+
+    func recoverBlockedAuthentication() async {
+        for account in await store.all() where account.needsLogin && account.routingEnabled && !account.isArchived {
+            guard let candidate = AuthenticationRecovery.candidate(for: account) else { continue }
+            if await AuthenticationRecovery.recover(alias: account.alias, candidate: candidate, store: store, usage: usage) == .committed {
+                needsLoginNotified.remove(account.alias)
+            }
+        }
+        emit(.snapshotChanged)
     }
 
     func reconcileImportedAccounts(_ accounts: [Account]) async {

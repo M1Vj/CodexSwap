@@ -53,11 +53,43 @@ Independent review also identified a pre-existing concurrent-import limitation: 
 
 ## Verification and evidence limits
 
+### Direct Terminal login follow-up
+
+After the protective ownership change was installed, the owner reported another sign-out. The owner clarified that the affected account was added through CodexBar; direct CodexSwap login was first tried on September 5, 2026. The long-running sign-out issue therefore cannot be attributed to that recent experiment from timing alone.
+
+Source inspection found an independent onboarding risk: the installed `CodexLoginLauncher` executes unscoped `codex login`, which can replace the default or inherited native credential location. A synthetic invocation of the committed launcher replaced a sentinel native auth file. This is not evidence that it invalidated the affected CodexBar session. The follow-up candidate isolates new logins in fresh homes and imports only completed CLI logins; browser success alone does not establish successful CLI persistence.
+
+The owner subsequently distinguished two cases: the affected account initially still worked through CodexBar/native Codex while CodexSwap retained `needsLogin`, then native Codex also signed out after seconds of use with CodexSwap routing disabled. Some accounts had been signed in through both applications. The second observation means a proxied request is not a necessary trigger for every reported logout. It does not identify the process that originally invalidated the refresh-token lineage, and disabling routing does not roll back an earlier invalidation. A reviewer process also reported an explicit revoked-refresh-token error during this investigation; that process was not independently mapped to the affected account.
+
+At 19:15 Philippine time on September 6, the safe runtime interface reported routing enabled again and the existing build 5 process still listening. This later snapshot does not contradict the owner's disabled-routing observation at the time of the logout. No routing setting was changed by this investigation.
+
+The safe account interface reports a persisted `needsLogin` flag, not the provider error or the time the flag was set. The affected account's opaque reference can be correlated with the privacy-safe routing log without reading credentials: its last retained successful terminal response was at 14:22:26 Philippine time on September 6, before build 5 reopened at 14:24:59. The active log contained no terminal 401 for that reference. This does not exclude an intermediate authentication error, and it does not prove that the owner can still refresh the session.
+
+The strongest historical code-level explanation remains competing refresh ownership: the old proxy redeemed imported refresh tokens, wrote CodexBar's managed home, and treated any refresh-endpoint 401 as invalidation. Native Codex could retain a different generation in memory. A persistent sign-in flag can also outlive the event that set it. Neither explanation is established for this particular report without the exact displaying application's error. The correction prevents the proxy from continuing that refresh/write-back behavior; it cannot undo an already-invalidated provider session.
+
+### Native login explicitly revokes the previous grant
+
+Exact-tag source supplies a stronger explanation for recent mixed-login cases. In Codex `rust-v0.153.4`, `codex-rs/cli/src/login.rs` calls `clear_existing_auth_before_login` before starting browser or device login. That helper invokes `logout_with_revoke`. The login auth manager loads the existing home credentials, attempts OAuth revocation, then clears the local stores. `auth/revoke.rs` prefers the refresh token and sends it to `/oauth/revoke`. Revocation is attempted before the new browser flow completes; abandoning or delaying the new login does not undo it. The callback's `persist_tokens_async` only saves the new bundle and is not the revocation trigger.
+
+CodexBar `v0.56.4` account promotion copies the selected managed account's auth material into the live native home. Promotion itself does not revoke it. If an unscoped native login later starts in that home, Codex can revoke a grant also held in the managed home. Existing access tokens may still appear usable until a later request or renewal exposes the revoked grant; the exact server timing is not established here.
+
+This is a source-confirmed mechanism, not proof of the affected account's actual sequence. The owner reported promotion and mixed login attempts, but no private credential lineage was inspected. It cannot establish the cause of every monthlong incident, nor prove the same native behavior existed in every earlier installed version. New CodexSwap logins now use fresh empty homes and forced file storage, so the native login's preflight has no previous shared account there to revoke. Existing CodexBar/native credentials are neither copied nor migrated by this fix.
+
+### Managed-workspace renewal availability
+
+CodexBar v0.56.4 provides a more directly relevant availability mechanism. `CodexOAuthCredentials.needsRefresh` considers native credentials due for refresh within five minutes of JWT expiry. Its OAuth preparation raises `nativeRefreshRequired` rather than redeeming the shared token itself. However, `CodexOAuthNativeRefreshCLIStrategy.isAvailable` rejects a context with a selected managed workspace. The source explains that the CLI fallback cannot carry the selected workspace header safely; its tests explicitly assert that automatic mode exposes no unscoped CLI fallback for that context.
+
+Consequently, a managed-workspace account can encounter unavailable renewal even though no refresh-token revocation has been demonstrated. CodexBar's credential error guidance can suggest login for missing/unreadable files, required renewal, or an expired/invalid access token. These are not interchangeable diagnoses. The affected account's actual workspace scope and error remain unverified; this is a source-confirmed mechanism, not a proven attribution.
+
+The build 5 proxy correction intentionally does not fill that gap: it stopped acting as a competing refresh owner, but did not supply a workspace-safe native renewal owner. Re-enabling proxy refresh or starting an unscoped app-server would undo the safety boundary. A durable renewal implementation must first establish exact account/workspace ownership and coordinate its lifecycle.
+
+Upstream issue #3143 also demonstrates that keyring-backed native login can remain authenticated while CodexBar's file-based/fallback usage path reports unavailable data. That issue is not proof the affected managed account uses keyring storage. The missing-JWT-expiry fallback bug described in #3221 was fixed by #3222 before v0.56.4 and must not be cited as an unfixed cause on the installed version.
+
 Synthetic regressions must test zero proxy OAuth requests, unchanged external source bytes, two proxy instances sharing one source, owner-update recovery, identity mismatch, and normal/task/warm-up isolation. All stubs and state must be local and disposable.
 
 An earlier test fixture used the default sanitized routing-log destination. Some recent log statuses therefore overlap synthetic tests and cannot be treated as production sign-out counts. Preserve the existing log; isolate new tests rather than deleting or rewriting evidence.
 
-The running installed app was not stopped or replaced during this investigation. Before any authorized replacement, arrange a relaunch independently of the proxy-dependent session and verify the new process, listener, and health endpoint.
+The protective ownership change was installed as local build 5 on September 6, 2026, with an independent automatic relaunch and verified listener/health. Before any further authorized replacement, arrange the same independent relaunch and verify the new process, listener, and health endpoint. Installation is not evidence that an existing invalidated credential has recovered.
 
 ## Primary sources
 
@@ -68,7 +100,14 @@ Public GitHub source and release evidence was retrieved directly and through the
 - CodexBar v0.50.1 release: `https://github.com/steipete/CodexBar/releases/tag/v0.50.1`
 - CodexBar shared-writer rationale: `https://github.com/steipete/CodexBar/pull/2944`
 - CodexBar expiry correction: `https://github.com/steipete/CodexBar/pull/3222`
+- CodexBar v0.56.4 native credential expiry and error categories: `https://github.com/steipete/CodexBar/blob/v0.56.4/Sources/CodexBarCore/Providers/Codex/CodexOAuth/CodexOAuthCredentials.swift`
+- CodexBar v0.56.4 managed-workspace fallback guard: `https://github.com/steipete/CodexBar/blob/v0.56.4/Sources/CodexBarCore/Providers/Codex/CodexProviderDescriptor.swift`
+- CodexBar managed-workspace recovery regression tests: `https://github.com/steipete/CodexBar/blob/v0.56.4/Tests/CodexBarTests/CodexOAuthManagedWorkspaceRecoveryTests.swift`
+- CodexBar keyring/file-source availability report (opened August 22, closed August 25, 2026): `https://github.com/steipete/CodexBar/issues/3143`
 - Codex 0.153.4 refresh semaphore and reload outcomes: `https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/auth/manager.rs` (inspected regions 2033–2051 and 2764–2859)
+- Codex 0.153.4 pre-login revocation: `https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/cli/src/login.rs` (122–168; device flows 318–435)
+- Codex 0.153.4 revocation implementation: `https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/auth/revoke.rs` (55–85 and 97–153), and `auth/manager.rs` (951–976)
+- CodexBar 0.56.4 native account promotion: `https://github.com/steipete/CodexBar/blob/v0.56.4/Sources/CodexBar/CodexAccountPromotionService.swift` (214–263)
 - Codex 0.153.4 file persistence: `https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/auth/storage.rs` (inspected region 154–223)
 - Codex app-server managed/external auth semantics: `https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/app-server/README.md`
 - Codex guarded-reload correction: `https://github.com/openai/codex/pull/11802`
