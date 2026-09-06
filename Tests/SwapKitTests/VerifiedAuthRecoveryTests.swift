@@ -353,4 +353,25 @@ final class VerifiedAuthRecoveryTests: XCTestCase {
         let saved = await AccountStore(url: path).account("xfn")
         XCTAssertTrue(try XCTUnwrap(saved).needsLogin)
     }
+
+    func testRecoveryRejectsCandidateIfOwnerFileChangedDuringUsageProbe() async throws {
+        let path = storeURL()
+        let store = AccountStore(url: path)
+        let authPath = path.deletingLastPathComponent().appendingPathComponent("auth.json")
+        let initial = tokens("initial", expiry: Date().addingTimeInterval(600))
+        let current = account(tokens: initial, source: source(authPath.path))
+        await store.upsert(current)
+        try JSONEncoder().encode(CodexAuthFile(tokens: initial)).write(to: authPath)
+        let usage = RecoveryUsageFetcher(outcome: .delayedSuccess(usage()))
+        let recovery = Task { await AuthenticationRecovery.recoverFromSource(alias: "xfn", store: store, usage: usage) }
+        await usage.waitUntilStarted()
+        let newer = tokens("newer", expiry: Date().addingTimeInterval(3600))
+        try JSONEncoder().encode(CodexAuthFile(tokens: newer)).write(to: authPath, options: .atomic)
+        await usage.finish()
+        let result = await recovery.value
+        XCTAssertEqual(result, .staleSnapshot)
+        let stored = await store.account("xfn")
+        XCTAssertTrue(try XCTUnwrap(stored).needsLogin)
+        XCTAssertEqual(try CodexAuth.read(authPath).tokens, newer)
+    }
 }

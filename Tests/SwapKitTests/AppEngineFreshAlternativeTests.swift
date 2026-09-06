@@ -33,7 +33,7 @@ final class AppEngineFreshAlternativeTests: XCTestCase {
         )
     }
 
-    func testFreshAlternativeHydratesBeforeFilteringStaleCooldownCapAndLoginState() async throws {
+    func testFreshAlternativeDoesNotClearLoginBlockFromTokenExpiryAlone() async throws {
         let accountStoreURL = storeURL("stale-state")
         let store = AccountStore(url: accountStoreURL)
         let managedHome = FileManager.default.temporaryDirectory
@@ -77,15 +77,16 @@ final class AppEngineFreshAlternativeTests: XCTestCase {
             allowedAliases: ["a", "b"]
         )
 
-        XCTAssertEqual(selected?.alias, "b")
+        XCTAssertNil(selected)
         let calls = await usage.calls()
-        XCTAssertEqual(calls.map(\.1), ["id-b-fresh"])
+        XCTAssertTrue(calls.isEmpty)
         let refreshedValue = await store.account("b")
         let refreshed = try XCTUnwrap(refreshedValue)
-        XCTAssertFalse(refreshed.needsLogin)
-        XCTAssertTrue(refreshed.disabledUntil.isEmpty)
-        XCTAssertFalse(refreshed.isUsageLimitReached)
-        XCTAssertTrue(refreshed.isEligible(now: now))
+        XCTAssertTrue(refreshed.needsLogin)
+        XCTAssertFalse(refreshed.disabledUntil.isEmpty)
+        XCTAssertTrue(refreshed.isUsageLimitReached)
+        XCTAssertFalse(refreshed.isEligible(now: now))
+        XCTAssertEqual(refreshed.accessToken, fresh.accessToken)
     }
 
     func testFreshAlternativeNeverHydratesOrFetchesArchivedOrRoutingDisabledAccounts() async throws {

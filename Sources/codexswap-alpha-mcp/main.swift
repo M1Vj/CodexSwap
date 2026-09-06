@@ -2,10 +2,6 @@ import Foundation
 import Darwin
 import SwapKit
 
-// A process can receive SIGTERM in the small interval between exec(2) and the
-// async MCP service reaching its normal signal-source setup. Keep the handler
-// intentionally tiny and async-signal-safe; startup consumes this flag before
-// switching the dispositions to SIG_IGN for DispatchSourceSignal.
 private nonisolated(unsafe) var startupShutdownSignal: sig_atomic_t = 0
 
 @_cdecl("codexswap_alpha_mcp_startup_shutdown_signal")
@@ -330,24 +326,6 @@ private func blockShutdownSignals() -> sigset_t {
     return mask
 }
 
-private func ignoreShutdownSignals() {
-    var action = sigaction()
-    precondition(
-        sigemptyset(&action.sa_mask) == 0,
-        "could not initialize shutdown signal disposition"
-    )
-    action.sa_flags = 0
-    action.__sigaction_u.__sa_handler = SIG_IGN
-    precondition(
-        sigaction(SIGINT, &action, nil) == 0,
-        "could not ignore SIGINT during MCP startup"
-    )
-    precondition(
-        sigaction(SIGTERM, &action, nil) == 0,
-        "could not ignore SIGTERM during MCP startup"
-    )
-}
-
 private func hasPendingShutdownSignal() -> Bool {
     var pending = sigset_t()
     guard sigpending(&pending) == 0 else { return startupShutdownSignal != 0 }
@@ -402,8 +380,6 @@ private func removeMCPWorkingDirectory(
 
 _ = startupShutdownSignalHandlerInstalled
 private let shutdownSignalMask = blockShutdownSignals()
-private let shutdownRequestedDuringStartup = hasPendingShutdownSignal()
-ignoreShutdownSignals()
 private let shutdownController = AlphaMCPShutdownController()
 let shutdownSignals = [SIGINT, SIGTERM].map {
     makeShutdownSignal(signalNumber: $0, controller: shutdownController)
@@ -469,7 +445,7 @@ shutdownController.bindCancellation {
     serviceTask.cancel()
     stdinLines.cancel()
 }
-if shutdownRequestedDuringStartup {
+if hasPendingShutdownSignal() {
     shutdownController.request()
 }
 var startupMask = shutdownSignalMask

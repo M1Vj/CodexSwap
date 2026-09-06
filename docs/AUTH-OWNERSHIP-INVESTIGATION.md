@@ -91,6 +91,14 @@ An earlier test fixture used the default sanitized routing-log destination. Some
 
 The protective ownership change was installed as local build 5 on September 6, 2026, with an independent automatic relaunch and verified listener/health. Before any further authorized replacement, arrange the same independent relaunch and verify the new process, listener, and health endpoint. Installation is not evidence that an existing invalidated credential has recovered.
 
+## Follow-up regression audit (September 6, 2026)
+
+Synthetic tests reproduced additional local defects: a copied Terminal login command could reuse its home; recovery could commit a candidate after its owner file changed during the usage check; a re-added managed account could retain an obsolete home; and expiry alone could clear a sign-in block without validating access. The fixes make login commands single-use, recheck the source at the locked recovery commit, accept identity-checked home replacement only through managed-roster reconciliation, and retain sign-in blocks until explicit read-only usage verification succeeds. Managed imports also reject roster/token identity mismatches. None of these paths renews OAuth tokens or writes external auth files.
+
+The source recheck detects changes observed before commit; it cannot lock out an independent external writer after that read. Recovery is deliberately limited to explicit Rescan/import, not startup, background polling, failover, or warm-up. After completing login with the credential owner, use Rescan to verify access; restarting CodexSwap alone does not clear a sign-in block. Duplicate roster entries for the same account still require an explicit owner-selection policy. Standalone renewal remains outside this fix, and installation alone does not recover a revoked session.
+
+Full-suite validation also reproduced an Alpha MCP startup shutdown race: changing a caught signal to ignored could discard pending shutdown before dispatch-source registration. The handler now remains installed and the startup latch is checked after cancellation is bound. Existing immediate-SIGTERM stress and protocol tests cover this path.
+
 ## Primary sources
 
 Public GitHub source and release evidence was retrieved directly and through the developer index. Web-search calls supplied no usable citations and later returned an explicit unavailable error; those failed calls are not evidence. No alternate retry was used for the explicitly denied fetches.

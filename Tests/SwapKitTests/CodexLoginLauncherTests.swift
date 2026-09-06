@@ -247,4 +247,44 @@ final class CodexLoginLauncherTests: XCTestCase {
         temporaryDirectories.append(directory)
         return directory
     }
+
+    func testReplayingPreparedCommandNeverInvokesLoginTwice() throws {
+        let support = try makeTemporaryDirectory()
+        let fakeCodex = support.appendingPathComponent("fake-codex")
+        let calls = support.appendingPathComponent("calls")
+        try Data("#!/bin/bash\nprintf 'called\\n' >> '\(calls.path)'\nprintf '{}' > \"$CODEX_HOME/auth.json\"\n".utf8).write(to: fakeCodex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+        let launch = try CodexLoginLauncher.prepareStandaloneLogin(codexPath: fakeCodex.path, supportDirectory: support)
+        let duplicate = support.appendingPathComponent("duplicate.command")
+        try FileManager.default.copyItem(at: launch.commandFile, to: duplicate)
+        XCTAssertEqual(try runCommand(launch.commandFile), 0)
+        XCTAssertNotEqual(try runCommand(duplicate), 0)
+        XCTAssertEqual(try String(contentsOf: calls, encoding: .utf8), "called\n")
+    }
+
+    func testPreparedCommandRejectsHomeThatAlreadyContainsCredentials() throws {
+        let support = try makeTemporaryDirectory()
+        let fakeCodex = support.appendingPathComponent("fake-codex")
+        let calls = support.appendingPathComponent("calls")
+        try Data("#!/bin/bash\nprintf 'called' > '\(calls.path)'\nprintf '{}' > \"$CODEX_HOME/auth.json\"\n".utf8).write(to: fakeCodex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+        let launch = try CodexLoginLauncher.prepareStandaloneLogin(codexPath: fakeCodex.path, supportDirectory: support)
+        let auth = launch.homePath.appendingPathComponent("auth.json")
+        try Data("existing-account".utf8).write(to: auth)
+        XCTAssertNotEqual(try runCommand(launch.commandFile), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path))
+        XCTAssertEqual(try String(contentsOf: auth, encoding: .utf8), "existing-account")
+    }
+
+    private func runCommand(_ command: URL) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [command.path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
 }

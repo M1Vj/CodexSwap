@@ -802,7 +802,7 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
-    func testUpsertClearsNeedsLoginOnlyForVerifiedNewerImportedToken() async throws {
+    func testUpsertPreservesNeedsLoginUntilUsageVerification() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-import-merge-\(UUID().uuidString)")
         let source = AccountCredentialSource(kind: .nativeAuth, path: root.appendingPathComponent("auth.json").path)
         let initial = tokens("merge-old", expiry: Date().addingTimeInterval(60))
@@ -825,7 +825,7 @@ final class ManagedAuthRecoveryTests: XCTestCase {
             idToken: newer.idToken,
             credentialSource: source
         ))
-        XCTAssertFalse(recovered.needsLogin)
+        XCTAssertTrue(recovered.needsLogin)
         XCTAssertEqual(recovered.accessToken, newer.accessToken)
 
         await store.markNeedsLoginOnly("imported")

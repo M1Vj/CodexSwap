@@ -1259,7 +1259,8 @@ public actor AccountStore {
     }
 
     func commitVerifiedAuthentication(snapshot: Account, candidate: Account,
-                                      windows: [UsageWindow]) -> AuthenticationRecovery.RecoveryResult {
+                                      windows: [UsageWindow],
+                                      sourceIsCurrent: @Sendable () -> Bool = { true }) -> AuthenticationRecovery.RecoveryResult {
         var result = AuthenticationRecovery.RecoveryResult.staleSnapshot
         let locked = Self.withStoreLock(url) {
             guard var latest = Self.loadFrom(url),
@@ -1271,7 +1272,8 @@ public actor AccountStore {
                   current.accessToken == snapshot.accessToken,
                   current.refreshToken == snapshot.refreshToken, current.idToken == snapshot.idToken,
                   AuthenticationRecovery.source(for: current) == AuthenticationRecovery.source(for: snapshot),
-                  AuthenticationRecovery.accepts(candidate, for: current, now: clock()) else { return }
+                  AuthenticationRecovery.accepts(candidate, for: current, now: clock()),
+                  sourceIsCurrent() else { return }
             latest.accounts[position].accessToken = candidate.accessToken
             latest.accounts[position].refreshToken = candidate.refreshToken
             latest.accounts[position].idToken = candidate.idToken
@@ -1669,7 +1671,6 @@ public actor AccountStore {
             data.accounts[i].accessToken = tokens.accessToken
             data.accounts[i].refreshToken = tokens.refreshToken
             advanceAuthGeneration(at: i)
-            data.accounts[i].needsLogin = false
             drainingAliases.remove(alias)
             drainingObservedAt.removeValue(forKey: alias)
             persist()
@@ -2042,6 +2043,20 @@ public actor AccountStore {
     /// Insert or update an account keyed by accountID (falling back to alias). Preserves priority on update.
     @discardableResult
     public func upsert(_ account: Account) -> Account {
+        upsert(account, acceptingManagedSource: false)
+    }
+
+    @discardableResult
+    func reconcileManagedAccount(_ account: Account) -> Account {
+        let source = AuthenticationRecovery.source(for: account)
+        let valid = source?.kind == .managedHome
+            && !account.accountID.isEmpty && !account.refreshToken.isEmpty
+            && JWT.identity(fromAccessToken: account.accessToken).accountID == account.accountID
+            && (JWT.expiry(account.accessToken) ?? .distantPast) > clock()
+        return upsert(account, acceptingManagedSource: valid)
+    }
+
+    private func upsert(_ account: Account, acceptingManagedSource: Bool) -> Account {
         refreshExternalStateIfNeeded()
         var account = account
         if let source = account.credentialSource, source.kind == .managedHome {
@@ -2077,7 +2092,9 @@ public actor AccountStore {
             if let managedHomePath = merged.managedHomePath {
                 merged.credentialSource = AccountCredentialSource(kind: .managedHome, path: managedHomePath)
             }
-            let incomingMayReplaceManagedOwner = Self.incomingSourceMayReplaceManagedOwner(
+            let replacingManagedSource = acceptingManagedSource && existing.accountID == account.accountID
+                && Self.credentialSource(for: existing) != Self.credentialSource(for: account)
+            let incomingMayReplaceManagedOwner = replacingManagedSource || Self.incomingSourceMayReplaceManagedOwner(
                 existing: existing,
                 incoming: account
             )
@@ -2101,22 +2118,7 @@ public actor AccountStore {
             // clobbers a fresher one, independent of import order.
             let existingExp = JWT.expiry(existing.accessToken) ?? .distantPast
             let incomingExp = JWT.expiry(account.accessToken) ?? .distantPast
-            let sourceIsKnown = account.credentialSource.map {
-                $0.kind != .unknown && ($0.path?.isEmpty == false)
-            } ?? false
-            let incomingIdentity = JWT.identity(fromAccessToken: account.accessToken).accountID
-            let verifiedSourceUpdate = sourceIsKnown
-                && incomingExp > existingExp
-                && incomingExp > clock()
-                && !data.accounts[i].accountID.isEmpty
-                && account.accountID == data.accounts[i].accountID
-                && incomingIdentity == data.accounts[i].accountID
-                && (account.tokens.accountId.isEmpty || account.tokens.accountId == data.accounts[i].accountID)
-                && incomingMayReplaceManagedOwner
-            if verifiedSourceUpdate {
-                merged.needsLogin = false
-            }
-            if !incomingMayReplaceManagedOwner || existingExp > incomingExp {
+            if !incomingMayReplaceManagedOwner || (!replacingManagedSource && existingExp > incomingExp) {
                 merged.accessToken = existing.accessToken
                 merged.refreshToken = existing.refreshToken
                 merged.idToken = existing.idToken

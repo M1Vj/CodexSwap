@@ -37,8 +37,18 @@ enum AuthenticationRecovery {
             && source(for: current) != nil && source(for: candidate) == source(for: current)
     }
 
+    static func recoverFromSource(alias: String, store: AccountStore,
+                                  usage: any UsageFetching) async -> RecoveryResult {
+        guard let account = await store.account(alias), let candidate = candidate(for: account) else {
+            return .candidateRejected
+        }
+        return await recover(alias: alias, candidate: candidate, store: store, usage: usage,
+                             sourceIsCurrent: { self.candidate(for: account)?.tokens == candidate.tokens })
+    }
+
     static func recover(alias: String, candidate: Account, store: AccountStore,
-                        usage: any UsageFetching) async -> RecoveryResult {
+                        usage: any UsageFetching,
+                        sourceIsCurrent: @Sendable () -> Bool = { true }) async -> RecoveryResult {
         guard let snapshot = await store.account(alias), accepts(candidate, for: snapshot) else {
             return .candidateRejected
         }
@@ -47,6 +57,7 @@ enum AuthenticationRecovery {
         catch { return .usageFailed }
         guard !windows.isEmpty else { return .emptyUsage }
         guard !Task.isCancelled else { return .staleSnapshot }
-        return await store.commitVerifiedAuthentication(snapshot: snapshot, candidate: candidate, windows: windows)
+        return await store.commitVerifiedAuthentication(snapshot: snapshot, candidate: candidate,
+                                                        windows: windows, sourceIsCurrent: sourceIsCurrent)
     }
 }

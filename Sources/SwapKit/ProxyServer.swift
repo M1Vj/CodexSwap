@@ -203,9 +203,6 @@ func selectProxyAccount(
         // parallel session and changing accounts without an upstream failure.
         return await store.current(now: now)
     case .warmup(let alias):
-        // Hydrate managed tokens before judging eligibility, exactly like normal traffic does:
-        // a stale store copy (old token, leftover needs-login flag) must not fail a warm-up
-        // that CodexBar's fresh credentials can serve.
         guard let account = await store.hydrateFromManagedHome(alias), account.isEligible(now: now) else { return nil }
         return account
     case .task(let allowed, _):

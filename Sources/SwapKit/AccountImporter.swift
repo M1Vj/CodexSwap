@@ -37,6 +37,9 @@ public enum AccountImporter {
     public static func codexBarAccounts(_ managedAccounts: [CodexBarBridge.ManagedAccount]) -> [Account] {
         managedAccounts.compactMap { managed in
             guard let tokens = CodexBarBridge.readTokens(home: managed.managedHomePath) else { return nil }
+            let claimedID = JWT.identity(fromAccessToken: tokens.accessToken).accountID ?? tokens.accountId
+            guard !managed.accountID.isEmpty, claimedID == managed.accountID,
+                  tokens.accountId.isEmpty || tokens.accountId == managed.accountID else { return nil }
             let hint = managed.email.split(separator: "@").first.map(String.init)
             return account(
                 from: tokens,

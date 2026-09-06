@@ -1213,7 +1213,7 @@ final class WarmupProxyTests: XCTestCase {
         return "e30.\(payload).sig"
     }
 
-    func testWarmupSelectionHydratesManagedTokensBeforeEligibility() async throws {
+    func testWarmupSelectionCannotClearLoginBlockByHydratingManagedTokens() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-hydrate-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let home = root.appendingPathComponent("managed-home", isDirectory: true)
@@ -1234,9 +1234,10 @@ final class WarmupProxyTests: XCTestCase {
 
         let selected = await selectProxyAccount(store: store, mode: .warmup(alias: "m"))
 
-        XCTAssertEqual(selected?.alias, "m")
-        XCTAssertEqual(selected?.accessToken, fresh)
-        XCTAssertEqual(selected?.needsLogin, false)
+        XCTAssertNil(selected)
+        let account = await store.account("m")
+        XCTAssertEqual(account?.accessToken, fresh)
+        XCTAssertEqual(account?.needsLogin, true)
     }
 
     func testMarkLimitedDoesNotRotateActiveAccount() async {
@@ -2747,7 +2748,7 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertNotNil(record?.retryAfter)
     }
 
-    func testWarmupHydratesManagedAccountsBeforeEligibility() async throws {
+    func testWarmupPreservesLoginBlockUntilVerifiedRecovery() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-managed-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let home = root.appendingPathComponent("managed-home", isDirectory: true)
@@ -2780,8 +2781,8 @@ final class WarmupEngineTests: XCTestCase {
 
         let summary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
 
-        XCTAssertEqual(summary.warmed, ["a"])
-        XCTAssertNil(summary.skipped["a"])
+        XCTAssertEqual(summary.warmed, [])
+        XCTAssertEqual(summary.skipped["a"], "needs login")
     }
 
     func testAutomaticWarmupPreferencePersistsIndependently() async {

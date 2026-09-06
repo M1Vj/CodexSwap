@@ -383,8 +383,9 @@ public actor AppEngine {
     }
 
     func reconcileManagedAccounts(_ accounts: [Account], presentAccountIDs: Set<String>) async {
-        for account in accounts { await store.upsert(account) }
+        for account in accounts { await store.reconcileManagedAccount(account) }
         let removal = await store.reconcileManagedWithTelemetry(present: presentAccountIDs)
+        needsLoginNotified.subtract(removal.removedAliases)
         for telemetryID in removal.removedTelemetryIDs {
             await telemetry.purge(accountTelemetryID: telemetryID)
         }
@@ -1290,8 +1291,7 @@ public actor AppEngine {
 
     func recoverBlockedAuthentication() async {
         for account in await store.all() where account.needsLogin && account.routingEnabled && !account.isArchived {
-            guard let candidate = AuthenticationRecovery.candidate(for: account) else { continue }
-            if await AuthenticationRecovery.recover(alias: account.alias, candidate: candidate, store: store, usage: usage) == .committed {
+            if await AuthenticationRecovery.recoverFromSource(alias: account.alias, store: store, usage: usage) == .committed {
                 needsLoginNotified.remove(account.alias)
             }
         }

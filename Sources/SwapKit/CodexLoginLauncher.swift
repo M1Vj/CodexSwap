@@ -50,6 +50,7 @@ public enum CodexLoginLauncher {
         let homeURL = URL(fileURLWithPath: homePath, isDirectory: true)
         let quotedMarkerPath = shellQuote(homeURL.appendingPathComponent(successMarkerName).path)
         let quotedAuthPath = shellQuote(homeURL.appendingPathComponent("auth.json").path)
+        let quotedAttemptPath = shellQuote(homeURL.appendingPathComponent(".codexswap-login-started").path)
         return """
         #!/usr/bin/env bash
         set -u
@@ -64,6 +65,11 @@ public enum CodexLoginLauncher {
             printf '\nCodex login could not enter its private home: %s. No account was imported.\n' "$CODEX_HOME"
             exit 1
         }
+
+        if [ -e \(quotedAuthPath) ] || [ -L \(quotedAuthPath) ] || ! mkdir -- \(quotedAttemptPath) 2>/dev/null; then
+            printf '\nThis login home has already been used. Choose Add Standalone again for a fresh login; existing credentials were not changed.\n'
+            exit 1
+        fi
 
         \(quotedCodexPath) login -c 'cli_auth_credentials_store="file"'
         status=$?

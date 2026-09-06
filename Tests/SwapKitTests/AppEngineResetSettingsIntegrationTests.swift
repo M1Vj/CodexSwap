@@ -3,6 +3,25 @@ import XCTest
 @testable import SwapKit
 
 final class AppEngineResetSettingsIntegrationTests: XCTestCase {
+    func testReaddedManagedAccountCanNotifyForANewSignInEpisode() async throws {
+        let fixture = try await makeFixture(availableCount: 0)
+        let events = ResetSettingsEventCounter()
+        await fixture.engine.setEventHandler { event in
+            if case .needsLogin = event { events.increment() }
+        }
+        let managed = Account(alias: "managed", accountID: "managed-id", accessToken: "synthetic",
+                              managedHomePath: "/synthetic/managed-home")
+        let event = ProxyEvent(kind: .needsLogin, from: "managed", to: nil, limit: nil, resetAt: nil)
+        await fixture.engine.reconcileManagedAccounts([managed], presentAccountIDs: ["managed-id"])
+        await fixture.engine.forwardProxyEvent(event)
+        await fixture.engine.forwardProxyEvent(event)
+        XCTAssertEqual(events.value(), 1)
+        await fixture.engine.reconcileManagedAccounts([], presentAccountIDs: [])
+        await fixture.engine.reconcileManagedAccounts([managed], presentAccountIDs: ["managed-id"])
+        await fixture.engine.forwardProxyEvent(event)
+        XCTAssertEqual(events.value(), 2)
+    }
+
     func testSuspendedServiceWaitTimesOutAndReleasesPendingOperation() async throws {
         let fixture = try await makeFixture(availableCount: 1)
         await fixture.service.suspendNextFetch()
