@@ -48,7 +48,7 @@ final class AppEngineFreshAlternativeTests: XCTestCase {
 
         var stale = Account(
             alias: "b",
-            accountID: "id-b-stale",
+            accountID: "id-b-fresh",
             accessToken: "",
             priority: 2,
             needsLogin: true,

@@ -13,6 +13,37 @@ enum AccountArchiveMenuPresentation {
     }
 }
 
+struct AccountMenuSelectionPresentation: Equatable {
+    let displayedAlias: String?
+    let lastRoutedTitle: String
+    let defaultTitle: String
+
+    static func resolve(
+        defaultAlias: String?,
+        lastRoutedAlias: String?,
+        accounts: [Account]
+    ) -> AccountMenuSelectionPresentation {
+        let visibleAliases = Set(accounts.filter { !$0.isArchived && $0.routingEnabled }.map(\.alias))
+        let defaultVisibleAlias = defaultAlias.flatMap { visibleAliases.contains($0) ? $0 : nil }
+        let routedAccount = lastRoutedAlias.flatMap { alias in accounts.first { $0.alias == alias } }
+        let displayedAlias = routedAccount.flatMap { visibleAliases.contains($0.alias) ? $0.alias : nil }
+            ?? defaultVisibleAlias
+        let lastRoutedTitle: String
+        if let routedAccount {
+            lastRoutedTitle = routedAccount.isArchived
+                ? "Last routed: \(routedAccount.alias) (archived)"
+                : "Last routed: \(routedAccount.alias)"
+        } else {
+            lastRoutedTitle = "Last routed: none"
+        }
+        return AccountMenuSelectionPresentation(
+            displayedAlias: displayedAlias,
+            lastRoutedTitle: lastRoutedTitle,
+            defaultTitle: "Default for new tasks: \(defaultVisibleAlias ?? "none")"
+        )
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum TaskNotification {
@@ -545,9 +576,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(poolLine)
         }
 
-        let active = NSMenuItem(title: "Active account: \(activeAlias ?? "none")", action: nil, keyEquivalent: "")
-        active.isEnabled = false
-        menu.addItem(active)
+        let selectionPresentation = AccountMenuSelectionPresentation.resolve(
+            defaultAlias: activeAlias,
+            lastRoutedAlias: latest.lastActivityAlias,
+            accounts: latest.accounts
+        )
+        let lastRouted = NSMenuItem(title: selectionPresentation.lastRoutedTitle, action: nil, keyEquivalent: "")
+        lastRouted.isEnabled = false
+        menu.addItem(lastRouted)
+        let defaultItem = NSMenuItem(title: selectionPresentation.defaultTitle, action: nil, keyEquivalent: "")
+        defaultItem.isEnabled = false
+        menu.addItem(defaultItem)
         if let stickyAlias = latest.stickyAlias {
             let sticky = NSMenuItem(title: "Sticky account: \(stickyAlias) · until quota error", action: nil, keyEquivalent: "")
             sticky.isEnabled = false
@@ -622,7 +661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let row = MenuAccountRow(
                 rank: index + 1,
                 alias: acc.alias,
-                isActive: acc.alias == activeAlias,
+                isActive: acc.alias == selectionPresentation.displayedAlias,
                 isSticky: acc.alias == latest.stickyAlias,
                 isEnabled: true,
                 needsLogin: acc.needsLogin,
@@ -630,7 +669,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 cooldownUntil: acc.cooldownUntil(now: Date()),
                 windows: acc.usage,
                 costEstimate: acc.usageStats.map { UsageAnalytics.estimatedCost($0) },
-                usageLimitSettings: acc.usageLimitSettings
+                usageLimitSettings: acc.usageLimitSettings,
+                selectionLabel: acc.alias == latest.lastActivityAlias ? "Last routed" : "Default for new tasks"
             )
             let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
             let alias = acc.alias

@@ -59,6 +59,11 @@ private func telemetryModel(from body: Data) -> String {
     return UsageTelemetryAttemptEvent.normalizeModel(raw)
 }
 
+private func accessTokenExpired(_ accessToken: String, now: Date = Date()) -> Bool {
+    guard let expiry = JWT.expiry(accessToken) else { return false }
+    return expiry <= now
+}
+
 enum ExhaustionDecision: Equatable, Sendable {
     case retryCurrent
     case switchTo(String)
@@ -422,16 +427,58 @@ public struct NullEventSink: ProxyEventSink {
 private func normalizedTurnValue(_ value: String?) -> String? {
     guard let value else { return nil }
     let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !normalized.isEmpty, normalized.utf8.count <= 4_096 else { return nil }
+    guard !normalized.isEmpty,
+          normalized.utf8.count <= 4_096,
+          normalized.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+        return nil
+    }
     return normalized
 }
 
+private func namespacedInteractiveKey(namespace: String, value: Any?) -> String? {
+    guard let value = value as? String,
+          let normalized = normalizedTurnValue(value) else { return nil }
+    return "\(namespace):\(normalized)"
+}
+
+private func structuredInteractiveKey(from value: Any?) -> String? {
+    if let metadata = value as? [String: Any] {
+        if let threadKey = namespacedInteractiveKey(namespace: "thread", value: metadata["thread_id"]) {
+            return threadKey
+        }
+        if let sessionKey = namespacedInteractiveKey(namespace: "session", value: metadata["session_id"]) {
+            return sessionKey
+        }
+        return nil
+    }
+    guard let encoded = value as? String,
+          let data = encoded.data(using: .utf8),
+          data.count <= 1_048_576,
+          let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return nil
+    }
+    return structuredInteractiveKey(from: metadata)
+}
+
 func interactiveTurnKey(headers: HTTPHeaders, body: Data) -> String? {
+    var bodyLegacy: String?
     if body.count <= 1_048_576,
        let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-       let metadata = object["client_metadata"] as? [String: Any],
-       let value = normalizedTurnValue(metadata["x-codex-turn-metadata"] as? String) {
-        return value
+       let metadata = object["client_metadata"] as? [String: Any] {
+        if let threadKey = namespacedInteractiveKey(namespace: "thread", value: metadata["thread_id"]) {
+            return threadKey
+        }
+        if let sessionKey = namespacedInteractiveKey(namespace: "session", value: metadata["session_id"]) {
+            return sessionKey
+        }
+        if let structuredKey = structuredInteractiveKey(from: metadata["x-codex-turn-metadata"]) {
+            return structuredKey
+        }
+        bodyLegacy = normalizedTurnValue(metadata["x-codex-turn-metadata"] as? String)
+    }
+    if let bodyLegacy { return bodyLegacy }
+    if let structuredKey = structuredInteractiveKey(from: headers.first(name: "x-codex-turn-metadata")) {
+        return structuredKey
     }
     return normalizedTurnValue(headers.first(name: "x-codex-turn-metadata"))
         ?? normalizedTurnValue(headers.first(name: "x-codex-turn-state"))
@@ -631,6 +678,7 @@ actor UpstreamRateLimitBackoff {
 private enum ProxyAttemptResult: Sendable {
     case completed(outcome: UsageTelemetryRootOutcome, status: Int?)
     case retry(account: Account, tokenRefreshed: Bool, exhaustionHandled: Bool, finalReplay: Bool)
+    case retryOnSuccessfulSelection(account: Account, tokenRefreshed: Bool, exhaustionHandled: Bool, finalReplay: Bool)
     case retryTransient(account: Account, retries: Int)
 }
 
@@ -689,7 +737,6 @@ public actor ProxyServer {
     static let maxCandidateRequestBodyBytes = 64 * 1024 * 1024
 
     private let store: AccountStore
-    private let refresher: TokenRefresher
     private let settingsProvider: @Sendable () async -> Settings
     private let routingEnabledProvider: @Sendable () async -> Bool
     private let sink: ProxyEventSink
@@ -723,7 +770,6 @@ public actor ProxyServer {
     private var lastActivityAlias: String?
     private let interactiveSelector = InteractiveTurnSelector()
     private var taskRunPins = TaskRunPins()
-    private var inflightRefresh: [String: Task<CodexTokens, Error>] = [:]
 
     public struct Activity: Sendable {
         public let servedCount: Int
@@ -759,7 +805,7 @@ public actor ProxyServer {
     ) {
         self.routingEnabledProvider = routingEnabledProvider
         self.store = store
-        self.refresher = refresher
+        _ = refresher
         self.config = config
         self.settingsProvider = settingsProvider
         self.exhaustionHandler = ExhaustionPolicyHandler(reset: automaticQuotaReset)
@@ -1224,6 +1270,7 @@ public actor ProxyServer {
         log("\(head.method.rawValue) \(rawPath) -> account=\(account.alias)")
 
         var tokenRefreshed = false
+        var bindSelectionOnSuccess = false
         var exhaustionHandled = false
         var finalReplay = false
         var transientRateLimitRetries = 0
@@ -1264,6 +1311,7 @@ public actor ProxyServer {
                     settings: settings,
                     interactiveKey: interactiveKey,
                     tokenRefreshed: tokenRefreshed,
+                    bindSelectionOnSuccess: bindSelectionOnSuccess,
                     exhaustionHandled: exhaustionHandled,
                     finalReplay: finalReplay,
                     rootRequestID: rootRequestID,
@@ -1311,12 +1359,22 @@ public actor ProxyServer {
                 _ = await attemptedAccounts.claim(next.alias)
                 account = next
                 tokenRefreshed = refreshed
+                bindSelectionOnSuccess = false
+                exhaustionHandled = handled
+                finalReplay = replay
+            case let .retryOnSuccessfulSelection(next, refreshed, handled, replay):
+                _ = await attemptedAccounts.claim(next.alias)
+                account = next
+                tokenRefreshed = refreshed
+                bindSelectionOnSuccess = true
                 exhaustionHandled = handled
                 finalReplay = replay
             case let .retryTransient(next, retries):
+                let preserveSelection = bindSelectionOnSuccess && next.alias == account.alias
                 _ = await attemptedAccounts.claim(next.alias)
                 account = next
                 tokenRefreshed = false
+                bindSelectionOnSuccess = preserveSelection
                 finalReplay = false
                 transientRateLimitRetries = retries
             }
@@ -1349,6 +1407,7 @@ public actor ProxyServer {
         settings: Settings,
         interactiveKey: String?,
         tokenRefreshed initialTokenRefreshed: Bool,
+        bindSelectionOnSuccess initialBindSelectionOnSuccess: Bool,
         exhaustionHandled initialExhaustionHandled: Bool,
         finalReplay initialFinalReplay: Bool,
         rootRequestID: UUID,
@@ -1397,15 +1456,23 @@ public actor ProxyServer {
         ) { () async throws -> ProxyAttemptResult in
             var account = initialAccount
             var tokenRefreshed = initialTokenRefreshed
+            let bindSelectionOnSuccess = initialBindSelectionOnSuccess
             var exhaustionHandled = initialExhaustionHandled
             var finalReplay = initialFinalReplay
             let transientRateLimitRetries = initialTransientRateLimitRetries
             let attemptStartedAt = Date()
 
-            // Prefer CodexBar's fresher token for managed accounts before spending a refresh ourselves.
+            // Read the selected external source before judging its token.
             if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
-            if JWT.isStale(account.accessToken) {
-                if let refreshed = try? await self.refreshTokens(account) { account = refreshed }
+            if accessTokenExpired(account.accessToken) {
+                return try await self.renewalRequired(
+                    account: account,
+                    mode: mode,
+                    outbound: outbound,
+                    resolveAlternative: resolveAlternative,
+                    exhaustionHandled: exhaustionHandled,
+                    finalReplay: finalReplay
+                )
             }
 
             let resp: HTTPClientResponse
@@ -1452,7 +1519,10 @@ public actor ProxyServer {
             // final; alternative-account replays remain eligible for the bounded
             // failover path below.
             if finalReplay {
-                await self.recordActivity(account.alias)
+                await self.publishServedActivity(account.alias, mode: mode)
+                if bindSelectionOnSuccess, resp.status.code >= 200, resp.status.code < 300 {
+                    await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
+                }
                 try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
                 return .completed(
                     outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure,
@@ -1460,82 +1530,19 @@ public actor ProxyServer {
                 )
             }
 
-            // 401 -> refresh once, then retry
-            if resp.status == .unauthorized, !tokenRefreshed,
-               await !burn.suppressed(alias: account.alias, refreshToken: account.refreshToken, now: Date()) {
+            if resp.status == .unauthorized, !tokenRefreshed {
                 let errBody = try await collect(resp.body, cap: 64 * 1024)
-                do {
-                    account = try await self.refreshTokens(account)
-                    tokenRefreshed = true
+                if let recovered = await self.recoverManagedAccount(account, store: store) {
                     return .retry(
-                        account: account,
-                        tokenRefreshed: tokenRefreshed,
+                        account: recovered,
+                        tokenRefreshed: false,
                         exhaustionHandled: exhaustionHandled,
                         finalReplay: finalReplay
                     )
-                } catch RefreshError.sessionInvalidated {
-                    if mode.isWarmup {
-                        await store.markNeedsLoginOnly(account.alias)
-                        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
-                        try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in")
-                        return .completed(outcome: .failure, status: Int(resp.status.code))
-                    }
-                    // A CodexBar-managed account may have lost the refresh race to CodexBar itself;
-                    // adopt its rotated copy before condemning the account to needs-login.
-                    if let hydrated = await store.hydrateFromManagedHome(account.alias),
-                       hydrated.accessToken != account.accessToken, !JWT.isStale(hydrated.accessToken) {
-                        account = hydrated
-                        return .retry(
-                            account: account,
-                            tokenRefreshed: tokenRefreshed,
-                            exhaustionHandled: exhaustionHandled,
-                            finalReplay: finalReplay
-                        )
-                    }
-                    if mode.isTask {
-                        if let next = try await self.taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
-                            return .retry(
-                                account: next,
-                                tokenRefreshed: false,
-                                exhaustionHandled: exhaustionHandled,
-                                finalReplay: finalReplay
-                            )
-                        }
-                        return .completed(outcome: .failure, status: Int(resp.status.code))
-                    }
-                    account = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) ?? account
-                    if account.needsLogin { return .completed(outcome: .failure, status: Int(resp.status.code)) }
-                    await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
-                    tokenRefreshed = false
-                    return .retry(
-                        account: account,
-                        tokenRefreshed: tokenRefreshed,
-                        exhaustionHandled: exhaustionHandled,
-                        finalReplay: finalReplay
-                    )
-                } catch {
-                    try await writeError(outbound, status: .unauthorized, message: "token refresh failed: \(error)")
-                    return .completed(outcome: .failure, status: Int(resp.status.code))
                 }
-            }
-
-            // 401 after refresh, session invalidated -> mark needs-login, fail over
-            if resp.status == .unauthorized, tokenRefreshed {
-                let errBody = try await collect(resp.body, cap: 64 * 1024)
                 if isSessionInvalidated(errBody) {
                     await burn.clear(alias: account.alias)
                     if mode.isTask {
-                        if let hydrated = await store.hydrateFromManagedHome(account.alias),
-                           hydrated.accessToken != account.accessToken, !JWT.isStale(hydrated.accessToken) {
-                            account = hydrated
-                            tokenRefreshed = false
-                            return .retry(
-                                account: account,
-                                tokenRefreshed: tokenRefreshed,
-                                exhaustionHandled: exhaustionHandled,
-                                finalReplay: finalReplay
-                            )
-                        }
                         if let next = try await self.taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
                             return .retry(
                                 account: next,
@@ -1565,9 +1572,14 @@ public actor ProxyServer {
                     }
                     return .completed(outcome: .failure, status: Int(resp.status.code))
                 }
-                await burn.markUnhelpful(alias: account.alias, refreshToken: account.refreshToken, now: Date())
-                try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                return .completed(outcome: .failure, status: Int(resp.status.code))
+                return try await self.renewalRequired(
+                    account: account,
+                    mode: mode,
+                    outbound: outbound,
+                    resolveAlternative: resolveAlternative,
+                    exhaustionHandled: exhaustionHandled,
+                    finalReplay: finalReplay
+                )
             }
 
             // 429 usage limit -> rotate
@@ -1782,11 +1794,10 @@ public actor ProxyServer {
             if resp.status != .unauthorized {
                 await burn.clear(alias: account.alias)
             }
-            let previousActivityAlias = await self.lastActivityAlias
-            if mode == .normal, previousActivityAlias != account.alias {
-                await sink.handle(ProxyEvent(kind: .served, from: account.alias, to: nil, limit: nil, resetAt: nil, runID: nil))
+            await self.publishServedActivity(account.alias, mode: mode)
+            if bindSelectionOnSuccess, resp.status.code >= 200, resp.status.code < 300 {
+                await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
             }
-            await self.recordActivity(account.alias)
             await self.log("\(head.method.rawValue) \(path) account=\(account.alias) -> \(resp.status.code)")
             await self.bindResponseTurnState(
                 headers: resp.headers,
@@ -1802,6 +1813,49 @@ public actor ProxyServer {
                 status: Int(resp.status.code)
             )
         }
+    }
+
+    private func publishServedActivity(_ alias: String, mode: ProxyRequestMode) async {
+        guard !mode.isWarmup else { return }
+        let previousActivityAlias = lastActivityAlias
+        recordActivity(alias)
+        guard previousActivityAlias != alias else { return }
+        await sink.handle(ProxyEvent(kind: .served, from: alias, to: nil, limit: nil, resetAt: nil, runID: mode.taskRunID))
+    }
+
+    private func renewalRequired(
+        account: Account,
+        mode: ProxyRequestMode,
+        outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        resolveAlternative: @escaping @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?,
+        exhaustionHandled: Bool,
+        finalReplay: Bool
+    ) async throws -> ProxyAttemptResult {
+        guard !mode.isWarmup else {
+            try await writeError(
+                outbound,
+                status: .serviceUnavailable,
+                message: "CodexSwap account \(account.alias) requires renewal by its credential owner"
+            )
+            return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
+        }
+        let allowedAliases: [String]?
+        if case .task(let allowed, _) = mode { allowedAliases = allowed }
+        else { allowedAliases = nil }
+        if let alternative = await resolveAlternative(account.alias, allowedAliases) {
+            return .retryOnSuccessfulSelection(
+                account: alternative,
+                tokenRefreshed: false,
+                exhaustionHandled: exhaustionHandled,
+                finalReplay: finalReplay
+            )
+        }
+        try await writeError(
+            outbound,
+            status: .serviceUnavailable,
+            message: "CodexSwap account \(account.alias) requires renewal by its credential owner"
+        )
+        return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
     }
 
     private func recordTelemetryAttempt(
@@ -1939,37 +1993,16 @@ public actor ProxyServer {
         return next
     }
 
-    /// Refreshes `account`'s tokens. Refresh tokens are single-use, so concurrent requests for the
-    /// same alias must never each spend one: a request first adopts a fresher store copy if another
-    /// request already refreshed, then joins any in-flight refresh instead of starting its own.
-    private func refreshTokens(_ account: Account) async throws -> Account {
-        if let current = await store.account(account.alias),
-           current.accessToken != account.accessToken, !JWT.isStale(current.accessToken) {
-            return current
+    private func recoverManagedAccount(
+        _ account: Account,
+        store: AccountStore
+    ) async -> Account? {
+        guard let hydrated = await store.hydrateFromManagedHome(account.alias),
+              hydrated.accessToken != account.accessToken,
+              !accessTokenExpired(hydrated.accessToken) else {
+            return nil
         }
-        let tokens: CodexTokens
-        if let running = inflightRefresh[account.alias] {
-            tokens = try await running.value
-        } else {
-            let refresher = self.refresher
-            let refreshToken = account.refreshToken
-            let task = Task { try await refresher.refresh(refreshToken: refreshToken) }
-            inflightRefresh[account.alias] = task
-            defer { inflightRefresh[account.alias] = nil }
-            tokens = try await task.value
-            await store.updateTokens(account.alias, tokens: tokens)
-            // Keep CodexBar's managed copy in sync so it doesn't later refresh an already-rotated token.
-            if let home = await store.managedHome(account.alias) {
-                CodexBarBridge.writeTokens(tokens, home: home)
-            }
-            await sink.handle(ProxyEvent(kind: .refreshed, from: account.alias, to: nil, limit: nil, resetAt: nil))
-        }
-        var updated = account
-        updated.idToken = tokens.idToken
-        updated.accessToken = tokens.accessToken
-        updated.refreshToken = tokens.refreshToken
-        if !tokens.accountId.isEmpty { updated.accountID = tokens.accountId }
-        return updated
+        return hydrated
     }
 
     private func forward(head: HTTPRequestHead, body: Data, account: Account, target: URL) async throws -> HTTPClientResponse {

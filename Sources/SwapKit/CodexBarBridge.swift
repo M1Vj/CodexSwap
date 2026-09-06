@@ -51,8 +51,4 @@ public enum CodexBarBridge {
         return tokens
     }
 
-    /// Write refreshed tokens back to CodexBar's managed home so CodexBar stays in sync after we rotate them.
-    public static func writeTokens(_ tokens: CodexTokens, home: String) {
-        try? CodexAuth.write(tokens, to: authURL(forHome: home))
-    }
 }

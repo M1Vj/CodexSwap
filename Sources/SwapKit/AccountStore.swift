@@ -634,6 +634,10 @@ public actor AccountStore {
         merged.lastUsedAt = mergeValue(local.lastUsedAt, baseline: baseline.lastUsedAt, latest: latest.lastUsedAt)
         merged.usage = mergeUsageWindows(local: local.usage, baseline: baseline.usage, latest: latest.usage)
         merged.managedHomePath = mergeValue(local.managedHomePath, baseline: baseline.managedHomePath, latest: latest.managedHomePath)
+        merged.credentialSource = mergeValue(local.credentialSource, baseline: baseline.credentialSource, latest: latest.credentialSource)
+        if let managedHomePath = merged.managedHomePath {
+            merged.credentialSource = AccountCredentialSource(kind: .managedHome, path: managedHomePath)
+        }
         merged.routingEnabled = mergeValue(local.routingEnabled, baseline: baseline.routingEnabled, latest: latest.routingEnabled)
         merged.usageStats = mergeUsageStats(
             local: local.usageStats,
@@ -1533,19 +1537,50 @@ public actor AccountStore {
 
     // MARK: - Mutations
 
-    /// For CodexBar-managed accounts, adopt CodexBar's token if it's fresher than ours (CodexBar owns refresh).
+    /// Adopt a fresher token from an explicitly imported external source.
     public func hydrateFromManagedHome(_ alias: String) -> Account? {
         refreshExternalStateIfNeeded()
         guard let i = index(alias) else { return nil }
-        guard let home = data.accounts[i].managedHomePath,
-              let tokens = CodexBarBridge.readTokens(home: home) else { return data.accounts[i] }
-        let ours = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast
+        let current = data.accounts[i]
+        let source: AccountCredentialSource?
+        if let home = current.managedHomePath, !home.isEmpty {
+            source = AccountCredentialSource(kind: .managedHome, path: home)
+        } else {
+            source = current.credentialSource
+        }
+        guard let source,
+              source.kind != .unknown,
+              let path = source.path,
+              !path.isEmpty else {
+            return current
+        }
+        let sourceURL: URL
+        switch source.kind {
+        case .managedHome:
+            sourceURL = URL(fileURLWithPath: path, isDirectory: true)
+                .appendingPathComponent("auth.json", isDirectory: false)
+        case .nativeAuth, .legacySnapshot:
+            sourceURL = URL(fileURLWithPath: path, isDirectory: false)
+        case .unknown:
+            return current
+        }
+        guard let file = try? CodexAuth.read(sourceURL),
+              let tokens = file.tokens,
+              !tokens.accessToken.isEmpty else {
+            return current
+        }
+        let claimedAccountID = JWT.identity(fromAccessToken: tokens.accessToken).accountID
+        guard !current.accountID.isEmpty,
+              (claimedAccountID ?? tokens.accountId) == current.accountID,
+              tokens.accountId.isEmpty || tokens.accountId == current.accountID else {
+            return current
+        }
+        let ours = JWT.expiry(current.accessToken) ?? .distantPast
         let theirs = JWT.expiry(tokens.accessToken) ?? .distantPast
-        if theirs > ours {
+        if theirs > ours, theirs > clock() {
             data.accounts[i].idToken = tokens.idToken
             data.accounts[i].accessToken = tokens.accessToken
             data.accounts[i].refreshToken = tokens.refreshToken
-            if !tokens.accountId.isEmpty { data.accounts[i].accountID = tokens.accountId }
             data.accounts[i].needsLogin = false
             drainingAliases.remove(alias)
             drainingObservedAt.removeValue(forKey: alias)
@@ -1921,8 +1956,15 @@ public actor AccountStore {
         refreshExternalStateIfNeeded()
         var account = account
         account.priority = AccountPriority.normalize(account.priority)
-        if let i = data.accounts.firstIndex(where: { !$0.accountID.isEmpty && $0.accountID == account.accountID })
-            ?? data.accounts.firstIndex(where: { $0.alias == account.alias }) {
+        let matchingAccountID = data.accounts.firstIndex {
+            !$0.accountID.isEmpty && !account.accountID.isEmpty && $0.accountID == account.accountID
+        }
+        let matchingAlias = data.accounts.firstIndex { $0.alias == account.alias }
+        let matchingIndex = matchingAccountID ?? matchingAlias.flatMap { index in
+            guard account.accountID.isEmpty || data.accounts[index].accountID.isEmpty else { return nil }
+            return index
+        }
+        if let i = matchingIndex {
             var merged = account
             merged.priority = data.accounts[i].priority
             merged.alias = data.accounts[i].alias
@@ -1938,6 +1980,10 @@ public actor AccountStore {
             // snapshots do not carry this field and must never reset a cap.
             merged.usageLimitSettings = data.accounts[i].usageLimitSettings
             merged.managedHomePath = account.managedHomePath ?? data.accounts[i].managedHomePath
+            merged.credentialSource = account.credentialSource ?? data.accounts[i].credentialSource
+            if let managedHomePath = merged.managedHomePath {
+                merged.credentialSource = AccountCredentialSource(kind: .managedHome, path: managedHomePath)
+            }
             // needsLogin is runtime overlay state, not import data: the periodic CodexBar
             // sync upserts every account, and imports always carry false, so copying the
             // incoming value here silently re-arms a logged-out account every poll cycle.
@@ -1954,6 +2000,20 @@ public actor AccountStore {
             // clobbers a fresher one, independent of import order.
             let existingExp = JWT.expiry(data.accounts[i].accessToken) ?? .distantPast
             let incomingExp = JWT.expiry(account.accessToken) ?? .distantPast
+            let sourceIsKnown = account.credentialSource.map {
+                $0.kind != .unknown && ($0.path?.isEmpty == false)
+            } ?? false
+            let incomingIdentity = JWT.identity(fromAccessToken: account.accessToken).accountID
+            let verifiedSourceUpdate = sourceIsKnown
+                && incomingExp > existingExp
+                && incomingExp > clock()
+                && !data.accounts[i].accountID.isEmpty
+                && account.accountID == data.accounts[i].accountID
+                && incomingIdentity == data.accounts[i].accountID
+                && (account.tokens.accountId.isEmpty || account.tokens.accountId == data.accounts[i].accountID)
+            if verifiedSourceUpdate {
+                merged.needsLogin = false
+            }
             if existingExp > incomingExp {
                 merged.accessToken = data.accounts[i].accessToken
                 merged.refreshToken = data.accounts[i].refreshToken
@@ -1978,6 +2038,19 @@ public actor AccountStore {
             }
             persist()
             return data.accounts[i]
+        }
+        if let existingIndex = matchingAlias,
+           !account.accountID.isEmpty,
+           !data.accounts[existingIndex].accountID.isEmpty,
+           data.accounts[existingIndex].accountID != account.accountID {
+            let baseAlias = account.alias
+            var candidate = "\(baseAlias)-2"
+            var suffixIndex = 3
+            while data.accounts.contains(where: { $0.alias == candidate }) {
+                candidate = "\(baseAlias)-\(suffixIndex)"
+                suffixIndex += 1
+            }
+            account.alias = candidate
         }
         if account.telemetryID == Account.missingTelemetryID {
             account.telemetryID = UUID()

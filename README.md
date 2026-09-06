@@ -10,7 +10,7 @@
 
 <p align="center">
   A native macOS menu-bar app that routes your Codex work across eligible accounts,<br>
-  watches quota, preserves active turns, and runs queued tasks when capacity returns.
+  watches quota, preserves active threads, and runs queued tasks when capacity returns.
 </p>
 
 <p align="center">
@@ -41,7 +41,7 @@ Codex can keep a productive session alive long after one account reaches a usage
 CodexSwap solves the problem at the routing layer:
 
 - **New work gets an eligible account.** Choose priority order or round-robin selection.
-- **Active work stays coherent.** Interactive turns and automated runs remain pinned to the account that started them.
+- **Active work stays coherent.** Interactive turns stay pinned to a stable thread identity when Codex supplies one; older opaque turn metadata remains a compatibility fallback, and automated runs remain pinned to the account that started them.
 - **Quota becomes visible.** See five-hour and weekly windows, reset countdowns, routing state, and account health from the menu bar.
 - **Backlog can wait for capacity.** Queue repository tasks and let CodexSwap start them when quota returns.
 - **Your Codex identity stays intact.** Model traffic is routed locally while normal Codex identity and history traffic stays with the account signed in to Codex.
@@ -52,8 +52,8 @@ CodexSwap solves the problem at the routing layer:
 
 | | Capability | What it means in practice |
 | --- | --- | --- |
-| 🔁 | **Quota-aware routing** | Select an eligible account for each new turn or run without replacing auth files mid-session. |
-| 📌 | **Sticky active work** | Usage polling and idle time never move an active turn or Task Board run. |
+| 🔁 | **Quota-aware routing** | Select an eligible account for each new thread or run without replacing auth files mid-session. |
+| 📌 | **Sticky active work** | Usage polling and idle time never move an active thread or Task Board run. |
 | 📍 | **Runtime account lock** | Double-click an account row to keep normal traffic there until a real quota error; double-click again to release it. |
 | 📊 | **Quota cockpit** | Monitor usage in the menu bar—or ask Codex for a safe, live all-account quota report. |
 | 🧭 | **Clear exhaustion policies** | Choose Reset Current First, Switch First, or Stop & Notify separately for interactive work and automation. |
@@ -122,7 +122,7 @@ flowchart LR
 This design has three important consequences:
 
 1. **History is not replaced or migrated.** Login and history remain tied to the account signed in to Codex.
-2. **A live turn is sticky.** Priority and round-robin selection apply when new work begins, not during every request.
+2. **A live thread is sticky.** Priority and round-robin selection apply when a new thread begins, not during every request. Stable thread metadata keeps later turns on that account when available; legacy opaque metadata remains supported as a fallback.
 3. **Routing is reversible.** CodexSwap backs up displaced configuration and restores it when routing is disabled. If another tool changes the managed block, CodexSwap asks before repairing it.
 
 Earlier CodexSwap builds used a separate provider identity that could hide existing history. They did not delete it. Current builds migrate that configuration to the built-in-provider route automatically; restart Codex once after migration.
@@ -166,8 +166,10 @@ Task runs use Codex's workspace-write sandbox and never bypass approvals. Reposi
 
 CodexSwap is intentionally conservative about account changes:
 
-- A new interactive turn or Task Board run selects by priority or round-robin.
-- The selected account stays pinned for the active turn or process lifetime.
+- A new interactive thread or Task Board run selects by priority or round-robin.
+- Stable thread metadata keeps later turns on the same eligible account; legacy clients retain affinity while their opaque turn key stays unchanged. Pins are bounded, in-memory state, not a guarantee across proxy restarts.
+- This may improve upstream cache locality, but CodexSwap does not guarantee a cache hit or savings.
+- The menu labels the most recently routed account separately from the default account for new tasks; concurrent threads may use different accounts.
 - Displayed usage percentage, polling, and idle time never trigger a switch.
 - A semantic upstream `usage_limit_reached` response may invoke the configured policy once, with at most one retry.
 - **Disable Routing** pauses one account without deleting credentials, history, or saved Task Board choices.
@@ -210,7 +212,7 @@ CodexSwap handles authentication tokens, so its trust boundary is intentionally 
 | **No CodexSwap cloud** | Model requests go to OpenAI; account data is not sent to the maintainer. |
 | **Local metadata telemetry** | Off by default; when enabled, bounded request metadata stays local with 30-day event, 365-day aggregate, and until-cleared lifetime retention. It records counts, categories, timings, token completeness, retry outcomes, and estimated-cost provenance. It never records prompts, responses, commands, paths, headers, OAuth data, or raw errors, and never uploads telemetry. Latency includes local and network time; metrics do not infer interactive quality or productivity. |
 | **Restricted local data** | Settings and imported state live under `~/Library/Application Support/CodexSwap/` with user-only permissions where supported. |
-| **Credential ownership** | CodexBar keeps ownership of CodexBar-managed accounts; standalone accounts come from standard Codex login files. |
+| **Credential ownership** | Imported credentials are read-only. CodexSwap reads matching owner updates but does not redeem refresh tokens or overwrite Codex/CodexBar auth files. |
 | **Recoverable configuration** | Routing changes are backed up and restored rather than silently replacing unrelated configuration. |
 
 Never attach auth files, tokens, account IDs, or verbose request headers to a public issue. Read the complete [Privacy policy](PRIVACY.md) and [Security policy](SECURITY.md). Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/M1Vj/CodexSwap/security/advisories/new).
@@ -226,7 +228,7 @@ No. Current routing changes only the model endpoint. Identity and history traffi
 <details>
 <summary><strong>Does it switch accounts in the middle of every request?</strong></summary>
 
-No. A new turn or run selects an account, then stays pinned. Only an actual upstream usage-limit response—or an explicit administrative pause—can change the route for ongoing work.
+No. A new thread or run selects an account, then stays pinned when stable thread metadata is available; legacy clients keep affinity for the same opaque turn key. Quota errors, hard ineligibility, or explicit sticky overrides can change the route for ongoing work.
 </details>
 
 <details>

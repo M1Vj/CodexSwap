@@ -224,6 +224,23 @@ public struct WindowSample: Codable, Sendable, Equatable {
     }
 }
 
+public struct AccountCredentialSource: Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable, Equatable {
+        case managedHome
+        case nativeAuth
+        case legacySnapshot
+        case unknown
+    }
+
+    public let kind: Kind
+    public let path: String?
+
+    public init(kind: Kind, path: String? = nil) {
+        self.kind = kind
+        self.path = path
+    }
+}
+
 public struct Account: Codable, Sendable, Identifiable, Equatable {
     /// Stable decode-only marker for records written before telemetry IDs existed.
     /// AccountStore replaces it with a random UUID during migration.
@@ -241,8 +258,11 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var needsLogin: Bool
     public var lastUsedAt: Date?
     public var usage: [UsageWindow]
-    /// If set, this account's tokens are owned by CodexBar; read/write them at this managed CODEX_HOME.
+    /// If set, this account's tokens are owned by CodexBar and read from this managed CODEX_HOME.
     public var managedHomePath: String?
+    /// Exact external credential source recorded during an explicit import.
+    /// A nil value is intentionally unknown and grants no refresh authority.
+    public var credentialSource: AccountCredentialSource?
     public var routingEnabled: Bool
     /// Lifetime token/cost telemetry observed through the proxy, if any.
     public var usageStats: UsageStats?
@@ -273,6 +293,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         lastUsedAt: Date? = nil,
         usage: [UsageWindow] = [],
         managedHomePath: String? = nil,
+        credentialSource: AccountCredentialSource? = nil,
         routingEnabled: Bool = true,
         archivedAt: Date? = nil,
         routingPausedAt: Date? = nil,
@@ -291,7 +312,12 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.needsLogin = needsLogin
         self.lastUsedAt = lastUsedAt
         self.usage = usage
-        self.managedHomePath = managedHomePath
+        let resolvedManagedHome = managedHomePath
+            ?? (credentialSource?.kind == .managedHome ? credentialSource?.path : nil)
+        self.managedHomePath = resolvedManagedHome
+        self.credentialSource = resolvedManagedHome.map {
+            AccountCredentialSource(kind: .managedHome, path: $0)
+        } ?? credentialSource
         self.routingEnabled = routingEnabled
         self.archivedAt = archivedAt
         self.routingPausedAt = routingPausedAt
@@ -301,7 +327,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
-        case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, routingEnabled
+        case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, credentialSource, routingEnabled
         case usageStats, usageHistory, lastServedByUs, archivedAt, routingPausedAt, telemetryID
         case usageLimitSettings
     }
@@ -325,6 +351,10 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         lastUsedAt = try c.decodeIfPresent(Date.self, forKey: .lastUsedAt)
         usage = try c.decodeIfPresent([UsageWindow].self, forKey: .usage) ?? []
         managedHomePath = try c.decodeIfPresent(String.self, forKey: .managedHomePath)
+        let decodedSource = try c.decodeIfPresent(AccountCredentialSource.self, forKey: .credentialSource)
+        credentialSource = managedHomePath.map {
+            AccountCredentialSource(kind: .managedHome, path: $0)
+        } ?? decodedSource
         routingEnabled = try c.decodeIfPresent(Bool.self, forKey: .routingEnabled) ?? true
         usageStats = try c.decodeIfPresent(UsageStats.self, forKey: .usageStats)
         usageHistory = try c.decodeIfPresent([WindowSample].self, forKey: .usageHistory)

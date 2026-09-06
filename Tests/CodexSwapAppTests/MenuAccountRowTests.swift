@@ -5,6 +5,63 @@ import SwapKit
 
 @MainActor
 final class MenuAccountRowTests: XCTestCase {
+    private func menuAccount(_ alias: String, archivedAt: Date? = nil, routingEnabled: Bool = true) -> Account {
+        Account(
+            alias: alias,
+            accountID: alias,
+            accessToken: "token-\(alias)",
+            routingEnabled: routingEnabled,
+            archivedAt: archivedAt
+        )
+    }
+
+    func testMenuDistinguishesLastRoutedAccountFromDefaultForNewTasks() {
+        let presentation = AccountMenuSelectionPresentation.resolve(
+            defaultAlias: "default",
+            lastRoutedAlias: "routed",
+            accounts: [menuAccount("default"), menuAccount("routed")]
+        )
+
+        XCTAssertEqual(presentation.displayedAlias, "routed")
+        XCTAssertEqual(presentation.lastRoutedTitle, "Last routed: routed")
+        XCTAssertEqual(presentation.defaultTitle, "Default for new tasks: default")
+    }
+
+    func testMenuFallsBackToDefaultWhenLastRoutedAccountIsArchived() {
+        let presentation = AccountMenuSelectionPresentation.resolve(
+            defaultAlias: "default",
+            lastRoutedAlias: "archived",
+            accounts: [menuAccount("default"), menuAccount("archived", archivedAt: Date(timeIntervalSince1970: 1))]
+        )
+
+        XCTAssertEqual(presentation.displayedAlias, "default")
+        XCTAssertEqual(presentation.lastRoutedTitle, "Last routed: archived (archived)")
+        XCTAssertEqual(presentation.defaultTitle, "Default for new tasks: default")
+    }
+
+    func testMenuSuppressesRemovedLastRoutedAccountAndKeepsDefault() {
+        let presentation = AccountMenuSelectionPresentation.resolve(
+            defaultAlias: "default",
+            lastRoutedAlias: "removed",
+            accounts: [menuAccount("default")]
+        )
+
+        XCTAssertEqual(presentation.displayedAlias, "default")
+        XCTAssertEqual(presentation.lastRoutedTitle, "Last routed: none")
+        XCTAssertEqual(presentation.defaultTitle, "Default for new tasks: default")
+    }
+
+    func testMenuDoesNotExpireLastRoutedPresentationByIdleAge() {
+        let presentation = AccountMenuSelectionPresentation.resolve(
+            defaultAlias: "default",
+            lastRoutedAlias: "routed",
+            accounts: [menuAccount("default"), menuAccount("routed")]
+        )
+
+        XCTAssertEqual(presentation.displayedAlias, "routed")
+        XCTAssertEqual(presentation.lastRoutedTitle, "Last routed: routed")
+    }
+
     func testDoubleClickUsesStickyActionWithoutSingleClickAction() throws {
         var singleClicks = 0
         var doubleClicks = 0

@@ -15,6 +15,9 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ### Fixed
 
+- Imported OAuth credentials are now read-only: the proxy no longer competes with native Codex refresh or overwrites CodexBar-managed auth files. Matching owner updates are read through; unavailable renewal reports HTTP 503 instead of a false sign-out. Renewal still requires the credential owner.
+- Menu selection distinguishes the last routed account from the default for new tasks, and served activity is updated before notifying the menu.
+- Stable thread/session metadata preserves eligible same-task account affinity across changing turn metadata. This reduces unnecessary switching but does not guarantee cache savings.
 - Repeated "Account needs sign-in" notifications every poll cycle: periodic CodexBar imports no longer clear the logged-out flag, sign-in reminders fire once per logged-out episode until the account recovers or is removed, and manual switching resets the reminder state.
 - Usage polling no longer spends a request per cycle on needs-login accounts.
 

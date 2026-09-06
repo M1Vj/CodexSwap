@@ -8,6 +8,7 @@ public enum AccountImporter {
         aliasHint: String? = nil,
         priority: Int = 0,
         managedHomePath: String? = nil,
+        credentialSource: AccountCredentialSource? = nil,
         telemetryID: UUID = UUID()
     ) -> Account {
         let id = JWT.identity(fromAccessToken: tokens.accessToken)
@@ -23,6 +24,7 @@ public enum AccountImporter {
             idToken: tokens.idToken,
             priority: priority,
             managedHomePath: managedHomePath,
+            credentialSource: credentialSource,
             telemetryID: telemetryID
         )
     }
@@ -32,7 +34,12 @@ public enum AccountImporter {
         CodexBarBridge.managedAccounts().compactMap { managed in
             guard let tokens = CodexBarBridge.readTokens(home: managed.managedHomePath) else { return nil }
             let hint = managed.email.split(separator: "@").first.map(String.init)
-            return account(from: tokens, aliasHint: hint, managedHomePath: managed.managedHomePath)
+            return account(
+                from: tokens,
+                aliasHint: hint,
+                managedHomePath: managed.managedHomePath,
+                credentialSource: AccountCredentialSource(kind: .managedHome, path: managed.managedHomePath)
+            )
         }
     }
 
@@ -45,7 +52,11 @@ public enum AccountImporter {
     /// The account Codex is currently logged in as, read live from ~/.codex/auth.json.
     public static func currentCodexAccount(priority: Int = 0) -> Account? {
         guard let file = try? CodexAuth.read(), let tokens = file.tokens, !tokens.accessToken.isEmpty else { return nil }
-        return account(from: tokens, priority: priority)
+        return account(
+            from: tokens,
+            priority: priority,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: CodexAuth.authPath().standardizedFileURL.path)
+        )
     }
 
     /// Existing per-account bundles written by @loongphy/codex-auth at ~/.codex/accounts/*.auth.json (base64-named).
@@ -57,7 +68,13 @@ public enum AccountImporter {
             guard let raw = try? Data(contentsOf: entry),
                   let file = try? JSONDecoder().decode(CodexAuthFile.self, from: raw),
                   let tokens = file.tokens, !tokens.accessToken.isEmpty else { continue }
-            result.append(account(from: tokens))
+            result.append(account(
+                from: tokens,
+                credentialSource: AccountCredentialSource(
+                    kind: .legacySnapshot,
+                    path: entry.standardizedFileURL.path
+                )
+            ))
         }
         return result
     }

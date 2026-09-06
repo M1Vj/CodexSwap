@@ -3305,6 +3305,35 @@ actor LocalRoutingUpstream {
     }
 }
 
+actor ActivityEventSink: ProxyEventSink {
+    struct Observation: Equatable, Sendable {
+        let eventAlias: String?
+        let activityAlias: String?
+        let servedCount: Int
+    }
+
+    private weak var server: ProxyServer?
+    private var observations: [Observation] = []
+
+    func attach(server: ProxyServer) {
+        self.server = server
+    }
+
+    func handle(_ event: ProxyEvent) async {
+        guard event.kind == .served, let server else { return }
+        let activity = await server.activity()
+        observations.append(
+            Observation(
+                eventAlias: event.from,
+                activityAlias: activity.lastAlias,
+                servedCount: activity.servedCount
+            )
+        )
+    }
+
+    func recordedObservations() -> [Observation] { observations }
+}
+
 private actor AsyncCompletionBarrier {
     private var completed = false
     private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
@@ -3458,6 +3487,169 @@ final class TurnPinningTests: XCTestCase {
 
         headers.remove(name: "x-codex-turn-metadata")
         XCTAssertEqual(interactiveTurnKey(headers: headers, body: Data("{".utf8)), "state")
+    }
+
+    func testStableThreadMetadataWinsAcrossChangingTurnsAndCompatibilityHeaders() {
+        var headers = HTTPHeaders()
+        headers.add(
+            name: "x-codex-turn-metadata",
+            value: #"{"thread_id":"header-thread","session_id":"header-session","turn_id":"header-turn"}"#
+        )
+        let firstTurn = Data(#"{"client_metadata":{"thread_id":"thread-1","session_id":"session-1","turn_id":"turn-1"}}"#.utf8)
+        let secondTurn = Data(#"{"client_metadata":{"thread_id":"thread-1","session_id":"session-1","turn_id":"turn-2"}}"#.utf8)
+
+        XCTAssertEqual(interactiveTurnKey(headers: headers, body: firstTurn), "thread:thread-1")
+        XCTAssertEqual(interactiveTurnKey(headers: headers, body: secondTurn), "thread:thread-1")
+        XCTAssertEqual(
+            interactiveTurnKey(
+                headers: headers,
+                body: Data(#"{"client_metadata":{"session_id":"session-only","turn_id":"turn-3"}}"#.utf8)
+            ),
+            "session:session-only"
+        )
+    }
+
+    func testStructuredCompatibilityMetadataUsesStableThreadBeforeSession() {
+        var headers = HTTPHeaders()
+        headers.add(
+            name: "x-codex-turn-metadata",
+            value: #"{"thread_id":"header-thread","session_id":"header-session","root_turn_id":"root"}"#
+        )
+
+        XCTAssertEqual(interactiveTurnKey(headers: headers, body: Data("{}".utf8)), "thread:header-thread")
+
+        headers.replaceOrAdd(
+            name: "x-codex-turn-metadata",
+            value: #"{"session_id":"header-session","parent_thread_id":"parent"}"#
+        )
+        XCTAssertEqual(interactiveTurnKey(headers: headers, body: Data("{}".utf8)), "session:header-session")
+    }
+
+    func testStableMetadataIgnoresParentAndRootIdentifiers() {
+        var headers = HTTPHeaders()
+        headers.add(
+            name: "x-codex-turn-metadata",
+            value: #"{"parent_thread_id":"parent","root_turn_id":"root","turn_id":"turn"}"#
+        )
+        headers.add(name: "x-codex-turn-state", value: "state-fallback")
+
+        XCTAssertEqual(
+            interactiveTurnKey(headers: headers, body: Data("{}".utf8)),
+            #"{"parent_thread_id":"parent","root_turn_id":"root","turn_id":"turn"}"#
+        )
+    }
+
+    func testMalformedOrOversizedStableMetadataFallsBackToLegacyOpaqueKeys() {
+        var headers = HTTPHeaders()
+        headers.add(name: "x-codex-turn-metadata", value: "legacy-metadata")
+        headers.add(name: "x-codex-turn-state", value: "legacy-state")
+
+        XCTAssertEqual(
+            interactiveTurnKey(
+                headers: headers,
+                body: Data(#"{"client_metadata":{"thread_id":42}}"#.utf8)
+            ),
+            "legacy-metadata"
+        )
+        XCTAssertEqual(
+            interactiveTurnKey(
+                headers: headers,
+                body: Data(#"{"client_metadata":{"thread_id":"bad\u0000value"}}"#.utf8)
+            ),
+            "legacy-metadata"
+        )
+
+        headers.replaceOrAdd(name: "x-codex-turn-metadata", value: String(repeating: "x", count: 4_097))
+        XCTAssertEqual(
+            interactiveTurnKey(headers: headers, body: Data("{}".utf8)),
+            "legacy-state"
+        )
+    }
+
+    func testStableThreadPinSurvivesRankAndDefaultChangesAcrossTurns() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("stable-thread-rank-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+        let server = ProxyServer(store: store, settingsProvider: { .default })
+        guard let firstKey = interactiveTurnKey(
+            headers: HTTPHeaders(),
+            body: Data(#"{"client_metadata":{"thread_id":"thread-1","turn_id":"turn-1"}}"#.utf8)
+        ), let secondKey = interactiveTurnKey(
+            headers: HTTPHeaders(),
+            body: Data(#"{"client_metadata":{"thread_id":"thread-1","turn_id":"turn-2"}}"#.utf8)
+        ) else {
+            XCTFail("stable thread metadata should produce an affinity key")
+            await server.stop()
+            return
+        }
+
+        let first = await server.reserveInteractiveAccount(key: firstKey, settings: .default)
+        if let first { await store.releaseRoutingLease(first.alias) }
+        _ = await store.setPriority("a", priority: 1)
+        _ = await store.setPriority("b", priority: 10)
+        _ = await store.setActive("b")
+        let second = await server.reserveInteractiveAccount(key: secondKey, settings: .default)
+
+        XCTAssertEqual(first?.alias, "a")
+        XCTAssertEqual(second?.alias, "a")
+        if let second { await store.releaseRoutingLease(second.alias) }
+        await server.stop()
+    }
+
+    func testDistinctStableThreadsRemainIndependentUnderRoundRobin() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("stable-thread-round-robin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .roundRobin)
+        await store.upsert(account("a"))
+        await store.upsert(account("b"))
+        var settings = Settings.default
+        settings.rotationStrategy = .roundRobin
+        let capturedSettings = settings
+        let server = ProxyServer(store: store, settingsProvider: { capturedSettings })
+        let firstKey = try XCTUnwrap(
+            interactiveTurnKey(
+                headers: HTTPHeaders(),
+                body: Data(#"{"client_metadata":{"thread_id":"thread-one","turn_id":"turn-one"}}"#.utf8)
+            )
+        )
+        let secondKey = try XCTUnwrap(
+            interactiveTurnKey(
+                headers: HTTPHeaders(),
+                body: Data(#"{"client_metadata":{"thread_id":"thread-two","turn_id":"turn-one"}}"#.utf8)
+            )
+        )
+
+        let first = await server.reserveInteractiveAccount(key: firstKey, settings: settings)
+        let second = await server.reserveInteractiveAccount(key: secondKey, settings: settings)
+
+        XCTAssertNotEqual(first?.alias, second?.alias)
+        if let first { await store.releaseRoutingLease(first.alias) }
+        if let second { await store.releaseRoutingLease(second.alias) }
+        await server.stop()
+    }
+
+    func testStableThreadPinRebindsAfterHardInvalidation() async {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("stable-thread-invalidation-\(UUID().uuidString)")
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), strategy: .priority)
+        await store.upsert(account("a", priority: 10))
+        await store.upsert(account("b", priority: 1))
+        let server = ProxyServer(store: store, settingsProvider: { .default })
+        let key = "thread:invalidated"
+
+        let first = await server.selectInteractiveAccount(key: key, settings: .default)
+        await store.setRoutingEnabled("a", enabled: false)
+        let replacement = await server.selectInteractiveAccount(key: key, settings: .default)
+        if let replacement {
+            await server.recordSelection(replacement.alias, mode: .normal, interactiveKey: key)
+        }
+        let repeated = await server.selectInteractiveAccount(key: key, settings: .default)
+
+        XCTAssertEqual(first?.alias, "a")
+        XCTAssertEqual(replacement?.alias, "b")
+        XCTAssertEqual(repeated?.alias, "b")
+        await server.stop()
     }
 
     func testOversizedOrNonStringBodyMetadataFallsBackWithoutError() {
@@ -4077,6 +4269,88 @@ final class TurnPinningTests: XCTestCase {
         await upstream.stop()
         let remainingConnections = await upstream.activeConnectionCount()
         XCTAssertEqual(remainingConnections, 0)
+    }
+
+    func testServedEventSeesRecordedActivityBeforeNotification() async throws {
+        let upstream = LocalRoutingUpstream(.success(state: "activity-state"))
+        let upstreamURL = try await upstream.start()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-activity-order-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(account("a"))
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let sink = ActivityEventSink()
+        let server = ProxyServer(
+            store: store, config: config, settingsProvider: { .default }, sink: sink,
+            routingLog: RoutingDecisionLog(url: root.appendingPathComponent("routing.jsonl"))
+        )
+        defer {
+            Task {
+                await server.stop()
+                await upstream.stop()
+            }
+        }
+        await sink.attach(server: server)
+        try await server.start()
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(port: port)
+        let observations = await sink.recordedObservations()
+
+        XCTAssertEqual(response.0, "a")
+        XCTAssertEqual(
+            observations,
+            [ActivityEventSink.Observation(eventAlias: "a", activityAlias: "a", servedCount: 1)]
+        )
+        await server.stop()
+        await upstream.stop()
+    }
+
+    func testFinalReplayPublishesServedEventAfterRecordingActivity() async throws {
+        let upstream = LocalRoutingUpstream(.usageLimitFirst(state: "final-replay-state"))
+        let upstreamURL = try await upstream.start()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proxy-final-replay-order-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(account("a"))
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        var settings = Settings.default
+        settings.interactiveExhaustionPolicy = .resetCurrentFirst
+        let capturedSettings = settings
+        let recorder = ResetRecorder(result: .reset(windowsReset: 1))
+        let sink = ActivityEventSink()
+        let server = ProxyServer(
+            store: store,
+            config: config,
+            settingsProvider: { capturedSettings },
+            automaticQuotaReset: { alias in await recorder.reset(alias) },
+            sink: sink,
+            routingLog: RoutingDecisionLog(url: root.appendingPathComponent("routing.jsonl"))
+        )
+        defer {
+            Task {
+                await server.stop()
+                await upstream.stop()
+            }
+        }
+        await sink.attach(server: server)
+        try await server.start()
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+
+        let response = try await proxyRequest(port: port)
+        let observations = await sink.recordedObservations()
+
+        XCTAssertEqual(response.0, "a")
+        XCTAssertEqual(
+            observations,
+            [ActivityEventSink.Observation(eventAlias: "a", activityAlias: "a", servedCount: 1)]
+        )
+        await server.stop()
+        await upstream.stop()
     }
 
     func testProxyHTTPTaskPinAtDisplayedHundredAndUnpinRelease() async throws {
@@ -5984,7 +6258,7 @@ private final class CoordinatorFixture: @unchecked Sendable {
         self.settings = settings ?? { var s = Settings.default; s.automaticallyResetExhaustedAccounts = true; return s }()
         let home = root.appendingPathComponent("managed", isDirectory: true)
         try CodexAuth.write(.init(idToken: "id", accessToken: freshToken, refreshToken: "refresh", accountId: "fresh-account"), to: home.appendingPathComponent("auth.json"))
-        await store.upsert(.init(alias: "alpha", accountID: "old-account", accessToken: "old", managedHomePath: home.path))
+        await store.upsert(.init(alias: "alpha", accountID: "fresh-account", accessToken: "old", managedHomePath: home.path))
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let late = ResetCredit(id: "late", resetType: "weekly", status: "available", grantedAt: now, expiresAt: now.addingTimeInterval(200))
         let early = ResetCredit(id: "early", resetType: "weekly", status: "available", grantedAt: now, expiresAt: now.addingTimeInterval(100))

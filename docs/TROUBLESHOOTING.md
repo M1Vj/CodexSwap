@@ -46,6 +46,16 @@ Without CodexBar, choose **Add Standalone…**, finish the standard `codex login
 
 Refresh or sign in through the application that owns the account. For a CodexBar-managed account, use CodexBar. For a standalone account, run the standard Codex login flow and rescan. Removing an account from CodexSwap does not revoke its OpenAI session.
 
+## A request reports credential renewal is required
+
+CodexSwap does not refresh imported OAuth sessions or write their source auth files. Competing refresh writers can leave another application holding stale credentials. CodexSwap instead reads updates from the known source and checks that they belong to the same account.
+
+If the owner has not supplied a usable update, the proxy may use an eligible alternative within the request's account scope. A targeted warm-up never changes accounts. When no alternative is available, the proxy returns HTTP 503 rather than declaring the account signed out. This does not mean your account was removed or its session was revoked.
+
+Open the account through its existing owner so native Codex can renew it. Use **Rescan Accounts** to update older imports with source information. If the owner itself reports a revoked session, sign in there once and rescan. Do not copy auth files between homes, repeatedly force refresh, or start extra Codex processes against the same home as a workaround.
+
+Automatic renewal still belongs to the owner; the proxy does not create a background login process. See [the credential ownership investigation](AUTH-OWNERSHIP-INVESTIGATION.md) for the verified defect, upstream evidence, and remaining limits.
+
 ## An account says Routing Disabled
 
 You paused this account in **Settings → Accounts**. The pause persists until you choose **Enable Routing**. CodexSwap retains its OAuth credentials, account record, and saved Task Board account choices.

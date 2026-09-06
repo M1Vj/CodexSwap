@@ -18,6 +18,7 @@ struct MenuAccountRow: View {
     let costEstimate: Double?
     /// Read-only cap metadata. Settings edits remain in the Accounts pane.
     var usageLimitSettings: AccountUsageLimitSettings = .disabled
+    var selectionLabel: String = "Selected"
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
@@ -28,7 +29,7 @@ struct MenuAccountRow: View {
                 .accessibilityLabel("Rank \(rank)")
             Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(isActive ? Color.green : Color.secondary.opacity(0.6))
-                .accessibilityLabel(isActive ? "Active" : "Inactive")
+                .accessibilityLabel(isActive ? selectionLabel : "Not selected")
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(alias)
@@ -91,7 +92,7 @@ struct MenuAccountRow: View {
     }
 
     private var accessibilitySummary: String {
-        var parts = ["Rank \(rank)", alias, isActive ? "active" : "inactive"]
+        var parts = ["Rank \(rank)", alias, isActive ? selectionLabel : "Not selected"]
         if isSticky { parts.append("sticky until quota error") }
         parts += windows.map { "\($0.label) \($0.usedPercent)% used" }
         if usageLimitSettings.enabled {

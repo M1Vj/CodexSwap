@@ -1251,9 +1251,6 @@ public actor AppEngine {
         // not used as the target set because a zero exit is only an unverified attempt.
         let attemptedAliases = Set(summary.attempted)
         if !attemptedAliases.isEmpty {
-            // A stale access token cannot produce fresh WHAM evidence here. ProxyServer
-            // owns refresh-token coalescing and updates AccountStore before a successful
-            // runner return; do not add a second refresh path or reinterpret this as verified.
             _ = await pollUsage(activeOnly: false, aliases: attemptedAliases, now: now)
             let refreshed = await store.activeAccounts().filter { attemptedAliases.contains($0.alias) }
             summary = await warmupService.reconcileSummary(summary, accounts: refreshed)
