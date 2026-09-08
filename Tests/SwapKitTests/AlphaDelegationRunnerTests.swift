@@ -580,13 +580,13 @@ final class AlphaDelegationRunnerTests: XCTestCase {
                 script: script,
                 arguments: [infoFile.path],
                 workspace: workspace,
-                timeout: .milliseconds(250)
+                timeout: .seconds(1)
             )
             XCTFail("expected timeout")
         } catch let error as AlphaDelegationRunnerError {
             XCTAssertEqual(error, .timedOut)
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5, "timeout teardown was not prompt")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.75, "timeout teardown was not prompt")
         let identities = (try await waitForText(in: infoFile))
             .split(separator: ":")
             .compactMap { Int32($0) }

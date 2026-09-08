@@ -2552,7 +2552,7 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(storedUsage, displayedUsage)
     }
 
-    func testFailedWarmupWithRefreshOnlyCredentialsFailsClosed() async throws {
+    func testWarmupWithExpiredCredentialsSkipsRunnerAndUsageFetch() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-failed-refresh-only-\(UUID().uuidString)")
         let staleReference = Date().addingTimeInterval(-7_200)
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
@@ -2584,16 +2584,14 @@ final class WarmupEngineTests: XCTestCase {
 
         let runnerCalls = await runner.calls()
         let usageCalls = await usage.calls()
-        XCTAssertEqual(runnerCalls, ["a"])
+        XCTAssertEqual(runnerCalls, [])
         XCTAssertEqual(usageCalls, [])
         XCTAssertEqual(summary.warmed, [])
-        XCTAssertEqual(summary.attempted, ["a"])
-        XCTAssertNotNil(summary.failed["a"])
+        XCTAssertEqual(summary.attempted, [])
+        XCTAssertNil(summary.failed["a"])
+        XCTAssertEqual(summary.skipped["a"], "access token expired")
         let record = await ledger.record(for: "id-a")
-        XCTAssertEqual(record?.outcome, .failed)
-        let retryAfter = try XCTUnwrap(record?.retryAfter)
-        XCTAssertGreaterThan(retryAfter, record?.attemptedAt ?? .distantPast)
-        XCTAssertLessThanOrEqual(retryAfter.timeIntervalSince(record?.attemptedAt ?? retryAfter), 300)
+        XCTAssertNil(record)
     }
 
     func testManualWarmupRefreshesAllAttemptedAliasesIncludingFailures() async throws {

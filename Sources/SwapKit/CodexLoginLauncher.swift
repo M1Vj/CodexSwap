@@ -57,14 +57,27 @@ public enum CodexLoginLauncher {
         SCRIPT_PATH="$0"
         trap 'rm -f -- "$SCRIPT_PATH"' EXIT
 
+        HOME=\(quotedHomePath)
+        export HOME
         CODEX_HOME=\(quotedHomePath)
         export CODEX_HOME
         unset OPENAI_API_KEY
+        unset CODEX_API_KEY
+        export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
         umask 077
         cd -- "$CODEX_HOME" || {
             printf '\nCodex login could not enter its private home: %s. No account was imported.\n' "$CODEX_HOME"
             exit 1
         }
+
+        printf '\n============================================================\n'
+        printf ' CodexSwap — Add Standalone Account\n'
+        printf '============================================================\n'
+        printf ' This login session is isolated in a private directory:\n'
+        printf '   %s\n' "$CODEX_HOME"
+        printf ' Local credentials are kept separate from your normal Codex home.\n'
+        printf ' Complete the login prompt in your browser when opened.\n'
+        printf '============================================================\n\n'
 
         if [ -e \(quotedAuthPath) ] || [ -L \(quotedAuthPath) ] || ! mkdir -- \(quotedAttemptPath) 2>/dev/null; then
             printf '\nThis login home has already been used. Choose Add Standalone again for a fresh login; existing credentials were not changed.\n'
@@ -86,7 +99,7 @@ public enum CodexLoginLauncher {
         else
             printf '\nCodex login exited with status %s. Its private home was preserved, but no account was imported. Return to CodexSwap and choose Rescan Accounts after retrying.\n' "$status"
         fi
-        read -r -p "Press Return to close this window. " _
+        read -r -p "Press Return to close this window. " _ || true
         exit "$status"
         """
     }

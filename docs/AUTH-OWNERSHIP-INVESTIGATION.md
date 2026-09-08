@@ -1,18 +1,71 @@
 # Repeated sign-outs: credential ownership investigation
 
-Investigated September 6, 2026. This is a source-grounded diagnosis, not proof that every reported sign-out has the same cause.
+Investigated September 6, 2026; upstream findings updated September 8. This is a source-grounded diagnosis, not proof that every reported sign-out has the same cause.
 
 ## Finding
 
-CodexSwap's refresh path violates the ownership contract of the credentials it imports. It independently redeems an imported refresh token and writes the replacement into a CodexBar-managed home. CodexBar's current implementation intentionally avoids doing that: native Codex owns refresh and persistence, and usage readers treat shared credentials as read-only.
+At the investigated baseline, CodexSwap's refresh path violated the ownership contract of the credentials it imported. It independently redeemed an imported refresh token and wrote the replacement into a CodexBar-managed home. The protective correction described below removes that behavior. CodexBar's current implementation intentionally avoids doing that: native Codex owns refresh and persistence, and usage readers treat shared credentials as read-only.
 
 The local proxy's in-flight refresh map only coordinates requests inside that proxy actor. It does not coordinate Codex, CodexBar's native recovery process, another `swapd` process, or another proxy. An atomic file replacement does not make the preceding OAuth request and subsequent write an atomic operation across these writers.
 
 This is a concrete source defect and a credible mechanism for recurring stale-session failures. No real credential was refreshed or revoked to reproduce it. The exact writer sequence behind the owner's historical incidents remains unverified.
 
-## Version and timeline evidence
+## September 8 upstream follow-up
 
-Locally observed versions: Codex CLI **0.153.4**, CodexBar **0.56.4 build 135**, and CodexSwap **0.2.0 build 4**. Version metadata does not establish that an installed binary is byte-identical to upstream.
+Several distinct failures can produce a sign-in warning. Keep their evidence separate:
+
+- **Explicit revocation:** a provider response containing `token_revoked` establishes that the presented credential was rejected as revoked. It does not identify the revoking client or prove that another native home has no usable credentials for the same account.
+- **Pre-login revocation:** Codex 0.153.4 calls `clear_existing_auth_before_login`, which invokes `logout_with_revoke`, before starting ChatGPT login. Issue #22577 reports effects on other sessions. The source verifies the revoke call, but the report does not establish its scope for every account. CodexSwap's corrected standalone launcher uses a fresh private home, file-based storage, and a one-attempt guard rather than logging into an already populated home.
+- **Stale managed credentials:** CodexBar PR #3379 proposes renewal through the credential-owning app-server inside the selected `CODEX_HOME`, followed by a scoped retry. As of September 8 it remains open, with provider-auth sign-off and real denied-workspace evidence outstanding. Its passing fixture tests and pre-rebase live recovery are not a shipped fix.
+- **Permission denial:** CodexBar v0.56.8, published September 7, preserves HTTP 403 instead of treating it as expired credentials and starting Auto recovery. This is a shipped classification fix, not proof of a `token_revoked` HTTP 401 remedy. Selected-workspace ownership fixes already shipped in v0.56.4.
+- **Upstream desktop loops:** Codex issues #39803 and #40395 report desktop sign-in loss while other clients can remain usable. Issue #39696 reports a Windows Stable/Advanced Account Security interaction. These are reported reproductions, not evidence that the same trigger explains this Mac's incidents.
+
+The contributor response in #10332 remains important: refresh tokens allow reuse within a limited grace window, approximately an hour. Two simultaneous refresh calls do not necessarily invalidate each other immediately. Long-lived stale copies and competing credential owners remain plausible, but concurrency alone is not a complete diagnosis.
+
+For new standalone onboarding, prefer CodexSwap's fresh-home flow. Do not migrate existing accounts merely to test a logout theory, copy auth files, disable account security, redirect revocation endpoints, or repeatedly log out and back in. A browser success page must be followed by successful completion of the original CLI and a verified import. A cached menu label is not a fresh credential-validity check.
+
+The latest stable Codex release checked, 0.153.4, lists model-picker and guidance changes rather than an authentication repair. No general upgrade cure was established. The separate warm-up PATH correction fixes a subprocess launch failure; it does not restore revoked credentials.
+
+Issue #42581 reports successful fresh device-code login followed immediately by
+`token_revoked` on both MCP startup and a core request, reproduced on CLI 0.152.1
+and 0.153.0. This is a close symptom match outside CodexSwap, not proof of the same
+cause or of a shipped fix. Another reporter explicitly retracted a competing-client
+diagnosis in #31459 after isolating a desktop account-settings request and comparing
+desktop builds. That correction is a reason to avoid attributing every sign-out to
+refresh races. Neither report establishes the cause of a particular local incident.
+
+Additional primary sources checked September 8:
+
+- Contributor clarification: `https://github.com/openai/codex/issues/10332#issuecomment-3831635259`
+- Login/logout propagation report: `https://github.com/openai/codex/issues/22577`
+- Current login source: `https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/cli/src/login.rs`
+- Pending selected-home renewal: `https://github.com/steipete/CodexBar/pull/3379`
+- Shipped permission classification: `https://github.com/steipete/CodexBar/releases/tag/v0.56.8`
+- Desktop/CLI disagreement: `https://github.com/openai/codex/issues/39803`
+- Desktop token loss: `https://github.com/openai/codex/issues/40395`
+- Security-mode reproduction: `https://github.com/openai/codex/issues/39696`
+- CLI release: `https://github.com/openai/codex/releases/tag/rust-v0.153.4`
+- Fresh-login revocation report: `https://github.com/openai/codex/issues/42581`
+- Retracted competing-client diagnosis: `https://github.com/openai/codex/issues/31459#issuecomment-5353509721`
+
+## Stale-response quarantine guard
+
+A deterministic local fixture reproduced a separate race: after the proxy checked
+for an owner-provided replacement, another writer installed newer credentials
+before the old request's 401 handler marked the account as needing sign-in.
+The newer credentials were incorrectly quarantined. This does not explain who
+revoked the credential used by the old request.
+
+Quarantine now compares the rejected credential snapshot with the persisted
+account under the store lock. A stale rejection cannot invalidate a newer
+generation. The proxy can retry a changed, eligible access token for the same
+account within its existing request budget, without sending a stale sign-in
+notification. A revocation of the current credential still fails closed. No
+OAuth refresh, provider revocation, or external credential-file write is added.
+
+## September 6 version snapshot and historical timeline
+
+Versions observed at the September 6 baseline: Codex CLI **0.153.4**, CodexBar **0.56.4 build 135**, and CodexSwap **0.2.0 build 4**. These are historical observations, not the current installed versions. Version metadata does not establish that an installed binary is byte-identical to upstream. The September 8 follow-up does not re-verify the restricted PR/commit sources listed in the original timeline; its conclusions use the additional sources above.
 
 | Date | Evidence | Significance |
 | --- | --- | --- |

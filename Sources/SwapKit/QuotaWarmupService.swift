@@ -369,7 +369,7 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
         process.environment = [
             "CODEX_HOME": home.path,
             "HOME": home.path,
-            "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": Self.executableSearchPath(binary: binary, inheritedPath: ProcessInfo.processInfo.environment["PATH"]),
             "CODEXSWAP_WARMUP_TOKEN": "local-loopback-only",
             "NO_COLOR": "1",
         ]
@@ -401,6 +401,14 @@ public struct ProcessWarmupRunner: WarmupCommandRunning {
             let bounded = String(decoding: data.prefix(4_096), as: UTF8.self)
             throw WarmupCommandError.failed(bounded)
         }
+    }
+
+    static func executableSearchPath(binary: String, inheritedPath: String?) -> String {
+        let directories = [URL(fileURLWithPath: binary).deletingLastPathComponent().path]
+            + (inheritedPath ?? "").split(separator: ":").map(String.init)
+            + ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        var seen = Set<String>()
+        return directories.filter { $0.hasPrefix("/") && seen.insert($0).inserted }.joined(separator: ":")
     }
 
     private static func wait(

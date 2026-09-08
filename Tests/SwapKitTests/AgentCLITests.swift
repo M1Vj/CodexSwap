@@ -605,7 +605,7 @@ final class AgentCLITests: XCTestCase {
         XCTAssertTrue(updated?.disabledUntil.isEmpty == true)
     }
 
-    func testWarmupAccountReportsWarmedStatusWhenAttempted() async throws {
+    func testWarmupAccountDoesNotReportUnverifiedAttemptAsWarmed() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentCLIWarmupAttempt-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -650,12 +650,12 @@ final class AgentCLITests: XCTestCase {
         guard case .object(let data)? = result.envelope.data else {
             return XCTFail("missing warmup data")
         }
-        XCTAssertEqual(data["accountStatus"], AgentCLIJSONValue.string("warmed"))
+        XCTAssertEqual(data["accountStatus"], AgentCLIJSONValue.string("skipped"))
         guard case .object(let counts)? = data["counts"] else {
             return XCTFail("missing counts")
         }
-        XCTAssertEqual(counts["warmed"], AgentCLIJSONValue.integer(1))
-        XCTAssertEqual(counts["skipped"], AgentCLIJSONValue.integer(0))
+        XCTAssertEqual(counts["warmed"], AgentCLIJSONValue.integer(0))
+        XCTAssertEqual(counts["skipped"], AgentCLIJSONValue.integer(1))
         XCTAssertEqual(counts["failed"], AgentCLIJSONValue.integer(0))
     }
 }
@@ -680,4 +680,3 @@ private struct StubQuotaResetForCLI: QuotaResetServing {
 private actor StubWarmupRunnerForCLI: WarmupCommandRunning {
     func run(alias: String, proxyURL: URL) async throws {}
 }
-

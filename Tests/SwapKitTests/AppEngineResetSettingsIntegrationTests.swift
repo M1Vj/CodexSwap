@@ -187,7 +187,9 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         let managed = Account(alias: "managed", accountID: "managed-id", accessToken: "managed-token")
 
         await fixture.engine.reconcileManagedAccounts([managed], presentAccountIDs: ["managed-id"])
-        await waitUntil { events.value() >= 2 }
+        await waitUntil {
+            await fixture.engine.snapshot().resetCreditStatuses["managed"] == .available(count: 1, earliestExpiry: nil)
+        }
         let fetchCountBeforePolicyChange = await fixture.service.creditFetchCount()
         await fixture.service.setAvailableCount(0)
         let before = Settings.default
@@ -195,7 +197,9 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         after.automaticallyResetExhaustedAccounts = true
         after.autoResetProtectedAccounts = ["managed"]
         await fixture.engine.settingsDidChange(from: before, to: after)
-        await waitUntil { events.value() >= 4 }
+        await waitUntil {
+            await fixture.engine.snapshot().resetCreditStatuses["managed"] == .noCredit
+        }
 
         let snapshot = await fixture.engine.snapshot()
         let fetchCount = await fixture.service.creditFetchCount()

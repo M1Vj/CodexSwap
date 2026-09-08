@@ -349,13 +349,15 @@ final class QuotaSafetyRegressionTests: XCTestCase {
                 state: "replay",
                 sessionInvalidated: sessionInvalidated
             ),
-            expectedStatusCode: 401
+            expectedStatusCode: 503,
+            expectedNeedsLogin: sessionInvalidated
         )
     }
 
     private func assertFinalReplay(
         behavior: LocalRoutingUpstream.Behavior,
-        expectedStatusCode: Int
+        expectedStatusCode: Int,
+        expectedNeedsLogin: Bool = false
     ) async throws {
         let upstream = LocalRoutingUpstream(behavior)
         let upstreamURL = try await upstream.start()
@@ -394,6 +396,8 @@ final class QuotaSafetyRegressionTests: XCTestCase {
 
         XCTAssertEqual(statusCode, expectedStatusCode)
         XCTAssertEqual(forwards, 2)
+        let account = await store.account("alpha")
+        XCTAssertEqual(account?.needsLogin, expectedNeedsLogin)
         await server.stop()
         await upstream.stop()
     }

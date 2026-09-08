@@ -228,10 +228,11 @@ final class AppEngineFreshAlternativeTests: XCTestCase {
             try? FileManager.default.removeItem(at: accountStoreURL)
         }
 
-        let expired = token(expiry: Int(now.timeIntervalSince1970) - 300, accountID: "id-expired")
+        let expiryReference = Date()
+        let expired = token(expiry: Int(expiryReference.timeIntervalSince1970) - 300, accountID: "id-expired")
         try CodexAuth.write(expired, to: managedHomeExpired.appendingPathComponent("auth.json"))
 
-        let valid = token(expiry: Int(now.timeIntervalSince1970) + 3_600, accountID: "id-valid")
+        let valid = token(expiry: Int(expiryReference.timeIntervalSince1970) + 3_600, accountID: "id-valid")
         try CodexAuth.write(valid, to: managedHomeValid.appendingPathComponent("auth.json"))
 
         await store.upsert(Account(

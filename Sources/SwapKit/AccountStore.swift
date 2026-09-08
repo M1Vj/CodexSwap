@@ -81,6 +81,13 @@ public enum AccountUsageLimitWriteResult: Sendable {
     case persistenceFailed
 }
 
+enum ConditionalNeedsLoginResult: Sendable {
+    case quarantined(next: Account?)
+    case stale(current: Account?, next: Account?)
+    case notFound
+    case persistenceFailed
+}
+
 public actor AccountStore {
     private let url: URL
     private let clock: @Sendable () -> Date
@@ -1256,6 +1263,133 @@ public actor AccountStore {
 
     private func advanceAuthGeneration(at index: Int) {
         data.accounts[index].authGeneration = UUID()
+    }
+
+    private static func authSnapshotMatches(_ current: Account, _ snapshot: Account) -> Bool {
+        current.telemetryID == snapshot.telemetryID
+            && current.alias == snapshot.alias
+            && current.accountID == snapshot.accountID
+            && current.authGeneration == snapshot.authGeneration
+            && current.accessToken == snapshot.accessToken
+            && current.refreshToken == snapshot.refreshToken
+            && current.idToken == snapshot.idToken
+            && current.managedHomePath == snapshot.managedHomePath
+            && current.credentialSource == snapshot.credentialSource
+    }
+
+    private static func nextEligibleAccount(
+        in data: StoreData,
+        excluding alias: String,
+        strategy: RotationStrategy,
+        now: Date,
+        drainingAliases: Set<String>
+    ) -> Account? {
+        let candidates = data.accounts
+            .filter { $0.alias != alias && $0.isEligible(now: now) }
+            .sorted { selectionOrder($0, $1, strategy: strategy) }
+        guard !drainingAliases.isEmpty else { return candidates.first }
+        let drainState = Dictionary(uniqueKeysWithValues: candidates.map { ($0.alias, drainingAliases.contains($0.alias)) })
+        return SmartSwitchPolicy.sortWithDrainingFirst(candidates, drainState: drainState).first
+    }
+
+    private func adoptLockedState(_ latest: StoreData) {
+        data = latest
+        persistedData = latest
+        persistedModificationDate = Self.modificationDate(for: url)
+        stickyAliasRuntime = latest.stickyAlias
+        stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride && latest.stickyAlias != nil
+    }
+
+    func markNeedsLoginOnlyIfCurrent(_ snapshot: Account) -> ConditionalNeedsLoginResult {
+        var result: ConditionalNeedsLoginResult = .notFound
+        let locked = Self.withStoreLock(url) {
+            guard let latest = Self.loadFrom(url),
+                  let index = latest.accounts.firstIndex(where: { $0.telemetryID == snapshot.telemetryID }) else {
+                result = .notFound
+                return
+            }
+            let current = latest.accounts[index]
+            guard Self.authSnapshotMatches(current, snapshot) else {
+                adoptLockedState(latest)
+                result = .stale(current: current, next: nil)
+                return
+            }
+
+            var committed = latest
+            committed.accounts[index].needsLogin = true
+            committed.accounts[index].authGeneration = UUID()
+            if committed.stickyAlias == snapshot.alias {
+                committed.stickyAlias = nil
+                committed.stickyUsageLimitOverride = false
+            }
+            do {
+                let raw = try JSONEncoder.codex.encode(committed)
+                try persistAtomically(raw)
+                adoptLockedState(committed)
+                clearRuntimeHolds(snapshot.alias)
+                result = .quarantined(next: nil)
+            } catch {
+                result = .persistenceFailed
+            }
+        }
+        return locked ? result : .persistenceFailed
+    }
+
+    func markNeedsLoginIfCurrent(
+        _ snapshot: Account,
+        now: Date = Date()
+    ) -> ConditionalNeedsLoginResult {
+        var result: ConditionalNeedsLoginResult = .notFound
+        let locked = Self.withStoreLock(url) {
+            guard let latest = Self.loadFrom(url),
+                  let index = latest.accounts.firstIndex(where: { $0.telemetryID == snapshot.telemetryID }) else {
+                result = .notFound
+                return
+            }
+            let current = latest.accounts[index]
+            guard Self.authSnapshotMatches(current, snapshot) else {
+                let next = Self.nextEligibleAccount(
+                    in: latest,
+                    excluding: snapshot.alias,
+                    strategy: strategy,
+                    now: now,
+                    drainingAliases: drainingAliases
+                )
+                adoptLockedState(latest)
+                result = .stale(current: current, next: next)
+                return
+            }
+
+            var committed = latest
+            committed.accounts[index].needsLogin = true
+            committed.accounts[index].authGeneration = UUID()
+            if committed.stickyAlias == snapshot.alias {
+                committed.stickyAlias = nil
+                committed.stickyUsageLimitOverride = false
+            }
+            let next = Self.nextEligibleAccount(
+                in: committed,
+                excluding: snapshot.alias,
+                strategy: strategy,
+                now: now,
+                drainingAliases: drainingAliases
+            )
+            if let next,
+               let nextIndex = committed.accounts.firstIndex(where: { $0.telemetryID == next.telemetryID }) {
+                committed.activeAlias = next.alias
+                committed.accounts[nextIndex].lastUsedAt = now
+            }
+            do {
+                let raw = try JSONEncoder.codex.encode(committed)
+                try persistAtomically(raw)
+                adoptLockedState(committed)
+                clearRuntimeHolds(snapshot.alias)
+                result = .quarantined(next: next)
+            } catch {
+                result = .persistenceFailed
+            }
+        }
+        return locked ? result : .persistenceFailed
     }
 
     func commitVerifiedAuthentication(snapshot: Account, candidate: Account,

@@ -1685,20 +1685,15 @@ public struct AgentCLI: Sendable {
             warmupService: warmupService,
             targetAliases: [entry.account.alias]
         )
-        let lastSummary = await warmupService.lastSummary()
-        let didAttempt = lastSummary?.attempted.contains(entry.account.alias) == true
-            && lastSummary?.failed[entry.account.alias] == nil
-        let accountStatus = didAttempt ? "warmed" : (report.accounts.first?.status.rawValue ?? "skipped")
-        let warmedCount = didAttempt ? 1 : report.counts.warmed
-        let skippedCount = didAttempt ? max(0, report.counts.total - warmedCount - report.counts.failed) : report.counts.skipped
+        let accountStatus = report.accounts.first?.status.rawValue ?? "skipped"
         let data: AgentCLIJSONValue = .object([
             "status": .string(report.status.rawValue),
             "ref": .string(ref),
             "accountStatus": .string(accountStatus),
             "counts": .object([
                 "total": .integer(report.counts.total),
-                "warmed": .integer(warmedCount),
-                "skipped": .integer(skippedCount),
+                "warmed": .integer(report.counts.warmed),
+                "skipped": .integer(report.counts.skipped),
                 "failed": .integer(report.counts.failed),
             ]),
             "startedAt": .string(Self.iso8601(report.startedAt)),

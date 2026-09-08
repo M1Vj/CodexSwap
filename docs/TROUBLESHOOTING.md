@@ -52,7 +52,26 @@ Do not migrate existing CodexBar accounts to standalone login expecting a guaran
 
 If the account still works through its owner, choose **Rescan Accounts**. CodexSwap verifies blocked accounts against the read-only usage endpoint using that same source. A successful check can clear a stale sign-in flag even when the token's expiry has not increased. A failed check leaves the flag intact; a concurrent sign-out, pause, removal, or credential change prevents an older check from re-enabling the account. This does not refresh or repair a revoked session.
 
+## Manual warm-up fails from the menu bar
+
+An npm-installed Codex launcher needs Node on its executable search path. macOS
+menu-bar apps can start with only system directories in PATH, even when the same
+command works in Terminal. CodexSwap includes the selected launcher's directory
+and standard Homebrew directories for warm-up subprocesses. This does not change
+the selected Codex version or load your normal Codex home.
+
+A completed command is an attempt, not proof of a restarted quota window.
+Single-account agent reports retain the headless report's unverified/skipped
+state until usage evidence verifies the cycle. A skipped account is not a failed
+login. Immediate blanket retries are not used to hide command failures.
+
 ## A request reports credential renewal is required
+
+CodexSwap reports an upstream account's authentication failure as HTTP 503 to
+the local client after eligible failover is exhausted. This avoids presenting an
+upstream account problem as a failure of the client's own proxy credentials.
+Missing or invalid local proxy authentication still receives HTTP 401. The
+upstream status remains available in sanitized routing diagnostics.
 
 CodexSwap does not refresh imported OAuth sessions or write their source auth files. Competing refresh writers can leave another application holding stale credentials. CodexSwap instead reads updates from the known source and checks that they belong to the same account.
 

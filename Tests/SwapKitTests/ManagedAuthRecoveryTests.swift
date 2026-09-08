@@ -31,6 +31,18 @@ private struct ManagedAuthResponse: Sendable {
     }
 }
 
+private actor ManagedAuthEventSink: ProxyEventSink {
+    private var needsLoginEvents = 0
+
+    func handle(_ event: ProxyEvent) async {
+        if case .needsLogin = event.kind {
+            needsLoginEvents += 1
+        }
+    }
+
+    func needsLoginCount() -> Int { needsLoginEvents }
+}
+
 private actor ManagedAuthHTTPServer {
     typealias Handler = @Sendable (ManagedAuthRequest) async -> ManagedAuthResponse
 
@@ -134,6 +146,7 @@ private enum ManagedAuthScenarioKind: Sendable {
     case ownerUpdate
     case invalidation
     case revoked
+    case quotaThenUnauthorized
     case genericUnauthorized
     case expectsAccessToken(String)
 }
@@ -186,6 +199,11 @@ private actor ManagedAuthScenario {
         case .invalidation:
             return Self.invalidated()
         case .revoked:
+            return Self.response(status: 401, body: #"{"error":{"code":"token_revoked"}}"#)
+        case .quotaThenUnauthorized:
+            if upstreamRequests == 1 {
+                return Self.response(status: 429, body: #"{"error":{"code":"usage_limit_reached"}}"#)
+            }
             return Self.response(status: 401, body: #"{"error":{"code":"token_revoked"}}"#)
         case .genericUnauthorized:
             return Self.response(status: 401, body: #"{"error":{"message":"unauthorized"}}"#)
@@ -276,7 +294,10 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         endpoint: URL,
         root: URL,
         freshAlternative: @escaping @Sendable (String, [String]?) async -> Account? = { _, _ in nil },
-        routingLog: RoutingDecisionLog? = nil
+        routingLog: RoutingDecisionLog? = nil,
+        sink: ProxyEventSink = NullEventSink(),
+        settingsProvider: @escaping @Sendable () async -> Settings = { .default },
+        automaticQuotaReset: @escaping @Sendable (String) async -> ResetAttemptResult = { _ in .automaticDisabled }
     ) -> ProxyServer {
         var config = ProxyServer.Config()
         config.upstream = endpoint
@@ -285,10 +306,286 @@ final class ManagedAuthRecoveryTests: XCTestCase {
             store: store,
             refresher: TokenRefresher(url: endpoint.appendingPathComponent("oauth/token")),
             config: config,
-            settingsProvider: { .default },
+            settingsProvider: settingsProvider,
+            automaticQuotaReset: automaticQuotaReset,
             freshAlternative: freshAlternative,
+            sink: sink,
             routingLog: routingLog ?? RoutingDecisionLog(url: root.appendingPathComponent("routing-\(UUID().uuidString).jsonl"))
         )
+    }
+
+    func testStaleQuarantineSnapshotRetriesFreshCredentialWithoutNeedsLoginEvent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-stale-quarantine-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("stale-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("stale-newer", expiry: Date().addingTimeInterval(7_200))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .expectsAccessToken(newer.accessToken), managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let sink = ManagedAuthEventSink()
+        let proxy = makeProxy(store: store, endpoint: endpoint, root: root, sink: sink)
+        await proxy.setAuthRecoveryReadTestHook {
+            await store.updateTokens("managed", tokens: newer)
+        }
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 200)
+        let upstreamCount = await scenario.upstreamCount()
+        XCTAssertEqual(upstreamCount, 2)
+        let needsLoginCount = await sink.needsLoginCount()
+        XCTAssertEqual(needsLoginCount, 0)
+        let accountValue = await store.account("managed")
+        let account = try XCTUnwrap(accountValue)
+        XCTAssertEqual(account.accessToken, newer.accessToken)
+        XCTAssertFalse(account.needsLogin)
+    }
+
+    func testTaskStaleQuarantineRetriesFreshCredentialWithoutNeedsLoginEvent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-task-stale-quarantine-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("task-stale-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("task-stale-newer", expiry: Date().addingTimeInterval(7_200))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .expectsAccessToken(newer.accessToken), managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let sink = ManagedAuthEventSink()
+        let proxy = makeProxy(store: store, endpoint: endpoint, root: root, sink: sink)
+        await proxy.setAuthRecoveryReadTestHook {
+            await store.updateTokens("managed", tokens: newer)
+        }
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(
+            port: try await requirePort(proxy),
+            headers: [
+                ProxyRequestMode.taskHeader: "managed",
+                ProxyRequestMode.taskRunHeader: UUID().uuidString
+            ]
+        )
+        XCTAssertEqual(result.0, 200)
+        let upstreamCount = await scenario.upstreamCount()
+        XCTAssertEqual(upstreamCount, 2)
+        let needsLoginCount = await sink.needsLoginCount()
+        XCTAssertEqual(needsLoginCount, 0)
+        let accountValue = await store.account("managed")
+        let account = try XCTUnwrap(accountValue)
+        XCTAssertEqual(account.accessToken, newer.accessToken)
+        XCTAssertFalse(account.needsLogin)
+    }
+
+    func testWarmupStaleQuarantineRetriesFreshCredentialWithoutNeedsLoginEvent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-warmup-stale-quarantine-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("warmup-stale-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("warmup-stale-newer", expiry: Date().addingTimeInterval(7_200))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .expectsAccessToken(newer.accessToken), managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let sink = ManagedAuthEventSink()
+        let proxy = makeProxy(store: store, endpoint: endpoint, root: root, sink: sink)
+        await proxy.setAuthRecoveryReadTestHook {
+            await store.updateTokens("managed", tokens: newer)
+        }
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(
+            port: try await requirePort(proxy),
+            headers: [ProxyRequestMode.warmupHeader: "managed"]
+        )
+        XCTAssertEqual(result.0, 200)
+        let upstreamCount = await scenario.upstreamCount()
+        XCTAssertEqual(upstreamCount, 2)
+        let needsLoginCount = await sink.needsLoginCount()
+        XCTAssertEqual(needsLoginCount, 0)
+        let accountValue = await store.account("managed")
+        let account = try XCTUnwrap(accountValue)
+        XCTAssertEqual(account.accessToken, newer.accessToken)
+        XCTAssertFalse(account.needsLogin)
+    }
+
+    func testConditionalQuarantineUsesLatestCrossStoreCredentialSnapshot() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-cross-store-cas-\(UUID().uuidString)")
+        let initial = tokens("cross-store-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("cross-store-newer", expiry: Date().addingTimeInterval(7_200))
+        let store1 = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken
+        ))
+        let store2 = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let snapshotValue = await store1.account("managed")
+        let snapshot = try XCTUnwrap(snapshotValue)
+        await store2.updateTokens("managed", tokens: newer)
+
+        let result = await store1.markNeedsLoginOnlyIfCurrent(snapshot)
+        guard case .stale(let current?, _) = result else {
+            XCTFail("expected stale cross-store snapshot result")
+            return
+        }
+        XCTAssertEqual(current.accessToken, newer.accessToken)
+        XCTAssertFalse(current.needsLogin)
+        let persistedValue = await store2.account("managed")
+        let persisted = try XCTUnwrap(persistedValue)
+        XCTAssertEqual(persisted.accessToken, newer.accessToken)
+        XCTAssertFalse(persisted.needsLogin)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testFinalReplayUnauthorizedReturnsSanitized503WithoutExtraReplay() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-final-replay-401-\(UUID().uuidString)")
+        let initial = tokens("final-replay", expiry: Date().addingTimeInterval(3_600))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken
+        ))
+        let scenario = ManagedAuthScenario(kind: .quotaThenUnauthorized, managedHome: root)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let sink = ManagedAuthEventSink()
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            sink: sink,
+            automaticQuotaReset: { _ in .reset(windowsReset: 1) }
+        )
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 503)
+        let body = String(decoding: result.1, as: UTF8.self)
+        XCTAssertTrue(body.contains("reauthentication through its owning app"))
+        XCTAssertFalse(body.contains("token_revoked"))
+        let upstreamCount = await scenario.upstreamCount()
+        XCTAssertEqual(upstreamCount, 2)
+        let needsLoginCount = await sink.needsLoginCount()
+        XCTAssertEqual(needsLoginCount, 1)
+        let accountValue = await store.account("managed")
+        let account = try XCTUnwrap(accountValue)
+        XCTAssertTrue(account.needsLogin)
+    }
+
+    func testFinalReplayUnauthorizedDoesNotQuarantineNewerCredential() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-final-replay-stale-\(UUID().uuidString)")
+        let initial = tokens("final-replay-stale-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("final-replay-stale-newer", expiry: Date().addingTimeInterval(7_200))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken
+        ))
+        let scenario = ManagedAuthScenario(kind: .quotaThenUnauthorized, managedHome: root)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let sink = ManagedAuthEventSink()
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            sink: sink,
+            automaticQuotaReset: { _ in
+                return .reset(windowsReset: 1)
+            }
+        )
+        await proxy.setAuthRecoveryReadTestHook {
+            await store.updateTokens("managed", tokens: newer)
+        }
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+        XCTAssertEqual(result.0, 503)
+        let body = String(decoding: result.1, as: UTF8.self)
+        XCTAssertFalse(body.contains("token_revoked"))
+        let upstreamCount = await scenario.upstreamCount()
+        XCTAssertEqual(upstreamCount, 2)
+        let needsLoginCount = await sink.needsLoginCount()
+        XCTAssertEqual(needsLoginCount, 0)
+        let accountValue = await store.account("managed")
+        let account = try XCTUnwrap(accountValue)
+        XCTAssertEqual(account.accessToken, newer.accessToken)
+        XCTAssertFalse(account.needsLogin)
+    }
+
+    func testConditionalQuarantineRejectsSnapshotAfterCredentialCommit() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-stale-cas-\(UUID().uuidString)")
+        let initial = tokens("cas-initial", expiry: Date().addingTimeInterval(3_600))
+        let newer = tokens("cas-newer", expiry: Date().addingTimeInterval(7_200))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken
+        ))
+        let snapshotValue = await store.account("managed")
+        let snapshot = try XCTUnwrap(snapshotValue)
+        await store.updateTokens("managed", tokens: newer)
+
+        let result = await store.markNeedsLoginOnlyIfCurrent(snapshot)
+        guard case .stale(let current?, _) = result else {
+            XCTFail("expected stale snapshot result")
+            return
+        }
+        XCTAssertEqual(current.accessToken, newer.accessToken)
+        XCTAssertFalse(current.needsLogin)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testConditionalQuarantineRejectsGenerationOnlyChangeWithoutMutation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-generation-cas-\(UUID().uuidString)")
+        let initial = tokens("generation-only", expiry: Date().addingTimeInterval(3_600))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken
+        ))
+        let snapshotValue = await store.account("managed")
+        let snapshot = try XCTUnwrap(snapshotValue)
+        _ = await store.setActive("managed")
+
+        let result = await store.markNeedsLoginOnlyIfCurrent(snapshot)
+        guard case .stale(let current?, _) = result else {
+            XCTFail("expected stale snapshot result")
+            return
+        }
+        XCTAssertEqual(current.accessToken, snapshot.accessToken)
+        XCTAssertFalse(current.needsLogin)
+        try? FileManager.default.removeItem(at: root)
     }
 
     private func routingObjects(at url: URL) throws -> [[String: Any]] {
@@ -522,11 +819,45 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         }
         try await proxy.start()
         let result = try await proxyRequest(port: try await requirePort(proxy))
-        XCTAssertEqual(result.0, 401)
+        XCTAssertEqual(result.0, 503)
         let refreshCount = await scenario.refreshCount()
         let account = await store.account("managed")
         XCTAssertEqual(refreshCount, 0)
         XCTAssertTrue(try XCTUnwrap(account).needsLogin)
+    }
+
+    func testWarmupRevocationQuarantinesAndReturnsSanitizedServiceUnavailable() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-auth-warmup-revoked-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let initial = tokens("warmup-revoked", expiry: Date().addingTimeInterval(3_600))
+        try writeTokens(initial, to: home.appendingPathComponent("auth.json"))
+        let store = await makeStore(root: root, account: Account(
+            alias: "managed", accountID: initial.accountId, accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken, idToken: initial.idToken, managedHomePath: home.path
+        ))
+        let scenario = ManagedAuthScenario(kind: .revoked, managedHome: home)
+        let stub = ManagedAuthHTTPServer { request in await scenario.handle(request) }
+        let endpoint = try await stub.start()
+        let proxy = makeProxy(store: store, endpoint: endpoint, root: root)
+        addTeardownBlock {
+            await proxy.stop()
+            await stub.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(
+            port: try await requirePort(proxy),
+            headers: [ProxyRequestMode.warmupHeader: "managed"]
+        )
+        XCTAssertEqual(result.0, 503)
+        let body = String(decoding: result.1, as: UTF8.self)
+        XCTAssertTrue(body.contains("reauthentication through its owning app"))
+        XCTAssertFalse(body.contains("token_revoked"))
+        XCTAssertFalse(body.contains(initial.accessToken))
+        let accountValue = await store.account("managed")
+        let account = try XCTUnwrap(accountValue)
+        XCTAssertTrue(account.needsLogin)
     }
 
     func testExplicitRevocationLogsClosedTokenReason() async throws {
@@ -556,7 +887,13 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         try await proxy.start()
 
         let result = try await proxyRequest(port: try await requirePort(proxy))
-        XCTAssertEqual(result.0, 401)
+        XCTAssertEqual(result.0, 503)
+        let guidance = String(decoding: result.1, as: UTF8.self)
+        XCTAssertTrue(guidance.contains("reauthentication through its owning app"))
+        XCTAssertTrue(guidance.contains("CodexBar for managed accounts"))
+        XCTAssertTrue(guidance.contains("Add Standalone in CodexSwap for standalone accounts"))
+        XCTAssertTrue(guidance.contains("Rescan Accounts"))
+        XCTAssertFalse(guidance.contains("codex login"))
 
         let objects = try await routingObjectsEventually(at: logURL, minimumCount: 4)
         XCTAssertEqual(objects.compactMap { $0["event"] as? String }, ["request_started", "auth_failure", "auth_failure", "request_terminal"])
@@ -564,7 +901,7 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         XCTAssertEqual(objects[1]["status"] as? Int, 401)
         XCTAssertEqual(objects[2]["reason"] as? String, "token_revoked")
         XCTAssertEqual(objects[2]["status"] as? Int, 401)
-        XCTAssertEqual(objects.last?["status"] as? Int, 401)
+        XCTAssertEqual(objects.last?["status"] as? Int, 503)
         let serialized = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
         XCTAssertFalse(serialized.contains("managed-secret-alias"))
         XCTAssertFalse(serialized.contains(initial.accessToken))

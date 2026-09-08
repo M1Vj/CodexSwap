@@ -133,12 +133,14 @@ final class CodexLoginLauncherTests: XCTestCase {
         let sentinel = inheritedHome.appendingPathComponent("auth.json")
         XCTAssertTrue(FileManager.default.createFile(atPath: sentinel.path, contents: Data("keep".utf8)))
         let observedHome = support.appendingPathComponent("observed-home")
+        let observedUserHome = support.appendingPathComponent("observed-user-home")
         let observedCWD = support.appendingPathComponent("observed-cwd")
         let observedArgs = support.appendingPathComponent("observed-args")
         let fakeCodex = support.appendingPathComponent("fake-codex")
         let fakeScript = """
         #!/usr/bin/env bash
         printf '%s' "${CODEX_HOME:-}" > '\(observedHome.path)'
+        printf '%s' "${HOME:-}" > '\(observedUserHome.path)'
         printf '%s' "$PWD" > '\(observedCWD.path)'
         printf '%s' "$*" > '\(observedArgs.path)'
         mkdir -p -- "$CODEX_HOME"
@@ -177,6 +179,7 @@ final class CodexLoginLauncherTests: XCTestCase {
 
         XCTAssertEqual(process.terminationStatus, 0)
         XCTAssertEqual(try String(contentsOf: observedHome, encoding: .utf8), launch.homePath.path)
+        XCTAssertEqual(try String(contentsOf: observedUserHome, encoding: .utf8), launch.homePath.path)
         XCTAssertEqual(try String(contentsOf: observedCWD, encoding: .utf8), launch.homePath.path)
         XCTAssertEqual(try String(contentsOf: observedArgs, encoding: .utf8), "login -c cli_auth_credentials_store=\"file\"")
         XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "keep")
@@ -274,6 +277,57 @@ final class CodexLoginLauncherTests: XCTestCase {
         XCTAssertNotEqual(try runCommand(launch.commandFile), 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path))
         XCTAssertEqual(try String(contentsOf: auth, encoding: .utf8), "existing-account")
+    }
+
+    func testCommandScriptIsolatesHomeWithoutBypassingLocalProtection() {
+        let script = CodexLoginLauncher.commandScript(
+            codexPath: "/opt/homebrew/bin/codex",
+            homePath: "/private/var/test-home"
+        )
+
+        XCTAssertTrue(script.contains("HOME='/private/var/test-home'"))
+        XCTAssertTrue(script.contains("export HOME"))
+        XCTAssertTrue(script.contains("CODEX_HOME='/private/var/test-home'"))
+        XCTAssertTrue(script.contains("export CODEX_HOME"))
+        XCTAssertFalse(script.contains("export CODEX_NO_JAIL=1"))
+        XCTAssertFalse(script.contains("export SAFE_CODEX_ACTIVE=1"))
+        XCTAssertTrue(script.contains("CodexSwap — Add Standalone Account"))
+        XCTAssertTrue(script.contains("This login session is isolated in a private directory"))
+        XCTAssertFalse(script.contains("It will NOT touch or log out your primary terminal session"))
+    }
+
+    func testRejectsCredentialsOutsideTheExplicitCodexHome() throws {
+        let support = try makeTemporaryDirectory()
+        let fakeCodex = support.appendingPathComponent("fake-codex")
+        let fakeScript = """
+        #!/usr/bin/env bash
+        mkdir -p -- "$HOME/.codex"
+        printf '%s' '{"tokens":{"access_token":"sub","refresh_token":"sub","account_id":"sub"}}' > "$HOME/.codex/auth.json"
+        """
+        try Data(fakeScript.utf8).write(to: fakeCodex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+
+        let launch = try CodexLoginLauncher.prepareStandaloneLogin(
+            codexPath: fakeCodex.path,
+            supportDirectory: support,
+            identifier: "sub-home"
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [launch.commandFile.path]
+        let input = Pipe()
+        process.standardInput = input
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        input.fileHandleForWriting.write(Data("\n".utf8))
+        input.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+
+        XCTAssertNotEqual(process.terminationStatus, 0)
+        let copiedAuth = launch.homePath.appendingPathComponent("auth.json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copiedAuth.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: launch.successMarker.path))
     }
 
     private func runCommand(_ command: URL) throws -> Int32 {

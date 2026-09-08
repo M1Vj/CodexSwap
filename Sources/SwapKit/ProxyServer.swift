@@ -64,6 +64,15 @@ private func accessTokenExpired(_ accessToken: String, now: Date = Date()) -> Bo
     return expiry <= now
 }
 
+private func isRetryableFreshCredential(_ snapshot: Account, _ current: Account, now: Date = Date()) -> Bool {
+    snapshot.telemetryID == current.telemetryID
+        && snapshot.alias == current.alias
+        && snapshot.accountID == current.accountID
+        && snapshot.accessToken != current.accessToken
+        && !accessTokenExpired(current.accessToken, now: now)
+        && current.isEligible(now: now)
+}
+
 enum ExhaustionDecision: Equatable, Sendable {
     case retryCurrent
     case switchTo(String)
@@ -765,6 +774,7 @@ public actor ProxyServer {
     private var lifecycleAfterBindTestHook: (@Sendable () async -> Void)?
     private var lifecycleStopCommittedTestHook: (@Sendable () async -> Void)?
     private var lifecycleStartCallerTestHook: (@Sendable () async -> Void)?
+    private var authRecoveryReadTestHook: (@Sendable () async -> Void)?
     private let verbose: Bool
     private var servedCount = 0
     private var lastActivityAt: Date?
@@ -1060,6 +1070,10 @@ public actor ProxyServer {
         lifecycleAfterBindTestHook = afterBind
         lifecycleStopCommittedTestHook = stopCommitted
         lifecycleStartCallerTestHook = startCaller
+    }
+
+    func setAuthRecoveryReadTestHook(_ hook: (@Sendable () async -> Void)?) {
+        authRecoveryReadTestHook = hook
     }
 
     private func startTrackedConnection(_ connection: NIOAsyncChannel<HTTPServerRequestPart, HTTPServerResponsePart>) {
@@ -1525,6 +1539,34 @@ public actor ProxyServer {
             // final; alternative-account replays remain eligible for the bounded
             // failover path below.
             if finalReplay {
+                if resp.status == .unauthorized {
+                    let errBody = try await collect(resp.body, cap: 64 * 1024)
+                    await self.authRecoveryReadTestHook?()
+                    await self.recordAuthDecision(.authFailure, reason: .upstreamUnauthorized, account: account,
+                                                  rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
+                    if let reason = sessionInvalidationReason(errBody) {
+                        await self.recordAuthDecision(.authFailure, reason: reason, account: account,
+                                                      rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
+                        await burn.clear(alias: account.alias)
+                        let quarantine = await store.markNeedsLoginOnlyIfCurrent(account)
+                        if case .quarantined = quarantine {
+                            await sink.handle(ProxyEvent.taskScoped(
+                                kind: .needsLogin,
+                                from: account.alias,
+                                to: nil,
+                                limit: nil,
+                                resetAt: nil,
+                                mode: mode
+                            ))
+                        }
+                    }
+                    try await writeError(
+                        outbound,
+                        status: .serviceUnavailable,
+                        message: "This account needs reauthentication through its owning app: use CodexBar for managed accounts or Add Standalone in CodexSwap for standalone accounts, then select Rescan Accounts."
+                    )
+                    return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
+                }
                 await self.publishServedActivity(account.alias, mode: mode)
                 if bindSelectionOnSuccess, resp.status.code >= 200, resp.status.code < 300 {
                     await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -1550,6 +1592,7 @@ public actor ProxyServer {
                         finalReplay: finalReplay
                     )
                 }
+                await self.authRecoveryReadTestHook?()
                 if isSessionInvalidated(errBody) {
                     if let reason = sessionInvalidationReason(errBody) {
                         await self.recordAuthDecision(.authFailure, reason: reason, account: account,
@@ -1565,13 +1608,32 @@ public actor ProxyServer {
                                 finalReplay: finalReplay
                             )
                         }
-                        return .completed(outcome: .failure, status: Int(resp.status.code))
+                        return .completed(
+                            outcome: .failure,
+                            status: resp.status == .unauthorized ? Int(HTTPResponseStatus.serviceUnavailable.code) : Int(resp.status.code)
+                        )
                     }
                     if mode.isWarmup {
-                        await store.markNeedsLoginOnly(account.alias)
-                        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
-                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: errBody)
-                        return .completed(outcome: .failure, status: Int(resp.status.code))
+                        let quarantine = await store.markNeedsLoginOnlyIfCurrent(account)
+                        if case .stale(let current, _) = quarantine,
+                           let current,
+                           isRetryableFreshCredential(account, current) {
+                            return .retry(
+                                account: current,
+                                tokenRefreshed: false,
+                                exhaustionHandled: exhaustionHandled,
+                                finalReplay: finalReplay
+                            )
+                        }
+                        if case .quarantined = quarantine {
+                            await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: nil, limit: nil, resetAt: nil))
+                        }
+                        try await writeError(
+                            outbound,
+                            status: .serviceUnavailable,
+                            message: "This account needs reauthentication through its owning app: use CodexBar for managed accounts or Add Standalone in CodexSwap for standalone accounts, then select Rescan Accounts."
+                        )
+                        return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
                     }
                     if let next = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
@@ -1584,7 +1646,7 @@ public actor ProxyServer {
                             finalReplay: finalReplay
                         )
                     }
-                    return .completed(outcome: .failure, status: Int(resp.status.code))
+                    return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
                 }
                 return try await self.renewalRequired(
                     account: account,
@@ -1596,6 +1658,16 @@ public actor ProxyServer {
                     exhaustionHandled: exhaustionHandled,
                     finalReplay: finalReplay
                 )
+            }
+
+            if resp.status == .unauthorized {
+                _ = try await collect(resp.body, cap: 64 * 1024)
+                try await writeError(
+                    outbound,
+                    status: .serviceUnavailable,
+                    message: "This account needs reauthentication through its owning app: use CodexBar for managed accounts or Add Standalone in CodexSwap for standalone accounts, then select Rescan Accounts."
+                )
+                return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
             }
 
             // 429 usage limit -> rotate
@@ -1855,7 +1927,7 @@ public actor ProxyServer {
             try await writeError(
                 outbound,
                 status: .serviceUnavailable,
-                message: "CodexSwap account \(account.alias) requires renewal by its credential owner"
+                message: "CodexSwap account requires renewal by its credential owner"
             )
             return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
         }
@@ -1873,7 +1945,7 @@ public actor ProxyServer {
         try await writeError(
             outbound,
             status: .serviceUnavailable,
-            message: "CodexSwap account \(account.alias) requires renewal by its credential owner"
+            message: "CodexSwap account requires renewal by its credential owner"
         )
         return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
     }
@@ -1998,18 +2070,39 @@ public actor ProxyServer {
     }
 
     private func taskFailover(from account: Account, mode: ProxyRequestMode, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, status: HTTPResponseStatus, headers: HTTPHeaders, errBody: ByteBuffer) async throws -> Account? {
-        await store.markNeedsLoginOnly(account.alias)
-        let next = await selectNextTaskAccount(mode: mode, excluding: account.alias)
-        await sink.handle(ProxyEvent.taskScoped(
-            kind: .needsLogin,
-            from: account.alias,
-            to: next?.alias,
-            limit: nil,
-            resetAt: nil,
-            mode: mode
-        ))
+        let quarantine = await store.markNeedsLoginOnlyIfCurrent(account)
+        if case .stale(let current, _) = quarantine,
+           let current,
+           isRetryableFreshCredential(account, current) {
+            return current
+        }
+        let next: Account?
+        switch quarantine {
+        case .quarantined, .stale:
+            next = await selectNextTaskAccount(mode: mode, excluding: account.alias)
+        case .notFound, .persistenceFailed:
+            next = nil
+        }
+        if case .quarantined = quarantine {
+            await sink.handle(ProxyEvent.taskScoped(
+                kind: .needsLogin,
+                from: account.alias,
+                to: next?.alias,
+                limit: nil,
+                resetAt: nil,
+                mode: mode
+            ))
+        }
         guard let next else {
-            try await deliverBuffered(outbound, status: status, headers: headers, body: errBody)
+            if status == .unauthorized {
+                try await writeError(
+                    outbound,
+                    status: .serviceUnavailable,
+                    message: "This account needs reauthentication through its owning app: use CodexBar for managed accounts or Add Standalone in CodexSwap for standalone accounts, then select Rescan Accounts."
+                )
+            } else {
+                try await deliverBuffered(outbound, status: status, headers: headers, body: errBody)
+            }
             return nil
         }
         return next
@@ -2018,10 +2111,27 @@ public actor ProxyServer {
     private enum FailoverReason { case needsLogin }
 
     private func failover(from account: Account, reason: FailoverReason, outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, errBody: ByteBuffer) async throws -> Account? {
-        let result = await store.markNeedsLogin(account.alias)
-        await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: result.next?.alias, limit: nil, resetAt: nil))
-        guard let next = result.next, result.rotated else {
-            try await writeError(outbound, status: .unauthorized, message: "CodexSwap account \(account.alias) needs sign-in: run `codex login`")
+        let quarantine = await store.markNeedsLoginIfCurrent(account)
+        if case .stale(let current, _) = quarantine,
+           let current,
+           isRetryableFreshCredential(account, current) {
+            return current
+        }
+        let next: Account?
+        if case .quarantined(let quarantinedNext) = quarantine {
+            next = quarantinedNext
+            await sink.handle(ProxyEvent(kind: .needsLogin, from: account.alias, to: next?.alias, limit: nil, resetAt: nil))
+        } else if case .stale(_, let staleNext) = quarantine {
+            next = staleNext
+        } else {
+            next = nil
+        }
+        guard let next else {
+            try await writeError(
+                outbound,
+                status: .serviceUnavailable,
+                message: "This account needs reauthentication through its owning app: use CodexBar for managed accounts or Add Standalone in CodexSwap for standalone accounts, then select Rescan Accounts."
+            )
             return nil
         }
         return next
