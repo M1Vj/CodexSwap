@@ -626,7 +626,14 @@ final class AgentCLITests: XCTestCase {
             runner: runner,
             ledger: WarmupLedgerStore(url: directory.appendingPathComponent("warmup.json"))
         )
-        let loopback = URL(string: "http://127.0.0.1:54321")!
+        var proxyConfig = ProxyServer.Config()
+        proxyConfig.port = 0
+        let proxy = ProxyServer(store: store, config: proxyConfig, settingsProvider: { .default })
+        try await proxy.start()
+        addTeardownBlock { await proxy.stop() }
+        let boundPort = await proxy.port()
+        let port = try XCTUnwrap(boundPort)
+        let loopback = URL(string: "http://127.0.0.1:\(port)")!
         let cli = AgentCLI(
             store: store,
             settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
