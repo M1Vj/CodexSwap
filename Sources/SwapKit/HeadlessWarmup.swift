@@ -90,6 +90,7 @@ public enum HeadlessWarmup {
     ) async -> HeadlessWarmupReport {
         // Keep archived rows out of both credential hydration and the operational
         // warm-up roster. The service still defends this boundary for direct callers.
+        _ = await store.expireCooldowns(now: now)
         let allAccounts = await store.activeAccounts()
         let originalAccounts: [Account]
         if let targetAliases {

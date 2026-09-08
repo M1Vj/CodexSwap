@@ -32,6 +32,34 @@ public struct UsageWindow: Codable, Sendable, Equatable {
             return "\(seconds / 60)m"
         }
     }
+
+    public static func windowSeconds(forLabel label: String) -> Int {
+        if label.caseInsensitiveCompare("5h") == .orderedSame {
+            return 18000
+        }
+        if label.caseInsensitiveCompare("Weekly") == .orderedSame {
+            return 604800
+        }
+        if label.hasSuffix("d"), let days = Int(label.dropLast()) {
+            return days * 86400
+        }
+        if label.hasSuffix("h"), let hours = Int(label.dropLast()) {
+            return hours * 3600
+        }
+        if label.hasSuffix("m"), let mins = Int(label.dropLast()) {
+            return mins * 60
+        }
+        return 0
+    }
+
+    public init(_ report: QuotaWindowReport) {
+        self.init(
+            label: report.label,
+            usedPercent: report.usedPercent,
+            windowSeconds: Self.windowSeconds(forLabel: report.label),
+            resetAt: report.resetAt
+        )
+    }
 }
 
 /// Cumulative token consumption attributed to one model on an account.

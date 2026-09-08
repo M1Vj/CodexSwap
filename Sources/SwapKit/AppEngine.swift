@@ -121,6 +121,7 @@ public actor AppEngine {
     private let supportDir: URL
     private let telemetry: UsageTelemetryStore
     private let beforeTaskLaunch: (@Sendable (String) async -> Void)?
+    private let networkCheck: @Sendable () -> Bool
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var onEvent: (@Sendable (AppEvent) -> Void)?
@@ -152,7 +153,8 @@ public actor AppEngine {
         taskStore: TaskStore = TaskStore(),
         taskRunner: TaskRunner? = nil,
         autoLog: AutomationLog = AutomationLog(),
-        supportDir: URL = AppPaths.supportDir()
+        supportDir: URL = AppPaths.supportDir(),
+        networkCheck: (@Sendable () -> Bool)? = nil
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -172,6 +174,7 @@ public actor AppEngine {
         self.supportDir = supportDir
         self.telemetry = UsageTelemetryStore(url: supportDir.appendingPathComponent(UsageTelemetryStore.defaultFileName))
         self.beforeTaskLaunch = nil
+        self.networkCheck = networkCheck ?? { NetworkReachability.shared.isOnline }
         self.taskRunner = taskRunner ?? TaskRunner(
             logSink: { [autoLog] category, message in
                 await autoLog.write(category, message)
@@ -205,7 +208,8 @@ public actor AppEngine {
         autoLog: AutomationLog = AutomationLog(),
         supportDir: URL = AppPaths.supportDir(),
         proxyForTesting: ProxyServer? = nil,
-        beforeTaskLaunch: (@Sendable (String) async -> Void)? = nil
+        beforeTaskLaunch: (@Sendable (String) async -> Void)? = nil,
+        networkCheck: (@Sendable () -> Bool)? = nil
     ) {
         self.store = store
         self.settingsStore = settingsStore
@@ -227,6 +231,7 @@ public actor AppEngine {
         self.telemetry = UsageTelemetryStore(url: supportDir.appendingPathComponent(UsageTelemetryStore.defaultFileName))
         self.proxy = proxyForTesting
         self.beforeTaskLaunch = beforeTaskLaunch
+        self.networkCheck = networkCheck ?? { NetworkReachability.shared.isOnline }
     }
 
     public func setEventHandler(_ handler: @escaping @Sendable (AppEvent) -> Void) {
@@ -1114,6 +1119,9 @@ public actor AppEngine {
         guard let url = runningURL else {
             return WarmupSummary(startedAt: Date(), finishedAt: Date(), failed: ["all": "proxy not running"])
         }
+        guard networkCheck() else {
+            return WarmupSummary(startedAt: Date(), finishedAt: Date(), skipped: ["all": "network unavailable"])
+        }
         return await performWarmup(proxyURL: url, force: true)
     }
 
@@ -1147,6 +1155,32 @@ public actor AppEngine {
             && (account.priority > 0 || settings.automationAccounts.contains(account.alias))
     }
 
+    static func warmupSkipReason(_ account: Account, settings: Settings, now: Date = Date()) -> String? {
+        if account.isArchived { return "archived" }
+        if !account.routingEnabled { return "routing disabled" }
+        if settings.warmupExcludedAccounts.contains(account.id)
+            || settings.warmupExcludedAccounts.contains(account.alias) {
+            return "warm-up excluded"
+        }
+        if let reason = QuotaWarmupService.skipReason(account, now: now) {
+            return reason
+        }
+        if account.usage.contains(where: { $0.windowSeconds >= 604_800 && $0.usedPercent >= 100 }) {
+            return "weekly quota exhausted"
+        }
+        if account.usage.contains(where: { $0.usedPercent >= 100 }) {
+            return "quota exhausted"
+        }
+        let shortWindows = account.usage.filter { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
+        if shortWindows.isEmpty {
+            return "no usage data"
+        }
+        if !shortWindows.allSatisfy({ $0.usedPercent == 0 }) {
+            return "usage non-zero"
+        }
+        return nil
+    }
+
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
         _ = await archiveDueAccounts()
         return await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force, now: Date())
@@ -1162,6 +1196,7 @@ public actor AppEngine {
         now: Date = Date(),
         usageAlreadyRefreshed: Bool = false
     ) async -> WarmupSummary? {
+        guard networkCheck() else { return nil }
         let currentSettings: Settings
         if let settings {
             currentSettings = settings
@@ -1212,6 +1247,21 @@ public actor AppEngine {
         )
     }
 
+    public func systemDidWake() async {
+        guard networkCheck() else { return }
+        let settings = await settingsStore.get()
+        await expireCooldownsAndNotify()
+        await pollUsage(activeOnly: !settings.smartSwitchEnabled)
+        if settings.automaticallyWarmAccounts, let url = await proxy?.proxyURL() {
+            _ = await automaticWarmupTick(
+                proxyURL: url,
+                settings: settings,
+                usageAlreadyRefreshed: settings.smartSwitchEnabled
+            )
+        }
+        emit(.snapshotChanged)
+    }
+
     private func performWarmup(
         candidates: [Account],
         proxyURL: URL,
@@ -1220,6 +1270,9 @@ public actor AppEngine {
     ) async -> WarmupSummary {
         guard !warmupInProgress else {
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
+        }
+        guard networkCheck() else {
+            return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "network unavailable"])
         }
         warmupInProgress = true
         emit(.snapshotChanged)
@@ -1236,14 +1289,8 @@ public actor AppEngine {
             guard let fresh = await store.account(account.alias) else {
                 return "account unavailable"
             }
-            if let reason = QuotaWarmupService.skipReason(fresh, now: now) {
+            if let reason = Self.warmupSkipReason(fresh, settings: settings, now: now) {
                 return reason
-            }
-            guard Self.quotaWarmupEligible(fresh, settings: settings) else {
-                return "warm-up not eligible"
-            }
-            guard QuotaWarmupService.usageAllowsWarmup(fresh) else {
-                return "usage changed"
             }
             return nil
         }
@@ -1254,6 +1301,11 @@ public actor AppEngine {
             now: now,
             recheck: recheck
         )
+        for account in candidates where !allowedCandidates.contains(where: { $0.alias == account.alias }) {
+            if summary.skipped[account.alias] == nil {
+                summary.skipped[account.alias] = Self.warmupSkipReason(account, settings: settings, now: now) ?? "warm-up not eligible"
+            }
+        }
         // Refresh every command attempt, including failures. `warmed` is deliberately
         // not used as the target set because a zero exit is only an unverified attempt.
         let attemptedAliases = Set(summary.attempted)

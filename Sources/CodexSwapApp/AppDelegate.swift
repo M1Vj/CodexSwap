@@ -111,6 +111,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+
         Task { @MainActor in
             await engine.setEventHandler { [weak self] event in
                 Task { @MainActor in self?.handle(event: event) }
@@ -1271,6 +1278,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func warmAllAccountsNow() {
         requestWarmAllAccounts()
+    }
+
+    @objc private func systemDidWake() {
+        Task { @MainActor in
+            await engine.systemDidWake()
+            await refreshSnapshot()
+        }
     }
 
     private func requestWarmAllAccounts() {

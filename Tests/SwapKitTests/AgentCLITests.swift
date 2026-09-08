@@ -568,4 +568,116 @@ final class AgentCLITests: XCTestCase {
         let payload = try XCTUnwrap(root["data"] as? [String: Any])
         return try XCTUnwrap(payload["accounts"] as? [[String: Any]])
     }
+
+    func testQuotaReportUpdatesStoreUsageAndClearsExpiredCooldowns() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIQuotaReportStore-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let account = Account(
+            alias: "alpha",
+            accountID: "alpha-id",
+            accessToken: "valid-token",
+            disabledUntil: ["5h": now.addingTimeInterval(-100)],
+            usage: [UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: now.addingTimeInterval(3600))]
+        )
+        await store.upsert(account)
+
+        let freshWindows = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))]
+        let stubUsage = StubQuotaUsageForCLI(windows: freshWindows)
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            usageService: stubUsage,
+            resetService: StubQuotaResetForCLI(),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let result = await cli.run(["agent", "quota", "report", "--json"])
+        XCTAssertEqual(result.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertTrue(result.envelope.ok)
+
+        let updated = await store.account("alpha")
+        XCTAssertEqual(updated?.usage.first?.usedPercent, 0)
+        XCTAssertTrue(updated?.disabledUntil.isEmpty == true)
+    }
+
+    func testWarmupAccountReportsWarmedStatusWhenAttempted() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIWarmupAttempt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        let account = Account(
+            alias: "warm-me",
+            accountID: "warm-id",
+            accessToken: "valid-token",
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))]
+        )
+        await store.upsert(account)
+        _ = await store.setActive("warm-me")
+
+        let runner = StubWarmupRunnerForCLI()
+        let warmupService = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: directory.appendingPathComponent("warmup.json"))
+        )
+        let loopback = URL(string: "http://127.0.0.1:54321")!
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            warmupService: warmupService,
+            supportDir: directory,
+            runtimeURLProvider: { loopback }
+        )
+
+        let listResult = await cli.run(["agent", "accounts", "list", "--json"])
+        guard case .object(let listData)? = listResult.envelope.data,
+              case .array(let accountsList)? = listData["accounts"],
+              case .object(let firstAccount)? = accountsList.first,
+              case .string(let ref)? = firstAccount["ref"] else {
+            return XCTFail("missing account ref")
+        }
+
+        let result = await cli.run(["agent", "warmup", "account", ref, "--confirm", "--json"])
+        XCTAssertEqual(result.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertTrue(result.envelope.ok)
+
+        guard case .object(let data)? = result.envelope.data else {
+            return XCTFail("missing warmup data")
+        }
+        XCTAssertEqual(data["accountStatus"], AgentCLIJSONValue.string("warmed"))
+        guard case .object(let counts)? = data["counts"] else {
+            return XCTFail("missing counts")
+        }
+        XCTAssertEqual(counts["warmed"], AgentCLIJSONValue.integer(1))
+        XCTAssertEqual(counts["skipped"], AgentCLIJSONValue.integer(0))
+        XCTAssertEqual(counts["failed"], AgentCLIJSONValue.integer(0))
+    }
 }
+
+private actor StubQuotaUsageForCLI: UsageFetching {
+    let windows: [UsageWindow]
+    init(windows: [UsageWindow]) { self.windows = windows }
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
+        windows
+    }
+}
+
+private struct StubQuotaResetForCLI: QuotaResetServing {
+    func credits(accessToken: String, accountID: String) async throws -> ResetCreditSnapshot {
+        ResetCreditSnapshot(availableCount: 0, credits: [], fetchedAt: Date())
+    }
+    func consume(accessToken: String, accountID: String, creditID: String, redemptionID: UUID) async throws -> ResetConsumeResult {
+        throw CancellationError()
+    }
+}
+
+private actor StubWarmupRunnerForCLI: WarmupCommandRunning {
+    func run(alias: String, proxyURL: URL) async throws {}
+}
+

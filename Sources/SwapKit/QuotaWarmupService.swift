@@ -32,6 +32,7 @@ public actor QuotaWarmupService {
     private let failureRetrySeconds: TimeInterval
     private let unknownRetrySeconds: TimeInterval
     private let lockURL: URL
+    private let networkCheck: @Sendable () -> Bool
     private var isRunning = false
 
     public init(
@@ -39,13 +40,15 @@ public actor QuotaWarmupService {
         ledger: WarmupLedgerStore = WarmupLedgerStore(),
         failureRetrySeconds: TimeInterval = 300,
         unknownRetrySeconds: TimeInterval = 1_800,
-        lockURL: URL = AppPaths.warmupLockFile()
+        lockURL: URL = AppPaths.warmupLockFile(),
+        networkCheck: (@Sendable () -> Bool)? = nil
     ) {
         self.runner = runner
         self.ledger = ledger
         self.failureRetrySeconds = failureRetrySeconds
         self.unknownRetrySeconds = unknownRetrySeconds
         self.lockURL = lockURL
+        self.networkCheck = networkCheck ?? { NetworkReachability.shared.isOnline }
     }
 
     public func run(
@@ -57,6 +60,9 @@ public actor QuotaWarmupService {
     ) async -> WarmupSummary {
         guard !isRunning else {
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
+        }
+        guard networkCheck() else {
+            return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "network unavailable"])
         }
         let processLock: WarmupInterprocessLock
         do {
@@ -103,6 +109,15 @@ public actor QuotaWarmupService {
             do {
                 try await runner.run(alias: account.alias, proxyURL: proxyURL)
             } catch {
+                if !networkCheck() {
+                    var restoredRecord = pendingRecord
+                    restoredRecord.primaryResetAt = now
+                    restoredRecord.retryAfter = nil
+                    restoredRecord.outcome = .unknown
+                    await ledger.setRecord(restoredRecord, for: key)
+                    summary.skipped[account.alias] = "network unavailable"
+                    continue
+                }
                 var failedRecord = pendingRecord
                 failedRecord.outcome = .failed
                 // A definite command failure should retry on the bounded failure
@@ -277,7 +292,7 @@ public actor QuotaWarmupService {
         account.usage.first(where: { $0.windowSeconds >= 604_800 })?.resetAt.flatMap { $0 > now ? $0 : nil }
     }
 
-    static func skipReason(_ account: Account, now: Date) -> String? {
+    public static func skipReason(_ account: Account, now: Date = Date()) -> String? {
         if account.isArchived { return "archived" }
         if account.isUsageLimitReached { return "account usage cap reached" }
         if account.needsLogin { return "needs login" }
@@ -294,6 +309,7 @@ public actor QuotaWarmupService {
     /// restarting a fresh short window.
     public nonisolated static func usageAllowsWarmup(_ account: Account) -> Bool {
         guard !account.isUsageLimitReached else { return false }
+        guard !account.usage.contains(where: { $0.usedPercent >= 100 }) else { return false }
         let shortWindows = account.usage.filter { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
         guard !shortWindows.isEmpty else { return false }
         return shortWindows.allSatisfy { $0.usedPercent == 0 }

@@ -162,6 +162,7 @@ LOG_REASON_VALUES = {
     "deadline_elapsed",
     "usage_decreased",
     "usage_nonzero",
+    "usage_exhausted",
     "reset_observed_zero_usage",
     "cooldown",
     "proxy_unavailable",
@@ -209,6 +210,7 @@ class AccountSnapshot:
     state: str
     usage_status: str
     window: Optional[WindowSnapshot]
+    any_window_exhausted: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -399,12 +401,14 @@ def parse_quota_report(value: Any) -> list[AccountSnapshot]:
                 raise MonitorError("invalid_remaining_percent")
             reset_at = parse_timestamp(raw_window.get("resetAt"), required=False)
             windows.append(WindowSnapshot(label=label, used_percent=used, reset_at=reset_at))
+        any_window_exhausted = any(w.used_percent >= 100 for w in windows)
         result.append(
             AccountSnapshot(
                 ref=ref,
                 state=state,
                 usage_status=usage_status,
                 window=_choose_window(windows),
+                any_window_exhausted=any_window_exhausted,
             )
         )
     return result
@@ -520,6 +524,8 @@ def reset_observation_reason(
         return None
     if current.state not in {"active", "available"} or current.usage_status != "ok":
         return None
+    if current.any_window_exhausted:
+        return None
     previous_reset = _state_timestamp(previous.get("resetAt"))
     if previous_reset is None:
         return None
@@ -540,6 +546,14 @@ def reset_observation_reason(
     # deadline forward.  Require a lower usage value or an elapsed old deadline.
     if current_reset != previous_reset and previous_reset <= now:
         return "deadline_elapsed"
+    # An idle account (0% usage) whose quota cycle has elapsed since lastWarmAt or observedAt.
+    # When usedPercent == 0, upstream resetAt slides with now (+5h) on every poll.
+    # If a full 5-hour cycle has elapsed since lastWarmAt (or observedAt), the cycle deadline has elapsed.
+    baseline_time = _state_timestamp(previous.get("lastWarmAt")) or _state_timestamp(previous.get("observedAt"))
+    if baseline_time is not None and current.window.used_percent == 0:
+        cycle_duration = _datetime.timedelta(seconds=18000)
+        if now >= baseline_time + cycle_duration:
+            return "deadline_elapsed"
     return None
 
 
@@ -863,7 +877,7 @@ def _pending_refs(state: Mapping[str, Any], snapshots: Iterable[AccountSnapshot]
             # be visible while an account is already serving traffic; keep the
             # marker for a later zero-usage reading, but never target a used
             # account (or fall back to a roster-wide warm-up).
-            if current.window.used_percent != 0:
+            if current.any_window_exhausted or current.window.used_percent != 0:
                 continue
             refs.append(ref)
     return sorted(refs)
@@ -894,6 +908,9 @@ def _apply_observations(
             record["pendingObservedAt"] = previous.get("pendingObservedAt")
             record["lastWarmFingerprint"] = previous.get("lastWarmFingerprint")
             record["lastWarmAt"] = previous.get("lastWarmAt")
+            current_used = snapshot.window.used_percent if snapshot.window else None
+            if previous.get("usedPercent") == current_used and previous.get("observedAt") is not None:
+                record["observedAt"] = previous.get("observedAt")
             # A transient report can omit resetAt (or the complete window)
             # while still reporting an otherwise healthy account. Preserve
             # the last baseline so the next complete report can still prove a
@@ -908,14 +925,18 @@ def _apply_observations(
                 record["resetAt"] = previous.get("resetAt")
                 record["usedPercent"] = previous.get("usedPercent")
         if observe_reset(previous, snapshot, now):
-            fingerprint = reset_fingerprint(snapshot)
-            if fingerprint is not None and fingerprint not in {
-                (previous or {}).get("lastWarmFingerprint"),
-                (previous or {}).get("pendingFingerprint"),
-            }:
-                record["pendingFingerprint"] = fingerprint
-                record["pendingObservedAt"] = timestamp_string(now)
-                observed_count += 1
+            if previous and previous.get("pendingFingerprint"):
+                record["pendingFingerprint"] = previous.get("pendingFingerprint")
+                record["pendingObservedAt"] = previous.get("pendingObservedAt")
+            else:
+                fingerprint = reset_fingerprint(snapshot)
+                if fingerprint is not None and fingerprint not in {
+                    (previous or {}).get("lastWarmFingerprint"),
+                    (previous or {}).get("pendingFingerprint"),
+                }:
+                    record["pendingFingerprint"] = fingerprint
+                    record["pendingObservedAt"] = timestamp_string(now)
+                    observed_count += 1
         elif (
             previous is not None
             and _usable_snapshot(snapshot)
@@ -944,6 +965,18 @@ def _mark_warmed(state: dict[str, Any], refs: Iterable[str], now: _datetime.date
         if pending:
             record["lastWarmFingerprint"] = pending
             record["lastWarmAt"] = timestamp_string(now)
+            record["pendingFingerprint"] = None
+            record["pendingObservedAt"] = None
+
+
+def _mark_skipped(state: dict[str, Any], refs: Iterable[str]) -> None:
+    for ref in refs:
+        record = state["accounts"].get(ref)
+        if record is None:
+            continue
+        pending = record.get("pendingFingerprint")
+        if pending:
+            record["lastWarmFingerprint"] = pending
             record["pendingFingerprint"] = None
             record["pendingObservedAt"] = None
 
@@ -1026,6 +1059,8 @@ def _pending_skip_reason(
         return "account_inactive"
     if current.window is None or current.window.reset_at is None:
         return "reset_unavailable"
+    if current.any_window_exhausted:
+        return "usage_exhausted"
     if current.window.used_percent != 0:
         return "usage_nonzero"
     # The caller should only ask about records with a pending fingerprint. A
@@ -1337,8 +1372,9 @@ def monitor_once(config: MonitorConfig, *, now: Optional[_datetime.datetime] = N
         # A valid targeted response is the deduplication boundary for that ref.
         # Even a safe skip (for example a race into cooldown) must not be
         # replayed for the same reset fingerprint on every monitor tick.
-        _mark_warmed(state, successful_refs, now)
-        if successful_refs:
+        _mark_warmed(state, warmed_refs, now)
+        _mark_skipped(state, successful_refs - warmed_refs)
+        if warmed_refs:
             state["lastWarmAt"] = timestamp_string(now)
         state["lastWarmStatus"] = "failed" if failed_refs else "succeeded"
         state["nextAttemptAfter"] = (

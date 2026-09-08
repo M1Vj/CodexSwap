@@ -1476,7 +1476,6 @@ public struct AgentCLI: Sendable {
         let service = QuotaReportService(usageService: usageService, resetService: resetService)
         let activeAlias = await store.activeAlias()
         let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias)
-        let privateValues = Set(accounts.flatMap { [$0.email, $0.accountID, $0.accessToken, $0.refreshToken, $0.idToken] })
         let reportOrder = accounts.sorted { lhs, rhs in
             let lhsActive = activeAlias.map { lhs.alias.caseInsensitiveCompare($0) == .orderedSame } ?? false
             let rhsActive = activeAlias.map { rhs.alias.caseInsensitiveCompare($0) == .orderedSame } ?? false
@@ -1485,6 +1484,16 @@ public struct AgentCLI: Sendable {
             if l != r { return l < r }
             return lhs.alias < rhs.alias
         }
+        let fetchedAt = Date()
+        for (account, accountReport) in zip(reportOrder, report.accounts) where accountReport.usageStatus == .ok && !accountReport.windows.isEmpty {
+            let usageWindows = accountReport.windows.map(UsageWindow.init)
+            await store.updateUsage(account.alias, windows: usageWindows)
+            if let updated = await store.account(account.alias) {
+                await warmupService.observeUsage(for: updated, now: fetchedAt)
+            }
+        }
+        _ = await store.expireCooldowns(now: fetchedAt)
+        let privateValues = Set(accounts.flatMap { [$0.email, $0.accountID, $0.accessToken, $0.refreshToken, $0.idToken] })
         let rosterEntries = await roster().entries
         let reportRefs = reportOrder.compactMap { account in rosterEntries.first(where: { $0.account.alias == account.alias })?.reference }
         let data = sanitizedQuotaData(report, privateValues: privateValues, refs: reportRefs)
@@ -1668,6 +1677,7 @@ public struct AgentCLI: Sendable {
             return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
         }
 
+        _ = await store.expireCooldowns()
         let report = await HeadlessWarmup.run(
             proxyURL: runtimeURL,
             store: store,
@@ -1675,15 +1685,20 @@ public struct AgentCLI: Sendable {
             warmupService: warmupService,
             targetAliases: [entry.account.alias]
         )
-        let accountStatus = report.accounts.first?.status.rawValue ?? "skipped"
+        let lastSummary = await warmupService.lastSummary()
+        let didAttempt = lastSummary?.attempted.contains(entry.account.alias) == true
+            && lastSummary?.failed[entry.account.alias] == nil
+        let accountStatus = didAttempt ? "warmed" : (report.accounts.first?.status.rawValue ?? "skipped")
+        let warmedCount = didAttempt ? 1 : report.counts.warmed
+        let skippedCount = didAttempt ? max(0, report.counts.total - warmedCount - report.counts.failed) : report.counts.skipped
         let data: AgentCLIJSONValue = .object([
             "status": .string(report.status.rawValue),
             "ref": .string(ref),
             "accountStatus": .string(accountStatus),
             "counts": .object([
                 "total": .integer(report.counts.total),
-                "warmed": .integer(report.counts.warmed),
-                "skipped": .integer(report.counts.skipped),
+                "warmed": .integer(warmedCount),
+                "skipped": .integer(skippedCount),
                 "failed": .integer(report.counts.failed),
             ]),
             "startedAt": .string(Self.iso8601(report.startedAt)),

@@ -9,3 +9,6 @@ dist/
 .omc/
 .worktrees/
 .superpowers/
+__pycache__/
+*.pyc
+.task-*/

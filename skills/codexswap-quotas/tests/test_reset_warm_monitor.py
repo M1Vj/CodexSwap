@@ -45,17 +45,28 @@ def envelope(command: str, data: object, *, ok: bool = True) -> dict[str, object
 
 def quota_report(
     *,
-    used: int,
-    reset_at: str | None,
+    used: int = 80,
+    reset_at: str | None = None,
     fetched_at: str = "2026-08-30T23:00:00Z",
     usage_status: str = "ok",
     state: str = "available",
     include_window: bool = True,
     extra_accounts: list[dict[str, object]] | None = None,
+    windows: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    windows: list[dict[str, object]] = []
-    if include_window:
-        windows.append(
+    report_windows: list[dict[str, object]] = []
+    if windows is not None:
+        report_windows = [
+            {
+                "label": str(w.get("label", "5h")),
+                "usedPercent": int(w.get("usedPercent", used)), # type: ignore
+                "remainingPercent": int(w.get("remainingPercent", 100 - int(w.get("usedPercent", used)))), # type: ignore
+                "resetAt": w.get("resetAt"),
+            }
+            for w in windows
+        ]
+    elif include_window:
+        report_windows.append(
             {
                 "label": "5h",
                 "usedPercent": used,
@@ -70,7 +81,7 @@ def quota_report(
             "state": state,
             "usageStatus": usage_status,
             "resetCreditStatus": "noCredit",
-            "windows": windows,
+            "windows": report_windows,
         }
     ]
     if extra_accounts:
@@ -101,14 +112,19 @@ def status_report(*, available: bool) -> dict[str, object]:
     )
 
 
-def warm_report(*, ref: str = REF) -> dict[str, object]:
+def warm_report(*, ref: str = REF, account_status: str = "warmed") -> dict[str, object]:
     return envelope(
         "agent warmup account",
         {
             "status": "ok",
             "ref": ref,
-            "accountStatus": "warmed",
-            "counts": {"total": 1, "warmed": 1, "skipped": 0, "failed": 0},
+            "accountStatus": account_status,
+            "counts": {
+                "total": 1,
+                "warmed": 1 if account_status == "warmed" else 0,
+                "skipped": 0 if account_status == "warmed" else 1,
+                "failed": 0,
+            },
             "startedAt": "2026-08-31T00:20:00Z",
             "finishedAt": "2026-08-31T00:20:01Z",
         },
@@ -189,12 +205,14 @@ else:
         self,
         name: str,
         *,
-        used: int,
-        reset_at: str | None,
+        used: int = 80,
+        reset_at: str | None = None,
         usage_status: str = "ok",
         state: str = "available",
         include_window: bool = True,
         extra_accounts: list[dict[str, object]] | None = None,
+        windows: list[dict[str, object]] | None = None,
+        warm_account_status: str = "warmed",
     ) -> None:
         self.phase_file.write_text(name, encoding="utf-8")
         self.fixtures.mkdir(parents=True, exist_ok=True)
@@ -207,13 +225,14 @@ else:
                     state=state,
                     include_window=include_window,
                     extra_accounts=extra_accounts,
+                    windows=windows,
                 ),
                 separators=(",", ":"),
             ),
             encoding="utf-8",
         )
         self.fixtures.joinpath("warm.json").write_text(
-            json.dumps(warm_report(), separators=(",", ":")),
+            json.dumps(warm_report(account_status=warm_account_status), separators=(",", ":")),
             encoding="utf-8",
         )
 
@@ -604,6 +623,94 @@ else:
         self.assertIsNotNone(selected)
         self.assertEqual(selected.label, "Weekly")
 
+    def test_idle_warmed_account_observes_reset_after_five_hour_cycle(self) -> None:
+        # Establish baseline and warm account at 00:00:00
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("reset", used=0, reset_at="2026-08-31T05:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(result["warmedCount"], 1)
+
+        # 2 hours later (02:00:00): account is idle (0% usage) and upstream resetAt slides to 07:00:00
+        self.write_phase("idle-2h", used=0, reset_at="2026-08-31T07:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T02:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+        self.assertEqual(result.get("warmedCount", 0), 0)
+
+        # 5 hours + 1 second later (05:00:01): 5h cycle elapsed, resetAt slides to 10:00:01
+        self.write_phase("cycle-elapsed", used=0, reset_at="2026-08-31T10:00:01Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T05:00:01Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(result["warmedCount"], 1)
+
+        # Immediately after warming (05:01:00): deduplicated, no duplicate warm
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T05:01:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+
+    def test_exhausted_secondary_window_is_not_targeted_for_warmup(self) -> None:
+        windows = [
+            {"label": "5h", "usedPercent": 80, "resetAt": "2026-08-31T00:10:00Z"},
+            {"label": "Weekly", "usedPercent": 100, "resetAt": "2026-09-07T00:00:00Z"},
+        ]
+        self.write_phase("baseline-exhausted", windows=windows)
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+
+        windows_reset = [
+            {"label": "5h", "usedPercent": 0, "resetAt": "2026-08-31T05:00:00Z"},
+            {"label": "Weekly", "usedPercent": 100, "resetAt": "2026-09-07T00:00:00Z"},
+        ]
+        self.write_phase("5h-reset-weekly-exhausted", windows=windows_reset)
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+        self.assertEqual(result.get("warmedCount", 0), 0)
+        self.assertFalse(any(args[:3] == ["agent", "warmup", "account"] for args in self.calls()))
+
+    def test_skipped_warmup_does_not_update_last_warm_at(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("reset", used=0, reset_at="2026-08-31T05:00:00Z", warm_account_status="skipped")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmSkipped")
+        self.assertEqual(result.get("warmedCount", 0), 0)
+
+        saved = json.loads((self.state_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertIsNone(saved["accounts"][REF]["lastWarmAt"])
+        self.assertIsNotNone(saved["accounts"][REF]["lastWarmFingerprint"])
+        self.assertIsNone(saved["accounts"][REF]["pendingFingerprint"])
+
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:01:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+
+    def test_idle_account_without_prior_warm_observes_reset_after_five_hours(self) -> None:
+        self.write_phase("baseline-0", used=0, reset_at="2026-08-31T05:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+        saved = json.loads((self.state_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertIsNone(saved["accounts"][REF]["lastWarmAt"])
+        self.assertIsNotNone(saved["accounts"][REF]["observedAt"])
+
+        self.write_phase("idle-2h", used=0, reset_at="2026-08-31T07:00:00Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T02:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "noReset")
+
+        self.write_phase("cycle-elapsed", used=0, reset_at="2026-08-31T10:00:01Z")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T05:00:01Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(result["warmedCount"], 1)
+        saved = json.loads((self.state_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertIsNotNone(saved["accounts"][REF]["lastWarmAt"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
