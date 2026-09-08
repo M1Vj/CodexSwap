@@ -353,6 +353,23 @@ else:
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(result["status"], "warmed")
 
+    def test_idle_account_preserves_pending_fingerprint_when_reset_slides_and_proxy_recovers(self) -> None:
+        monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
+        self.write_phase("reset-1", used=0, reset_at="2026-08-31T05:00:00Z")
+        self.proxy_file.write_text("unavailable", encoding="utf-8")
+
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:00:00Z"))
+        self.assertEqual(code, monitor.EXIT_UNAVAILABLE)
+        self.assertEqual(result["status"], "proxyUnavailable")
+
+        # Sliding window shifts reset_at by 1 minute while account remains at 0% usage
+        self.write_phase("reset-2", used=0, reset_at="2026-08-31T05:01:00Z")
+        self.proxy_file.write_text("available", encoding="utf-8")
+        code, result = monitor.monitor_once(self.config, now=instant("2026-08-31T00:01:00Z"))
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(result["status"], "warmed")
+        self.assertEqual(result.get("warmedCount", 0), 1)
+
     def test_app_open_catches_up_pending_reset_after_monitor_relaunch(self) -> None:
         monitor.monitor_once(self.config, now=instant("2026-08-30T23:00:00Z"))
         self.write_phase("reset", used=0, reset_at="2026-08-31T01:00:00Z")

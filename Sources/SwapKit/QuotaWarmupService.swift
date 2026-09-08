@@ -78,6 +78,10 @@ public actor QuotaWarmupService {
 
         var summary = WarmupSummary(startedAt: now, finishedAt: now)
         for account in accounts {
+            guard networkCheck() else {
+                summary.skipped[account.alias] = "network unavailable"
+                continue
+            }
             if let reason = Self.skipReason(account, now: now) {
                 summary.skipped[account.alias] = reason
                 continue

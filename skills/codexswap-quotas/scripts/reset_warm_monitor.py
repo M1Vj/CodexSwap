@@ -942,8 +942,9 @@ def _apply_observations(
             and _usable_snapshot(snapshot)
             and record["pendingFingerprint"]
             and record["pendingFingerprint"] != reset_fingerprint(snapshot)
+            and (snapshot.window is None or snapshot.window.used_percent > 0)
         ):
-            # A later, non-reset observation supersedes stale pending work. A
+            # A later observation with non-zero usage supersedes stale pending work. A
             # genuine new reset will set a fresh pending fingerprint above.
             record["pendingFingerprint"] = None
             record["pendingObservedAt"] = None

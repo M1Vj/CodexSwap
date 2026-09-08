@@ -874,6 +874,7 @@ public actor ProxyServer {
             return reserved
         }
         if selection.leaseReservedBySelection {
+            _ = await store.consumeRoutingReservation(selection.alias)
             await store.releaseRoutingLease(selection.alias)
         }
         if let pinned = await store.reserveEligible(selection.alias) {
