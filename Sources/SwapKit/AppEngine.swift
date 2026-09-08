@@ -1183,6 +1183,7 @@ public actor AppEngine {
 
     private func performWarmup(proxyURL: URL, force: Bool) async -> WarmupSummary {
         _ = await archiveDueAccounts()
+        _ = await store.expireCooldowns()
         return await performWarmup(candidates: await warmupCandidates(), proxyURL: proxyURL, force: force, now: Date())
     }
 
@@ -1248,9 +1249,12 @@ public actor AppEngine {
     }
 
     public func systemDidWake() async {
-        guard networkCheck() else { return }
-        let settings = await settingsStore.get()
         await expireCooldownsAndNotify()
+        guard networkCheck() else {
+            emit(.snapshotChanged)
+            return
+        }
+        let settings = await settingsStore.get()
         await pollUsage(activeOnly: !settings.smartSwitchEnabled)
         if settings.automaticallyWarmAccounts, let url = await proxy?.proxyURL() {
             _ = await automaticWarmupTick(

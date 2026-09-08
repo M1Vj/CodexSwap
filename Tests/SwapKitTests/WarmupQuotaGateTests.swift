@@ -177,12 +177,23 @@ final class WarmupQuotaGateTests: XCTestCase {
             networkCheck: { online.value }
         )
 
+        // Cooldown before wake
+        let cooldownAccount = Account(
+            alias: "cooling",
+            accountID: "id-cooling",
+            accessToken: "token",
+            disabledUntil: ["5h": now.addingTimeInterval(-100)]
+        )
+        await store.upsert(cooldownAccount)
+
         // Offline: warmAllAccountsNow should skip immediately
         let offlineSummary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
         XCTAssertEqual(offlineSummary.skipped["all"], "network unavailable")
 
-        // Offline: systemDidWake should do nothing
+        // Offline: systemDidWake expires cooldowns locally even without network
         await engine.systemDidWake()
+        let wokeAccount = await store.account("cooling")
+        XCTAssertNil(wokeAccount?.cooldownUntil(now: now))
 
         // Turn online: warmAllAccountsNow proceeds
         online.value = true
