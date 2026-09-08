@@ -406,6 +406,11 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         disabledUntil.values.filter { $0 > now }.max()
     }
 
+    public func isAccessTokenExpired(now: Date = Date()) -> Bool {
+        guard let expiry = JWT.expiry(accessToken) else { return false }
+        return expiry <= now
+    }
+
     public func isEligible(now: Date, ignoringUsageLimit: Bool = false) -> Bool {
         !isArchived && routingEnabled && !accessToken.isEmpty && !needsLogin && cooldownUntil(now: now) == nil
             && (ignoringUsageLimit || !isUsageLimitReached)

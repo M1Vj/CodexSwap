@@ -203,7 +203,9 @@ func selectProxyAccount(
         // parallel session and changing accounts without an upstream failure.
         return await store.current(now: now)
     case .warmup(let alias):
-        guard let account = await store.hydrateFromManagedHome(alias), account.isEligible(now: now) else { return nil }
+        guard let account = await store.hydrateFromManagedHome(alias),
+              account.isEligible(now: now),
+              !account.isAccessTokenExpired(now: now) else { return nil }
         return account
     case .task(let allowed, _):
         for alias in allowed {
@@ -264,7 +266,9 @@ func reserveProxyAccount(
         // must not rotate merely because that account already has work in flight.
         return await store.reserveCurrent(now: now)
     case .warmup(let alias):
-        guard let hydrated = await store.hydrateFromManagedHome(alias), hydrated.isEligible(now: now) else { return nil }
+        guard let hydrated = await store.hydrateFromManagedHome(alias),
+              hydrated.isEligible(now: now),
+              !hydrated.isAccessTokenExpired(now: now) else { return nil }
         return await store.reserveEligible(alias, now: now)
     case .task(let allowed, _):
         for alias in allowed {

@@ -42,6 +42,7 @@ public enum FreshAlternativeResolver {
                   !fresh.isArchived,
                   fresh.routingEnabled,
                   !fresh.accessToken.isEmpty,
+                  !fresh.isAccessTokenExpired(),
                   !fresh.needsLogin,
                   let windows = try? await usage.fetch(
                       accessToken: fresh.accessToken,

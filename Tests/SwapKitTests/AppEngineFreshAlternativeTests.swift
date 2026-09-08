@@ -214,6 +214,60 @@ final class AppEngineFreshAlternativeTests: XCTestCase {
         let leasesAfterAllLeased = await store.routingLeaseAliases()
         XCTAssertEqual(leasesAfterAllLeased, ["b", "c"])
     }
+
+    func testFreshAlternativeSkipsExpiredCandidateWithoutUsageFetch() async throws {
+        let accountStoreURL = storeURL("expired-candidate")
+        let store = AccountStore(url: accountStoreURL)
+        let managedHomeExpired = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fresh-home-expired-\(UUID().uuidString)", isDirectory: true)
+        let managedHomeValid = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fresh-home-valid-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: managedHomeExpired)
+            try? FileManager.default.removeItem(at: managedHomeValid)
+            try? FileManager.default.removeItem(at: accountStoreURL)
+        }
+
+        let expired = token(expiry: Int(now.timeIntervalSince1970) - 300, accountID: "id-expired")
+        try CodexAuth.write(expired, to: managedHomeExpired.appendingPathComponent("auth.json"))
+
+        let valid = token(expiry: Int(now.timeIntervalSince1970) + 3_600, accountID: "id-valid")
+        try CodexAuth.write(valid, to: managedHomeValid.appendingPathComponent("auth.json"))
+
+        await store.upsert(Account(
+            alias: "current", accountID: "id-current", accessToken: "current-token"
+        ))
+        await store.upsert(Account(
+            alias: "expired-candidate",
+            accountID: "id-expired",
+            accessToken: expired.accessToken,
+            priority: 10,
+            managedHomePath: managedHomeExpired.path
+        ))
+        await store.upsert(Account(
+            alias: "valid-candidate",
+            accountID: "id-valid",
+            accessToken: valid.accessToken,
+            priority: 1,
+            managedHomePath: managedHomeValid.path
+        ))
+
+        let usage = FreshAlternativeUsage(values: [
+            "id-valid": [window("5h", 10, seconds: 18_000)]
+        ])
+
+        let selected = await AppEngine.freshAlternative(
+            store: store,
+            usage: usage,
+            currentAlias: "current",
+            allowedAliases: ["current", "expired-candidate", "valid-candidate"]
+        )
+
+        XCTAssertEqual(selected?.alias, "valid-candidate")
+        let calls = await usage.calls()
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.1, "id-valid")
+    }
 }
 
 private actor FreshAlternativeUsage: UsageFetching {

@@ -138,6 +138,25 @@ final class WarmupQuotaGateTests: XCTestCase {
             UsageWindow(label: "5h", usedPercent: 5, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000)),
         ]
         XCTAssertEqual(AppEngine.warmupSkipReason(nonZero, settings: settings, now: now), "usage non-zero")
+
+        var expiredTokenAcc = healthy
+        expiredTokenAcc.alias = "expired-token"
+        expiredTokenAcc.accessToken = expiredToken(expiry: now.addingTimeInterval(-60))
+        XCTAssertEqual(AppEngine.warmupSkipReason(expiredTokenAcc, settings: settings, now: now), "access token expired")
+        XCTAssertEqual(QuotaWarmupService.skipReason(expiredTokenAcc, now: now), "access token expired")
+    }
+
+    private func expiredToken(expiry: Date) -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: [
+            "account_id": "test-account",
+            "exp": Int(expiry.timeIntervalSince1970),
+        ])
+        let encoded = payload
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "e30.\(encoded).sig"
     }
 
     func testNetworkReachabilityOverride() {

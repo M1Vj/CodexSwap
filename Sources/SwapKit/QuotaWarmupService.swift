@@ -297,6 +297,7 @@ public actor QuotaWarmupService {
         if account.isUsageLimitReached { return "account usage cap reached" }
         if account.needsLogin { return "needs login" }
         if account.accessToken.isEmpty && account.refreshToken.isEmpty { return "missing credentials" }
+        if account.isAccessTokenExpired(now: now) { return "access token expired" }
         if account.cooldownUntil(now: now) != nil { return "usage limited" }
         return nil
     }

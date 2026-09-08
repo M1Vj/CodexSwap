@@ -394,6 +394,7 @@ public actor AppEngine {
         for telemetryID in removal.removedTelemetryIDs {
             await telemetry.purge(accountTelemetryID: telemetryID)
         }
+        await recoverBlockedAuthentication()
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
     }
