@@ -331,6 +331,48 @@ final class StandaloneAccountImporterTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent("auth.json").path))
     }
 
+    func testRemovalRestoresStoreAndHomeWhenPostWriteVerificationFails() async throws {
+        let support = try makeTemporaryDirectory()
+        let homes = support.appendingPathComponent("standalone-homes", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: homes,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let home = try makeHome(in: homes)
+        try writeBundle(
+            to: home,
+            tokens: tokens(accountID: "verify", email: "verify@example.com", expiry: now.addingTimeInterval(3_600)),
+            marker: true
+        )
+        let account = try XCTUnwrap(
+            AccountImporter.standaloneCodexAuthAccounts(supportDirectory: support, now: now).first
+        )
+        let storeURL = support.appendingPathComponent("accounts.json")
+        let seedStore = AccountStore(url: storeURL)
+        await seedStore.upsert(account)
+        let failingStore = AccountStore(
+            url: storeURL,
+            persistenceWriter: { _, target in
+                try Data("corrupt".utf8).write(to: target, options: .atomic)
+            }
+        )
+        let engine = AppEngine(store: failingStore, supportDir: support)
+
+        let result = await engine.removeStandaloneAccount(alias: account.alias, externalAccountIDs: [])
+        let reloaded = AccountStore(url: storeURL)
+        let restoredAccount = await reloaded.account(account.alias)
+
+        XCTAssertEqual(result, .failed)
+        XCTAssertEqual(restoredAccount?.accountID, account.accountID)
+        XCTAssertEqual(
+            AccountImporter.standaloneCodexAuthAccounts(supportDirectory: support, now: now).map(\.accountID),
+            ["verify"]
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent("auth.json").path))
+    }
+
     func testAtomicRemovalRefusesAnAliasThatNowRepresentsAnotherAccount() async throws {
         let support = try makeTemporaryDirectory()
         let store = AccountStore(url: support.appendingPathComponent("accounts.json"))

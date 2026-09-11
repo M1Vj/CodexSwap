@@ -2196,13 +2196,22 @@ public actor AccountStore {
                 latest.stickyUsageLimitOverride = false
             }
             Self.renumberRanks(&latest)
-            guard let raw = try? JSONEncoder.codex.encode(latest) else {
+            guard let previousRaw = try? JSONEncoder.codex.encode(Self.loadFrom(url) ?? data),
+                  let raw = try? JSONEncoder.codex.encode(latest) else {
                 result = .persistenceFailed
                 return
             }
             do {
                 try persistAtomically(raw)
             } catch {
+                do {
+                    try Self.persistUnlockedThrowing(previousRaw, to: url)
+                    guard (try? Data(contentsOf: url)) == previousRaw else {
+                        throw AccountStorePersistenceError.verificationFailed
+                    }
+                } catch {
+                    Self.recordPersistenceFailure()
+                }
                 result = .persistenceFailed
                 return
             }
