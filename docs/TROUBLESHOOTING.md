@@ -1,5 +1,12 @@
 # Troubleshooting
 
+## Find the event that failed
+
+Open **Diagnostics…** from the menu bar for the app-wide timeline, filters and
+safe JSON export. See [Diagnostics](DIAGNOSTICS.md) for coverage, correlation IDs,
+retention and the sanitized CLI. Export promptly after an incident, before old
+events rotate out. No credentials or raw task output are bundled.
+
 ## CodexSwap is not in the Dock
 
 CodexSwap is a menu-bar application. Look for the circular-arrow icon in the macOS menu bar. Open `/Applications/CodexSwap.app` again if it is not running.

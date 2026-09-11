@@ -38,26 +38,171 @@ enum AuthenticationRecovery {
     }
 
     static func recoverFromSource(alias: String, store: AccountStore,
-                                  usage: any UsageFetching) async -> RecoveryResult {
+                                  usage: any UsageFetching,
+                                  diagnosticsLog: DiagnosticsLog = .shared) async -> RecoveryResult {
+        let correlationID = UUID()
+        recordStarted(operation: .importAccounts, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
         guard let account = await store.account(alias), let candidate = candidate(for: account) else {
-            return .candidateRejected
+            let result: RecoveryResult = .candidateRejected
+            recordTerminal(result, operation: .importAccounts, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
+            return result
         }
-        return await recover(alias: alias, candidate: candidate, store: store, usage: usage,
-                             sourceIsCurrent: { self.candidate(for: account)?.tokens == candidate.tokens })
+        let result = await recover(alias: alias, candidate: candidate, store: store, usage: usage,
+                                   sourceIsCurrent: { self.candidate(for: account)?.tokens == candidate.tokens },
+                                   diagnosticsCorrelationID: correlationID,
+                                   diagnosticsLog: diagnosticsLog)
+        recordTerminal(result, operation: .importAccounts, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
+        return result
     }
 
     static func recover(alias: String, candidate: Account, store: AccountStore,
                         usage: any UsageFetching,
-                        sourceIsCurrent: @Sendable () -> Bool = { true }) async -> RecoveryResult {
+                        sourceIsCurrent: @Sendable () -> Bool = { true },
+                        diagnosticsCorrelationID: UUID? = nil,
+                        diagnosticsLog: DiagnosticsLog = .shared) async -> RecoveryResult {
+        let correlationID = diagnosticsCorrelationID ?? UUID()
+        recordStarted(operation: .authentication, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
         guard let snapshot = await store.account(alias), accepts(candidate, for: snapshot) else {
-            return .candidateRejected
+            let result: RecoveryResult = .candidateRejected
+            recordTerminal(result, operation: .authentication, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
+            return result
         }
         let windows: [UsageWindow]
         do { windows = try await usage.fetch(accessToken: candidate.accessToken, accountID: candidate.accountID) }
-        catch { return .usageFailed }
-        guard !windows.isEmpty else { return .emptyUsage }
-        guard !Task.isCancelled else { return .staleSnapshot }
-        return await store.commitVerifiedAuthentication(snapshot: snapshot, candidate: candidate,
-                                                        windows: windows, sourceIsCurrent: sourceIsCurrent)
+        catch {
+            let result: RecoveryResult = .usageFailed
+            if error is CancellationError {
+                diagnosticsLog.record(
+                    component: .accounts,
+                    operation: .authentication,
+                    outcome: .cancelled,
+                    level: .warning,
+                    code: .none,
+                    correlationID: correlationID
+                )
+            } else {
+                recordTerminal(
+                    result,
+                    operation: .authentication,
+                    correlationID: correlationID,
+                    diagnosticsLog: diagnosticsLog,
+                    code: usageFailureCode(for: error)
+                )
+            }
+            return result
+        }
+        guard !windows.isEmpty else {
+            let result: RecoveryResult = .emptyUsage
+            recordTerminal(result, operation: .authentication, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
+            return result
+        }
+        guard !Task.isCancelled else {
+            let result: RecoveryResult = .staleSnapshot
+            recordTerminal(result, operation: .authentication, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
+            return result
+        }
+        let result = await store.commitVerifiedAuthentication(snapshot: snapshot, candidate: candidate,
+                                                               windows: windows, sourceIsCurrent: sourceIsCurrent)
+        recordTerminal(result, operation: .authentication, correlationID: correlationID, diagnosticsLog: diagnosticsLog)
+        return result
+    }
+
+    private static func recordStarted(
+        operation: DiagnosticOperation,
+        correlationID: UUID,
+        diagnosticsLog: DiagnosticsLog
+    ) {
+        diagnosticsLog.record(
+            component: .accounts,
+            operation: operation,
+            outcome: .started,
+            correlationID: correlationID
+        )
+    }
+
+    private static func recordTerminal(
+        _ result: RecoveryResult,
+        operation: DiagnosticOperation,
+        correlationID: UUID,
+        diagnosticsLog: DiagnosticsLog,
+        code usageCode: DiagnosticCode? = nil
+    ) {
+        switch result {
+        case .committed:
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: operation,
+                outcome: .succeeded,
+                correlationID: correlationID
+            )
+        case .candidateRejected:
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: operation,
+                outcome: .failed,
+                level: .warning,
+                code: .invalidInput,
+                correlationID: correlationID
+            )
+        case .usageFailed:
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: operation,
+                outcome: .failed,
+                level: .error,
+                code: usageCode ?? .unknown,
+                correlationID: correlationID
+            )
+        case .emptyUsage:
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: operation,
+                outcome: .failed,
+                level: .warning,
+                code: .unavailable,
+                correlationID: correlationID
+            )
+        case .staleSnapshot:
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: operation,
+                outcome: .failed,
+                level: .warning,
+                code: .staleSnapshot,
+                correlationID: correlationID
+            )
+        case .persistenceFailed:
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: operation,
+                outcome: .failed,
+                level: .error,
+                code: .io,
+                correlationID: correlationID
+            )
+        }
+    }
+
+    private static func usageFailureCode(for error: Error) -> DiagnosticCode {
+        switch DiagnosticCode.classify(error) {
+        case .unauthorized:
+            return .unauthorized
+        case .revoked:
+            return .unauthorized
+        case .invalidInput:
+            return .invalidInput
+        case .notFound:
+            return .notFound
+        case .io:
+            return .io
+        case .network:
+            return .network
+        case .unavailable:
+            return .unavailable
+        case .staleSnapshot:
+            return .staleSnapshot
+        default:
+            return .network
+        }
     }
 }

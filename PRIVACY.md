@@ -6,6 +6,15 @@ When enabled, telemetry stores only random local identifiers, bounded provider/m
 
 ## Data stored locally
 
+Always-on [diagnostics](docs/DIAGNOSTICS.md) are separate from optional usage
+telemetry. They record closed operation/error categories, timestamps, random
+process/operation UUIDs and bounded status, duration and count fields across the
+app. They exclude credentials, account identities, prompts, responses, paths,
+environment values and raw error text. The local rotating store is capped at
+8 MiB. The Diagnostics pane and sanitized CLI expose bounded exports; export
+requires a local action and does not upload anything. Older automation and task
+output logs are not included and do not have the same closed-schema guarantees.
+
 CodexSwap stores its settings, account rotation state, quota observations, and warm-up ledger below:
 
 `~/Library/Application Support/CodexSwap/`

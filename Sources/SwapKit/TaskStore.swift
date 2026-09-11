@@ -143,6 +143,7 @@ public actor TaskStore {
         // The file exists but cannot be decoded: quarantine the original bytes so a
         // later persist of the empty fallback store can never destroy user data.
         let quarantine = url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
+        DiagnosticsLog.shared.record(component: .tasks, operation: .persistence, outcome: .failed, level: .error, code: .invalidInput)
         try? FileManager.default.moveItem(at: url, to: quarantine)
         return nil
     }
@@ -172,13 +173,17 @@ public actor TaskStore {
     }
 
     private func persist() {
-        guard let raw = try? JSONEncoder.codex.encode(data) else { return }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try? raw.write(to: url, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        do {
+            let raw = try JSONEncoder.codex.encode(data)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try raw.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            DiagnosticsLog.shared.record(component: .tasks, operation: .persistence, outcome: .failed, level: .error, code: .io)
+        }
     }
 }

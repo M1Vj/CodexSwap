@@ -5,6 +5,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case accounts
     case quotaAndResets
     case taskBoard
+    case diagnostics
     case advanced
 
     var id: Self { self }
@@ -13,6 +14,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         switch self {
         case .quotaAndResets: "Quota & Resets"
         case .taskBoard: "Task Board"
+        case .diagnostics: "Diagnostics"
         default: rawValue.capitalized
         }
     }
@@ -23,6 +25,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .accounts: "person.2"
         case .quotaAndResets: "gauge.with.dots.needle.67percent"
         case .taskBoard: "rectangle.3.group"
+        case .diagnostics: "waveform.path.ecg"
         case .advanced: "wrench.and.screwdriver"
         }
     }
@@ -46,6 +49,7 @@ struct SettingsView: View {
                 case .accounts: AccountsSettingsView(model: model)
                 case .quotaAndResets: QuotaResetsSettingsView(model: model)
                 case .taskBoard: TaskBoardSettingsView(model: model)
+                case .diagnostics: DiagnosticsView()
                 case .advanced: AdvancedSettingsView(model: model)
                 }
             }

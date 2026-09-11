@@ -6,6 +6,13 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 
 ### Added
 
+- App-wide Diagnostics timeline with component/severity filters, correlation IDs,
+  safe JSON export and `swapd agent diagnostics --json`. Structured events cover
+  app lifecycle, proxy/routing, auth recovery, quota/reset/warmup, tasks, Alpha,
+  settings and storage. Local retention is capped at 8 MiB; logger failures,
+  dropped records and truncation are visible without exporting credentials or
+  raw task output.
+
 - Usage Monitor window (menu bar → Usage Monitor…): pool overview (healthy/eligible accounts, total tokens, estimated cost, average usage), per-account cards with per-window meters, reset countdowns, burn rate, time-to-exhaustion (suppressed until a window is ≥3% consumed), pace-vs-reset status, health tiers, and a lifetime per-model token/cost breakdown.
 - Per-account usage telemetry: the proxy now observes `response.completed` SSE events and attributes input/cached/output tokens and model to the serving account; totals persist in `accounts.json` and roll up into pool summaries. Cost figures are estimates from published list pricing.
 - Smart Switch (opt-in, General → Account Rotation): polls the whole pool each cycle, detects shared accounts whose quota is draining without your own traffic, floats them to the front of rotation ahead of their ranking position, and badges them in the menu, Accounts settings, and Usage Monitor.

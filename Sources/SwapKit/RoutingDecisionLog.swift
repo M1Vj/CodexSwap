@@ -153,18 +153,43 @@ public actor RoutingDecisionLog {
 
     public nonisolated let fileURL: URL
     public nonisolated let maxBytes: Int
+    private let diagnosticsLog: DiagnosticsLog
 
     public init(
         url: URL = AppPaths.supportDir().appendingPathComponent(RoutingDecisionLog.defaultFileName),
-        maxBytes: Int = RoutingDecisionLogRecord.maximumActiveBytes
+        maxBytes: Int = RoutingDecisionLogRecord.maximumActiveBytes,
+        diagnosticsLog: DiagnosticsLog = .shared
     ) {
         self.fileURL = url
         self.maxBytes = min(max(1, maxBytes), RoutingDecisionLogRecord.maximumActiveBytes)
+        self.diagnosticsLog = diagnosticsLog
     }
 
     /// Persists one allowlisted record. Logging failures are deliberately
     /// swallowed so observability cannot change request-routing behavior.
     public func write(_ record: RoutingDecisionLogRecord) {
+        let outcome: DiagnosticOutcome
+        let operation: DiagnosticOperation
+        let level: DiagnosticLevel
+        switch record.event {
+        case .requestStarted: (outcome, operation, level) = (.started, .request, .info)
+        case .requestTerminal:
+            (outcome, operation, level) = record.routingDecision == .success ? (.succeeded, .request, .info) : (.failed, .request, .error)
+        case .authFailure: (outcome, operation, level) = (.failed, .authentication, .warning)
+        case .authRecovery: (outcome, operation, level) = (.succeeded, .authentication, .info)
+        case .genericRetryCurrent, .switchReplay: (outcome, operation, level) = (.retrying, .selection, .warning)
+        case .semanticLimit, .genericExhausted, .noTargetStop: (outcome, operation, level) = (.skipped, .selection, .warning)
+        }
+        let code: DiagnosticCode
+        switch record.reason {
+        case .tokenRevoked, .tokenInvalidated: code = .revoked
+        case .upstreamUnauthorized, .expiredAccessToken: code = .unauthorized
+        case .renewalRequired: code = .unavailable
+        case .noEligibleTarget, .noAlternative: code = .notFound
+        case .semanticLimit, .generic429Exhausted, .genericRetryAfter: code = .rateLimited
+        default: code = .none
+        }
+        diagnosticsLog.record(component: .routing, operation: operation, outcome: outcome, level: level, code: code, correlationID: record.rootRequestID, status: record.status, count: record.attemptCount ?? record.attempt)
         do {
             var data = try Self.encoder.encode(record)
             data.append(0x0A)
@@ -217,6 +242,7 @@ public actor RoutingDecisionLog {
             try handle.write(contentsOf: data)
             try handle.synchronize()
         } catch {
+            diagnosticsLog.record(component: .storage, operation: .persistence, outcome: .failed, level: .error, code: .io)
             return
         }
     }

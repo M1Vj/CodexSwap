@@ -47,6 +47,7 @@ public actor QuotaResetCoordinator {
     private let uuid: @Sendable () -> UUID
     private let allowPersistence: @Sendable (Bool) -> Bool
     private let filesystemTransactionHook: @Sendable () -> Void
+    private let diagnosticsLog: DiagnosticsLog
     private var pending: [String: PendingRecord]
     private var snapshots: [String: ResetCreditSnapshot] = [:]
     private var statuses: [String: QuotaResetCoordinatorStatus] = [:]
@@ -62,7 +63,8 @@ public actor QuotaResetCoordinator {
         clock: @escaping @Sendable () -> Date = Date.init,
         uuid: @escaping @Sendable () -> UUID = UUID.init,
         allowPersistence: @escaping @Sendable (Bool) -> Bool = { _ in true },
-        filesystemTransactionHook: @escaping @Sendable () -> Void = {}
+        filesystemTransactionHook: @escaping @Sendable () -> Void = {},
+        diagnosticsLog: DiagnosticsLog = .shared
     ) {
         self.accountStore = accountStore
         self.settings = settings
@@ -73,6 +75,7 @@ public actor QuotaResetCoordinator {
         self.uuid = uuid
         self.allowPersistence = allowPersistence
         self.filesystemTransactionHook = filesystemTransactionHook
+        self.diagnosticsLog = diagnosticsLog
         self.pending = Self.loadPending(from: pendingRecordURL)
     }
 
@@ -91,6 +94,15 @@ public actor QuotaResetCoordinator {
 
     @discardableResult
     public func refreshCredits(aliases: Set<String>? = nil, generation: UInt64? = nil) async -> Bool {
+        let correlationID = UUID()
+        let startedAt = Date()
+        diagnosticsLog.record(
+            component: .quota,
+            operation: .usageFetch,
+            outcome: .started,
+            correlationID: correlationID,
+            count: aliases?.count
+        )
         // A refresh can be triggered independently of the engine poller (for
         // example by a CodexBar roster watcher), so reconcile due archives before
         // selecting accounts for any quota request.
@@ -98,8 +110,10 @@ public actor QuotaResetCoordinator {
         let refreshGeneration = generation ?? reserveOperationGeneration()
         latestRefreshGeneration = max(latestRefreshGeneration, refreshGeneration)
         let selected = await accountStore.activeAccounts().filter { aliases?.contains($0.alias) ?? true }
+        var failureCount = 0
         for account in selected {
             guard let fresh = await accountStore.hydrateFromManagedHome(account.alias), !fresh.accessToken.isEmpty else {
+                failureCount += 1
                 if refreshGeneration == latestRefreshGeneration { statuses[account.alias] = .failed }
                 continue
             }
@@ -110,34 +124,97 @@ public actor QuotaResetCoordinator {
                 snapshots[account.alias] = snapshot
                 statuses[account.alias] = .ready
             } catch {
+                failureCount += 1
                 if refreshGeneration == latestRefreshGeneration { statuses[account.alias] = .failed }
             }
         }
-        return refreshGeneration == latestRefreshGeneration
+        let isCurrent = refreshGeneration == latestRefreshGeneration
+        let outcome: DiagnosticOutcome
+        let code: DiagnosticCode
+        if !isCurrent {
+            outcome = .skipped
+            code = .staleSnapshot
+        } else if failureCount > 0 {
+            outcome = .failed
+            code = .unknown
+        } else {
+            outcome = .succeeded
+            code = .none
+        }
+        diagnosticsLog.record(
+            component: .quota,
+            operation: .usageFetch,
+            outcome: outcome,
+            level: failureCount > 0 ? .warning : .info,
+            code: code,
+            correlationID: correlationID,
+            durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+            count: selected.count
+        )
+        return isCurrent
     }
 
     public func reset(alias: String, trigger: Trigger, generation: UInt64? = nil) async -> ResetAttemptResult {
+        let correlationID = UUID()
+        let startedAt = Date()
+        diagnosticsLog.record(
+            component: .quota,
+            operation: .reset,
+            outcome: .started,
+            correlationID: correlationID
+        )
         // Keep direct reset callers on the same archive boundary as the poller.
         _ = await accountStore.archiveDueAccounts()
         let normalizedAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedAlias.isEmpty else { return .accountUnavailable }
+        guard !normalizedAlias.isEmpty else {
+            let result: ResetAttemptResult = .accountUnavailable
+            recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+            return result
+        }
         guard let currentAccount = await accountStore.account(normalizedAlias), !currentAccount.isArchived else {
-            return .accountUnavailable
+            let result: ResetAttemptResult = .accountUnavailable
+            recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+            return result
         }
         if trigger == .automatic {
             let current = await settings()
-            guard current.automaticallyResetExhaustedAccounts else { return .automaticDisabled }
-            guard currentAccount.routingEnabled else { return .accountUnavailable }
+            guard current.automaticallyResetExhaustedAccounts else {
+                let result: ResetAttemptResult = .automaticDisabled
+                recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+                return result
+            }
+            guard currentAccount.routingEnabled else {
+                let result: ResetAttemptResult = .accountUnavailable
+                recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+                return result
+            }
             let protected = Set(current.autoResetProtectedAccounts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
-            guard !protected.contains(normalizedAlias.lowercased()) else { return .protectedAccount }
+            guard !protected.contains(normalizedAlias.lowercased()) else {
+                let result: ResetAttemptResult = .protectedAccount
+                recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+                return result
+            }
         }
-        if let operation = inFlight[normalizedAlias] { return await operation.value }
+        if let operation = inFlight[normalizedAlias] {
+            let result = await operation.value
+            diagnosticsLog.record(
+                component: .quota,
+                operation: .reset,
+                outcome: .skipped,
+                level: .warning,
+                code: .busy,
+                correlationID: correlationID,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt)
+            )
+            return result
+        }
         let operationGeneration = generation ?? reserveOperationGeneration()
         latestRefreshGeneration = max(latestRefreshGeneration, operationGeneration)
         let operation = Task { await self.performReset(alias: normalizedAlias, generation: operationGeneration) }
         inFlight[normalizedAlias] = operation
         let result = await operation.value
         inFlight.removeValue(forKey: normalizedAlias)
+        recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
         return result
     }
 
@@ -384,5 +461,93 @@ public actor QuotaResetCoordinator {
             }
             return true
         }
+    }
+
+    private func recordResetResult(
+        _ result: ResetAttemptResult,
+        correlationID: UUID,
+        startedAt: Date
+    ) {
+        let outcome: DiagnosticOutcome
+        let level: DiagnosticLevel
+        let code: DiagnosticCode
+        let count: Int?
+        switch result {
+        case let .reset(windowsReset):
+            outcome = .succeeded
+            level = .info
+            code = .none
+            count = windowsReset
+        case .nothingToReset:
+            outcome = .skipped
+            level = .info
+            code = .none
+            count = 0
+        case .noCredit:
+            outcome = .skipped
+            level = .warning
+            code = .notFound
+            count = 0
+        case .alreadyRedeemed:
+            outcome = .changed
+            level = .info
+            code = .staleSnapshot
+            count = 0
+        case .automaticDisabled:
+            outcome = .skipped
+            level = .info
+            code = .unavailable
+            count = 0
+        case .protectedAccount:
+            outcome = .skipped
+            level = .info
+            code = .none
+            count = 0
+        case .accountUnavailable:
+            outcome = .skipped
+            level = .warning
+            code = .notFound
+            count = 0
+        case .authorizationFailed:
+            outcome = .failed
+            level = .error
+            code = .unauthorized
+            count = nil
+        case .networkFailure:
+            outcome = .failed
+            level = .error
+            code = .network
+            count = nil
+        case .ambiguousFailure:
+            outcome = .failed
+            level = .error
+            code = .unknown
+            count = nil
+        case .cancelled:
+            outcome = .cancelled
+            level = .info
+            code = .none
+            count = nil
+        case .failed:
+            outcome = .failed
+            level = .error
+            code = .unknown
+            count = nil
+        }
+        diagnosticsLog.record(
+            component: .quota,
+            operation: .reset,
+            outcome: outcome,
+            level: level,
+            code: code,
+            correlationID: correlationID,
+            durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+            count: count
+        )
+    }
+
+    private static func diagnosticsDurationMilliseconds(since start: Date, at end: Date = Date()) -> Int {
+        let milliseconds = max(0, end.timeIntervalSince(start) * 1_000)
+        return Int(min(milliseconds, Double(Int.max)))
     }
 }

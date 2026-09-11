@@ -290,7 +290,10 @@ public actor AccountStore {
             if repairingStickyUsageLimitOverride, snapshot.stickyAlias == nil {
                 snapshot.stickyUsageLimitOverride = false
             }
-            guard let raw = try? encoder.encode(snapshot) else { return }
+            guard let raw = try? encoder.encode(snapshot) else {
+                Self.recordPersistenceFailure()
+                return
+            }
             // JSON's ISO-8601 encoding intentionally drops sub-second Date
             // precision. Keep only the merge baseline in the same canonical
             // form as the bytes on disk; the actor's public in-memory snapshot
@@ -305,7 +308,10 @@ public actor AccountStore {
 
     private static func persist(_ data: StoreData, to url: URL) {
         let encoder = JSONEncoder.codex
-        guard let raw = try? encoder.encode(data) else { return }
+        guard let raw = try? encoder.encode(data) else {
+            recordPersistenceFailure()
+            return
+        }
         persist(raw, to: url)
     }
 
@@ -322,20 +328,45 @@ public actor AccountStore {
     private static func withStoreLock(_ url: URL, _ body: () -> Void) -> Bool {
         let fileManager = FileManager.default
         let dir = url.deletingLastPathComponent()
-        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        do {
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        } catch {
+            recordPersistenceFailure()
+            return false
+        }
         let lockURL = dir.appendingPathComponent("." + url.lastPathComponent + ".lock")
         let descriptor = open(lockURL.path, O_CREAT | O_RDWR, mode_t(0o600))
-        guard descriptor >= 0 else { return false }
+        guard descriptor >= 0 else {
+            recordPersistenceFailure()
+            return false
+        }
         defer { close(descriptor) }
-        guard flock(descriptor, LOCK_EX) == 0 else { return false }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            recordPersistenceFailure()
+            return false
+        }
         defer { _ = flock(descriptor, LOCK_UN) }
         try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: lockURL.path)
         body()
         return true
     }
 
+    private static func recordPersistenceFailure() {
+        DiagnosticsLog.shared.record(
+            component: .accounts,
+            operation: .persistence,
+            outcome: .failed,
+            level: .error,
+            code: .io
+        )
+    }
+
     private static func persistUnlocked(_ raw: Data, to url: URL) {
-        try? persistUnlockedThrowing(raw, to: url)
+        do {
+            try persistUnlockedThrowing(raw, to: url)
+        } catch {
+            DiagnosticsLog.shared.record(component: .storage, operation: .persistence, outcome: .failed, level: .error, code: .io)
+        }
     }
 
     /// Performs the same-directory temporary-file write and atomic replacement
@@ -365,10 +396,17 @@ public actor AccountStore {
     }
 
     private func persistAtomically(_ raw: Data) throws {
+        var saved = false
+        defer {
+            if !saved {
+                DiagnosticsLog.shared.record(component: .accounts, operation: .persistence, outcome: .failed, level: .error, code: .io)
+            }
+        }
         try persistenceWriter(raw, url)
         guard let persisted = try? Data(contentsOf: url), persisted == raw else {
             throw AccountStorePersistenceError.verificationFailed
         }
+        saved = true
     }
 
     /// Merges a stale actor's changed fields onto the newest document while the

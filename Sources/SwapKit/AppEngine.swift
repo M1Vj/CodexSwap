@@ -238,9 +238,34 @@ public actor AppEngine {
         onEvent = handler
     }
 
-    private func emit(_ event: AppEvent) { onEvent?(event) }
+    private func emit(_ event: AppEvent) {
+        switch event {
+        case .taskStarted(let id, _, _):
+            DiagnosticsLog.shared.record(component: .tasks, operation: .taskRun, outcome: .started, correlationID: id)
+        case .taskCompleted(let id, _), .taskCycleCompleted(let id, _):
+            DiagnosticsLog.shared.record(component: .tasks, operation: .taskRun, outcome: .succeeded, correlationID: id)
+        case .taskFailed(let id, _, _):
+            DiagnosticsLog.shared.record(component: .tasks, operation: .taskRun, outcome: .failed, level: .error, code: .unknown, correlationID: id)
+        case .taskPausedQuota(let id, _):
+            DiagnosticsLog.shared.record(component: .tasks, operation: .taskRun, outcome: .skipped, level: .warning, code: .rateLimited, correlationID: id)
+        case .rotated:
+            DiagnosticsLog.shared.record(component: .routing, operation: .selection, outcome: .changed)
+        case .exhausted:
+            DiagnosticsLog.shared.record(component: .quota, operation: .usageFetch, outcome: .failed, level: .warning, code: .rateLimited)
+        case .needsLogin:
+            DiagnosticsLog.shared.record(component: .accounts, operation: .authentication, outcome: .failed, level: .error, code: .unauthorized)
+        case .refreshed:
+            DiagnosticsLog.shared.record(component: .accounts, operation: .authentication, outcome: .succeeded)
+        case .windowReset:
+            DiagnosticsLog.shared.record(component: .quota, operation: .reset, outcome: .changed)
+        case .snapshotChanged:
+            break
+        }
+        onEvent?(event)
+    }
 
     public func start() async throws {
+        DiagnosticsLog.shared.record(component: .proxy, operation: .lifecycle, outcome: .started)
         let settings = await settingsStore.get()
         await telemetry.setEnabled(settings.metadataTelemetryEnabled)
         await store.setStrategy(settings.rotationStrategy)
@@ -277,7 +302,9 @@ public actor AppEngine {
         )
         do {
             try await proxy.start()
+            DiagnosticsLog.shared.record(component: .proxy, operation: .lifecycle, outcome: .succeeded)
         } catch {
+            DiagnosticsLog.shared.record(component: .proxy, operation: .lifecycle, outcome: .failed, level: .error, code: .unavailable)
             // A failed bind must still shut the HTTP client down: dropping the server
             // otherwise traps in AsyncHTTPClient's deinit and crashes the app.
             await proxy.stop()
@@ -325,6 +352,7 @@ public actor AppEngine {
     }
 
     public func stop() async {
+        DiagnosticsLog.shared.record(component: .proxy, operation: .lifecycle, outcome: .cancelled)
         watcher?.stop()
         watcher = nil
         pollerTask?.cancel()
@@ -592,6 +620,7 @@ public actor AppEngine {
         to current: Settings,
         publish: (@Sendable () async -> Void)? = nil
     ) async {
+        DiagnosticsLog.shared.record(component: .settings, operation: .configuration, outcome: .changed)
         await publish?()
         // SettingsStore is shared with the agent CLI. Keep the live engine's
         // actor caches in step with an external update instead of waiting for
@@ -951,6 +980,7 @@ public actor AppEngine {
             await taskStore.update(queued)
         }
         schedulingReasons[id.uuidString] = queueReason
+        DiagnosticsLog.shared.record(component: .tasks, operation: .taskQueue, outcome: .changed, code: proxyURL == nil ? .unavailable : occupiedCount >= maximumConcurrent ? .busy : .none, correlationID: id, count: queueIndex + 1)
         emit(.snapshotChanged)
         return .queued(reason: queueReason)
     }
@@ -966,6 +996,7 @@ public actor AppEngine {
         task.updatedAt = Date()
         await taskStore.update(task)
         schedulingReasons.removeValue(forKey: id.uuidString)
+        DiagnosticsLog.shared.record(component: .tasks, operation: .taskQueue, outcome: .changed, correlationID: id, count: queueIndex + 1)
         await autoLog.write("api", "requeueTask \(Self.taskLabel(task))")
         emit(.snapshotChanged)
         await automationTick()
@@ -1339,11 +1370,14 @@ public actor AppEngine {
     }
 
     public func importAccounts() async {
+        let operationID = UUID()
+        DiagnosticsLog.shared.record(component: .accounts, operation: .importAccounts, outcome: .started, correlationID: operationID)
         await syncCodexBar()
         await reconcileImportedAccounts(
             AccountImporter.newestCodexAuthAccounts(supportDirectory: supportDir)
         )
         await recoverBlockedAuthentication()
+        DiagnosticsLog.shared.record(component: .accounts, operation: .importAccounts, outcome: .changed, correlationID: operationID, count: await store.all().count)
     }
 
     func recoverBlockedAuthentication() async {
@@ -2307,7 +2341,11 @@ public actor AppEngine {
             // A needs-login account rejects every usage call; polling it wastes a request
             // per tick until the user signs in again.
             guard !acc.needsLogin else { continue }
-            if let windows = try? await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID) {
+            let operationID = UUID()
+            let startedAt = Date()
+            do {
+                let windows = try await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID)
+                DiagnosticsLog.shared.record(component: .quota, operation: .usageFetch, outcome: .succeeded, level: .debug, correlationID: operationID, durationMilliseconds: Int(max(0, Date().timeIntervalSince(startedAt)) * 1_000), count: windows.count)
                 if windows.isEmpty {
                     // AccountStore intentionally retains the dashboard's last non-empty
                     // reading, but warm-up reconciliation must still observe a successful
@@ -2334,6 +2372,8 @@ public actor AppEngine {
                 } else if settings.smartSwitchEnabled {
                     assessments.append(DrainAssessment(alias: acc.alias, isDraining: false))
                 }
+            } catch {
+                DiagnosticsLog.shared.record(component: .quota, operation: .usageFetch, outcome: error is CancellationError ? .cancelled : .failed, level: .warning, code: DiagnosticCode.classify(error), correlationID: operationID, durationMilliseconds: Int(max(0, Date().timeIntervalSince(startedAt)) * 1_000))
             }
         }
         if settings.smartSwitchEnabled {

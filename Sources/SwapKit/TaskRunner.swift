@@ -51,8 +51,11 @@ public actor TaskRunner {
         let process: Process
         let logURL: URL
         let runID: UUID
+        let startedAt: Date
         var quotaExhausted: Bool
         var stalled: Bool
+        var cancelled: Bool
+        var timedOut: Bool
     }
 
     private static let timeoutNanoseconds: UInt64 = 6 * 60 * 60 * 1_000_000_000
@@ -63,15 +66,18 @@ public actor TaskRunner {
     private let logSink: (@Sendable (String, String) async -> Void)?
     private let taskHomeMaterializer: TaskHomeMaterializer?
     private let codexBinaryResolver: CodexBinaryResolver
+    private let diagnosticsLog: DiagnosticsLog
 
     public init(
         logSink: (@Sendable (String, String) async -> Void)? = nil,
         taskHomeMaterializer: TaskHomeMaterializer? = nil,
-        codexBinaryResolver: @escaping CodexBinaryResolver = CodexLauncher.resolveWarmupBinary
+        codexBinaryResolver: @escaping CodexBinaryResolver = CodexLauncher.resolveWarmupBinary,
+        diagnosticsLog: DiagnosticsLog = .shared
     ) {
         self.logSink = logSink
         self.taskHomeMaterializer = taskHomeMaterializer
         self.codexBinaryResolver = codexBinaryResolver
+        self.diagnosticsLog = diagnosticsLog
     }
 
     public static func launchArgs(
@@ -138,17 +144,47 @@ public actor TaskRunner {
         supportDir: URL,
         onExit: @escaping @Sendable (UUID, RunExit) async -> Void
     ) async throws {
-        guard running[task.id] == nil else { throw TaskRunnerError.alreadyRunning }
+        let startedAt = Date()
+        var launched = false
+        var terminalRecorded = false
+        func recordStartFailureOnce(code: DiagnosticCode) {
+            guard !terminalRecorded else { return }
+            terminalRecorded = true
+            diagnosticsLog.record(
+                component: .tasks,
+                operation: .taskRun,
+                outcome: .failed,
+                level: .error,
+                code: code,
+                correlationID: runID,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt)
+            )
+        }
+        defer {
+            if !launched && !terminalRecorded {
+                recordStartFailureOnce(code: .io)
+            }
+        }
+        diagnosticsLog.record(component: .tasks, operation: .taskRun, outcome: .started, correlationID: runID)
+        guard running[task.id] == nil else {
+            recordStartFailureOnce(code: .busy)
+            throw TaskRunnerError.alreadyRunning
+        }
 
         guard TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath) else {
+            recordStartFailureOnce(code: .invalidInput)
             throw TaskRunnerError.invalidRepository
         }
         guard TaskRepositoryValidator.isValidBranchName(task.branch) else {
+            recordStartFailureOnce(code: .invalidInput)
             throw TaskRunnerError.invalidBranch
         }
         // Warm-up's resolution order: prefer the real binary over any PATH shim — a write-jailing
         // shim would deny the isolated CODEX_HOME and fight the runner's own workspace-write sandbox.
-        guard let binary = codexBinaryResolver() else { throw TaskRunnerError.binaryNotFound }
+        guard let binary = codexBinaryResolver() else {
+            recordStartFailureOnce(code: .notFound)
+            throw TaskRunnerError.binaryNotFound
+        }
 
         let taskDir = task.taskDirURL(supportDir: supportDir)
         let codexHome = taskDir.appendingPathComponent("codex-home", isDirectory: true)
@@ -231,11 +267,9 @@ public actor TaskRunner {
                     continuation.finish()
                 }
             }
-            await log(
-                "runner",
-                "launch task \(Self.shortID(task.id)) run \(runNumber) binary \(binary) cwd \(task.repoPath) model \(task.model) allowNetwork \(task.allowNetwork) allowedAliases \(allowedAliases.count)"
-            )
+            await log("runner", "task command started")
             try process.run()
+            launched = true
             let prompt = Data(Self.promptInput(task: task).utf8)
             Task.detached(priority: .utility) {
                 try? inputPipe.fileHandleForWriting.write(contentsOf: prompt)
@@ -245,8 +279,11 @@ public actor TaskRunner {
                 process: process,
                 logURL: logURL,
                 runID: runID,
+                startedAt: startedAt,
                 quotaExhausted: false,
-                stalled: false
+                stalled: false,
+                cancelled: false,
+                timedOut: false
             )
             taskIDsByRunID[runID] = task.id
 
@@ -259,9 +296,11 @@ public actor TaskRunner {
                 do {
                     exitCode = try await Self.wait(for: process, termination: termination)
                 } catch TaskRunnerError.timedOut {
-                    await self?.log("runner", "timeout hit for task \(Self.shortID(task.id))")
+                    await self?.markTimedOut(taskID: task.id)
+                    await self?.log("runner", "task command timed out")
                     exitCode = 124
                 } catch {
+                    await self?.log("runner", "task command wait failed")
                     exitCode = 1
                 }
                 try? logHandle.close()
@@ -270,12 +309,14 @@ public actor TaskRunner {
         } catch {
             try? inputPipe.fileHandleForWriting.close()
             try? logHandle.close()
+            recordStartFailureOnce(code: .io)
             throw error
         }
     }
 
     public func stop(taskID: UUID) async {
-        await log("runner", "stop() called for task \(Self.shortID(taskID))")
+        await log("runner", "task cancellation requested")
+        running[taskID]?.cancelled = true
         guard let process = running[taskID]?.process, process.isRunning else { return }
         process.terminate()
     }
@@ -292,7 +333,7 @@ public actor TaskRunner {
     public func noteQuotaExhausted(taskID: UUID) async {
         guard running[taskID] != nil else { return }
         running[taskID]?.quotaExhausted = true
-        await log("runner", "noteQuotaExhausted for task \(Self.shortID(taskID))")
+        await log("runner", "task quota exhausted")
     }
 
     private func finish(
@@ -309,9 +350,40 @@ public actor TaskRunner {
             || lowercasedTail.contains("usage_limit_reached")
             || lowercasedTail.contains("429")
         let stderrTail = String(decoding: tail.suffix(2_048), as: UTF8.self)
-        await log(
-            "runner",
-            "exit task \(Self.shortID(taskID)) code \(exitCode) quotaExhausted \(quotaExhausted) stalled \(run.stalled) log \(run.logURL.lastPathComponent)"
+        await log("runner", "task command exited")
+        let outcome: DiagnosticOutcome
+        let level: DiagnosticLevel
+        let code: DiagnosticCode
+        if run.cancelled {
+            outcome = .cancelled
+            level = .info
+            code = .none
+        } else if run.timedOut || run.stalled {
+            outcome = .failed
+            level = .error
+            code = .timeout
+        } else if quotaExhausted {
+            outcome = .failed
+            level = .warning
+            code = .rateLimited
+        } else if exitCode == 0 {
+            outcome = .succeeded
+            level = .info
+            code = .none
+        } else {
+            outcome = .failed
+            level = .error
+            code = .unknown
+        }
+        diagnosticsLog.record(
+            component: .tasks,
+            operation: .taskRun,
+            outcome: outcome,
+            level: level,
+            code: code,
+            correlationID: run.runID,
+            durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: run.startedAt),
+            count: quotaExhausted ? 1 : nil
         )
         await onExit(taskID, RunExit(exitCode: exitCode, quotaExhausted: quotaExhausted, stderrTail: stderrTail, stalled: run.stalled))
         Self.pruneTemporaryArtifacts(
@@ -327,11 +399,12 @@ public actor TaskRunner {
     private func killStalled(taskID: UUID, runID: UUID) async {
         guard let run = running[taskID], run.runID == runID, run.process.isRunning else { return }
         running[taskID]?.stalled = true
-        await log(
-            "runner",
-            "stall: no log growth for \(Int(Self.stallTimeoutSeconds / 60))m on task \(Self.shortID(taskID)) — terminating run"
-        )
+        await log("runner", "task command stalled")
         run.process.terminate()
+    }
+
+    private func markTimedOut(taskID: UUID) {
+        running[taskID]?.timedOut = true
     }
 
     // The codex JSONL log only grows on completed items, so quiet stretches are
@@ -360,8 +433,9 @@ public actor TaskRunner {
         await logSink?(category, message)
     }
 
-    private static func shortID(_ id: UUID) -> String {
-        String(id.uuidString.lowercased().prefix(8))
+    private static func diagnosticsDurationMilliseconds(since start: Date, at end: Date = Date()) -> Int {
+        let milliseconds = max(0, end.timeIntervalSince(start) * 1_000)
+        return Int(min(milliseconds, Double(Int.max)))
     }
 
     private static func wait(for process: Process, termination: AsyncStream<Int32>) async throws -> Int32 {

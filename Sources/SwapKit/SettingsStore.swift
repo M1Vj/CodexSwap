@@ -36,6 +36,9 @@ public actor SettingsStore {
             self.value = s
         } else {
             self.value = .default
+            if FileManager.default.fileExists(atPath: url.path) {
+                DiagnosticsLog.shared.record(component: .settings, operation: .persistence, outcome: .failed, level: .error, code: .invalidInput)
+            }
         }
         self.persistedModificationDate = Self.modificationDate(for: url)
     }
@@ -80,6 +83,7 @@ public actor SettingsStore {
             persistedModificationDate = Self.modificationDate(for: url)
             return committed
         } catch {
+            DiagnosticsLog.shared.record(component: .settings, operation: .persistence, outcome: .failed, level: .error, code: .io)
             // Preserve the historical non-throwing API: an app write failure
             // still updates this actor's in-memory value, while the throwing
             // API surfaces the failure to agent callers.
@@ -93,6 +97,10 @@ public actor SettingsStore {
     /// Persists a settings change and updates the actor cache only after the
     /// atomic write can be read back and decoded as the requested value.
     public func updatePersisting(_ mutate: @Sendable (inout Settings) -> Void) throws -> Settings {
+        var saved = false
+        defer {
+            DiagnosticsLog.shared.record(component: .settings, operation: .persistence, outcome: saved ? .succeeded : .failed, level: saved ? .info : .error, code: saved ? .none : .io)
+        }
         // Read the latest on-disk document *inside* the lock, then mutate and
         // atomically replace it. Independent SettingsStore actors therefore
         // merge disjoint field updates instead of last-writer-wins overwrites.
@@ -104,6 +112,7 @@ public actor SettingsStore {
         }
         value = committed
         persistedModificationDate = Self.modificationDate(for: url)
+        saved = true
         return committed
     }
 

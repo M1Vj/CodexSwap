@@ -17,9 +17,13 @@ public final class NetworkReachability: @unchecked Sendable {
         self.monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
             self.lock.lock()
+            let changed = !self.hasReceivedUpdate || self._status != path.status
             self._status = path.status
             self.hasReceivedUpdate = true
             self.lock.unlock()
+            if changed {
+                DiagnosticsLog.shared.record(component: .app, operation: .configuration, outcome: .changed, level: path.status == .satisfied ? .info : .warning, code: path.status == .satisfied ? .none : .network)
+            }
         }
         self.start()
     }

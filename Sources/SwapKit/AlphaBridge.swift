@@ -855,9 +855,53 @@ extension AlphaBridge {
         httpClient: HTTPClient,
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         sink: ProxyEventSink,
-        log: (@Sendable (String) -> Void)? = nil
+        log: (@Sendable (String) -> Void)? = nil,
+        diagnosticsLog: DiagnosticsLog = .shared
     ) async throws {
+        let correlationID = UUID()
+        let startedAt = Date()
+        diagnosticsLog.record(
+            component: .alpha,
+            operation: .request,
+            outcome: .started,
+            correlationID: correlationID
+        )
+        var didRecordFinal = false
+        func recordFinal(
+            outcome: DiagnosticOutcome,
+            level: DiagnosticLevel = .info,
+            code: DiagnosticCode = .none,
+            status: Int? = nil,
+            count: Int? = nil
+        ) {
+            didRecordFinal = true
+            diagnosticsLog.record(
+                component: .alpha,
+                operation: .request,
+                outcome: outcome,
+                level: level,
+                code: code,
+                correlationID: correlationID,
+                status: status,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+                count: count
+            )
+        }
+        defer {
+            if !didRecordFinal {
+                diagnosticsLog.record(
+                    component: .alpha,
+                    operation: .request,
+                    outcome: Task.isCancelled ? .cancelled : .failed,
+                    level: .error,
+                    code: Task.isCancelled ? .none : .unknown,
+                    correlationID: correlationID,
+                    durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt)
+                )
+            }
+        }
         guard var payload = chatPayload(fromResponsesData: body, model: entry.modelID) else {
+            recordFinal(outcome: .failed, level: .warning, code: .invalidInput, status: 400)
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
             return
         }
@@ -870,12 +914,14 @@ extension AlphaBridge {
             toolNamespaces = namespaces
         }
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
+            recordFinal(outcome: .failed, level: .warning, code: .invalidInput, status: 400)
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
             return
         }
         let wantsStream = (payload["stream"] as? Bool) ?? false
 
         guard let base = BridgedModel.validatedBaseURL(entry.baseURL) else {
+            recordFinal(outcome: .failed, level: .error, code: .invalidInput, status: 500)
             try await writeHTTPError(outbound, status: .internalServerError, code: "bad_bridged_base_url", message: "Bridged model has an invalid base URL")
             return
         }
@@ -898,16 +944,29 @@ extension AlphaBridge {
         var headWritten = false
 
         attemptLoop: for attempt in 1...maxUpstreamAttempts {
+            let attemptStartedAt = Date()
             wireLog("attempt \(attempt)/\(maxUpstreamAttempts)")
             let resp: HTTPClientResponse
             do {
                 resp = try await httpClient.execute(request, timeout: .seconds(600))
             } catch {
                 wireLog("attempt \(attempt) transport failure")
+                let transportCode = DiagnosticCode.classify(error)
                 if attempt < maxUpstreamAttempts {
+                    diagnosticsLog.record(
+                        component: .alpha,
+                        operation: .request,
+                        outcome: .retrying,
+                        level: .warning,
+                        code: transportCode,
+                        correlationID: correlationID,
+                        durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: attemptStartedAt),
+                        count: attempt
+                    )
                     try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
                     continue attemptLoop
                 }
+                recordFinal(outcome: .failed, level: .error, code: transportCode, status: 502, count: attempt)
                 if wantsStream {
                     try await writeFailedEvent(outbound, code: "upstream_unreachable", message: "\(error)")
                 } else {
@@ -928,9 +987,27 @@ extension AlphaBridge {
                 let retryable = resp.status.code == 429 || resp.status.code >= 500
                     || isPromptLengthFailure(code: String(resp.status.code), message: detail)
                 if retryable, attempt < maxUpstreamAttempts {
+                    diagnosticsLog.record(
+                        component: .alpha,
+                        operation: .request,
+                        outcome: .retrying,
+                        level: .warning,
+                        code: Self.diagnosticsCode(for: Int(resp.status.code)),
+                        correlationID: correlationID,
+                        status: Int(resp.status.code),
+                        durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: attemptStartedAt),
+                        count: attempt
+                    )
                     try? await Task.sleep(nanoseconds: UInt64(attempt) * 300_000_000)
                     continue attemptLoop
                 }
+                recordFinal(
+                    outcome: .failed,
+                    level: .error,
+                    code: Self.diagnosticsCode(for: Int(resp.status.code)),
+                    status: Int(resp.status.code),
+                    count: attempt
+                )
                 if wantsStream {
                     try await writeFailedEvent(outbound, code: "upstream_status_\(resp.status.code)", message: detail.isEmpty ? "Upstream returned \(resp.status.code)" : detail)
                 } else {
@@ -951,6 +1028,7 @@ extension AlphaBridge {
                 }
                 if !translator.finished { translator.finish() }
                 if translator.failed {
+                    recordFinal(outcome: .failed, level: .error, code: .unknown, status: 502, count: attempt)
                     try await writeFailedEvent(outbound, code: "upstream_error", message: translator.failureMessage ?? "Free-model upstream failed")
                     return
                 }
@@ -981,6 +1059,7 @@ extension AlphaBridge {
                         cacheWriteInputPresence: sample.cacheWriteInputPresence
                     )
                 }
+                recordFinal(outcome: .succeeded, status: 200, count: attempt)
                 return
             }
 
@@ -1006,6 +1085,16 @@ extension AlphaBridge {
                     // A prompt-length rejection before any client-visible output is
                     // backend-specific: a fresh connection may land elsewhere.
                     if promptTooLong && !translator.emittedVisibleOutput && attempt < maxUpstreamAttempts {
+                        diagnosticsLog.record(
+                            component: .alpha,
+                            operation: .request,
+                            outcome: .retrying,
+                            level: .warning,
+                            code: .invalidInput,
+                            correlationID: correlationID,
+                            durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: attemptStartedAt),
+                            count: attempt
+                        )
                         continue attemptLoop
                     }
                     break
@@ -1049,7 +1138,28 @@ extension AlphaBridge {
                     cacheWriteInputPresence: sample.cacheWriteInputPresence
                 )
             }
+            if translator.failed {
+                recordFinal(outcome: .failed, level: .error, code: .unknown, status: 502, count: attempt)
+            } else {
+                recordFinal(outcome: .succeeded, status: 200, count: attempt)
+            }
             return
+        }
+    }
+
+    private static func diagnosticsDurationMilliseconds(since start: Date, at end: Date = Date()) -> Int {
+        let milliseconds = max(0, end.timeIntervalSince(start) * 1_000)
+        return Int(min(milliseconds, Double(Int.max)))
+    }
+
+    private static func diagnosticsCode(for status: Int) -> DiagnosticCode {
+        switch status {
+        case 401, 403: return .unauthorized
+        case 408, 504: return .timeout
+        case 429: return .rateLimited
+        case 400..<500: return .invalidInput
+        case 500..<600: return .network
+        default: return .unknown
         }
     }
 

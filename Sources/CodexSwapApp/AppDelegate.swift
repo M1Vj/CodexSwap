@@ -76,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usageMonitorWindowController: UsageMonitorWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DiagnosticsLog.shared.record(component: .app, operation: .lifecycle, outcome: .started)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle", accessibilityDescription: "CodexSwap")
@@ -99,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 _ = try ShimManager().migrateLegacyShimIfNeeded()
             } catch {
+                DiagnosticsLog.shared.record(component: .app, operation: .configuration, outcome: .failed, level: .error, code: .io)
                 notify(title: "CodexSwap", body: "The optional terminal shim could not be upgraded: \(error.localizedDescription)")
             }
             let notificationCenter = UNUserNotificationCenter.current()
@@ -106,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             registerTaskNotificationCategories(on: notificationCenter)
             notificationCenter.requestAuthorization(options: [.alert, .sound]) { granted, _ in
                 if !granted {
+                    DiagnosticsLog.shared.record(component: .notifications, operation: .configuration, outcome: .failed, level: .warning, code: .unauthorized)
                     FileHandle.standardError.write("[notify] notifications denied; menu-bar alerts will not be shown\n".data(using: .utf8)!)
                 }
             }
@@ -135,13 +138,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        DiagnosticsLog.shared.record(component: .app, operation: .lifecycle, outcome: .cancelled)
         // Detached: a main-actor Task could never run while the semaphore blocks the main thread.
         let sem = DispatchSemaphore(value: 0)
         Task.detached { [engine] in
             await engine.stop()
             sem.signal()
         }
-        _ = sem.wait(timeout: .now() + 2)
+        let shutdown = sem.wait(timeout: .now() + 2)
+        DiagnosticsLog.shared.record(component: .app, operation: .lifecycle, outcome: shutdown == .success ? .succeeded : .failed, level: shutdown == .success ? .info : .error, code: shutdown == .success ? .none : .timeout)
     }
 
     func applicationShouldHandleReopen(
@@ -728,6 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(warm)
         menu.addItem(.separator())
         addAction("Usage Monitor…", #selector(showUsageMonitor))
+        addAction("Diagnostics…", #selector(showDiagnostics))
         let taskBoard = NSMenuItem(title: "Task Board…", action: #selector(showTaskBoard), keyEquivalent: "t")
         taskBoard.target = self
         taskBoard.keyEquivalentModifierMask = [.command]
@@ -1030,6 +1036,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         presentSettings()
     }
 
+    @objc private func showDiagnostics() {
+        presentSettings(pane: .diagnostics)
+    }
+
     @objc private func showArchivedAccounts() {
         presentSettings(pane: .accounts)
     }
@@ -1158,6 +1168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func addStandaloneAccount() {
         guard let codex = CodexLauncher.resolveCodexBinary() else {
+            DiagnosticsLog.shared.record(component: .accounts, operation: .configuration, outcome: .failed, level: .error, code: .notFound)
             presentMessage(CodexLoginLaunchError.binaryNotFound.userMessage)
             return
         }
@@ -1167,7 +1178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 codexPath: codex,
                 supportDirectory: AppPaths.supportDir()
             )
-            guard NSWorkspace.shared.open(launch.commandFile) else {
+            let opened = NSWorkspace.shared.open(launch.commandFile)
+            CodexLoginLauncher.recordOpenOutcome(opened: opened, correlationID: launch.correlationID)
+            guard opened else {
                 // Keep the exact command file so the user can double-click it if
                 // Launch Services declines to open it automatically.
                 throw CodexLoginLaunchError.terminalOpenFailed(path: launch.commandFile.path)
@@ -1281,6 +1294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func systemDidWake() {
+        DiagnosticsLog.shared.record(component: .app, operation: .lifecycle, outcome: .changed)
         Task { @MainActor in
             await engine.systemDidWake()
             await refreshSnapshot()
@@ -1350,7 +1364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let category { content.categoryIdentifier = category }
         if let taskID { content.userInfo[TaskNotification.taskIDKey] = taskID.uuidString }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req)
+        UNUserNotificationCenter.current().add(req) { error in
+            DiagnosticsLog.shared.record(component: .notifications, operation: .notification, outcome: error == nil ? .succeeded : .failed, level: error == nil ? .debug : .warning, code: error == nil ? .none : .unavailable)
+        }
     }
 
     private func registerTaskNotificationCategories(on center: UNUserNotificationCenter) {

@@ -1506,6 +1506,7 @@ public actor ProxyServer {
                 await self.upstreamRateLimitBackoff.waitIfNeeded()
                 resp = try await self.forward(head: head, body: body, account: account, target: target)
             } catch {
+                let cancelled = error is CancellationError
                 await self.recordTelemetryAttempt(
                     rootRequestID: rootRequestID,
                     attemptIndex: attemptIndex,
@@ -1514,9 +1515,9 @@ public actor ProxyServer {
                     account: account,
                     model: requestModel,
                     category: requestCategory,
-                    outcome: .transportError,
+                    outcome: cancelled ? .cancelled : .transportError,
                     status: nil,
-                    errorClass: .network
+                    errorClass: cancelled ? .cancelled : .network
                 )
                 try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
                 return .completed(outcome: .failure, status: Int(HTTPResponseStatus.badGateway.code))
@@ -1976,6 +1977,21 @@ public actor ProxyServer {
         status: Int?,
         errorClass: UsageTelemetryErrorClass?
     ) async {
+        let diagnosticOutcome: DiagnosticOutcome = outcome == .cancelled ? .cancelled : outcome == .success ? .succeeded : .failed
+        let diagnosticCode: DiagnosticCode
+        switch errorClass {
+        case .authentication: diagnosticCode = .unauthorized
+        case .rateLimit, .quotaExhausted: diagnosticCode = .rateLimited
+        case .timeout: diagnosticCode = .timeout
+        case .network: diagnosticCode = .network
+        case .upstream5xx: diagnosticCode = .unavailable
+        case .malformedResponse: diagnosticCode = .invalidInput
+        case .cancelled: diagnosticCode = .none
+        case .other: diagnosticCode = .unknown
+        case nil:
+            diagnosticCode = status == 401 || status == 403 ? .unauthorized : status == 429 ? .rateLimited : outcome == .transportError ? .network : .none
+        }
+        DiagnosticsLog.shared.record(component: .proxy, operation: .request, outcome: diagnosticOutcome, level: diagnosticOutcome == .failed ? .warning : .info, code: diagnosticCode, correlationID: rootRequestID, status: status, durationMilliseconds: Int(max(0, finishedAt.timeIntervalSince(startedAt)) * 1_000), count: attemptIndex)
         guard let telemetry else { return }
         let event = UsageTelemetryAttemptEvent(
             rootRequestID: rootRequestID,

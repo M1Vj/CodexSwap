@@ -30,11 +30,13 @@ public struct CodexStandaloneLoginLaunch: Sendable, Equatable {
     public let commandFile: URL
     public let homePath: URL
     public let successMarker: URL
+    public let correlationID: UUID
 
-    public init(commandFile: URL, homePath: URL, successMarker: URL) {
+    public init(commandFile: URL, homePath: URL, successMarker: URL, correlationID: UUID = UUID()) {
         self.commandFile = commandFile
         self.homePath = homePath
         self.successMarker = successMarker
+        self.correlationID = correlationID
     }
 }
 
@@ -108,8 +110,16 @@ public enum CodexLoginLauncher {
         codexPath: String,
         supportDirectory: URL,
         identifier: String = UUID().uuidString,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        diagnosticsLog: DiagnosticsLog = .shared
     ) throws -> CodexStandaloneLoginLaunch {
+        let correlationID = UUID()
+        diagnosticsLog.record(
+            component: .accounts,
+            operation: .configuration,
+            outcome: .started,
+            correlationID: correlationID
+        )
         let trustedSupportDirectory = supportDirectory.resolvingSymlinksInPath().standardizedFileURL
         let homesDirectory = trustedSupportDirectory.appendingPathComponent(standaloneHomesDirectoryName, isDirectory: true)
         do {
@@ -147,12 +157,54 @@ public enum CodexLoginLauncher {
             try Data(commandScript(codexPath: codexPath, homePath: homePath.path).utf8).write(to: commandFile, options: .atomic)
             guard !isSymbolicLink(commandFile) else { throw CocoaError(.fileNoSuchFile) }
             try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: commandFile.path)
-            return CodexStandaloneLoginLaunch(commandFile: commandFile, homePath: homePath, successMarker: successMarker)
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: .configuration,
+                outcome: .succeeded,
+                correlationID: correlationID
+            )
+            return CodexStandaloneLoginLaunch(
+                commandFile: commandFile,
+                homePath: homePath,
+                successMarker: successMarker,
+                correlationID: correlationID
+            )
         } catch let error as CodexLoginLaunchError {
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: .configuration,
+                outcome: .failed,
+                level: .error,
+                code: configurationCode(for: error),
+                correlationID: correlationID
+            )
             throw error
         } catch {
+            diagnosticsLog.record(
+                component: .accounts,
+                operation: .configuration,
+                outcome: .failed,
+                level: .error,
+                code: configurationCode(for: error),
+                correlationID: correlationID
+            )
             throw CodexLoginLaunchError.commandFileWriteFailed(path: supportDirectory.path)
         }
+    }
+
+    public static func recordOpenOutcome(
+        opened: Bool,
+        correlationID: UUID,
+        diagnosticsLog: DiagnosticsLog = .shared
+    ) {
+        diagnosticsLog.record(
+            component: .accounts,
+            operation: .configuration,
+            outcome: opened ? .succeeded : .failed,
+            level: opened ? .info : .error,
+            code: opened ? .none : .unavailable,
+            correlationID: correlationID
+        )
     }
 
     @discardableResult
@@ -160,18 +212,52 @@ public enum CodexLoginLauncher {
         codexPath: String,
         directory: URL,
         identifier: String = UUID().uuidString,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        diagnosticsLog: DiagnosticsLog = .shared
     ) throws -> URL {
         try prepareStandaloneLogin(
             codexPath: codexPath,
             supportDirectory: directory,
             identifier: identifier,
-            fileManager: fileManager
+            fileManager: fileManager,
+            diagnosticsLog: diagnosticsLog
         ).commandFile
     }
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func configurationCode(for error: CodexLoginLaunchError) -> DiagnosticCode {
+        switch error {
+        case .binaryNotFound:
+            return .notFound
+        case .commandFileWriteFailed:
+            return .io
+        case .terminalOpenFailed:
+            return .unavailable
+        }
+    }
+
+    private static func configurationCode(for error: Error) -> DiagnosticCode {
+        switch DiagnosticCode.classify(error) {
+        case .invalidInput:
+            return .invalidInput
+        case .unauthorized:
+            return .unauthorized
+        case .notFound:
+            return .notFound
+        case .io:
+            return .io
+        case .unavailable:
+            return .unavailable
+        case .staleSnapshot:
+            return .staleSnapshot
+        case .network, .timeout, .busy, .revoked, .rateLimited, .unknown:
+            return .network
+        case .none:
+            return .io
+        }
     }
 
     private static func ensureDirectory(_ url: URL, permissions: Int, fileManager: FileManager) throws {

@@ -249,6 +249,7 @@ public struct AgentCLIOptions: Sendable, Equatable {
 public enum AgentCLIOperation: Sendable, Equatable {
     case help
     case status
+    case diagnostics
     case accountsList
     case accountsShow(String)
     case accountsImport
@@ -288,6 +289,7 @@ public struct AgentCLICommand: Sendable, Equatable {
         switch operation {
         case .help: return "agent help"
         case .status: return "agent status"
+        case .diagnostics: return "agent diagnostics"
         case .accountsList: return "agent accounts list"
         case .accountsShow: return "agent accounts show"
         case .accountsImport: return "agent accounts import"
@@ -411,6 +413,9 @@ public enum AgentCLIParser {
         case "status":
             guard tail.isEmpty else { throw AgentCLIParseError.invalidArgument }
             operation = .status
+        case "diagnostics":
+            guard tail.isEmpty else { throw AgentCLIParseError.invalidArgument }
+            operation = .diagnostics
         case "accounts":
             guard let subcommand = tail.first else { throw AgentCLIParseError.missingArgument }
             let rest = Array(tail.dropFirst())
@@ -761,6 +766,7 @@ public struct AgentCLI: Sendable {
       account usage-limit show <alias-or-ref> --json
       account usage-limit set <alias-or-ref> --five-hour N --weekly N [--enable|--disable] [--confirm|--dry-run] --json
       quota report --json
+      diagnostics --json
       warmup all --json --confirm
       warmup account <alias-or-ref> --json --confirm
       reset status --json; reset use <alias-or-ref> --json --confirm
@@ -774,6 +780,10 @@ public struct AgentCLI: Sendable {
             return AgentCLIResult(envelope: .success(command: command.canonicalName), exitCode: .ok)
         case .status:
             return await status(command)
+        case .diagnostics:
+            let log = DiagnosticsLog(url: supportDir.appendingPathComponent("diagnostics-v1.jsonl"))
+            let data = try JSONDecoder().decode(AgentCLIJSONValue.self, from: log.exportData(limit: 500))
+            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
         case .accountsList:
             return await accountsList(command)
         case .accountsShow(let target):

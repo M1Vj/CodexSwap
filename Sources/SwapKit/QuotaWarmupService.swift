@@ -33,6 +33,7 @@ public actor QuotaWarmupService {
     private let unknownRetrySeconds: TimeInterval
     private let lockURL: URL
     private let networkCheck: @Sendable () -> Bool
+    private let diagnosticsLog: DiagnosticsLog
     private var isRunning = false
 
     public init(
@@ -41,7 +42,8 @@ public actor QuotaWarmupService {
         failureRetrySeconds: TimeInterval = 300,
         unknownRetrySeconds: TimeInterval = 1_800,
         lockURL: URL = AppPaths.warmupLockFile(),
-        networkCheck: (@Sendable () -> Bool)? = nil
+        networkCheck: (@Sendable () -> Bool)? = nil,
+        diagnosticsLog: DiagnosticsLog = .shared
     ) {
         self.runner = runner
         self.ledger = ledger
@@ -49,6 +51,7 @@ public actor QuotaWarmupService {
         self.unknownRetrySeconds = unknownRetrySeconds
         self.lockURL = lockURL
         self.networkCheck = networkCheck ?? { NetworkReachability.shared.isOnline }
+        self.diagnosticsLog = diagnosticsLog
     }
 
     public func run(
@@ -58,18 +61,67 @@ public actor QuotaWarmupService {
         now: Date = Date(),
         recheck: AccountRecheck? = nil
     ) async -> WarmupSummary {
+        let correlationID = UUID()
+        let startedAt = now
+        diagnosticsLog.record(
+            component: .warmup,
+            operation: .warmup,
+            outcome: .started,
+            correlationID: correlationID,
+            count: accounts.count
+        )
         guard !isRunning else {
+            diagnosticsLog.record(
+                component: .warmup,
+                operation: .warmup,
+                outcome: .skipped,
+                level: .warning,
+                code: .busy,
+                correlationID: correlationID,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+                count: 0
+            )
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         }
         guard networkCheck() else {
+            diagnosticsLog.record(
+                component: .warmup,
+                operation: .warmup,
+                outcome: .skipped,
+                level: .warning,
+                code: .network,
+                correlationID: correlationID,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+                count: 0
+            )
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "network unavailable"])
         }
         let processLock: WarmupInterprocessLock
         do {
             processLock = try WarmupInterprocessLock(url: lockURL)
         } catch WarmupInterprocessLockError.busy {
+            diagnosticsLog.record(
+                component: .warmup,
+                operation: .warmup,
+                outcome: .skipped,
+                level: .warning,
+                code: .busy,
+                correlationID: correlationID,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+                count: 0
+            )
             return WarmupSummary(startedAt: now, finishedAt: now, skipped: ["all": "warm-up already running"])
         } catch {
+            diagnosticsLog.record(
+                component: .warmup,
+                operation: .warmup,
+                outcome: .failed,
+                level: .error,
+                code: .io,
+                correlationID: correlationID,
+                durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+                count: 0
+            )
             return WarmupSummary(startedAt: now, finishedAt: now, failed: ["all": "warm-up lock unavailable"])
         }
         defer { processLock.release() }
@@ -110,9 +162,46 @@ public actor QuotaWarmupService {
             await ledger.setRecord(pendingRecord, for: key)
             summary.attempted.append(account.alias)
 
+            let attemptCorrelationID = UUID()
+            let attemptStartedAt = Date()
+            diagnosticsLog.record(
+                component: .warmup,
+                operation: .request,
+                outcome: .started,
+                correlationID: attemptCorrelationID,
+                count: 1
+            )
             do {
                 try await runner.run(alias: account.alias, proxyURL: proxyURL)
+                diagnosticsLog.record(
+                    component: .warmup,
+                    operation: .request,
+                    outcome: .succeeded,
+                    correlationID: attemptCorrelationID,
+                    durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: attemptStartedAt),
+                    count: 1
+                )
             } catch {
+                let cancelled = error is CancellationError
+                diagnosticsLog.record(
+                    component: .warmup,
+                    operation: .request,
+                    outcome: cancelled ? .cancelled : .failed,
+                    level: cancelled ? .info : .warning,
+                    code: Self.diagnosticsCode(for: error),
+                    correlationID: attemptCorrelationID,
+                    durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: attemptStartedAt),
+                    count: 1
+                )
+                if cancelled {
+                    var restoredRecord = pendingRecord
+                    restoredRecord.primaryResetAt = now
+                    restoredRecord.retryAfter = nil
+                    restoredRecord.outcome = .unknown
+                    await ledger.setRecord(restoredRecord, for: key)
+                    summary.skipped[account.alias] = "cancelled"
+                    continue
+                }
                 if !networkCheck() {
                     var restoredRecord = pendingRecord
                     restoredRecord.primaryResetAt = now
@@ -140,6 +229,29 @@ public actor QuotaWarmupService {
         }
         summary.finishedAt = Date()
         await ledger.setLastSummary(summary)
+        let overallCode: DiagnosticCode = summary.failed.isEmpty
+            ? (summary.skipped.values.contains(where: { $0 == "network unavailable" }) ? .network : .none)
+            : .unknown
+        let overallOutcome: DiagnosticOutcome
+        if !summary.failed.isEmpty {
+            overallOutcome = .failed
+        } else if summary.skipped.values.contains("cancelled") {
+            overallOutcome = .cancelled
+        } else if summary.attempted.isEmpty {
+            overallOutcome = .skipped
+        } else {
+            overallOutcome = .changed
+        }
+        diagnosticsLog.record(
+            component: .warmup,
+            operation: .warmup,
+            outcome: overallOutcome,
+            level: summary.failed.isEmpty ? .info : .warning,
+            code: overallCode,
+            correlationID: correlationID,
+            durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt, at: summary.finishedAt),
+            count: summary.attempted.count
+        )
         return summary
     }
 
@@ -149,6 +261,15 @@ public actor QuotaWarmupService {
     /// fresh usage observations. Process failures are cleared when that evidence proves
     /// an active reset cycle; unverified attempts remain in `attempted` and out of `warmed`.
     public func reconcileSummary(_ summary: WarmupSummary, accounts: [Account]) async -> WarmupSummary {
+        let startedAt = Date()
+        let correlationID = UUID()
+        diagnosticsLog.record(
+            component: .warmup,
+            operation: .warmup,
+            outcome: .started,
+            correlationID: correlationID,
+            count: summary.attempted.count
+        )
         var reconciled = summary
         for alias in summary.attempted {
             guard let account = accounts.first(where: { $0.alias == alias }),
@@ -165,6 +286,14 @@ public actor QuotaWarmupService {
             }
         }
         await ledger.setLastSummary(reconciled)
+        diagnosticsLog.record(
+            component: .warmup,
+            operation: .warmup,
+            outcome: .changed,
+            correlationID: correlationID,
+            durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
+            count: reconciled.warmed.count
+        )
         return reconciled
     }
 
@@ -318,6 +447,21 @@ public actor QuotaWarmupService {
         let shortWindows = account.usage.filter { $0.windowSeconds > 0 && $0.windowSeconds < 604_800 }
         guard !shortWindows.isEmpty else { return false }
         return shortWindows.allSatisfy { $0.usedPercent == 0 }
+    }
+
+    private static func diagnosticsDurationMilliseconds(since start: Date, at end: Date = Date()) -> Int {
+        let milliseconds = max(0, end.timeIntervalSince(start) * 1_000)
+        return Int(min(milliseconds, Double(Int.max)))
+    }
+
+    private static func diagnosticsCode(for error: Error) -> DiagnosticCode {
+        if error is CancellationError { return .none }
+        switch error as? WarmupCommandError {
+        case .binaryNotFound: return .notFound
+        case .timedOut: return .timeout
+        case .failed: return .unknown
+        case nil: return .unknown
+        }
     }
 }
 
