@@ -1465,13 +1465,48 @@ public struct AgentCLI: Sendable {
             return confirmationRequired(command: command.canonicalName, action: "remove")
         }
         if command.options.dryRun {
-            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["ref": .string(entry.reference), "wouldRemove": .bool(true)])), exitCode: .ok)
+            let removable = StandaloneAccountRemoval.ownsCredentialSource(
+                entry.account,
+                supportDirectory: supportDir
+            )
+            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object([
+                "ref": .string(entry.reference),
+                "wouldRemove": .bool(false),
+                "wouldAttemptRemove": .bool(removable),
+                "externalCredentialOwner": .bool(!removable),
+                "impactKnown": .bool(false),
+            ])), exitCode: .ok)
         }
-        await engine.remove(entry.account.alias)
-        guard await store.account(entry.account.alias) == nil else {
+        switch await engine.removeStandaloneAccount(alias: entry.account.alias) {
+        case .removed(let homeCount):
+            return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object([
+                "ref": .string(entry.reference),
+                "removed": .bool(true),
+                "retiredStandaloneLogins": .integer(homeCount),
+            ])), exitCode: .ok)
+        case .accountUnavailable:
+            return missingAccount(command: command.canonicalName)
+        case .externalCredentialOwner:
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "external_credential_owner",
+                    message: "account credentials are external or their owner is unverified; archive it locally or remove it through the owning login"
+                ),
+                exitCode: .data
+            )
+        case .sourceUnavailable:
+            return AgentCLIResult(
+                envelope: .failure(
+                    command: command.canonicalName,
+                    code: "source_unavailable",
+                    message: "standalone credential source could not be verified; nothing was removed"
+                ),
+                exitCode: .data
+            )
+        case .failed:
             return AgentCLIResult(envelope: .failure(command: command.canonicalName, code: "remove_failed", message: "account could not be removed"), exitCode: .software)
         }
-        return AgentCLIResult(envelope: .success(command: command.canonicalName, data: .object(["ref": .string(entry.reference), "removed": .bool(true)])), exitCode: .ok)
     }
 
     private func confirmationRequired(command: String, action: String) -> AgentCLIResult {

@@ -26,6 +26,7 @@ public enum DiagnosticOperation: String, Codable, CaseIterable, Sendable {
     case selection
     case authentication
     case importAccounts = "import_accounts"
+    case removeAccount = "remove_account"
     case usageFetch = "usage_fetch"
     case reset
     case warmup

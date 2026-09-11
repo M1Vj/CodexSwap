@@ -401,6 +401,12 @@ final class AgentCLITests: XCTestCase {
         XCTAssertEqual(preview.exitCode, AgentCLIExitCode.ok.rawValue)
         let stillPresentAfterPreview = await store.account("alpha")
         XCTAssertNotNil(stillPresentAfterPreview)
+
+        let confirmed = await cli.run(["agent", "account", "remove", "alpha", "--confirm", "--json"])
+        XCTAssertEqual(confirmed.exitCode, AgentCLIExitCode.data.rawValue)
+        XCTAssertEqual(confirmed.envelope.error?.code, "external_credential_owner")
+        let stillPresentAfterConfirmedRefusal = await store.account("alpha")
+        XCTAssertNotNil(stillPresentAfterConfirmedRefusal)
     }
 
     func testReconcileRequiresConfirmationAndSupportsDryRun() async throws {

@@ -56,6 +56,13 @@ public struct AccountRemovalResult: Sendable, Equatable {
     }
 }
 
+enum AccountRemovalWriteResult: Sendable, Equatable {
+    case removed(AccountRemovalResult)
+    case accountNotFound
+    case accountChanged
+    case persistenceFailed
+}
+
 public struct RotationResult: Sendable {
     public let next: Account?
     public let rotated: Bool
@@ -2144,7 +2151,7 @@ public actor AccountStore {
     }
 
     @discardableResult
-    public func remove(_ alias: String) -> UUID? {
+    func remove(_ alias: String) -> UUID? {
         let removedAccounts = data.accounts.filter { $0.alias == alias }
         // A stale actor may attempt to remove an alias that another process
         // added after this actor's snapshot. Treat that operation as a true
@@ -2162,15 +2169,57 @@ public actor AccountStore {
         return removedTelemetryID
     }
 
-    /// Permanent removal result used by the later telemetry purge hook. The archive path
-    /// never calls this operation.
     @discardableResult
-    public func removeWithTelemetry(_ alias: String) -> AccountRemovalResult {
-        guard let account = data.accounts.first(where: { $0.alias == alias }) else {
-            return AccountRemovalResult()
+    func removeWithTelemetryAtomically(
+        _ alias: String,
+        expectedTelemetryID: UUID,
+        expectedAccountID: String,
+        expectedCredentialSource: AccountCredentialSource?
+    ) -> AccountRemovalWriteResult {
+        var result: AccountRemovalWriteResult = .persistenceFailed
+        let didLock = Self.withStoreLock(url) {
+            guard var latest = Self.loadFrom(url),
+                  let account = latest.accounts.first(where: { $0.alias == alias }) else {
+                result = .accountNotFound
+                return
+            }
+            guard account.telemetryID == expectedTelemetryID,
+                  account.accountID == expectedAccountID,
+                  account.credentialSource == expectedCredentialSource else {
+                result = .accountChanged
+                return
+            }
+            latest.accounts.removeAll { $0.alias == alias }
+            if latest.activeAlias == alias { latest.activeAlias = nil }
+            if latest.stickyAlias == alias {
+                latest.stickyAlias = nil
+                latest.stickyUsageLimitOverride = false
+            }
+            Self.renumberRanks(&latest)
+            guard let raw = try? JSONEncoder.codex.encode(latest) else {
+                result = .persistenceFailed
+                return
+            }
+            do {
+                try persistAtomically(raw)
+            } catch {
+                result = .persistenceFailed
+                return
+            }
+            data = latest
+            persistedData = latest
+            persistedModificationDate = Self.modificationDate(for: url)
+            stickyAliasRuntime = latest.stickyAlias
+            stickyUsageLimitOverrideRuntime = latest.stickyUsageLimitOverride && latest.stickyAlias != nil
+            clearRuntimeHolds(alias)
+            drainingAliases.remove(alias)
+            drainingObservedAt.removeValue(forKey: alias)
+            result = .removed(AccountRemovalResult(
+                removedAliases: [account.alias],
+                removedTelemetryIDs: [account.telemetryID]
+            ))
         }
-        _ = remove(alias)
-        return AccountRemovalResult(removedAliases: [account.alias], removedTelemetryIDs: [account.telemetryID])
+        return didLock ? result : .persistenceFailed
     }
 
     /// Drop CodexBar-managed accounts whose accountID is no longer in CodexBar's roster.

@@ -1148,12 +1148,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "Remove \(alias) from CodexSwap?"
-        alert.informativeText = "This removes the locally imported account from CodexSwap."
+        alert.informativeText = "This removes the account from routing and retires every CodexSwap-owned standalone login copy. CodexBar and normal Codex credentials are never changed."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { await engine.remove(alias); await refreshSnapshot() }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await engine.removeStandaloneAccount(alias: alias)
+            switch result {
+            case .removed(let homeCount):
+                let suffix = homeCount == 1 ? "login" : "logins"
+                presentMessage("Removed \(alias) and retired \(homeCount) standalone \(suffix).")
+            case .accountUnavailable:
+                presentMessage("\(alias) is no longer available.")
+            case .externalCredentialOwner:
+                presentMessage("\(alias) is external or its credential owner could not be verified. Use the owning login or Archive it in CodexSwap.")
+            case .sourceUnavailable:
+                presentMessage("Could not verify \(alias)'s standalone login source. Nothing was removed.")
+            case .failed:
+                presentMessage("Could not finish removing \(alias). The account remains listed; check Diagnostics.")
+            }
+            await refreshSnapshot()
+        }
     }
 
     private func changeStrategy(_ strategy: RotationStrategy) {

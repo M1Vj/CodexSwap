@@ -236,7 +236,12 @@ private struct AccountCard: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
-            chip(account.ownership == .codexBarManaged ? "CodexBar" : "Standalone", color: .secondary)
+            chip(
+                account.ownership == .codexBarManaged
+                    ? "CodexBar"
+                    : (account.canRemoveStandalone ? "Standalone" : "External / Unknown"),
+                color: .secondary
+            )
             if account.isDraining {
                 chip("Draining by others", color: .orange)
             }
@@ -516,7 +521,7 @@ private struct AccountCard: View {
                 Button("Manage", action: model.actions.openCodexBar)
                     .help("Remove or reauthenticate this account in CodexBar")
                     .accessibilityLabel("Manage \(account.alias) in CodexBar")
-            } else {
+            } else if account.canRemoveStandalone {
                 Button("Remove", role: .destructive) { model.actions.removeAccount(account.alias) }
                     .accessibilityLabel("Remove \(account.alias)")
             }

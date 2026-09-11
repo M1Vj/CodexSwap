@@ -1,6 +1,37 @@
 import Foundation
 
 public enum AccountImporter {
+    public static func importNewestCodexAuthAccounts(
+        into store: AccountStore,
+        supportDirectory: URL = AppPaths.supportDir(),
+        now: Date = Date(),
+        includeLegacy: Bool = true
+    ) async -> [Account]? {
+        let homesLock: StandaloneHomesLock
+        do {
+            homesLock = try StandaloneHomesLock.acquire(supportDirectory: supportDirectory)
+        } catch {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .importAccounts,
+                outcome: .skipped,
+                level: .warning,
+                code: diagnosticCode(forStandaloneHomesLockError: error)
+            )
+            return nil
+        }
+        defer { homesLock.release() }
+        var imported = includeLegacy ? existingCodexAuthAccounts() : []
+        if let current = currentCodexAccount() { imported.append(current) }
+        imported.append(contentsOf: standaloneCodexAuthAccountsLocked(
+            supportDirectory: supportDirectory,
+            now: now
+        ))
+        let selected = newestAccounts(imported)
+        for account in selected { await store.upsert(account) }
+        return selected
+    }
+
     /// Build a fresh imported record, deriving identity from the access-token JWT. The store
     /// owns preservation of archive/pause state when this record is periodically upserted.
     public static func account(
@@ -69,6 +100,27 @@ public enum AccountImporter {
     public static func standaloneCodexAuthAccounts(
         supportDirectory: URL = AppPaths.supportDir(),
         now: Date = Date()
+    ) -> [Account] {
+        let homesLock: StandaloneHomesLock
+        do {
+            homesLock = try StandaloneHomesLock.acquire(supportDirectory: supportDirectory)
+        } catch {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .importAccounts,
+                outcome: .skipped,
+                level: .warning,
+                code: diagnosticCode(forStandaloneHomesLockError: error)
+            )
+            return []
+        }
+        defer { homesLock.release() }
+        return standaloneCodexAuthAccountsLocked(supportDirectory: supportDirectory, now: now)
+    }
+
+    private static func standaloneCodexAuthAccountsLocked(
+        supportDirectory: URL,
+        now: Date
     ) -> [Account] {
         let homesDirectory = supportDirectory.appendingPathComponent(
             CodexLoginLauncher.standaloneHomesDirectoryName,
@@ -219,5 +271,16 @@ public enum AccountImporter {
         #else
         return false
         #endif
+    }
+
+    private static func diagnosticCode(forStandaloneHomesLockError error: Error) -> DiagnosticCode {
+        switch error {
+        case StandaloneAccountRemovalError.busy:
+            return .busy
+        case StandaloneAccountRemovalError.untrustedSource:
+            return .unauthorized
+        default:
+            return .io
+        }
     }
 }

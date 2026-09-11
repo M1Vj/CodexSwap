@@ -212,7 +212,7 @@ CodexSwap handles authentication tokens, so its trust boundary is intentionally 
 | **No CodexSwap cloud** | Model requests go to OpenAI; account data is not sent to the maintainer. |
 | **Local metadata telemetry** | Off by default; when enabled, bounded request metadata stays local with 30-day event, 365-day aggregate, and until-cleared lifetime retention. It records counts, categories, timings, token completeness, retry outcomes, and estimated-cost provenance. It never records prompts, responses, commands, paths, headers, OAuth data, or raw errors, and never uploads telemetry. Latency includes local and network time; metrics do not infer interactive quality or productivity. |
 | **Restricted local data** | Settings and imported state live under `~/Library/Application Support/CodexSwap/` with user-only permissions where supported. |
-| **Credential ownership** | Imported credentials are read-only. CodexSwap reads matching owner updates but does not redeem refresh tokens or overwrite Codex/CodexBar auth files. |
+| **Credential ownership** | CodexBar, normal Codex, and legacy imported credentials are read-only. A confirmed Remove can retire only CodexSwap-owned isolated standalone homes; it never overwrites external auth files or revokes an OpenAI session. |
 | **Recoverable configuration** | Routing changes are backed up and restored rather than silently replacing unrelated configuration. |
 
 Never attach auth files, tokens, account IDs, or verbose request headers to a public issue. Read the complete [Privacy policy](PRIVACY.md) and [Security policy](SECURITY.md). Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/M1Vj/CodexSwap/security/advisories/new).
@@ -235,6 +235,12 @@ No. A new thread or run selects an account, then stays pinned when stable thread
 <summary><strong>Do I need CodexBar?</strong></summary>
 
 No. CodexBar remains the login owner for accounts it already manages. **Add Standalone…** creates a separate native login without replacing your normal Codex home. Existing default-home accounts remain importable. Standalone isolation does not provide unattended credential renewal or prevent provider-side revocation; do not migrate existing accounts merely to work around an unexplained sign-out. See [authentication troubleshooting](docs/TROUBLESHOOTING.md#an-account-says-sign-in-is-required).
+</details>
+
+<details>
+<summary><strong>What does Remove do for a standalone account?</strong></summary>
+
+After confirmation, CodexSwap retires every valid isolated login home for that account ID, verifies the account-store write, and removes the account from future routing. Retired homes remain private under CodexSwap support data for recovery but are no longer imported. If CodexBar, normal Codex, or a legacy auth bundle also owns the same account, removal refuses safely; use that owner or Archive the account locally.
 </details>
 
 <details>

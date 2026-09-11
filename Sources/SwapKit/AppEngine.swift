@@ -19,6 +19,14 @@ public enum AccountArchiveResult: Sendable, Equatable {
     case accountUnavailable
 }
 
+public enum StandaloneAccountRemovalResult: Sendable, Equatable {
+    case removed(homeCount: Int)
+    case accountUnavailable
+    case externalCredentialOwner
+    case sourceUnavailable
+    case failed
+}
+
 public enum AppEvent: Sendable {
     case rotated(from: String, to: String, limit: String, resetAt: Date?)
     case exhausted(limit: String)
@@ -317,9 +325,7 @@ public actor AppEngine {
         // paused accounts before any periodic quota/reset/warm-up network work.
         _ = await archiveDueAccounts()
         await syncCodexBar()
-        await reconcileImportedAccounts(
-            AccountImporter.newestCodexAuthAccounts(supportDirectory: supportDir, includeLegacy: false)
-        )
+        await importNewestCodexAuthAccounts(includeLegacy: false)
 
         if CodexBarBridge.isPresent() {
             let watcher = CodexBarWatcher { [weak self] in
@@ -1070,14 +1076,186 @@ public actor AppEngine {
         return restored
     }
 
-    public func remove(_ alias: String) async {
-        let removal = await store.removeWithTelemetry(alias)
-        for telemetryID in removal.removedTelemetryIDs {
-            await telemetry.purge(accountTelemetryID: telemetryID)
+    public func removeStandaloneAccount(alias: String) async -> StandaloneAccountRemovalResult {
+        await removeStandaloneAccount(
+            alias: alias,
+            externalAccountIDs: Self.externalCredentialAccountIDs(),
+            recheckExternalAccountIDs: Self.externalCredentialAccountIDs
+        )
+    }
+
+    func removeStandaloneAccount(
+        alias: String,
+        externalAccountIDs: Set<String>?,
+        recheckExternalAccountIDs: @Sendable () -> Set<String>? = { [] }
+    ) async -> StandaloneAccountRemovalResult {
+        let operationID = UUID()
+        DiagnosticsLog.shared.record(
+            component: .accounts,
+            operation: .removeAccount,
+            outcome: .started,
+            correlationID: operationID
+        )
+        guard let account = await store.account(alias) else {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .failed,
+                level: .warning,
+                code: .notFound,
+                correlationID: operationID
+            )
+            return .accountUnavailable
         }
-        needsLoginNotified.remove(alias)
-        emit(.snapshotChanged)
-        await scheduleResetCreditStatusRefresh()
+        guard StandaloneAccountRemoval.ownsCredentialSource(account, supportDirectory: supportDir) else {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .skipped,
+                level: .warning,
+                code: .unavailable,
+                correlationID: operationID
+            )
+            return .externalCredentialOwner
+        }
+        guard let externalAccountIDs else {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .failed,
+                level: .error,
+                code: .unavailable,
+                correlationID: operationID
+            )
+            return .failed
+        }
+        guard !externalAccountIDs.contains(account.accountID) else {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .skipped,
+                level: .warning,
+                code: .busy,
+                correlationID: operationID
+            )
+            return .externalCredentialOwner
+        }
+        do {
+            let homesLock = try StandaloneHomesLock.acquire(supportDirectory: supportDir)
+            defer { homesLock.release() }
+            let quarantine = try StandaloneAccountRemoval.quarantineHomes(
+                accountID: account.accountID,
+                supportDirectory: supportDir,
+                lock: homesLock
+            )
+            guard let latestExternalAccountIDs = recheckExternalAccountIDs() else {
+                try quarantine.restore()
+                DiagnosticsLog.shared.record(
+                    component: .accounts,
+                    operation: .removeAccount,
+                    outcome: .failed,
+                    level: .error,
+                    code: .unavailable,
+                    correlationID: operationID
+                )
+                return .failed
+            }
+            guard !latestExternalAccountIDs.contains(account.accountID) else {
+                try quarantine.restore()
+                DiagnosticsLog.shared.record(
+                    component: .accounts,
+                    operation: .removeAccount,
+                    outcome: .skipped,
+                    level: .warning,
+                    code: .busy,
+                    correlationID: operationID
+                )
+                return .externalCredentialOwner
+            }
+            let removal = await store.removeWithTelemetryAtomically(
+                alias,
+                expectedTelemetryID: account.telemetryID,
+                expectedAccountID: account.accountID,
+                expectedCredentialSource: account.credentialSource
+            )
+            guard case .removed(let details) = removal else {
+                try quarantine.restore()
+                DiagnosticsLog.shared.record(
+                    component: .accounts,
+                    operation: .removeAccount,
+                    outcome: .failed,
+                    level: .error,
+                    code: removal == .accountNotFound ? .notFound : (removal == .accountChanged ? .busy : .io),
+                    correlationID: operationID
+                )
+                return removal == .accountNotFound ? .accountUnavailable : .failed
+            }
+            for telemetryID in details.removedTelemetryIDs {
+                await telemetry.purge(accountTelemetryID: telemetryID)
+            }
+            needsLoginNotified.remove(alias)
+            emit(.snapshotChanged)
+            await scheduleResetCreditStatusRefresh()
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .succeeded,
+                correlationID: operationID,
+                count: quarantine.count
+            )
+            return .removed(homeCount: quarantine.count)
+        } catch StandaloneAccountRemovalError.sourceUnavailable {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .failed,
+                level: .warning,
+                code: .notFound,
+                correlationID: operationID
+            )
+            return .sourceUnavailable
+        } catch StandaloneAccountRemovalError.busy {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .failed,
+                level: .warning,
+                code: .busy,
+                correlationID: operationID
+            )
+            return .failed
+        } catch {
+            DiagnosticsLog.shared.record(
+                component: .accounts,
+                operation: .removeAccount,
+                outcome: .failed,
+                level: .error,
+                code: DiagnosticCode.classify(error),
+                correlationID: operationID
+            )
+            return .failed
+        }
+    }
+
+    private static func externalCredentialAccountIDs() -> Set<String>? {
+        var accountIDs = Set<String>()
+        switch CodexBarBridge.readManagedAccountsSnapshot() {
+        case .success(let snapshot):
+            accountIDs.formUnion(snapshot.accountIDs)
+        case .failure(.absent):
+            break
+        case .failure:
+            return nil
+        }
+        if let current = AccountImporter.currentCodexAccount(), !current.accountID.isEmpty {
+            accountIDs.insert(current.accountID)
+        }
+        accountIDs.formUnion(
+            AccountImporter.existingCodexAuthAccounts()
+                .map(\.accountID)
+                .filter { !$0.isEmpty }
+        )
+        return accountIDs
     }
 
     public func setMetadataTelemetryEnabled(_ enabled: Bool) async {
@@ -1373,9 +1551,7 @@ public actor AppEngine {
         let operationID = UUID()
         DiagnosticsLog.shared.record(component: .accounts, operation: .importAccounts, outcome: .started, correlationID: operationID)
         await syncCodexBar()
-        await reconcileImportedAccounts(
-            AccountImporter.newestCodexAuthAccounts(supportDirectory: supportDir)
-        )
+        await importNewestCodexAuthAccounts(includeLegacy: true)
         await recoverBlockedAuthentication()
         DiagnosticsLog.shared.record(component: .accounts, operation: .importAccounts, outcome: .changed, correlationID: operationID, count: await store.all().count)
     }
@@ -1391,6 +1567,16 @@ public actor AppEngine {
 
     func reconcileImportedAccounts(_ accounts: [Account]) async {
         for account in accounts { await store.upsert(account) }
+        emit(.snapshotChanged)
+        await scheduleResetCreditStatusRefresh()
+    }
+
+    private func importNewestCodexAuthAccounts(includeLegacy: Bool) async {
+        _ = await AccountImporter.importNewestCodexAuthAccounts(
+            into: store,
+            supportDirectory: supportDir,
+            includeLegacy: includeLegacy
+        )
         emit(.snapshotChanged)
         await scheduleResetCreditStatusRefresh()
     }

@@ -5273,9 +5273,37 @@ final class SettingsPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.proxyAddress, "127.0.0.1:58432")
         XCTAssertEqual(presentation.accounts.map(\.alias), ["managed", "standalone"])
         XCTAssertEqual(presentation.accounts[0].ownership, .codexBarManaged)
+        XCTAssertFalse(presentation.accounts[0].canRemoveStandalone)
         XCTAssertTrue(presentation.accounts[0].isActive)
         XCTAssertEqual(presentation.accounts[0].usageSummary, "5h 23%")
         XCTAssertTrue(presentation.accounts[1].needsLogin)
+        XCTAssertFalse(presentation.accounts[1].canRemoveStandalone)
+    }
+
+    func testAccountRowOffersRemovalOnlyForCodexSwapOwnedStandaloneSource() {
+        let support = URL(fileURLWithPath: "/private/tmp/codexswap-settings", isDirectory: true)
+        let home = support
+            .appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let account = Account(
+            alias: "standalone",
+            accountID: "standalone",
+            accessToken: "token",
+            credentialSource: AccountCredentialSource(
+                kind: .nativeAuth,
+                path: home.appendingPathComponent("auth.json").path
+            )
+        )
+        let snapshot = EngineSnapshot(
+            accounts: [account],
+            activeAlias: nil,
+            proxyURL: nil,
+            strategy: .priority
+        )
+
+        let presentation = SettingsPresentation(snapshot: snapshot, supportDirectory: support)
+
+        XCTAssertTrue(presentation.accounts[0].canRemoveStandalone)
     }
 
     func testArchivedAccountsAreExcludedFromActiveRanking() {

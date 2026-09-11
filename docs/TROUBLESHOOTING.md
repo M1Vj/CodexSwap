@@ -51,6 +51,8 @@ Without CodexBar, choose **Add Standalone…**, finish the Terminal login, then 
 
 An unreadable or malformed CodexBar roster is not treated as an empty account list. CodexSwap preserves its existing managed accounts until it can read a valid snapshot. An explicitly valid empty roster still reflects removal through CodexBar.
 
+**Remove** is available only for a CodexSwap-owned isolated standalone home. It retires every completed standalone home for the same stable account ID before removing the store row, so an older duplicate login cannot reappear on rescan. CodexSwap refuses removal when CodexBar, normal Codex, or a legacy bundle also owns that identity; use the owning app or choose **Archive** for a durable local routing hide.
+
 ## An account says sign-in is required
 
 Check the error in the application that owns the account. For a CodexBar-managed account, use CodexBar. A stored authentication flag alone does not prove a fresh provider revocation. For an isolated standalone account, use its exact Codex home, or explicitly complete a new **Add Standalone…** login and rescan. An unscoped `codex login` targets the normal native home instead. Removing an account from CodexSwap does not revoke its OpenAI session.

@@ -166,6 +166,7 @@ public struct AccountSettingsRow: Identifiable, Sendable, Equatable {
     /// Total ranked accounts, for up/down control bounds.
     public let rankCount: Int
     public let ownership: AccountOwnership
+    public let canRemoveStandalone: Bool
     public let isActive: Bool
     /// The account is currently held by the menu's sticky selection. When a
     /// cap is reached, this is the explicit manual-override affordance.
@@ -202,7 +203,8 @@ public struct SettingsPresentation: Sendable, Equatable {
 
     public init(
         snapshot: EngineSnapshot,
-        resetCreditStatuses: [String: AccountResetCreditStatus]? = nil
+        resetCreditStatuses: [String: AccountResetCreditStatus]? = nil,
+        supportDirectory: URL = AppPaths.supportDir()
     ) {
         let resetCreditStatuses = resetCreditStatuses ?? snapshot.resetCreditStatuses
         let ranked = snapshot.accounts
@@ -220,6 +222,10 @@ public struct SettingsPresentation: Sendable, Equatable {
                 rank: rank,
                 rankCount: rankCount,
                 ownership: AccountOwnership.classify(account: account),
+                canRemoveStandalone: StandaloneAccountRemoval.ownsCredentialSource(
+                    account,
+                    supportDirectory: supportDirectory
+                ),
                 isActive: account.alias == snapshot.activeAlias,
                 isSticky: account.alias == snapshot.stickyAlias,
                 needsLogin: account.needsLogin,

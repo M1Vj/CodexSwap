@@ -18,7 +18,8 @@ final class CodexLoginLauncherTests: XCTestCase {
         let script = CodexLoginLauncher.commandScript(codexPath: path, homePath: "/private/test-home")
 
         XCTAssertTrue(script.hasPrefix("#!/usr/bin/env bash\n"))
-        XCTAssertTrue(script.contains("'/Users/vj mabansag/O'\\''Reilly/bin/codex' login"))
+        XCTAssertTrue(script.contains("'/Users/vj mabansag/O'\\''Reilly/bin/codex'"))
+        XCTAssertTrue(script.contains("system {$codex} $codex, \"login\""))
         XCTAssertFalse(script.localizedCaseInsensitiveContains("osascript"))
         XCTAssertFalse(script.localizedCaseInsensitiveContains("tell application"))
     }
@@ -193,6 +194,94 @@ final class CodexLoginLauncherTests: XCTestCase {
         let markerAttributes = try FileManager.default.attributesOfItem(atPath: launch.successMarker.path)
         let markerPermissions = try XCTUnwrap(markerAttributes[.posixPermissions] as? NSNumber).intValue & 0o777
         XCTAssertEqual(markerPermissions, 0o600)
+    }
+
+    func testStandaloneLoginHoldsHomesLockThroughAuthAndSuccessMarkerWrite() throws {
+        let support = try makeTemporaryDirectory()
+        let started = support.appendingPathComponent("started")
+        let fakeCodex = support.appendingPathComponent("fake-codex")
+        let fakeScript = """
+        #!/usr/bin/env bash
+        printf 'started' > '\(started.path)'
+        sleep 1
+        printf '{}' > "$CODEX_HOME/auth.json"
+        """
+        try Data(fakeScript.utf8).write(to: fakeCodex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+        let launch = try CodexLoginLauncher.prepareStandaloneLogin(
+            codexPath: fakeCodex.path,
+            supportDirectory: support
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [launch.commandFile.path]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let deadline = Date().addingTimeInterval(1)
+        while !FileManager.default.fileExists(atPath: started.path), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+
+        XCTAssertThrowsError(try StandaloneHomesLock.acquire(
+            supportDirectory: support,
+            timeout: 0.05
+        )) { error in
+            XCTAssertEqual(error as? StandaloneAccountRemovalError, .busy)
+        }
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: launch.successMarker.path))
+    }
+
+    func testPreparedCommandRejectsSymlinkedHomesLockWithoutChangingTarget() throws {
+        let support = try makeTemporaryDirectory()
+        let target = support.appendingPathComponent("lock-target")
+        try Data("keep".utf8).write(to: target)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: target.path)
+        let fakeCodex = support.appendingPathComponent("fake-codex")
+        let calls = support.appendingPathComponent("calls")
+        try Data("#!/bin/bash\nprintf 'called' > '\(calls.path)'\nprintf '{}' > \"$CODEX_HOME/auth.json\"\n".utf8).write(to: fakeCodex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+        let launch = try CodexLoginLauncher.prepareStandaloneLogin(
+            codexPath: fakeCodex.path,
+            supportDirectory: support
+        )
+        let lock = support.appendingPathComponent(".standalone-homes.lock")
+        try FileManager.default.removeItem(at: lock)
+        try FileManager.default.createSymbolicLink(at: lock, withDestinationURL: target)
+
+        XCTAssertEqual(try runCommand(launch.commandFile), 73)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path))
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "keep")
+        let attributes = try FileManager.default.attributesOfItem(atPath: target.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o644)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: launch.successMarker.path))
+    }
+
+    func testPreparedCommandRejectsFIFOHomesLockWithoutBlocking() throws {
+        let support = try makeTemporaryDirectory()
+        let fakeCodex = support.appendingPathComponent("fake-codex")
+        let calls = support.appendingPathComponent("calls")
+        try Data("#!/bin/bash\nprintf 'called' > '\(calls.path)'\nprintf '{}' > \"$CODEX_HOME/auth.json\"\n".utf8).write(to: fakeCodex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+        let launch = try CodexLoginLauncher.prepareStandaloneLogin(
+            codexPath: fakeCodex.path,
+            supportDirectory: support
+        )
+        let lock = support.appendingPathComponent(".standalone-homes.lock")
+        try FileManager.default.removeItem(at: lock)
+        let makeFIFO = Process()
+        makeFIFO.executableURL = URL(fileURLWithPath: "/usr/bin/mkfifo")
+        makeFIFO.arguments = [lock.path]
+        try makeFIFO.run()
+        makeFIFO.waitUntilExit()
+        XCTAssertEqual(makeFIFO.terminationStatus, 0)
+
+        XCTAssertEqual(try runCommand(launch.commandFile), 73)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: launch.successMarker.path))
     }
 
     func testFailedStandaloneLoginPreservesHomeWithoutSuccessMarker() throws {

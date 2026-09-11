@@ -53,6 +53,10 @@ public enum CodexLoginLauncher {
         let quotedMarkerPath = shellQuote(homeURL.appendingPathComponent(successMarkerName).path)
         let quotedAuthPath = shellQuote(homeURL.appendingPathComponent("auth.json").path)
         let quotedAttemptPath = shellQuote(homeURL.appendingPathComponent(".codexswap-login-started").path)
+        let quotedLockPath = shellQuote(
+            homeURL.deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent(".standalone-homes.lock").path
+        )
         return """
         #!/usr/bin/env bash
         set -u
@@ -86,18 +90,34 @@ public enum CodexLoginLauncher {
             exit 1
         fi
 
-        \(quotedCodexPath) login -c 'cli_auth_credentials_store="file"'
+        /usr/bin/perl -MFcntl=:flock,O_CREAT,O_EXCL,O_WRONLY,O_RDWR,O_NONBLOCK,O_NOFOLLOW -e '
+          my ($lock, $auth, $marker, $codex) = splice(@ARGV, 0, 4);
+          sysopen(my $lock_handle, $lock, O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW, 0600) or exit 73;
+          my @lock_stat = stat($lock_handle);
+          exit 73 unless @lock_stat && (($lock_stat[2] & 0170000) == 0100000) && $lock_stat[3] == 1 && $lock_stat[4] == $<;
+          chmod 0600, $lock_handle or exit 73;
+          flock($lock_handle, LOCK_EX) or exit 73;
+          system {$codex} $codex, "login", "-c", q{cli_auth_credentials_store="file"};
+          my $status = $? == -1 ? 127 : $? >> 8;
+          if ($status == 0 && -f $auth && !-l $auth) {
+            sysopen(my $marker_handle, $marker, O_WRONLY | O_CREAT | O_EXCL, 0600) or exit 74;
+            print {$marker_handle} "completed\\n" or exit 74;
+            close($marker_handle) or exit 74;
+          } elsif ($status == 0) {
+            $status = 1;
+          }
+          exit $status;
+        ' \(quotedLockPath) \(quotedAuthPath) \(quotedMarkerPath) \(quotedCodexPath)
         status=$?
         if [ "$status" -eq 0 ] && [ -f \(quotedAuthPath) ] && [ ! -L \(quotedAuthPath) ]; then
-            if ! (umask 077; printf 'completed\n' > \(quotedMarkerPath) && chmod 600 \(quotedMarkerPath)); then
-                status=1
-                printf '\nCodex login completed but its success marker could not be written. No account was imported.\n'
-            else
-                printf '\nCodex login succeeded. Standalone credentials are stored in %s. Return to CodexSwap and choose Rescan Accounts.\n' "$CODEX_HOME"
-            fi
+            printf '\nCodex login succeeded. Standalone credentials are stored in %s. Return to CodexSwap and choose Rescan Accounts.\n' "$CODEX_HOME"
         elif [ "$status" -eq 0 ]; then
             status=1
             printf '\nCodex login finished without an auth bundle. No account was imported; retry and choose Rescan Accounts.\n'
+        elif [ "$status" -eq 73 ]; then
+            printf '\nCodex login could not lock its private home. No account was imported.\n'
+        elif [ "$status" -eq 74 ]; then
+            printf '\nCodex login completed but its success marker could not be written. No account was imported.\n'
         else
             printf '\nCodex login exited with status %s. Its private home was preserved, but no account was imported. Return to CodexSwap and choose Rescan Accounts after retrying.\n' "$status"
         fi
@@ -124,6 +144,8 @@ public enum CodexLoginLauncher {
         let homesDirectory = trustedSupportDirectory.appendingPathComponent(standaloneHomesDirectoryName, isDirectory: true)
         do {
             try ensureDirectory(trustedSupportDirectory, permissions: 0o700, fileManager: fileManager)
+            let homesLock = try StandaloneHomesLock.acquire(supportDirectory: trustedSupportDirectory)
+            defer { homesLock.release() }
             try ensureDirectory(homesDirectory, permissions: 0o700, fileManager: fileManager)
 
             var homePath: URL?

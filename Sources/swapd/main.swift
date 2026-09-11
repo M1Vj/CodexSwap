@@ -48,11 +48,15 @@ case "import":
         print("imported CodexBar-managed account: \(acc.alias) <\(acc.email)> plan=\(acc.planType ?? "?")")
         added += 1
     }
-    for acc in importer.newestCodexAuthAccounts(supportDirectory: AppPaths.supportDir()) {
-        await store.upsert(acc)
+    let imported = await importer.importNewestCodexAuthAccounts(
+        into: store,
+        supportDirectory: AppPaths.supportDir()
+    )
+    for acc in imported ?? [] {
         print("imported existing account: \(acc.alias) <\(acc.email)>")
         added += 1
     }
+    if imported == nil { print("standalone account import skipped: account homes are busy or unavailable") }
     print("done, \(added) account(s) processed. total: \(await store.all().count)")
 
 case "list":

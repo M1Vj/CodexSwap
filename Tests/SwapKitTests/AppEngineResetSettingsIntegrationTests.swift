@@ -251,7 +251,7 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(ordering.values().first, "settings-published")
     }
 
-    func testImportedAccountAndRemovalEachPublishAndScheduleRefresh() async throws {
+    func testImportedAccountPublishesAndSchedulesRefresh() async throws {
         let fixture = try await makeFixture(availableCount: 1)
         let events = ResetSettingsEventCounter()
         await fixture.engine.setEventHandler { event in
@@ -264,12 +264,8 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         let importedSnapshot = await fixture.engine.snapshot()
         XCTAssertTrue(importedSnapshot.accounts.contains { $0.alias == "imported" })
 
-        await fixture.engine.remove("imported")
-        await waitUntil { events.value() >= 4 }
-        let removedSnapshot = await fixture.engine.snapshot()
         let fetchCount = await fixture.service.creditFetchCount()
-        XCTAssertFalse(removedSnapshot.accounts.contains { $0.alias == "imported" })
-        XCTAssertGreaterThanOrEqual(fetchCount, 2)
+        XCTAssertGreaterThanOrEqual(fetchCount, 1)
     }
 
     func testGenericSnapshotDoesNotFetchResetCredits() async throws {

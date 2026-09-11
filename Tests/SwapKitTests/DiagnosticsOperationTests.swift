@@ -88,15 +88,15 @@ final class DiagnosticsOperationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let blockedParent = root.appendingPathComponent("blocked")
         try Data("not-a-directory".utf8).write(to: blockedParent)
-        let before = DiagnosticsLog.shared.snapshot().records.count
+        let beforeIDs = Set(DiagnosticsLog.shared.snapshot().records.map(\.id))
         let store = AccountStore(url: blockedParent.appendingPathComponent("accounts.json"))
 
         await store.upsert(Account(alias: "synthetic"))
 
         let records = DiagnosticsLog.shared.snapshot().records
-        XCTAssertGreaterThan(records.count, before)
-        XCTAssertTrue(records.suffix(from: min(before, records.count)).contains {
-            $0.component == .accounts && $0.operation == .persistence
+        XCTAssertTrue(records.contains {
+            !beforeIDs.contains($0.id)
+                && $0.component == .accounts && $0.operation == .persistence
                 && $0.outcome == .failed && $0.code == .io
         })
     }
