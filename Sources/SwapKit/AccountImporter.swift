@@ -68,17 +68,26 @@ public enum AccountImporter {
     public static func codexBarAccounts(_ managedAccounts: [CodexBarBridge.ManagedAccount]) -> [Account] {
         managedAccounts.compactMap { managed in
             guard let tokens = CodexBarBridge.readTokens(home: managed.managedHomePath) else { return nil }
-            let claimedID = JWT.identity(fromAccessToken: tokens.accessToken).accountID ?? tokens.accountId
-            guard !managed.accountID.isEmpty, claimedID == managed.accountID,
-                  tokens.accountId.isEmpty || tokens.accountId == managed.accountID else { return nil }
+            guard !managed.accountID.isEmpty, managedCredentialBundleIsValid(tokens) else { return nil }
             let hint = managed.email.split(separator: "@").first.map(String.init)
-            return account(
+            var imported = account(
                 from: tokens,
                 aliasHint: hint,
                 managedHomePath: managed.managedHomePath,
                 credentialSource: AccountCredentialSource(kind: .managedHome, path: managed.managedHomePath)
             )
+            imported.accountID = managed.accountID
+            return imported
         }
+    }
+
+    static func managedCredentialBundleIsValid(_ tokens: CodexTokens, now: Date = Date()) -> Bool {
+        guard !tokens.accessToken.isEmpty, !tokens.refreshToken.isEmpty,
+              let expiry = JWT.expiry(tokens.accessToken), expiry > now else { return false }
+        let claimedID = JWT.identity(fromAccessToken: tokens.accessToken).accountID
+        let credentialAccountID = claimedID ?? (tokens.accountId.isEmpty ? nil : tokens.accountId)
+        guard let credentialAccountID, !credentialAccountID.isEmpty else { return false }
+        return tokens.accountId.isEmpty || tokens.accountId == credentialAccountID
     }
 
     static func alias(fromEmail email: String, accountId: String) -> String {

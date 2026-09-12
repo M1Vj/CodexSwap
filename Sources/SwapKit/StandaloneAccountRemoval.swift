@@ -35,6 +35,45 @@ final class StandaloneHomesLock: @unchecked Sendable {
         supportDirectory: URL,
         timeout: TimeInterval = 5
     ) throws -> StandaloneHomesLock {
+        let (descriptor, support) = try openLock(supportDirectory: supportDirectory)
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            guard errno == EWOULDBLOCK || errno == EAGAIN, Date() < deadline else {
+                close(descriptor)
+                throw StandaloneAccountRemovalError.busy
+            }
+            usleep(10_000)
+        }
+        return StandaloneHomesLock(descriptor: descriptor, supportDirectory: support)
+    }
+
+    static func acquireAsync(
+        supportDirectory: URL,
+        timeout: TimeInterval = 5
+    ) async throws -> StandaloneHomesLock {
+        try Task.checkCancellation()
+        let (descriptor, support) = try openLock(supportDirectory: supportDirectory)
+        var handedOff = false
+        defer {
+            if !handedOff { close(descriptor) }
+        }
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while true {
+            try Task.checkCancellation()
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                try Task.checkCancellation()
+                handedOff = true
+                return StandaloneHomesLock(descriptor: descriptor, supportDirectory: support)
+            }
+            let lockError = errno
+            guard (lockError == EWOULDBLOCK || lockError == EAGAIN), Date() < deadline else {
+                throw StandaloneAccountRemovalError.busy
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private static func openLock(supportDirectory: URL) throws -> (Int32, URL) {
         let support = supportDirectory.standardizedFileURL
         if !FileManager.default.fileExists(atPath: support.path) {
             do {
@@ -65,15 +104,7 @@ final class StandaloneHomesLock: @unchecked Sendable {
             close(descriptor)
             throw StandaloneAccountRemovalError.untrustedSource
         }
-        let deadline = Date().addingTimeInterval(max(0, timeout))
-        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
-            guard errno == EWOULDBLOCK || errno == EAGAIN, Date() < deadline else {
-                close(descriptor)
-                throw StandaloneAccountRemovalError.busy
-            }
-            usleep(10_000)
-        }
-        return StandaloneHomesLock(descriptor: descriptor, supportDirectory: support)
+        return (descriptor, support)
     }
 
     private static func isPrivateOwnedDirectory(_ url: URL) -> Bool {
@@ -123,6 +154,23 @@ enum StandaloneAccountRemoval {
         return auth.lastPathComponent == "auth.json"
             && UUID(uuidString: home.lastPathComponent) != nil
             && home.deletingLastPathComponent() == homes
+    }
+
+    static func verifiedAuthURL(_ account: Account, supportDirectory: URL) -> URL? {
+        guard ownsCredentialSource(account, supportDirectory: supportDirectory),
+              let rawPath = account.credentialSource?.path else { return nil }
+        let support = supportDirectory.standardizedFileURL
+        let homes = support.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+        let auth = URL(fileURLWithPath: rawPath).standardizedFileURL
+        let home = auth.deletingLastPathComponent()
+        let marker = home.appendingPathComponent(CodexLoginLauncher.successMarkerName)
+        guard isPrivateDirectory(support, fileManager: .default),
+              isPrivateDirectory(homes, fileManager: .default),
+              isPrivateDirectory(home, fileManager: .default),
+              isPrivateRegularFile(marker, maximumSize: 64, fileManager: .default),
+              boundedRead(marker, maximumSize: 64) == Data("completed\n".utf8),
+              isPrivateRegularFile(auth, maximumSize: 1_048_576, fileManager: .default) else { return nil }
+        return auth
     }
 
     static func quarantineHomes(

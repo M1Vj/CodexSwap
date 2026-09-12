@@ -297,7 +297,8 @@ final class ManagedAuthRecoveryTests: XCTestCase {
         routingLog: RoutingDecisionLog? = nil,
         sink: ProxyEventSink = NullEventSink(),
         settingsProvider: @escaping @Sendable () async -> Settings = { .default },
-        automaticQuotaReset: @escaping @Sendable (String) async -> ResetAttemptResult = { _ in .automaticDisabled }
+        automaticQuotaReset: @escaping @Sendable (String) async -> ResetAttemptResult = { _ in .automaticDisabled },
+        standaloneCredentialRenewal: @escaping @Sendable (Account, Bool) async -> StandaloneCredentialRenewalResult = { _, _ in .notOwned }
     ) -> ProxyServer {
         var config = ProxyServer.Config()
         config.upstream = endpoint
@@ -310,8 +311,66 @@ final class ManagedAuthRecoveryTests: XCTestCase {
             automaticQuotaReset: automaticQuotaReset,
             freshAlternative: freshAlternative,
             sink: sink,
-            routingLog: routingLog ?? RoutingDecisionLog(url: root.appendingPathComponent("routing-\(UUID().uuidString).jsonl"))
+            routingLog: routingLog ?? RoutingDecisionLog(url: root.appendingPathComponent("routing-\(UUID().uuidString).jsonl")),
+            standaloneCredentialRenewal: standaloneCredentialRenewal
         )
+    }
+
+    func testStandaloneUnauthorizedRefreshesOwnedCredentialAndRetriesOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("standalone-auth-retry-\(UUID().uuidString)")
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let homes = support.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+        let home = homes.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        for directory in [support, homes, home] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+        let marker = home.appendingPathComponent(CodexLoginLauncher.successMarkerName)
+        try Data("completed\n".utf8).write(to: marker)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: marker.path)
+        let initial = tokens("standalone-old", expiry: Date().addingTimeInterval(3_600), accountID: "standalone-account")
+        let refreshed = tokens("standalone-new", expiry: Date().addingTimeInterval(7_200), accountID: "standalone-account")
+        let authURL = home.appendingPathComponent("auth.json")
+        try CodexAuth.write(initial, to: authURL)
+        let account = Account(
+            alias: "standalone",
+            accountID: initial.accountId,
+            accessToken: initial.accessToken,
+            refreshToken: initial.refreshToken,
+            idToken: initial.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: authURL.path)
+        )
+        let store = await makeStore(root: root, account: account)
+        let upstream = ManagedAuthHTTPServer { request in
+            let expected = "Bearer \(refreshed.accessToken)"
+            return ManagedAuthResponse(
+                statusCode: request.headers["authorization"] == expected ? 200 : 401,
+                body: Data((request.headers["authorization"] == expected ? "{}" : #"{"error":{"code":"token_revoked"}}"#).utf8)
+            )
+        }
+        let endpoint = try await upstream.start()
+        let renewal = StandaloneCredentialRenewal(supportDirectory: support) { _ in refreshed }
+        let proxy = makeProxy(
+            store: store,
+            endpoint: endpoint,
+            root: root,
+            standaloneCredentialRenewal: { account, force in
+                await renewal.renew(account, store: store, force: force)
+            }
+        )
+        addTeardownBlock {
+            await proxy.stop()
+            await upstream.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try await proxy.start()
+
+        let result = try await proxyRequest(port: try await requirePort(proxy))
+
+        XCTAssertEqual(result.0, 200)
+        let stored = await store.account("standalone")
+        XCTAssertEqual(stored?.accessToken, refreshed.accessToken)
+        XCTAssertEqual(try CodexAuth.read(authURL).tokens?.refreshToken, refreshed.refreshToken)
     }
 
     func testStaleQuarantineSnapshotRetriesFreshCredentialWithoutNeedsLoginEvent() async throws {

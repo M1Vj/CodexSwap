@@ -277,6 +277,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var alias: String
     public var email: String
     public var accountID: String
+    public var credentialAccountID: String?
     public var planType: String?
     public var accessToken: String
     public var refreshToken: String
@@ -312,6 +313,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         alias: String,
         email: String = "",
         accountID: String = "",
+        credentialAccountID: String? = nil,
         planType: String? = nil,
         accessToken: String = "",
         refreshToken: String = "",
@@ -333,6 +335,9 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.alias = alias
         self.email = email
         self.accountID = accountID
+        self.credentialAccountID = credentialAccountID
+            ?? JWT.identity(fromAccessToken: accessToken).accountID
+            ?? (accountID.isEmpty ? nil : accountID)
         self.planType = planType
         self.accessToken = accessToken
         self.refreshToken = refreshToken
@@ -357,7 +362,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case alias, email, accountID, planType, accessToken, refreshToken, idToken, priority
+        case alias, email, accountID, credentialAccountID, planType, accessToken, refreshToken, idToken, priority
         case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, credentialSource, routingEnabled
         case usageStats, usageHistory, lastServedByUs, archivedAt, routingPausedAt, telemetryID
         case usageLimitSettings, authGeneration
@@ -370,6 +375,9 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         accountID = try c.decodeIfPresent(String.self, forKey: .accountID) ?? ""
         planType = try c.decodeIfPresent(String.self, forKey: .planType)
         accessToken = try c.decodeIfPresent(String.self, forKey: .accessToken) ?? ""
+        credentialAccountID = try c.decodeIfPresent(String.self, forKey: .credentialAccountID)
+            ?? JWT.identity(fromAccessToken: accessToken).accountID
+            ?? (accountID.isEmpty ? nil : accountID)
         refreshToken = try c.decodeIfPresent(String.self, forKey: .refreshToken) ?? ""
         idToken = try c.decodeIfPresent(String.self, forKey: .idToken) ?? ""
         // Persisted ranks are dense ordinals (N…1), so they may exceed the
@@ -398,7 +406,12 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     }
 
     public var tokens: CodexTokens {
-        CodexTokens(idToken: idToken, accessToken: accessToken, refreshToken: refreshToken, accountId: accountID)
+        CodexTokens(
+            idToken: idToken,
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            accountId: credentialAccountID ?? accountID
+        )
     }
 
     /// Latest future cooldown across all limit windows, if any.

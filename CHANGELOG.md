@@ -23,10 +23,12 @@ All notable changes to CodexSwap are documented here. The format follows [Keep a
 ### Fixed
 
 - Rescanning can clear stale authentication blocks after read-only validation against the established credential source; concurrent invalidation and routing controls remain protected.
-- New standalone Terminal logins use separate private Codex homes and file credential storage. Only successful, validated login sources are imported; existing native and CodexBar sessions are not copied or migrated. This is login isolation, not unattended renewal.
+- New standalone Terminal logins use separate private Codex homes and file credential storage. Only successful, validated login sources are imported; existing native and CodexBar sessions are not copied or migrated. Verified CodexSwap-owned homes now persist rotated OAuth tokens under a cross-process lock.
 - Malformed or unreadable CodexBar rosters no longer authorize managed-account removal. Synchronization uses a single validated snapshot.
 - Authentication diagnostics retain closed error categories and timestamps without credentials, aliases, or provider bodies. Notifications no longer claim a stored authentication flag proves the account was signed out.
 - Imported OAuth credentials are now read-only: the proxy no longer competes with native Codex refresh or overwrites CodexBar-managed auth files. Matching owner updates are read through; unavailable renewal reports HTTP 503 instead of a false sign-out. Renewal still requires the credential owner.
+- CodexBar's explicitly selected workspace now overrides the token bundle's default workspace for routing, while a separate credential identity continues to reject swapped or inconsistent managed auth files. When that selected workspace changes, CodexSwap discards quota and cooldown state from the retired workspace and requires a fresh verified usage read before routing it.
+- Standalone accounts now renew expired or rejected access tokens only inside their verified CodexSwap-owned private home, atomically preserve rotated refresh tokens and unknown auth fields, and retry the failed request once without touching CodexBar or ambient Codex credentials.
 - Menu selection distinguishes the last routed account from the default for new tasks, and served activity is updated before notifying the menu.
 - Stable thread/session metadata preserves eligible same-task account affinity across changing turn metadata. This reduces unnecessary switching but does not guarantee cache savings.
 - Repeated "Account needs sign-in" notifications every poll cycle: periodic CodexBar imports no longer clear the logged-out flag, sign-in reminders fire once per logged-out episode until the account recovers or is removed, and manual switching resets the reminder state.

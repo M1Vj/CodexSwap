@@ -21,10 +21,13 @@ public struct TokenRefresher: Sendable {
 
     public func refresh(refreshToken: String) async throws -> CodexTokens {
         guard !refreshToken.isEmpty else { throw RefreshError.missingRefreshToken }
-        var req = URLRequest(url: url)
+        var req = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 30
+        )
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 30
         let body: [String: String] = [
             "client_id": Self.clientID,
             "grant_type": "refresh_token",
@@ -35,7 +38,12 @@ public struct TokenRefresher: Sendable {
         let (data, response) = try await session.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw RefreshError.malformed }
         guard http.statusCode == 200 else {
-            if let code = Self.errorCode(data), ["refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"].contains(code) {
+            if let code = Self.errorCode(data), [
+                "invalid_grant",
+                "refresh_token_expired",
+                "refresh_token_reused",
+                "refresh_token_invalidated",
+            ].contains(code) {
                 throw RefreshError.sessionInvalidated
             }
             if http.statusCode == 401 { throw RefreshError.sessionInvalidated }
@@ -55,6 +63,7 @@ public struct TokenRefresher: Sendable {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         if let err = obj["error"] as? [String: Any], let code = err["code"] as? String { return code }
         if let code = obj["error"] as? String { return code }
+        if let code = obj["code"] as? String { return code }
         return nil
     }
 }

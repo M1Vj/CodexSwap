@@ -140,7 +140,7 @@ public enum CodexBarBridge {
                 workspaceAccountID = nil
             }
 
-            guard let accountID = providerAccountID ?? workspaceAccountID,
+            guard let accountID = workspaceAccountID ?? providerAccountID,
                   !accountID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .failure(.invalidEntry) }
             accountIDs.insert(accountID)
 

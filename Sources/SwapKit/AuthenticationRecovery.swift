@@ -20,21 +20,37 @@ enum AuthenticationRecovery {
         let url = source.kind == .managedHome
             ? URL(fileURLWithPath: path).appendingPathComponent("auth.json")
             : URL(fileURLWithPath: path)
-        guard let file = try? CodexAuth.read(url), let tokens = file.tokens,
-              tokens.accountId.isEmpty || tokens.accountId == account.accountID else { return nil }
-        return AccountImporter.account(from: tokens, aliasHint: account.alias,
-                                       managedHomePath: account.managedHomePath, credentialSource: source)
+        guard let file = try? CodexAuth.read(url), let tokens = file.tokens else { return nil }
+        var candidate: Account
+        if source.kind == .managedHome {
+            guard AccountImporter.managedCredentialBundleIsValid(tokens) else { return nil }
+            candidate = AccountImporter.account(from: tokens, aliasHint: account.alias,
+                                                managedHomePath: account.managedHomePath, credentialSource: source)
+            candidate.accountID = account.accountID
+        } else {
+            guard tokens.accountId.isEmpty || tokens.accountId == account.accountID else { return nil }
+            candidate = AccountImporter.account(from: tokens, aliasHint: account.alias,
+                                                managedHomePath: account.managedHomePath, credentialSource: source)
+        }
+        return candidate
     }
 
     static func accepts(_ candidate: Account, for current: Account, now: Date = Date()) -> Bool {
-        let identity = JWT.identity(fromAccessToken: candidate.accessToken).accountID
+        let currentSource = source(for: current)
+        let candidateIdentity = JWT.identity(fromAccessToken: candidate.accessToken).accountID
+        let identityMatches = if currentSource?.kind == .managedHome {
+            candidate.credentialAccountID == current.credentialAccountID
+                && candidateIdentity == candidate.credentialAccountID
+        } else {
+            candidateIdentity == current.accountID
+        }
         return current.needsLogin && current.routingEnabled && !current.isArchived
             && current.routingPausedAt == nil && !current.accountID.isEmpty
             && candidate.accountID == current.accountID
-            && (identity ?? candidate.accountID) == current.accountID
+            && identityMatches
             && !candidate.accessToken.isEmpty && !candidate.refreshToken.isEmpty
             && (JWT.expiry(candidate.accessToken) ?? .distantPast) > now
-            && source(for: current) != nil && source(for: candidate) == source(for: current)
+            && currentSource != nil && source(for: candidate) == currentSource
     }
 
     static func recoverFromSource(alias: String, store: AccountStore,

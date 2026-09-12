@@ -48,6 +48,119 @@ Additional primary sources checked September 8:
 - Fresh-login revocation report: `https://github.com/openai/codex/issues/42581`
 - Retracted competing-client diagnosis: `https://github.com/openai/codex/issues/31459#issuecomment-5353509721`
 
+## September 12 CodexBar 0.59 workspace and standalone renewal repair
+
+The installed CodexBar is 0.59.0 build 142. Its current managed-account model
+defines `workspaceAccountID` as the explicitly selected remote workspace and
+uses `providerAccountID` only as a legacy fallback. The source also states that
+the managed auth file may name a different default workspace. CodexSwap had the
+precedence reversed and rejected a managed credential unless the token's
+default workspace equaled the selected workspace. That combination could omit
+the freshly logged-in CodexBar record while leaving an older CodexSwap record,
+usage reading, or credential source visible under the same account label.
+
+The correction keeps two identities separate: `accountID` is the workspace sent
+in `ChatGPT-Account-Id`, while `credentialAccountID` is the OAuth bundle owner
+used to detect a swapped or mismatched auth file. CodexBar roster reconciliation,
+read-through hydration, verified recovery, persistence, and conditional
+quarantine now retain both identities. A selected workspace can differ from the
+token's default workspace without weakening the credential-owner check. When a
+roster entry migrates from a retired workspace identity, CodexSwap preserves
+user-owned routing controls but clears workspace-scoped usage, cooldown, and
+history state and keeps the account blocked until a fresh verified quota read.
+
+Standalone login had a separate lifecycle defect. `ProxyServer` accepted a
+`TokenRefresher` but discarded it, so a CodexSwap-owned standalone account could
+never renew after its first access token expired. The repair enables refresh
+only for a verified CodexSwap standalone home: private owned directories, UUID
+home, success marker, exact source path, matching credential identity, and the
+cross-process standalone-home lock are required. Rotated access, refresh, and ID
+tokens are atomically written back to that same owned auth document while
+preserving unknown fields, then committed to the account store. CodexBar,
+ambient native Codex, and legacy sources remain read-only. A 401 gets one owned
+refresh and one retry; a second 401 is quarantined instead of looping.
+
+The official Codex source is the authority for the refresh request. Its current
+`RefreshRequest` sends `client_id`, `grant_type`, and `refresh_token`, without a
+`scope` field, and persists returned rotated tokens plus `last_refresh`. CodexBar's
+generic helper includes `scope`, but its active native strategy deliberately
+defers shared credential renewal to the owning Codex process. CodexSwap therefore
+uses the official request shape and applies it only to its exclusively owned
+standalone homes.
+
+The privacy-safe live snapshot for `alyy2` on September 12 did not report a
+sign-out: `needsLogin` was false. It reported a 100% weekly window and a cooldown
+through the recorded reset, so the current installed build considered that
+record quota-ineligible. That snapshot does not prove the reading belongs to the
+same CodexBar-selected workspace; the reversed workspace precedence is the
+confirmed local defect that could make those states diverge. No live credential
+or raw account identifier was inspected during this diagnosis.
+
+Focused synthetic coverage verifies selected-workspace precedence, distinct
+credential identity, mismatch rejection, managed rotation, standalone-only
+ownership, unknown-field preservation, one refresh across concurrent callers,
+rotated-token persistence, invalid-grant classification, and a successful
+401-refresh-retry sequence. These tests do not prove that every provider-side
+`token_revoked` incident is local: upstream issues #40918, #41171, and #42581
+document similar first-interaction failures outside CodexSwap.
+
+### Observable scenarios
+
+```gherkin
+Scenario: CodexBar selects a workspace different from the token default
+  Given a valid managed OAuth bundle for its default workspace
+  And the CodexBar roster selects another workspace
+  When CodexSwap reconciles and routes the account
+  Then it sends the selected workspace header
+  And it still validates rotations against the credential owner
+```
+
+Passed with synthetic roster, hydration, recovery, and migration tests.
+
+```gherkin
+Scenario: A CodexSwap-owned standalone access token is rejected
+  Given a verified private standalone home
+  When the first upstream request returns 401
+  Then CodexSwap persists one rotated refresh bundle under the shared lock
+  And retries the original request once
+  And a second 401 ends without another refresh loop
+```
+
+The refresh and successful retry paths passed synthetic tests. The second-401
+quarantine is covered by the existing bounded retry behavior; no live account
+was intentionally forced to reject a refreshed credential.
+
+```gherkin
+Scenario: A CodexBar or ambient native credential needs renewal
+  Given the credential source is not a verified CodexSwap standalone home
+  When CodexSwap sees expiry or 401
+  Then it does not redeem or write that source's refresh token
+```
+
+Passed with external-source ownership and proxy no-refresh regressions.
+
+```gherkin
+Scenario: The reported alyy2 login is reconciled after installation
+  Given the current installed build reports authenticated but quota-ineligible state
+  When the repaired build starts and performs a fresh managed-workspace sync
+  Then obsolete identity state is migrated without an alias suffix
+  And a fresh quota read determines routing eligibility
+```
+
+Not tested against the live account before installation. Installation validation
+must use only the sanitized agent status and quota surfaces.
+
+Primary sources checked September 12:
+
+- CodexBar managed workspace semantics: `https://github.com/steipete/CodexBar/blob/8b254dbec11ddd5c5547878d9640e4e965306c71/Sources/CodexBarCore/CodexManagedAccounts.swift`
+- CodexBar workspace header use: `https://github.com/steipete/CodexBar/blob/8b254dbec11ddd5c5547878d9640e4e965306c71/Sources/CodexBarCore/Providers/Codex/CodexOAuth/CodexOAuthUsageFetcher.swift`
+- CodexBar refresh helper and error mapping: `https://github.com/steipete/CodexBar/blob/8b254dbec11ddd5c5547878d9640e4e965306c71/Sources/CodexBarCore/Providers/Codex/CodexOAuth/CodexTokenRefresher.swift`
+- Official Codex refresh request and persistence: `https://github.com/openai/codex/blob/aee8a55ab6010f1d53e741edec74dbcffa07bcfe/codex-rs/login/src/auth/manager.rs`
+- Official Codex auth storage model: `https://github.com/openai/codex/blob/aee8a55ab6010f1d53e741edec74dbcffa07bcfe/codex-rs/login/src/auth/storage.rs`
+- Fresh-login immediate revocation report: `https://github.com/openai/codex/issues/42581`
+- First-message sign-out report: `https://github.com/openai/codex/issues/40918`
+- First-interaction refresh invalidation report: `https://github.com/openai/codex/issues/41171`
+
 ## Stale-response quarantine guard
 
 A deterministic local fixture reproduced a separate race: after the proxy checked

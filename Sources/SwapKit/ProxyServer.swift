@@ -752,6 +752,7 @@ public actor ProxyServer {
     private let sink: ProxyEventSink
     private let exhaustionHandler: ExhaustionPolicyHandler
     private let freshAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?
+    private let standaloneCredentialRenewal: @Sendable (Account, Bool) async -> StandaloneCredentialRenewalResult
     private let telemetry: UsageTelemetryStore?
     private let routingLog: RoutingDecisionLog
     private let config: Config
@@ -812,7 +813,8 @@ public actor ProxyServer {
         sink: ProxyEventSink = NullEventSink(),
         verbose: Bool = false,
         telemetry: UsageTelemetryStore? = nil,
-        routingLog: RoutingDecisionLog? = nil
+        routingLog: RoutingDecisionLog? = nil,
+        standaloneCredentialRenewal: @escaping @Sendable (Account, Bool) async -> StandaloneCredentialRenewalResult = { _, _ in .notOwned }
     ) {
         self.routingEnabledProvider = routingEnabledProvider
         self.store = store
@@ -821,6 +823,7 @@ public actor ProxyServer {
         self.settingsProvider = settingsProvider
         self.exhaustionHandler = ExhaustionPolicyHandler(reset: automaticQuotaReset)
         self.freshAlternative = freshAlternative
+        self.standaloneCredentialRenewal = standaloneCredentialRenewal
         self.sink = sink
         self.telemetry = telemetry
         self.routingLog = routingLog ?? RoutingDecisionLog()
@@ -1481,6 +1484,19 @@ public actor ProxyServer {
             // Read the selected external source before judging its token.
             if let hydrated = await store.hydrateFromManagedHome(account.alias) { account = hydrated }
             if accessTokenExpired(account.accessToken) {
+                switch await self.standaloneCredentialRenewal(account, false) {
+                case .renewed(let renewed):
+                    account = renewed
+                    tokenRefreshed = true
+                    await self.recordAuthDecision(.authRecovery, reason: .ownerRecovered, account: renewed,
+                                                  rootRequestID: rootRequestID, attemptIndex: attemptIndex)
+                case .invalidated:
+                    _ = await store.markNeedsLoginOnlyIfCurrent(account)
+                case .notOwned, .unavailable:
+                    break
+                }
+            }
+            if accessTokenExpired(account.accessToken) {
                 await self.recordAuthDecision(.authFailure, reason: .expiredAccessToken, account: account,
                                               rootRequestID: rootRequestID, attemptIndex: attemptIndex)
                 return try await self.renewalRequired(
@@ -1593,8 +1609,24 @@ public actor ProxyServer {
                         finalReplay: finalReplay
                     )
                 }
+                var standaloneRefreshInvalidated = false
+                switch await self.standaloneCredentialRenewal(account, true) {
+                case .renewed(let renewed):
+                    await self.recordAuthDecision(.authRecovery, reason: .ownerRecovered, account: renewed,
+                                                  rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
+                    return .retry(
+                        account: renewed,
+                        tokenRefreshed: true,
+                        exhaustionHandled: exhaustionHandled,
+                        finalReplay: finalReplay
+                    )
+                case .invalidated:
+                    standaloneRefreshInvalidated = true
+                case .notOwned, .unavailable:
+                    break
+                }
                 await self.authRecoveryReadTestHook?()
-                if isSessionInvalidated(errBody) {
+                if isSessionInvalidated(errBody) || standaloneRefreshInvalidated {
                     if let reason = sessionInvalidationReason(errBody) {
                         await self.recordAuthDecision(.authFailure, reason: reason, account: account,
                                                       rootRequestID: rootRequestID, attemptIndex: attemptIndex, status: 401)
@@ -1663,6 +1695,17 @@ public actor ProxyServer {
 
             if resp.status == .unauthorized {
                 _ = try await collect(resp.body, cap: 64 * 1024)
+                let quarantine = await store.markNeedsLoginOnlyIfCurrent(account)
+                if case .quarantined = quarantine {
+                    await sink.handle(ProxyEvent.taskScoped(
+                        kind: .needsLogin,
+                        from: account.alias,
+                        to: nil,
+                        limit: nil,
+                        resetAt: nil,
+                        mode: mode
+                    ))
+                }
                 try await writeError(
                     outbound,
                     status: .serviceUnavailable,

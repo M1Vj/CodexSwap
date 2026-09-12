@@ -120,6 +120,7 @@ public actor AppEngine {
     private let settingsStore: SettingsStore
     private let usage: any UsageFetching
     private let refresher: TokenRefresher
+    private let standaloneCredentialRenewal: StandaloneCredentialRenewal
     private let configManager: CodexConfigManager
     private let warmupService: QuotaWarmupService
     private let quotaResetCoordinator: QuotaResetCoordinator
@@ -168,6 +169,10 @@ public actor AppEngine {
         self.settingsStore = settingsStore
         self.usage = usage
         self.refresher = refresher
+        self.standaloneCredentialRenewal = StandaloneCredentialRenewal(
+            supportDirectory: supportDir,
+            refresher: refresher
+        )
         self.configManager = configManager
         self.warmupService = warmupService
         self.quotaResetCoordinator = quotaResetCoordinator ?? QuotaResetCoordinator(
@@ -223,6 +228,10 @@ public actor AppEngine {
         self.settingsStore = settingsStore
         self.usage = usage
         self.refresher = refresher
+        self.standaloneCredentialRenewal = StandaloneCredentialRenewal(
+            supportDirectory: supportDir,
+            refresher: refresher
+        )
         self.configManager = configManager
         self.warmupService = warmupService
         self.quotaResetCoordinator = quotaResetCoordinator ?? QuotaResetCoordinator(
@@ -286,6 +295,8 @@ public actor AppEngine {
             _ = try? configManager.migrateLegacyBackendRouting(proxyURL: stableURL)
         }
         let automaticQuotaReset = proxyAutomaticResetHandler()
+        let standaloneRenewal = standaloneCredentialRenewal
+        let accountStore = store
         let proxy = ProxyServer(
             store: store,
             refresher: refresher,
@@ -306,7 +317,10 @@ public actor AppEngine {
             sink: sink,
             verbose: ProcessInfo.processInfo.environment["CODEXSWAP_VERBOSE"] != nil,
             telemetry: telemetry,
-            routingLog: RoutingDecisionLog(url: supportDir.appendingPathComponent(RoutingDecisionLog.defaultFileName))
+            routingLog: RoutingDecisionLog(url: supportDir.appendingPathComponent(RoutingDecisionLog.defaultFileName)),
+            standaloneCredentialRenewal: { account, force in
+                await standaloneRenewal.renew(account, store: accountStore, force: force)
+            }
         )
         do {
             try await proxy.start()
@@ -422,7 +436,9 @@ public actor AppEngine {
     }
 
     func reconcileManagedAccounts(_ accounts: [Account], presentAccountIDs: Set<String>) async {
-        for account in accounts { await store.reconcileManagedAccount(account) }
+        for account in accounts {
+            await store.reconcileManagedAccount(account, presentAccountIDs: presentAccountIDs)
+        }
         let removal = await store.reconcileManagedWithTelemetry(present: presentAccountIDs)
         needsLoginNotified.subtract(removal.removedAliases)
         for telemetryID in removal.removedTelemetryIDs {
@@ -1558,6 +1574,16 @@ public actor AppEngine {
 
     func recoverBlockedAuthentication() async {
         for account in await store.all() where account.needsLogin && account.routingEnabled && !account.isArchived {
+            let standaloneResult = await standaloneCredentialRenewal.renew(account, store: store, force: true)
+            switch standaloneResult {
+            case .renewed:
+                needsLoginNotified.remove(account.alias)
+                continue
+            case .invalidated:
+                continue
+            case .notOwned, .unavailable:
+                break
+            }
             if await AuthenticationRecovery.recoverFromSource(alias: account.alias, store: store, usage: usage) == .committed {
                 needsLoginNotified.remove(account.alias)
             }

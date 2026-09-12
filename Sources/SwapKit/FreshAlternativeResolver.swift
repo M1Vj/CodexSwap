@@ -62,9 +62,15 @@ public enum FreshAlternativeResolver {
         config: ProxyServer.Config = ProxyServer.Config(),
         settingsProvider: @escaping @Sendable () async -> Settings,
         usage: any UsageFetching = UsageClient(),
+        supportDirectory: URL = AppPaths.supportDir(),
+        refresher: TokenRefresher = TokenRefresher(),
         verbose: Bool = false
     ) -> ProxyServer {
-        ProxyServer(
+        let renewal = StandaloneCredentialRenewal(
+            supportDirectory: supportDirectory,
+            refresher: refresher
+        )
+        return ProxyServer(
             store: store,
             config: config,
             settingsProvider: settingsProvider,
@@ -76,7 +82,10 @@ public enum FreshAlternativeResolver {
                     allowedAliases: allowedAliases
                 )
             },
-            verbose: verbose
+            verbose: verbose,
+            standaloneCredentialRenewal: { account, force in
+                await renewal.renew(account, store: store, force: force)
+            }
         )
     }
 }

@@ -102,7 +102,7 @@ final class CodexBarRosterReadTests: XCTestCase {
         XCTAssertEqual(try result.get().accounts.count, 2)
     }
 
-    func testProviderIDRetainsPrecedenceOverDifferentWorkspaceID() throws {
+    func testSelectedWorkspaceIDTakesPrecedenceOverLegacyProviderID() throws {
         let file = try writeRoster(
             """
             {"accounts":[
@@ -113,7 +113,9 @@ final class CodexBarRosterReadTests: XCTestCase {
 
         let result = CodexBarBridge.readManagedAccountsSnapshot(from: file)
 
-        XCTAssertEqual(try result.get().accountIDs, ["acc-provider"])
+        let snapshot = try result.get()
+        XCTAssertEqual(snapshot.accounts.map(\.accountID), ["acc-workspace"])
+        XCTAssertEqual(snapshot.accountIDs, ["acc-workspace"])
     }
 
     func testVerifiedSnapshotCapturesIDsAndAccountsFromOneRoster() throws {

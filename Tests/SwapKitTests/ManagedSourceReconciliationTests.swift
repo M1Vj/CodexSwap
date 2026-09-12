@@ -177,15 +177,152 @@ final class ManagedSourceReconciliationTests: XCTestCase {
         XCTAssertTrue(trusted.needsLogin)
     }
 
-    func testManagedImporterRejectsRosterAndTokenIdentityMismatch() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-mismatch-\(UUID().uuidString)")
+    func testManagedImporterUsesSelectedWorkspaceWhenTokenNamesDifferentDefaultWorkspace() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-selected-workspace-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
-        try CodexAuth.write(Self.tokens("wrong", expiry: Date().addingTimeInterval(600), accountID: "wrong"),
+        try CodexAuth.write(Self.tokens("default", expiry: Date().addingTimeInterval(600), accountID: "default-workspace"),
                             to: root.appendingPathComponent("auth.json"))
         let imported = AccountImporter.codexBarAccounts([
-            CodexBarBridge.ManagedAccount(email: "", accountID: "expected", managedHomePath: root.path)
+            CodexBarBridge.ManagedAccount(email: "", accountID: "selected-workspace", managedHomePath: root.path)
         ])
+
+        XCTAssertEqual(imported.count, 1)
+        XCTAssertEqual(imported.first?.accountID, "selected-workspace")
+        XCTAssertEqual(imported.first?.managedHomePath, root.path)
+    }
+
+    func testManagedImporterRejectsInternallyInconsistentTokenIdentity() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-token-mismatch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        var tokens = Self.tokens("wrong", expiry: Date().addingTimeInterval(600), accountID: "jwt-workspace")
+        tokens.accountId = "auth-file-workspace"
+        try CodexAuth.write(tokens, to: root.appendingPathComponent("auth.json"))
+        let imported = AccountImporter.codexBarAccounts([
+            CodexBarBridge.ManagedAccount(email: "", accountID: "selected-workspace", managedHomePath: root.path)
+        ])
+
         XCTAssertTrue(imported.isEmpty)
+    }
+
+    func testManagedHydrationPreservesSelectedWorkspaceAcrossDefaultTokenRotation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-workspace-hydration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let oldTokens = Self.tokens("old", expiry: Date().addingTimeInterval(60), accountID: "default-workspace")
+        let newTokens = Self.tokens("new", expiry: Date().addingTimeInterval(600), accountID: "default-workspace")
+        try CodexAuth.write(newTokens, to: home.appendingPathComponent("auth.json"))
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "managed",
+            accountID: "selected-workspace",
+            accessToken: oldTokens.accessToken,
+            refreshToken: oldTokens.refreshToken,
+            idToken: oldTokens.idToken,
+            managedHomePath: home.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: home.path)
+        ))
+
+        let hydrated = await store.hydrateFromManagedHome("managed")
+
+        XCTAssertEqual(hydrated?.accountID, "selected-workspace")
+        XCTAssertEqual(hydrated?.accessToken, newTokens.accessToken)
+        XCTAssertEqual(hydrated?.refreshToken, newTokens.refreshToken)
+    }
+
+    func testManagedRecoveryUsesSelectedWorkspaceWithoutChangingCredentialOwner() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-workspace-recovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let oldTokens = Self.tokens("old", expiry: Date().addingTimeInterval(60), accountID: "default-workspace")
+        let newTokens = Self.tokens("new", expiry: Date().addingTimeInterval(600), accountID: "default-workspace")
+        try CodexAuth.write(newTokens, to: home.appendingPathComponent("auth.json"))
+        let current = Account(
+            alias: "managed",
+            accountID: "selected-workspace",
+            accessToken: oldTokens.accessToken,
+            refreshToken: oldTokens.refreshToken,
+            idToken: oldTokens.idToken,
+            needsLogin: true,
+            managedHomePath: home.path
+        )
+
+        let candidate = try XCTUnwrap(AuthenticationRecovery.candidate(for: current))
+
+        XCTAssertEqual(candidate.accountID, "selected-workspace")
+        XCTAssertEqual(candidate.credentialAccountID, "default-workspace")
+        XCTAssertTrue(AuthenticationRecovery.accepts(candidate, for: current))
+    }
+
+    func testWorkspacePrecedenceMigrationReplacesRetiredManagedIdentityWithoutAliasSuffix() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("managed-workspace-migration-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let tokens = Self.tokens("managed", expiry: Date().addingTimeInterval(600), accountID: "default-workspace")
+        try CodexAuth.write(tokens, to: home.appendingPathComponent("auth.json"))
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let usage = [UsageWindow(label: "Weekly", usedPercent: 44, windowSeconds: 604_800, resetAt: nil)]
+        let disabledUntil = Date().addingTimeInterval(3_600)
+        let lastUsedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let lastServedByUs = Date(timeIntervalSince1970: 1_700_000_100)
+        let usageStats = UsageStats(totalRequests: 4, inputTokens: 120, outputTokens: 80)
+        let usageHistory = [WindowSample(capturedAt: lastServedByUs, label: "Weekly", usedPercent: 44)]
+        let telemetryID = UUID()
+        let usageLimitSettings = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 42, weeklyPercent: 73)
+        var existingAccount = Account(
+            alias: "alyy2",
+            accountID: "legacy-provider-workspace",
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            disabledUntil: ["quota": disabledUntil],
+            lastUsedAt: lastUsedAt,
+            usage: usage,
+            managedHomePath: home.path,
+            telemetryID: telemetryID,
+            usageLimitSettings: usageLimitSettings
+        )
+        existingAccount.usageStats = usageStats
+        existingAccount.usageHistory = usageHistory
+        existingAccount.lastServedByUs = lastServedByUs
+        await store.upsert(existingAccount)
+        _ = await store.setActive("alyy2", now: lastUsedAt)
+        let stickyEnabled = await store.toggleStickyAlias("alyy2", now: lastUsedAt)
+        XCTAssertTrue(stickyEnabled)
+        let incoming = try XCTUnwrap(AccountImporter.codexBarAccounts([
+            CodexBarBridge.ManagedAccount(
+                email: "alyy2@example.com",
+                accountID: "selected-workspace",
+                managedHomePath: home.path
+            )
+        ]).first)
+
+        let migrated = await store.reconcileManagedAccount(
+            incoming,
+            presentAccountIDs: ["selected-workspace"]
+        )
+        let removal = await store.reconcileManagedWithTelemetry(present: ["selected-workspace"])
+
+        XCTAssertEqual(migrated.alias, "alyy2")
+        XCTAssertEqual(migrated.accountID, "selected-workspace")
+        XCTAssertEqual(migrated.credentialAccountID, "default-workspace")
+        XCTAssertTrue(migrated.needsLogin)
+        XCTAssertTrue(migrated.usage.isEmpty)
+        XCTAssertTrue(migrated.disabledUntil.isEmpty)
+        XCTAssertNil(migrated.usageStats)
+        XCTAssertNil(migrated.usageHistory)
+        XCTAssertNil(migrated.lastServedByUs)
+        XCTAssertNil(migrated.lastUsedAt)
+        XCTAssertEqual(migrated.priority, 1)
+        XCTAssertTrue(migrated.routingEnabled)
+        XCTAssertEqual(migrated.telemetryID, telemetryID)
+        XCTAssertEqual(migrated.usageLimitSettings, usageLimitSettings)
+        let activeAlias = await store.activeAlias()
+        let stickyAlias = await store.stickyAlias()
+        XCTAssertEqual(activeAlias, "alyy2")
+        XCTAssertEqual(stickyAlias, "alyy2")
+        XCTAssertTrue(removal.removedAliases.isEmpty)
+        let aliases = await store.all().map(\.alias)
+        XCTAssertEqual(aliases, ["alyy2"])
     }
 
     private static func jwt(_ label: String, expiry: Date, accountID: String) -> String {

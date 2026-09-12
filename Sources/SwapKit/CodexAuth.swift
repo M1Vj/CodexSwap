@@ -43,6 +43,11 @@ public struct CodexAuthFile: Codable, Sendable {
 }
 
 public enum CodexAuth {
+    enum UpdateError: Error {
+        case malformed
+        case staleSource
+        case writeFailed
+    }
     public static func codexHome() -> URL {
         if let custom = ProcessInfo.processInfo.environment["CODEX_HOME"], !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
@@ -82,6 +87,43 @@ public enum CodexAuth {
         }
         _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+    }
+
+    static func updateTokensPreservingDocument(
+        _ tokens: CodexTokens,
+        at path: URL,
+        expectedSource: Data
+    ) throws {
+        let current = try Data(contentsOf: path)
+        guard current == expectedSource else { throw UpdateError.staleSource }
+        guard var document = try JSONSerialization.jsonObject(with: current) as? [String: Any],
+              var tokenDocument = document["tokens"] as? [String: Any] else { throw UpdateError.malformed }
+        tokenDocument["id_token"] = tokens.idToken
+        tokenDocument["access_token"] = tokens.accessToken
+        tokenDocument["refresh_token"] = tokens.refreshToken
+        tokenDocument["account_id"] = tokens.accountId
+        document["tokens"] = tokenDocument
+        document["last_refresh"] = ISO8601DateFormatter.codex.string(from: Date())
+        var data = try JSONSerialization.data(
+            withJSONObject: document,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        data.append(0x0A)
+        let temporary = path.deletingLastPathComponent()
+            .appendingPathComponent(".auth-refresh-\(UUID().uuidString).tmp")
+        guard FileManager.default.createFile(
+            atPath: temporary.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else { throw UpdateError.writeFailed }
+        do {
+            _ = try FileManager.default.replaceItemAt(path, withItemAt: temporary)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+        guard let stored = try? read(path).tokens, stored == tokens else { throw UpdateError.writeFailed }
     }
 }
 
