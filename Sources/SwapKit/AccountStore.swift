@@ -1865,7 +1865,12 @@ public actor AccountStore {
         }
         let ours = JWT.expiry(current.accessToken) ?? .distantPast
         let theirs = JWT.expiry(tokens.accessToken) ?? .distantPast
-        if theirs > ours, theirs > clock() {
+        let bundleChanged = tokens.accessToken != current.accessToken
+            || tokens.refreshToken != current.refreshToken
+            || tokens.idToken != current.idToken
+        let expiryAllowsAdoption = theirs > ours
+            || (source.kind == .managedHome && theirs == ours)
+        if bundleChanged, expiryAllowsAdoption, theirs > clock() {
             data.accounts[i].idToken = tokens.idToken
             data.accounts[i].accessToken = tokens.accessToken
             data.accounts[i].refreshToken = tokens.refreshToken

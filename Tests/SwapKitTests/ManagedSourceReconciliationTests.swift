@@ -109,6 +109,155 @@ final class ManagedSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: authPath), sourceBeforeHydration)
     }
 
+    func testHydrationAdoptsChangedManagedBundleAtEqualExpiryAndPreservesControls() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("managed-source-equal-expiry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = now.addingTimeInterval(3_600)
+        let credentialOwner = "credential-owner"
+        let storedTokens = Self.tokens("stored", expiry: expiry, accountID: credentialOwner)
+        let sourceTokens = Self.tokens("source", expiry: expiry, accountID: credentialOwner)
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let authPath = home.appendingPathComponent("auth.json")
+        try CodexAuth.write(sourceTokens, to: authPath)
+        let sourceBeforeHydration = try Data(contentsOf: authPath)
+
+        let generation = UUID()
+        let usage = [UsageWindow(label: "5h", usedPercent: 31, windowSeconds: 18_000, resetAt: expiry)]
+        let disabledUntil = now.addingTimeInterval(1_800)
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: "selected-workspace",
+            credentialAccountID: credentialOwner,
+            accessToken: storedTokens.accessToken,
+            refreshToken: storedTokens.refreshToken,
+            idToken: storedTokens.idToken,
+            priority: 7,
+            disabledUntil: ["quota": disabledUntil],
+            needsLogin: true,
+            lastUsedAt: now.addingTimeInterval(-120),
+            usage: usage,
+            managedHomePath: home.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: home.path),
+            routingEnabled: false,
+            archivedAt: now.addingTimeInterval(-300),
+            routingPausedAt: now.addingTimeInterval(-60),
+            telemetryID: UUID(),
+            usageLimitSettings: AccountUsageLimitSettings(enabled: true, fiveHourPercent: 80, weeklyPercent: 90),
+            authGeneration: generation
+        ))
+
+        let beforeValue = await store.account("krisondaent")
+        let before = try XCTUnwrap(beforeValue)
+        let hydratedValue = await store.hydrateFromManagedHome("krisondaent")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated.accessToken, sourceTokens.accessToken)
+        XCTAssertEqual(hydrated.refreshToken, sourceTokens.refreshToken)
+        XCTAssertEqual(hydrated.idToken, sourceTokens.idToken)
+        XCTAssertEqual(hydrated.accountID, "selected-workspace")
+        XCTAssertEqual(hydrated.credentialAccountID, credentialOwner)
+        XCTAssertEqual(hydrated.alias, before.alias)
+        XCTAssertEqual(hydrated.priority, before.priority)
+        XCTAssertEqual(hydrated.disabledUntil, before.disabledUntil)
+        XCTAssertEqual(hydrated.needsLogin, true)
+        XCTAssertEqual(hydrated.archivedAt, before.archivedAt)
+        XCTAssertEqual(hydrated.usage, before.usage)
+        XCTAssertEqual(hydrated.lastUsedAt, before.lastUsedAt)
+        XCTAssertEqual(hydrated.routingEnabled, before.routingEnabled)
+        XCTAssertEqual(hydrated.routingPausedAt, before.routingPausedAt)
+        XCTAssertEqual(hydrated.usageLimitSettings, before.usageLimitSettings)
+        XCTAssertEqual(hydrated.telemetryID, before.telemetryID)
+        XCTAssertNotEqual(hydrated.authGeneration, before.authGeneration)
+        XCTAssertEqual(try Data(contentsOf: authPath), sourceBeforeHydration)
+    }
+
+    func testHydrationLeavesIdenticalManagedBundleAndGenerationUnchanged() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("managed-source-identical-bundle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let tokens = Self.tokens("identical", expiry: now.addingTimeInterval(3_600), accountID: "credential-owner")
+        let home = root.appendingPathComponent("managed-home", isDirectory: true)
+        let authPath = home.appendingPathComponent("auth.json")
+        try CodexAuth.write(tokens, to: authPath)
+        let sourceBeforeHydration = try Data(contentsOf: authPath)
+        let generation = UUID()
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(url: storeURL, clock: { now })
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: "selected-workspace",
+            credentialAccountID: "credential-owner",
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            needsLogin: true,
+            managedHomePath: home.path,
+            authGeneration: generation
+        ))
+        let storeBeforeHydration = try Data(contentsOf: storeURL)
+        let beforeValue = await store.account("krisondaent")
+        let before = try XCTUnwrap(beforeValue)
+
+        let hydratedValue = await store.hydrateFromManagedHome("krisondaent")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated, before)
+        XCTAssertEqual(hydrated.authGeneration, generation)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storeBeforeHydration)
+        XCTAssertEqual(try Data(contentsOf: authPath), sourceBeforeHydration)
+    }
+
+    func testHydrationRejectsChangedEqualExpiryNativeAndLegacyBundles() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = now.addingTimeInterval(3_600)
+        let sourceKinds: [(String, AccountCredentialSource.Kind)] = [
+            ("native-auth", .nativeAuth),
+            ("legacy-snapshot", .legacySnapshot),
+        ]
+
+        for (label, sourceKind) in sourceKinds {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("equal-expiry-\(label)-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let accountID = "\(label)-account"
+            let storedTokens = Self.tokens("stored-\(label)", expiry: expiry, accountID: accountID)
+            let sourceTokens = Self.tokens("source-\(label)", expiry: expiry, accountID: accountID)
+            let sourcePath = root.appendingPathComponent("auth.json")
+            try CodexAuth.write(sourceTokens, to: sourcePath)
+            let sourceBeforeHydration = try Data(contentsOf: sourcePath)
+            let generation = UUID()
+            let storeURL = root.appendingPathComponent("accounts.json")
+            let store = AccountStore(url: storeURL, clock: { now })
+            await store.upsert(Account(
+                alias: label,
+                accountID: accountID,
+                accessToken: storedTokens.accessToken,
+                refreshToken: storedTokens.refreshToken,
+                idToken: storedTokens.idToken,
+                credentialSource: AccountCredentialSource(kind: sourceKind, path: sourcePath.path),
+                authGeneration: generation
+            ))
+            let storeBeforeHydration = try Data(contentsOf: storeURL)
+
+            let hydratedValue = await store.hydrateFromManagedHome(label)
+            let hydrated = try XCTUnwrap(hydratedValue)
+
+            XCTAssertEqual(hydrated.accessToken, storedTokens.accessToken, label)
+            XCTAssertEqual(hydrated.refreshToken, storedTokens.refreshToken, label)
+            XCTAssertEqual(hydrated.idToken, storedTokens.idToken, label)
+            XCTAssertEqual(hydrated.authGeneration, generation, label)
+            XCTAssertEqual(try Data(contentsOf: storeURL), storeBeforeHydration, label)
+            XCTAssertEqual(try Data(contentsOf: sourcePath), sourceBeforeHydration, label)
+        }
+    }
+
     func testGenericUpsertDoesNotClearNeedsLoginWithoutUsageVerification() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("managed-source-generic-upsert-\(UUID().uuidString)", isDirectory: true)
