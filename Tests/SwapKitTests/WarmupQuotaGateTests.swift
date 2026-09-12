@@ -219,4 +219,97 @@ final class WarmupQuotaGateTests: XCTestCase {
         let onlineSummary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
         XCTAssertNotEqual(onlineSummary.skipped["all"], "network unavailable")
     }
+
+    func testAppEnginePollingHydratesManagedHomeBeforeUsageLookup() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("engine-managed-home-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountID = "managed-account"
+        let stale = managedHomeTokensForEngine(label: "stale", expiry: Date().addingTimeInterval(-60), accountID: accountID)
+        let fresh = managedHomeTokensForEngine(label: "fresh", expiry: Date().addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        try writeManagedHomeTokensForEngine(fresh, to: managedHome.appendingPathComponent("auth.json"))
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: accountID,
+            accessToken: stale.accessToken,
+            refreshToken: stale.refreshToken,
+            idToken: stale.idToken,
+            usage: [UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(3_600))],
+            managedHomePath: managedHome.path
+        ))
+        _ = await store.setActive("krisondaent")
+
+        let usage = ManagedHomeUsageForEngine(
+            expectedToken: fresh.accessToken,
+            windows: [UsageWindow(label: "5h", usedPercent: 7, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        )
+        let engine = AppEngine(
+            store: store,
+            settingsStore: SettingsStore(url: root.appendingPathComponent("settings.json")),
+            usage: usage,
+            supportDir: root,
+            networkCheck: { true }
+        )
+
+        await engine.systemDidWake()
+
+        let observedAccessTokens = await usage.observedAccessTokens()
+        XCTAssertEqual(observedAccessTokens, [fresh.accessToken])
+        let updated = await store.account("krisondaent")
+        XCTAssertEqual(updated?.accessToken, fresh.accessToken)
+        XCTAssertEqual(updated?.usage.first?.usedPercent, 7)
+        XCTAssertFalse(updated?.needsLogin ?? true)
+    }
+}
+
+private actor ManagedHomeUsageForEngine: UsageFetching {
+    private let expectedToken: String
+    private let windows: [UsageWindow]
+    private var accessTokens: [String] = []
+
+    init(expectedToken: String, windows: [UsageWindow]) {
+        self.expectedToken = expectedToken
+        self.windows = windows
+    }
+
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
+        accessTokens.append(accessToken)
+        guard accessToken == expectedToken else { throw UsageClient.UsageError.unauthorized }
+        return windows
+    }
+
+    func observedAccessTokens() -> [String] { accessTokens }
+}
+
+private func managedHomeTokensForEngine(label: String, expiry: Date, accountID: String) -> CodexTokens {
+    let payload = try! JSONSerialization.data(withJSONObject: [
+        "exp": Int(expiry.timeIntervalSince1970),
+        "account_id": accountID,
+        "jti": label,
+    ])
+    let encoded = payload
+        .base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    return CodexTokens(
+        idToken: "id-\(label)",
+        accessToken: "e30.\(encoded).sig",
+        refreshToken: "refresh-\(label)",
+        accountId: accountID
+    )
+}
+
+private func writeManagedHomeTokensForEngine(_ tokens: CodexTokens, to path: URL) throws {
+    let fileManager = FileManager.default
+    try fileManager.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if !fileManager.fileExists(atPath: path.path) {
+        guard fileManager.createFile(atPath: path.path, contents: Data()) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+    try CodexAuth.write(tokens, to: path)
 }

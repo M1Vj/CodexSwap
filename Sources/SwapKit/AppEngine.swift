@@ -2546,9 +2546,15 @@ public actor AppEngine {
         )
         var assessments: [DrainAssessment] = []
         var refreshedAccounts: [Account] = []
-        for acc in accounts where !acc.accessToken.isEmpty {
-            if activeOnly && acc.alias != activeAlias { continue }
-            if let aliases, !aliases.contains(acc.alias) { continue }
+        for storedAccount in accounts {
+            if activeOnly && storedAccount.alias != activeAlias { continue }
+            if let aliases, !aliases.contains(storedAccount.alias) { continue }
+            var acc = storedAccount
+            if acc.managedHomePath != nil || acc.credentialSource?.kind == .managedHome,
+               let hydrated = await store.hydrateFromManagedHome(acc.alias) {
+                acc = hydrated
+            }
+            guard !acc.accessToken.isEmpty else { continue }
             guard !JWT.isStale(acc.accessToken, now: now) else { continue }
             // A needs-login account rejects every usage call; polling it wastes a request
             // per tick until the user signs in again.

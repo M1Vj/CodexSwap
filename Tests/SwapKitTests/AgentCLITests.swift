@@ -611,6 +611,58 @@ final class AgentCLITests: XCTestCase {
         XCTAssertTrue(updated?.disabledUntil.isEmpty == true)
     }
 
+    func testQuotaReportHydratesManagedHomeBeforeUsageLookup() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIManagedHomeQuota-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let accountID = "managed-account"
+        let stale = managedHomeTokens(label: "stale", expiry: Date().addingTimeInterval(-60), accountID: accountID)
+        let fresh = managedHomeTokens(label: "fresh", expiry: Date().addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = directory.appendingPathComponent("managed-home", isDirectory: true)
+        try writeManagedHomeTokens(fresh, to: managedHome.appendingPathComponent("auth.json"))
+
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: accountID,
+            accessToken: stale.accessToken,
+            refreshToken: stale.refreshToken,
+            idToken: stale.idToken,
+            usage: [UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(3_600))],
+            managedHomePath: managedHome.path
+        ))
+
+        let usage = ManagedHomeQuotaUsageForCLI(
+            expectedToken: fresh.accessToken,
+            windows: [UsageWindow(label: "5h", usedPercent: 12, windowSeconds: 18_000, resetAt: Date().addingTimeInterval(18_000))]
+        )
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            usageService: usage,
+            resetService: StubQuotaResetForCLI(),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let result = await cli.run(["agent", "quota", "report", "--json"])
+
+        XCTAssertEqual(result.exitCode, AgentCLIExitCode.ok.rawValue)
+        XCTAssertTrue(result.envelope.ok)
+        let observedAccessTokens = await usage.observedAccessTokens()
+        XCTAssertEqual(observedAccessTokens, [fresh.accessToken])
+        guard case .object(let data)? = result.envelope.data,
+              case .array(let reports)? = data["accounts"],
+              case .object(let report)? = reports.first else {
+            return XCTFail("missing quota report data")
+        }
+        XCTAssertEqual(report["usageStatus"], .string("ok"))
+        let updated = await store.account("krisondaent")
+        XCTAssertEqual(updated?.accessToken, fresh.accessToken)
+        XCTAssertEqual(updated?.usage.first?.usedPercent, 12)
+    }
+
     func testWarmupAccountDoesNotReportUnverifiedAttemptAsWarmed() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentCLIWarmupAttempt-\(UUID().uuidString)", isDirectory: true)
@@ -679,6 +731,55 @@ private actor StubQuotaUsageForCLI: UsageFetching {
     func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
         windows
     }
+}
+
+private actor ManagedHomeQuotaUsageForCLI: UsageFetching {
+    private let expectedToken: String
+    private let windows: [UsageWindow]
+    private var accessTokens: [String] = []
+
+    init(expectedToken: String, windows: [UsageWindow]) {
+        self.expectedToken = expectedToken
+        self.windows = windows
+    }
+
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
+        accessTokens.append(accessToken)
+        guard accessToken == expectedToken else { throw UsageClient.UsageError.unauthorized }
+        return windows
+    }
+
+    func observedAccessTokens() -> [String] { accessTokens }
+}
+
+private func managedHomeTokens(label: String, expiry: Date, accountID: String) -> CodexTokens {
+    let payload = try! JSONSerialization.data(withJSONObject: [
+        "exp": Int(expiry.timeIntervalSince1970),
+        "account_id": accountID,
+        "jti": label,
+    ])
+    let encoded = payload
+        .base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    return CodexTokens(
+        idToken: "id-\(label)",
+        accessToken: "e30.\(encoded).sig",
+        refreshToken: "refresh-\(label)",
+        accountId: accountID
+    )
+}
+
+private func writeManagedHomeTokens(_ tokens: CodexTokens, to path: URL) throws {
+    let fileManager = FileManager.default
+    try fileManager.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if !fileManager.fileExists(atPath: path.path) {
+        guard fileManager.createFile(atPath: path.path, contents: Data()) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+    try CodexAuth.write(tokens, to: path)
 }
 
 private struct StubQuotaResetForCLI: QuotaResetServing {

@@ -1517,7 +1517,7 @@ public struct AgentCLI: Sendable {
     }
 
     private func quotaReport(_ command: AgentCLICommand) async throws -> AgentCLIResult {
-        let accounts = await store.activeAccounts()
+        let accounts = await hydratedManagedAccounts(await store.activeAccounts())
         let service = QuotaReportService(usageService: usageService, resetService: resetService)
         let activeAlias = await store.activeAlias()
         let report = try await service.fetch(accounts: accounts, activeAlias: activeAlias)
@@ -1543,6 +1543,18 @@ public struct AgentCLI: Sendable {
         let reportRefs = reportOrder.compactMap { account in rosterEntries.first(where: { $0.account.alias == account.alias })?.reference }
         let data = sanitizedQuotaData(report, privateValues: privateValues, refs: reportRefs)
         return AgentCLIResult(envelope: .success(command: command.canonicalName, data: data), exitCode: .ok)
+    }
+
+    private func hydratedManagedAccounts(_ accounts: [Account]) async -> [Account] {
+        var hydratedAccounts = accounts
+        for index in hydratedAccounts.indices {
+            let account = hydratedAccounts[index]
+            guard account.managedHomePath != nil || account.credentialSource?.kind == .managedHome else { continue }
+            if let hydrated = await store.hydrateFromManagedHome(account.alias) {
+                hydratedAccounts[index] = hydrated
+            }
+        }
+        return hydratedAccounts
     }
 
     private func sanitizedQuotaData(_ report: CodexQuotaReport, privateValues: Set<String>, refs: [String]) -> AgentCLIJSONValue {
