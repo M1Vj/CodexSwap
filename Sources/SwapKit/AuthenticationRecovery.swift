@@ -20,9 +20,22 @@ enum AuthenticationRecovery {
         let url = source.kind == .managedHome
             ? URL(fileURLWithPath: path).appendingPathComponent("auth.json")
             : URL(fileURLWithPath: path)
-        guard let file = try? CodexAuth.read(url), let tokens = file.tokens else { return nil }
+        if source.kind == .standaloneHome {
+            guard let homes = standaloneHomesDirectory(for: url),
+                  StandaloneAccountRemoval.verifiedAuthURL(
+                      account,
+                      supportDirectory: homes.deletingLastPathComponent()
+                  ) == url.standardizedFileURL else { return nil }
+        }
+        let file: CodexAuthFile?
+        if source.kind == .standaloneHome {
+            file = StandaloneAccountRemoval.readBoundedAuthFile(url)
+        } else {
+            file = try? CodexAuth.read(url)
+        }
+        guard let file, let tokens = file.tokens else { return nil }
         var candidate: Account
-        if source.kind == .managedHome {
+        if source.kind == .managedHome || source.kind == .standaloneHome {
             guard AccountImporter.managedCredentialBundleIsValid(tokens) else { return nil }
             candidate = AccountImporter.account(from: tokens, aliasHint: account.alias,
                                                 managedHomePath: account.managedHomePath, credentialSource: source)
@@ -35,10 +48,19 @@ enum AuthenticationRecovery {
         return candidate
     }
 
+    private static func standaloneHomesDirectory(for authURL: URL) -> URL? {
+        let home = authURL.standardizedFileURL.deletingLastPathComponent()
+        let homes = home.deletingLastPathComponent()
+        guard authURL.lastPathComponent == "auth.json",
+              UUID(uuidString: home.lastPathComponent) != nil,
+              homes.lastPathComponent == CodexLoginLauncher.standaloneHomesDirectoryName else { return nil }
+        return homes
+    }
+
     static func accepts(_ candidate: Account, for current: Account, now: Date = Date()) -> Bool {
         let currentSource = source(for: current)
         let candidateIdentity = JWT.identity(fromAccessToken: candidate.accessToken).accountID
-        let identityMatches = if currentSource?.kind == .managedHome {
+        let identityMatches = if currentSource?.kind == .managedHome || currentSource?.kind == .standaloneHome {
             candidate.credentialAccountID == current.credentialAccountID
                 && candidateIdentity == candidate.credentialAccountID
         } else {

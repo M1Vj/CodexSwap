@@ -74,7 +74,7 @@ final class StandaloneAccountImporterTests: XCTestCase {
         XCTAssertEqual(imported.count, 1)
         let account = try XCTUnwrap(imported.first)
         XCTAssertEqual(account.accountID, "valid")
-        XCTAssertEqual(account.credentialSource?.kind, .nativeAuth)
+        XCTAssertEqual(account.credentialSource?.kind, .standaloneHome)
         XCTAssertEqual(account.credentialSource?.path, validHome.appendingPathComponent("auth.json").path)
         XCTAssertNil(account.managedHomePath)
     }
@@ -169,6 +169,69 @@ final class StandaloneAccountImporterTests: XCTestCase {
         })
     }
 
+    func testRemovalChecksCredentialOwnerBeforeQuarantiningSelectedWorkspace() async throws {
+        let support = try makeTemporaryDirectory()
+        let homes = support.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: homes, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let owner = "credential-owner"
+        let home = try makeHome(in: homes)
+        try writeBundle(
+            to: home,
+            tokens: tokens(accountID: owner, email: "owner@example.com", expiry: Date().addingTimeInterval(3_600)),
+            marker: true
+        )
+        var account = try XCTUnwrap(
+            AccountImporter.standaloneCodexAuthAccounts(supportDirectory: support).first
+        )
+        account.accountID = "selected-workspace"
+        account.credentialAccountID = owner
+        let store = AccountStore(url: support.appendingPathComponent("accounts.json"))
+        await store.upsert(account)
+        let engine = AppEngine(store: store, supportDir: support)
+
+        let result = await engine.removeStandaloneAccount(
+            alias: account.alias,
+            externalAccountIDs: [owner]
+        )
+        let storedAfterRemoval = await store.account(account.alias)
+
+        XCTAssertEqual(result, .externalCredentialOwner)
+        XCTAssertNotNil(storedAfterRemoval)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent("auth.json").path))
+    }
+
+    func testRemovalRechecksCredentialOwnerAfterQuarantineForSelectedWorkspace() async throws {
+        let support = try makeTemporaryDirectory()
+        let homes = support.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: homes, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let owner = "credential-owner"
+        let home = try makeHome(in: homes)
+        try writeBundle(
+            to: home,
+            tokens: tokens(accountID: owner, email: "owner@example.com", expiry: Date().addingTimeInterval(3_600)),
+            marker: true
+        )
+        var account = try XCTUnwrap(
+            AccountImporter.standaloneCodexAuthAccounts(supportDirectory: support).first
+        )
+        account.accountID = "selected-workspace"
+        account.credentialAccountID = owner
+        let store = AccountStore(url: support.appendingPathComponent("accounts.json"))
+        await store.upsert(account)
+        let engine = AppEngine(store: store, supportDir: support)
+
+        let result = await engine.removeStandaloneAccount(
+            alias: account.alias,
+            externalAccountIDs: [],
+            recheckExternalAccountIDs: { [owner] }
+        )
+        let storedAfterRemoval = await store.account(account.alias)
+
+        XCTAssertEqual(result, .externalCredentialOwner)
+        XCTAssertNotNil(storedAfterRemoval)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent("auth.json").path))
+    }
+
     func testRemovalRefusesCredentialSourceOutsideCodexSwapStandaloneHomes() async throws {
         let support = try makeTemporaryDirectory()
         let externalHome = try makeTemporaryDirectory()
@@ -209,7 +272,7 @@ final class StandaloneAccountImporterTests: XCTestCase {
         let account = AccountImporter.account(
             from: accountTokens,
             credentialSource: AccountCredentialSource(
-                kind: .nativeAuth,
+                kind: .standaloneHome,
                 path: linkedHome.appendingPathComponent("auth.json").path
             )
         )

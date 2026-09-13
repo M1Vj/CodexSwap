@@ -143,33 +143,66 @@ enum StandaloneAccountRemoval {
     static let quarantineDirectoryName = ".removed"
 
     static func ownsCredentialSource(_ account: Account, supportDirectory: URL) -> Bool {
-        guard account.credentialSource?.kind == .nativeAuth,
+        guard account.credentialSource?.kind == .standaloneHome,
               let rawPath = account.credentialSource?.path else { return false }
+        return standaloneAuthURL(rawPath: rawPath, supportDirectory: supportDirectory) != nil
+    }
+
+    static func verifiedAuthURL(_ account: Account, supportDirectory: URL) -> URL? {
+        verifiedAuthURL(account, supportDirectory: supportDirectory, acceptingLegacyNativeAuth: false)
+    }
+
+    static func verifiedLegacyAuthURL(_ account: Account, supportDirectory: URL) -> URL? {
+        verifiedAuthURL(account, supportDirectory: supportDirectory, acceptingLegacyNativeAuth: true)
+    }
+
+    private static func verifiedAuthURL(
+        _ account: Account,
+        supportDirectory: URL,
+        acceptingLegacyNativeAuth: Bool
+    ) -> URL? {
+        guard let source = account.credentialSource,
+              source.kind == .standaloneHome || (acceptingLegacyNativeAuth && source.kind == .nativeAuth),
+              let rawPath = source.path,
+              let auth = standaloneAuthURL(rawPath: rawPath, supportDirectory: supportDirectory) else { return nil }
+        let support = supportDirectory.standardizedFileURL
+        let homes = support.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+        let home = auth.deletingLastPathComponent()
+        let marker = home.appendingPathComponent(CodexLoginLauncher.successMarkerName)
+        let expectedAccountID = account.credentialAccountID ?? account.accountID
+        guard isPrivateDirectory(support, fileManager: .default),
+              isPrivateDirectory(homes, fileManager: .default),
+              isPrivateDirectory(home, fileManager: .default),
+              isPrivateRegularFile(marker, maximumSize: 64, fileManager: .default),
+              boundedRead(marker, maximumSize: 64) == Data("completed\n".utf8),
+              isPrivateRegularFile(auth, maximumSize: 1_048_576, fileManager: .default),
+              let file = readBoundedAuthFile(auth),
+              let tokens = file.tokens,
+              !tokens.accessToken.isEmpty,
+              !tokens.refreshToken.isEmpty,
+              !expectedAccountID.isEmpty,
+              tokens.accountId == expectedAccountID,
+              JWT.identity(fromAccessToken: tokens.accessToken).accountID == expectedAccountID else { return nil }
+        return auth
+    }
+
+    static func readBoundedAuthFile(_ auth: URL) -> CodexAuthFile? {
+        guard isPrivateRegularFile(auth, maximumSize: 1_048_576, fileManager: .default),
+              let raw = boundedRead(auth, maximumSize: 1_048_576),
+              let file = try? JSONDecoder().decode(CodexAuthFile.self, from: raw) else { return nil }
+        return file
+    }
+
+    private static func standaloneAuthURL(rawPath: String, supportDirectory: URL) -> URL? {
         let homes = supportDirectory.standardizedFileURL.appendingPathComponent(
             CodexLoginLauncher.standaloneHomesDirectoryName,
             isDirectory: true
         )
         let auth = URL(fileURLWithPath: rawPath).standardizedFileURL
         let home = auth.deletingLastPathComponent()
-        return auth.lastPathComponent == "auth.json"
-            && UUID(uuidString: home.lastPathComponent) != nil
-            && home.deletingLastPathComponent() == homes
-    }
-
-    static func verifiedAuthURL(_ account: Account, supportDirectory: URL) -> URL? {
-        guard ownsCredentialSource(account, supportDirectory: supportDirectory),
-              let rawPath = account.credentialSource?.path else { return nil }
-        let support = supportDirectory.standardizedFileURL
-        let homes = support.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
-        let auth = URL(fileURLWithPath: rawPath).standardizedFileURL
-        let home = auth.deletingLastPathComponent()
-        let marker = home.appendingPathComponent(CodexLoginLauncher.successMarkerName)
-        guard isPrivateDirectory(support, fileManager: .default),
-              isPrivateDirectory(homes, fileManager: .default),
-              isPrivateDirectory(home, fileManager: .default),
-              isPrivateRegularFile(marker, maximumSize: 64, fileManager: .default),
-              boundedRead(marker, maximumSize: 64) == Data("completed\n".utf8),
-              isPrivateRegularFile(auth, maximumSize: 1_048_576, fileManager: .default) else { return nil }
+        guard auth.lastPathComponent == "auth.json",
+              UUID(uuidString: home.lastPathComponent) != nil,
+              home.deletingLastPathComponent() == homes else { return nil }
         return auth
     }
 

@@ -210,6 +210,13 @@ public actor AccountStore {
             }
             return normalized
         }
+        if Self.migrateLegacyStandaloneSources(
+            in: &loaded.accounts,
+            supportDirectory: url.deletingLastPathComponent(),
+            now: migrationDate
+        ) {
+            needsMigration = true
+        }
         if let activeAlias = loaded.activeAlias,
            !loaded.accounts.contains(where: { $0.alias == activeAlias && !$0.isArchived }) {
             // The active alias is part of the active-roster invariant. Clear stale
@@ -292,7 +299,9 @@ public actor AccountStore {
                 preservingRanking: preservingRanking,
                 preservingActiveAlias: preservingActiveAlias,
                 preservingStickyAlias: preservingStickyAlias,
-                clearingActiveAliases: clearingActiveAliases
+                clearingActiveAliases: clearingActiveAliases,
+                supportDirectory: url.deletingLastPathComponent(),
+                now: clock()
             )
             if repairingStickyUsageLimitOverride, snapshot.stickyAlias == nil {
                 snapshot.stickyUsageLimitOverride = false
@@ -430,7 +439,9 @@ public actor AccountStore {
         preservingRanking: Bool,
         preservingActiveAlias: Bool,
         preservingStickyAlias: Bool,
-        clearingActiveAliases: Set<String>
+        clearingActiveAliases: Set<String>,
+        supportDirectory: URL,
+        now: Date
     ) -> StoreData {
         guard let latest else { return local }
         var merged = latest
@@ -472,7 +483,9 @@ public actor AccountStore {
             local: local.accounts,
             baseline: baseline.accounts,
             latest: latest.accounts,
-            preservingRanking: preservingRanking
+            preservingRanking: preservingRanking,
+            supportDirectory: supportDirectory,
+            now: now
         )
         return merged
     }
@@ -494,7 +507,9 @@ public actor AccountStore {
         local: [Account],
         baseline: [Account],
         latest: [Account],
-        preservingRanking: Bool
+        preservingRanking: Bool,
+        supportDirectory: URL,
+        now: Date
     ) -> [Account] {
         let localBaseline = pairAccounts(baseline, with: local)
         let latestBaseline = pairAccounts(baseline, with: latest)
@@ -521,7 +536,9 @@ public actor AccountStore {
                         local: local[localIndex],
                         baseline: baseline[baselineIndex],
                         latest: latestAccount,
-                        preservingRanking: preservingRanking
+                        preservingRanking: preservingRanking,
+                        supportDirectory: supportDirectory,
+                        now: now
                     )
                 )
                 continue
@@ -664,7 +681,9 @@ public actor AccountStore {
         local: Account,
         baseline: Account,
         latest: Account,
-        preservingRanking: Bool
+        preservingRanking: Bool,
+        supportDirectory: URL,
+        now: Date
     ) -> Account {
         var merged = latest
         merged.alias = mergeValue(local.alias, baseline: baseline.alias, latest: latest.alias)
@@ -684,7 +703,16 @@ public actor AccountStore {
             || latest.refreshToken != baseline.refreshToken || latest.idToken != baseline.idToken
             || latest.credentialAccountID != baseline.credentialAccountID
             || latest.managedHomePath != baseline.managedHomePath || latest.credentialSource != baseline.credentialSource
-        let credentials = credentialsChanged && !latestCredentialsChanged ? local : latest
+        let localPriority = credentialSourcePriority(local, supportDirectory: supportDirectory, now: now)
+        let latestPriority = credentialSourcePriority(latest, supportDirectory: supportDirectory, now: now)
+        let credentials: Account
+        if localPriority > latestPriority {
+            credentials = local
+        } else if latestPriority > localPriority {
+            credentials = latest
+        } else {
+            credentials = credentialsChanged && !latestCredentialsChanged ? local : latest
+        }
         merged.accessToken = credentials.accessToken
         merged.refreshToken = credentials.refreshToken
         merged.idToken = credentials.idToken
@@ -732,6 +760,9 @@ public actor AccountStore {
         )
         if local.authGeneration != baseline.authGeneration, local.needsLogin {
             merged.needsLogin = true
+        }
+        if localPriority < latestPriority, credentialsChanged {
+            merged.accountID = latest.accountID
         }
         return merged
     }
@@ -1495,19 +1526,126 @@ public actor AccountStore {
         return source
     }
 
-    private static func incomingSourceMayReplaceManagedOwner(
-        existing: Account,
-        incoming: Account
+    private static func migrateLegacyStandaloneSources(
+        in accounts: inout [Account],
+        supportDirectory: URL,
+        now: Date
     ) -> Bool {
-        guard let existingManagedPath = existing.managedHomePath, !existingManagedPath.isEmpty else {
-            return true
+        var migrated = false
+        for index in accounts.indices {
+            guard accounts[index].credentialSource?.kind == .nativeAuth,
+                  let authURL = StandaloneAccountRemoval.verifiedLegacyAuthURL(
+                      accounts[index],
+                      supportDirectory: supportDirectory
+                  ),
+                  standaloneCredentialIsValid(
+                      accounts[index],
+                      supportDirectory: supportDirectory,
+                      now: now,
+                      acceptingLegacyNativeAuth: true
+                  ) else { continue }
+            accounts[index].credentialSource = AccountCredentialSource(
+                kind: .standaloneHome,
+                path: authURL.path
+            )
+            migrated = true
         }
-        guard let incomingSource = credentialSource(for: incoming),
-              incomingSource.kind == .managedHome,
-              let incomingPath = incomingSource.path else {
-            return false
+        return migrated
+    }
+
+    private static func standaloneCredentialIsValid(
+        _ account: Account,
+        supportDirectory: URL,
+        now: Date,
+        acceptingLegacyNativeAuth: Bool = false
+    ) -> Bool {
+        let authURL: URL?
+        if acceptingLegacyNativeAuth {
+            authURL = StandaloneAccountRemoval.verifiedLegacyAuthURL(
+                account,
+                supportDirectory: supportDirectory
+            )
+        } else {
+            authURL = StandaloneAccountRemoval.verifiedAuthURL(
+                account,
+                supportDirectory: supportDirectory
+            )
         }
-        return incomingPath == existingManagedPath
+        guard let authURL,
+              let file = StandaloneAccountRemoval.readBoundedAuthFile(authURL),
+              let sourceTokens = file.tokens,
+              let sourceExpiry = JWT.expiry(sourceTokens.accessToken),
+              sourceExpiry > now,
+              !account.accessToken.isEmpty,
+              !account.refreshToken.isEmpty,
+              let candidateIdentity = JWT.identity(fromAccessToken: account.accessToken).accountID,
+              let candidateExpiry = JWT.expiry(account.accessToken),
+              candidateExpiry > now,
+              let credentialAccountID = account.credentialAccountID
+                  ?? (account.accountID.isEmpty ? nil : account.accountID),
+              !credentialAccountID.isEmpty,
+              candidateIdentity == credentialAccountID,
+              JWT.identity(fromAccessToken: sourceTokens.accessToken).accountID == credentialAccountID,
+              sourceTokens.accountId == credentialAccountID else { return false }
+        return true
+    }
+
+    private static func credentialSourcePriority(
+        _ account: Account,
+        supportDirectory: URL,
+        now: Date
+    ) -> Int {
+        switch credentialSource(for: account)?.kind {
+        case .standaloneHome:
+            return standaloneCredentialIsValid(account, supportDirectory: supportDirectory, now: now) ? 3 : 0
+        case .managedHome:
+            return 2
+        case .nativeAuth, .legacySnapshot:
+            return 1
+        case .unknown, nil:
+            return 0
+        }
+    }
+
+    private static func incomingSourceMayReplaceOwner(
+        existing: Account,
+        incoming: Account,
+        acceptingManagedSource: Bool,
+        supportDirectory: URL,
+        now: Date
+    ) -> Bool {
+        guard let incomingSource = credentialSource(for: incoming) else {
+            return credentialSourcePriority(existing, supportDirectory: supportDirectory, now: now) <= 1
+        }
+        switch incomingSource.kind {
+        case .managedHome:
+            if let existingPath = existing.managedHomePath, !existingPath.isEmpty,
+               incomingSource.path == existingPath {
+                // A generic upsert may refresh the same already-owned managed
+                // source. A different managed home still requires a validated
+                // reconciliation so it cannot silently replace ownership.
+            } else {
+                guard acceptingManagedSource else { return false }
+            }
+        case .standaloneHome:
+            guard standaloneCredentialIsValid(incoming, supportDirectory: supportDirectory, now: now) else {
+                return false
+            }
+        case .nativeAuth, .legacySnapshot, .unknown:
+            break
+        }
+        let existingPriority = credentialSourcePriority(existing, supportDirectory: supportDirectory, now: now)
+        let incomingPriority = credentialSourcePriority(incoming, supportDirectory: supportDirectory, now: now)
+        if incomingPriority != existingPriority {
+            return incomingPriority > existingPriority
+        }
+        if incomingSource.kind == .managedHome,
+           let incomingPath = incomingSource.path,
+           let existingPath = existing.managedHomePath,
+           !existingPath.isEmpty {
+            return incomingPath == existingPath
+        }
+        return true
     }
 
     /// Shared ordering for picking the next account: priority strategy ranks by priority
@@ -1838,12 +1976,18 @@ public actor AccountStore {
         case .managedHome:
             sourceURL = URL(fileURLWithPath: path, isDirectory: true)
                 .appendingPathComponent("auth.json", isDirectory: false)
-        case .nativeAuth, .legacySnapshot:
+        case .standaloneHome, .nativeAuth, .legacySnapshot:
             sourceURL = URL(fileURLWithPath: path, isDirectory: false)
         case .unknown:
             return current
         }
-        guard let file = try? CodexAuth.read(sourceURL),
+        let file: CodexAuthFile?
+        if source.kind == .standaloneHome {
+            file = StandaloneAccountRemoval.readBoundedAuthFile(sourceURL)
+        } else {
+            file = try? CodexAuth.read(sourceURL)
+        }
+        guard let file,
               let tokens = file.tokens,
               !tokens.accessToken.isEmpty else {
             return current
@@ -1857,6 +2001,15 @@ public actor AccountStore {
             guard AccountImporter.managedCredentialBundleIsValid(tokens, now: clock()),
                   let currentCredentialAccountID,
                   (claimedAccountID ?? tokens.accountId) == currentCredentialAccountID else { return current }
+        case .standaloneHome:
+            let currentCredentialAccountID = current.credentialAccountID ?? current.accountID
+            guard StandaloneAccountRemoval.verifiedAuthURL(
+                current,
+                supportDirectory: url.deletingLastPathComponent()
+            ) != nil,
+            !currentCredentialAccountID.isEmpty,
+            (claimedAccountID ?? tokens.accountId) == currentCredentialAccountID,
+            tokens.accountId.isEmpty || tokens.accountId == currentCredentialAccountID else { return current }
         case .nativeAuth, .legacySnapshot:
             guard (claimedAccountID ?? tokens.accountId) == current.accountID,
                   tokens.accountId.isEmpty || tokens.accountId == current.accountID else { return current }
@@ -1893,7 +2046,9 @@ public actor AccountStore {
         data.accounts[i].refreshToken = tokens.refreshToken
         data.accounts[i].credentialAccountID = JWT.identity(fromAccessToken: tokens.accessToken).accountID
             ?? (tokens.accountId.isEmpty ? nil : tokens.accountId)
-        if data.accounts[i].credentialSource?.kind != .managedHome, !tokens.accountId.isEmpty {
+        if data.accounts[i].credentialSource?.kind != .managedHome,
+           data.accounts[i].credentialSource?.kind != .standaloneHome,
+           !tokens.accountId.isEmpty {
             data.accounts[i].accountID = tokens.accountId
         }
         if clearNeedsLogin {
@@ -1914,7 +2069,7 @@ public actor AccountStore {
         let locked = Self.withStoreLock(url) {
             guard var latest = Self.loadFrom(url),
                   let index = latest.accounts.firstIndex(where: {
-                      $0.credentialSource?.kind == .nativeAuth
+                      $0.credentialSource?.kind == .standaloneHome
                           && $0.credentialSource?.path == sourcePath
                           && $0.credentialAccountID == credentialAccountID
                   }),
@@ -2379,6 +2534,15 @@ public actor AccountStore {
         var account = account
         if let source = account.credentialSource, source.kind == .managedHome {
             account.managedHomePath = source.path
+        } else if account.credentialSource?.kind == .nativeAuth,
+                  let authURL = StandaloneAccountRemoval.verifiedLegacyAuthURL(
+                      account,
+                      supportDirectory: url.deletingLastPathComponent()
+                  ) {
+            account.credentialSource = AccountCredentialSource(
+                kind: .standaloneHome,
+                path: authURL.path
+            )
         }
         account.priority = AccountPriority.normalize(account.priority)
         let matchingAccountID = data.accounts.firstIndex {
@@ -2396,12 +2560,27 @@ public actor AccountStore {
             }
         }()
         let matchingAlias = data.accounts.firstIndex { $0.alias == account.alias }
-        let matchingIndex = matchingAccountID ?? matchingRetiredManagedSource ?? matchingAlias.flatMap { index in
+        let matchingCredentialOwner: Int? = {
+            guard let incomingSource = Self.credentialSource(for: account),
+                  incomingSource.kind == .standaloneHome || incomingSource.kind == .managedHome,
+                  let credentialAccountID = account.credentialAccountID,
+                  !credentialAccountID.isEmpty else { return nil }
+            let candidates = data.accounts.indices.filter {
+                data.accounts[$0].accountID != account.accountID
+                    && data.accounts[$0].credentialAccountID == credentialAccountID
+            }
+            if let aliasMatch = candidates.first(where: { data.accounts[$0].alias == account.alias }) {
+                return aliasMatch
+            }
+            return candidates.count == 1 ? candidates[0] : nil
+        }()
+        let matchingIndex = matchingAccountID ?? matchingRetiredManagedSource ?? matchingCredentialOwner ?? matchingAlias.flatMap { index in
             guard account.accountID.isEmpty || data.accounts[index].accountID.isEmpty else { return nil }
             return index
         }
         if let i = matchingIndex {
             let existing = data.accounts[i]
+            let matchedByCredentialOwner = matchingCredentialOwner == i
             let migratingManagedWorkspaceIdentity = acceptingManagedSource
                 && matchingRetiredManagedSource == i
                 && !existing.accountID.isEmpty
@@ -2423,19 +2602,29 @@ public actor AccountStore {
                 merged.disabledUntil = existing.disabledUntil
                 merged.lastUsedAt = existing.lastUsedAt
             }
-            merged.managedHomePath = account.managedHomePath ?? existing.managedHomePath
-            merged.credentialSource = account.credentialSource ?? existing.credentialSource
             merged.credentialAccountID = account.credentialAccountID ?? existing.credentialAccountID
-            if let managedHomePath = merged.managedHomePath {
-                merged.credentialSource = AccountCredentialSource(kind: .managedHome, path: managedHomePath)
-            }
-            let replacingManagedSource = acceptingManagedSource && existing.accountID == account.accountID
-                && Self.credentialSource(for: existing) != Self.credentialSource(for: account)
-            let incomingMayReplaceManagedOwner = replacingManagedSource || Self.incomingSourceMayReplaceManagedOwner(
+            let existingSource = Self.credentialSource(for: existing)
+            let incomingSource = Self.credentialSource(for: account)
+            let replacingManagedSource = acceptingManagedSource
+                && existing.accountID == account.accountID
+                && existingSource?.kind == .managedHome
+                && incomingSource?.kind == .managedHome
+                && existingSource != incomingSource
+            let incomingMayReplaceOwner = replacingManagedSource || Self.incomingSourceMayReplaceOwner(
                 existing: existing,
-                incoming: account
+                incoming: account,
+                acceptingManagedSource: acceptingManagedSource,
+                supportDirectory: url.deletingLastPathComponent(),
+                now: clock()
             )
-            if !incomingMayReplaceManagedOwner {
+            if !existing.accountID.isEmpty,
+               (matchedByCredentialOwner && incomingSource?.kind == .standaloneHome || !incomingMayReplaceOwner) {
+                merged.accountID = existing.accountID
+            }
+            if incomingMayReplaceOwner {
+                merged.managedHomePath = incomingSource?.kind == .managedHome ? incomingSource?.path : nil
+                merged.credentialSource = incomingSource
+            } else {
                 merged.managedHomePath = existing.managedHomePath
                 merged.credentialSource = existing.credentialSource
             }
@@ -2464,7 +2653,19 @@ public actor AccountStore {
             // clobbers a fresher one, independent of import order.
             let existingExp = JWT.expiry(existing.accessToken) ?? .distantPast
             let incomingExp = JWT.expiry(account.accessToken) ?? .distantPast
-            if !incomingMayReplaceManagedOwner || (!replacingManagedSource && existingExp > incomingExp) {
+            let existingPriority = Self.credentialSourcePriority(
+                existing,
+                supportDirectory: url.deletingLastPathComponent(),
+                now: clock()
+            )
+            let incomingPriority = Self.credentialSourcePriority(
+                account,
+                supportDirectory: url.deletingLastPathComponent(),
+                now: clock()
+            )
+            let shouldAdoptIncomingCredentials = incomingMayReplaceOwner
+                && (incomingPriority > existingPriority || replacingManagedSource || existingExp <= incomingExp)
+            if !shouldAdoptIncomingCredentials {
                 merged.accessToken = existing.accessToken
                 merged.refreshToken = existing.refreshToken
                 merged.idToken = existing.idToken

@@ -338,7 +338,7 @@ final class ManagedAuthRecoveryTests: XCTestCase {
             accessToken: initial.accessToken,
             refreshToken: initial.refreshToken,
             idToken: initial.idToken,
-            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: authURL.path)
+            credentialSource: AccountCredentialSource(kind: .standaloneHome, path: authURL.path)
         )
         let store = await makeStore(root: root, account: account)
         let upstream = ManagedAuthHTTPServer { request in

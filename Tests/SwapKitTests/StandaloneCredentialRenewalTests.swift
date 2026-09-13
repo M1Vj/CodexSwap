@@ -265,7 +265,7 @@ final class StandaloneCredentialRenewalTests: XCTestCase {
             refreshToken: original.refreshToken,
             idToken: original.idToken,
             needsLogin: true,
-            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: authURL.path)
+            credentialSource: AccountCredentialSource(kind: .standaloneHome, path: authURL.path)
         )
         let store = AccountStore(url: support.appendingPathComponent("accounts.json"))
         await store.upsert(account)

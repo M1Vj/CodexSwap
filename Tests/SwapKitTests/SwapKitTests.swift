@@ -5383,7 +5383,7 @@ final class SettingsPresentationTests: XCTestCase {
             accountID: "standalone",
             accessToken: "token",
             credentialSource: AccountCredentialSource(
-                kind: .nativeAuth,
+                kind: .standaloneHome,
                 path: home.appendingPathComponent("auth.json").path
             )
         )

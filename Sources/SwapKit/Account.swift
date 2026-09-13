@@ -254,6 +254,7 @@ public struct WindowSample: Codable, Sendable, Equatable {
 
 public struct AccountCredentialSource: Codable, Sendable, Equatable {
     public enum Kind: String, Codable, Sendable, Equatable {
+        case standaloneHome
         case managedHome
         case nativeAuth
         case legacySnapshot
@@ -263,9 +264,37 @@ public struct AccountCredentialSource: Codable, Sendable, Equatable {
     public let kind: Kind
     public let path: String?
 
+    private enum CodingKeys: String, CodingKey {
+        case kind, path, owner
+    }
+
+    private static let standaloneOwnerDiscriminator = "codexswapStandalone"
+
     public init(kind: Kind, path: String? = nil) {
         self.kind = kind
         self.path = path
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedKind = try container.decodeIfPresent(Kind.self, forKey: .kind) ?? .unknown
+        let owner = try container.decodeIfPresent(String.self, forKey: .owner)
+        if decodedKind == .nativeAuth, owner == Self.standaloneOwnerDiscriminator {
+            kind = .standaloneHome
+        } else {
+            kind = decodedKind
+        }
+        path = try container.decodeIfPresent(String.self, forKey: .path)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        let persistedKind: Kind = kind == .standaloneHome ? .nativeAuth : kind
+        try container.encode(persistedKind, forKey: .kind)
+        try container.encodeIfPresent(path, forKey: .path)
+        if kind == .standaloneHome {
+            try container.encode(Self.standaloneOwnerDiscriminator, forKey: .owner)
+        }
     }
 }
 

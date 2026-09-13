@@ -213,6 +213,282 @@ final class ManagedSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: authPath), sourceBeforeHydration)
     }
 
+    func testRejectedManagedTakeoverPreservesStandaloneWorkspaceAndOverlays() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-rejected-managed-takeover-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let credentialOwner = "credential-owner"
+        let standaloneTokens = Self.tokens("standalone-owner", expiry: now.addingTimeInterval(3_600), accountID: credentialOwner)
+        let standaloneHome = try Self.makeStandaloneHome(root: root, tokens: standaloneTokens)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let managedTokens = Self.tokens("managed-incoming", expiry: now.addingTimeInterval(7_200), accountID: credentialOwner)
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+
+        let disabledUntil = now.addingTimeInterval(1_800)
+        let archivedAt = now.addingTimeInterval(-600)
+        let pausedAt = now.addingTimeInterval(-300)
+        let lastUsedAt = now.addingTimeInterval(-120)
+        let usage = [UsageWindow(label: "5h", usedPercent: 37, windowSeconds: 18_000, resetAt: disabledUntil)]
+        let telemetryID = UUID()
+        let usageLimits = AccountUsageLimitSettings(enabled: true, fiveHourPercent: 70, weeklyPercent: 85)
+        var standalone = Account(
+            alias: "standalone",
+            email: "owner@example.com",
+            accountID: "selected-workspace",
+            credentialAccountID: credentialOwner,
+            accessToken: standaloneTokens.accessToken,
+            refreshToken: standaloneTokens.refreshToken,
+            idToken: standaloneTokens.idToken,
+            priority: 6,
+            disabledUntil: ["quota": disabledUntil],
+            needsLogin: true,
+            lastUsedAt: lastUsedAt,
+            usage: usage,
+            credentialSource: AccountCredentialSource(
+                kind: .standaloneHome,
+                path: standaloneHome.appendingPathComponent("auth.json").path
+            ),
+            routingEnabled: false,
+            archivedAt: archivedAt,
+            routingPausedAt: pausedAt,
+            telemetryID: telemetryID,
+            usageLimitSettings: usageLimits
+        )
+        standalone.usageStats = UsageStats(totalRequests: 4, inputTokens: 120, outputTokens: 80)
+        standalone.usageHistory = [WindowSample(capturedAt: lastUsedAt, label: "5h", usedPercent: 37)]
+        standalone.lastServedByUs = lastUsedAt
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        await store.upsert(standalone)
+        let beforeValue = await store.account("standalone")
+        let before = try XCTUnwrap(beforeValue)
+        let incoming = try XCTUnwrap(AccountImporter.codexBarAccounts([
+            CodexBarBridge.ManagedAccount(
+                email: "managed@example.com",
+                accountID: "incoming-workspace",
+                managedHomePath: managedHome.path
+            )
+        ]).first)
+
+        let merged = await store.reconcileManagedAccount(
+            incoming,
+            presentAccountIDs: ["incoming-workspace"]
+        )
+
+        XCTAssertEqual(merged.accountID, "selected-workspace")
+        XCTAssertEqual(merged.credentialAccountID, credentialOwner)
+        XCTAssertEqual(merged.accessToken, standaloneTokens.accessToken)
+        XCTAssertEqual(merged.refreshToken, standaloneTokens.refreshToken)
+        XCTAssertEqual(merged.idToken, standaloneTokens.idToken)
+        XCTAssertEqual(merged.credentialSource?.kind, .standaloneHome)
+        XCTAssertEqual(merged.credentialSource?.path, standalone.credentialSource?.path)
+        XCTAssertNil(merged.managedHomePath)
+        XCTAssertEqual(merged.alias, standalone.alias)
+        XCTAssertEqual(merged.priority, before.priority)
+        XCTAssertEqual(merged.disabledUntil, standalone.disabledUntil)
+        XCTAssertEqual(merged.needsLogin, standalone.needsLogin)
+        XCTAssertEqual(merged.lastUsedAt, standalone.lastUsedAt)
+        XCTAssertEqual(merged.usage, standalone.usage)
+        XCTAssertEqual(merged.usageStats, standalone.usageStats)
+        XCTAssertEqual(merged.usageHistory, standalone.usageHistory)
+        XCTAssertEqual(merged.lastServedByUs, standalone.lastServedByUs)
+        XCTAssertEqual(merged.archivedAt, standalone.archivedAt)
+        XCTAssertEqual(merged.routingPausedAt, standalone.routingPausedAt)
+        XCTAssertEqual(merged.routingEnabled, standalone.routingEnabled)
+        XCTAssertEqual(merged.telemetryID, telemetryID)
+        XCTAssertEqual(merged.usageLimitSettings, usageLimits)
+    }
+
+    func testInvalidStandaloneRowsDoNotDisplaceValidManagedOwner() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cases: [(String, CodexTokens)] = [
+            ("expired-row", Self.tokens("expired-row", expiry: now.addingTimeInterval(-60), accountID: "credential-owner")),
+            ("mismatched-row", Self.tokens("mismatched-row", expiry: now.addingTimeInterval(3_600), accountID: "other-owner")),
+        ]
+
+        for (label, rowTokens) in cases {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("standalone-invalid-row-\(label)-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let credentialOwner = "credential-owner"
+            let sourceTokens = Self.tokens("fresh-home-\(label)", expiry: now.addingTimeInterval(3_600), accountID: credentialOwner)
+            let standaloneHome = try Self.makeStandaloneHome(root: root, tokens: sourceTokens)
+            let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+            let managedTokens = Self.tokens("managed-\(label)", expiry: now.addingTimeInterval(7_200), accountID: credentialOwner)
+            try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+            try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+
+            let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+            await store.upsert(Account(
+                alias: "standalone",
+                accountID: "selected-workspace",
+                credentialAccountID: credentialOwner,
+                accessToken: rowTokens.accessToken,
+                refreshToken: rowTokens.refreshToken,
+                idToken: rowTokens.idToken,
+                credentialSource: AccountCredentialSource(
+                    kind: .standaloneHome,
+                    path: standaloneHome.appendingPathComponent("auth.json").path
+                )
+            ))
+            let incoming = try XCTUnwrap(AccountImporter.codexBarAccounts([
+                CodexBarBridge.ManagedAccount(
+                    email: "managed@example.com",
+                    accountID: "selected-workspace",
+                    managedHomePath: managedHome.path
+                )
+            ]).first)
+
+            let merged = await store.reconcileManagedAccount(
+                incoming,
+                presentAccountIDs: ["selected-workspace"]
+            )
+
+            XCTAssertEqual(merged.accessToken, managedTokens.accessToken, label)
+            XCTAssertEqual(merged.refreshToken, managedTokens.refreshToken, label)
+            XCTAssertEqual(merged.idToken, managedTokens.idToken, label)
+            XCTAssertEqual(merged.credentialSource?.kind, .managedHome, label)
+            XCTAssertEqual(merged.managedHomePath, managedHome.path, label)
+        }
+    }
+
+    func testStalePersistenceKeepsValidStandaloneBundleAndSelectedWorkspace() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-stale-persistence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let credentialOwner = "credential-owner"
+        let sourceTokens = Self.tokens("valid-standalone", expiry: now.addingTimeInterval(3_600), accountID: credentialOwner)
+        let home = try Self.makeStandaloneHome(root: root, tokens: sourceTokens)
+        let source = AccountCredentialSource(
+            kind: .standaloneHome,
+            path: home.appendingPathComponent("auth.json").path
+        )
+        let seed = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        await seed.upsert(Account(
+            alias: "standalone",
+            accountID: "selected-workspace",
+            credentialAccountID: credentialOwner,
+            accessToken: sourceTokens.accessToken,
+            refreshToken: sourceTokens.refreshToken,
+            idToken: sourceTokens.idToken,
+            usage: [UsageWindow(label: "5h", usedPercent: 10, windowSeconds: 18_000, resetAt: nil)],
+            credentialSource: source
+        ))
+
+        let latest = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        let stale = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        let freshUsage = [UsageWindow(label: "5h", usedPercent: 61, windowSeconds: 18_000, resetAt: now.addingTimeInterval(1_800))]
+        await latest.updateUsage("standalone", windows: freshUsage)
+        let invalidTokens = Self.tokens("stale-invalid", expiry: now.addingTimeInterval(-60), accountID: credentialOwner)
+        await stale.updateTokens("standalone", tokens: invalidTokens, clearNeedsLogin: false)
+
+        let reloaded = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        let retainedValue = await reloaded.account("standalone")
+        let retained = try XCTUnwrap(retainedValue)
+
+        XCTAssertEqual(retained.accountID, "selected-workspace")
+        XCTAssertEqual(retained.credentialAccountID, credentialOwner)
+        XCTAssertEqual(retained.accessToken, sourceTokens.accessToken)
+        XCTAssertEqual(retained.refreshToken, sourceTokens.refreshToken)
+        XCTAssertEqual(retained.idToken, sourceTokens.idToken)
+        XCTAssertEqual(retained.credentialSource, source)
+        XCTAssertEqual(retained.usage, freshUsage)
+    }
+
+    func testLegacyNativeAuthMigrationRejectsMismatchedCandidateBundle() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("legacy-native-mismatch-migration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let credentialOwner = "credential-owner"
+        let sourceTokens = Self.tokens("verified-home", expiry: now.addingTimeInterval(3_600), accountID: credentialOwner)
+        let home = try Self.makeStandaloneHome(root: root, tokens: sourceTokens)
+        let rowTokens = Self.tokens("row-other-owner", expiry: now.addingTimeInterval(3_600), accountID: "other-owner")
+        let authPath = home.appendingPathComponent("auth.json").path
+        let legacy = Account(
+            alias: "legacy",
+            accountID: "selected-workspace",
+            credentialAccountID: credentialOwner,
+            accessToken: rowTokens.accessToken,
+            refreshToken: rowTokens.refreshToken,
+            idToken: rowTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: authPath)
+        )
+        let storeURL = root.appendingPathComponent("accounts.json")
+        try JSONEncoder.codex.encode(StoreData(accounts: [legacy])).write(to: storeURL)
+
+        let store = AccountStore(url: storeURL, clock: { now })
+        let retainedValue = await store.account("legacy")
+        let retained = try XCTUnwrap(retainedValue)
+
+        XCTAssertEqual(retained.credentialSource?.kind, .nativeAuth)
+        XCTAssertEqual(retained.credentialSource?.path, authPath)
+    }
+
+    func testLegacyNativeAuthMigrationRejectsArbitraryPlausiblePath() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("legacy-native-arbitrary-migration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "arbitrary-account"
+        let tokens = Self.tokens("arbitrary-path", expiry: now.addingTimeInterval(3_600), accountID: accountID)
+        let arbitraryHome = root.appendingPathComponent("plausible-home-\(UUID().uuidString)", isDirectory: true)
+        let authPath = arbitraryHome.appendingPathComponent("auth.json")
+        try FileManager.default.createDirectory(at: arbitraryHome, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try CodexAuth.write(tokens, to: authPath)
+        try Data("completed\n".utf8).write(to: arbitraryHome.appendingPathComponent(CodexLoginLauncher.successMarkerName))
+
+        let legacy = Account(
+            alias: "legacy-arbitrary",
+            accountID: accountID,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: authPath.path)
+        )
+        let storeURL = root.appendingPathComponent("accounts.json")
+        try JSONEncoder.codex.encode(StoreData(accounts: [legacy])).write(to: storeURL)
+
+        let store = AccountStore(url: storeURL, clock: { now })
+        let retainedValue = await store.account("legacy-arbitrary")
+        let retained = try XCTUnwrap(retainedValue)
+
+        XCTAssertEqual(retained.credentialSource?.kind, .nativeAuth)
+        XCTAssertEqual(retained.credentialSource?.path, authPath.path)
+    }
+
+    func testStandaloneCredentialSourceEncodingUsesLegacyKindAndDiscriminator() throws {
+        let source = AccountCredentialSource(
+            kind: .standaloneHome,
+            path: "/tmp/codexswap-standalone/auth.json"
+        )
+        let encoded = try JSONEncoder.codex.encode(source)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        XCTAssertEqual(object["kind"] as? String, "nativeAuth")
+        XCTAssertEqual(object["owner"] as? String, "codexswapStandalone")
+        let legacyDecoded = try JSONDecoder.codex.decode(LegacyCredentialSourceFixture.self, from: encoded)
+        XCTAssertEqual(legacyDecoded.kind, .nativeAuth)
+        let decoded = try JSONDecoder.codex.decode(AccountCredentialSource.self, from: encoded)
+        XCTAssertEqual(decoded, source)
+    }
+
+    func testLegacyNativeAuthCredentialSourceWithoutDiscriminatorRemainsNativeAuth() throws {
+        let data = Data(#"{"kind":"nativeAuth","path":"/tmp/codexswap-native/auth.json"}"#.utf8)
+        let decoded = try JSONDecoder.codex.decode(AccountCredentialSource.self, from: data)
+
+        XCTAssertEqual(decoded.kind, .nativeAuth)
+        XCTAssertEqual(decoded.path, "/tmp/codexswap-native/auth.json")
+    }
+
     func testHydrationRejectsChangedEqualExpiryNativeAndLegacyBundles() async throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let expiry = now.addingTimeInterval(3_600)
@@ -256,6 +532,335 @@ final class ManagedSourceReconciliationTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: storeURL), storeBeforeHydration, label)
             XCTAssertEqual(try Data(contentsOf: sourcePath), sourceBeforeHydration, label)
         }
+    }
+
+    func testVerifiedStandaloneHomeWinsManagedDuplicateAndRemainsOwner() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-precedence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "selected-workspace"
+        let credentialOwner = "credential-owner"
+        let standaloneTokens = Self.tokens("standalone", expiry: now.addingTimeInterval(1_800), accountID: credentialOwner)
+        let managedTokens = Self.tokens("managed", expiry: now.addingTimeInterval(3_600), accountID: credentialOwner)
+        _ = try Self.makeStandaloneHome(root: root, tokens: standaloneTokens)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        let managed = Account(
+            alias: "managed",
+            accountID: accountID,
+            credentialAccountID: credentialOwner,
+            accessToken: managedTokens.accessToken,
+            refreshToken: managedTokens.refreshToken,
+            idToken: managedTokens.idToken,
+            usage: [UsageWindow(label: "5h", usedPercent: 44, windowSeconds: 18_000, resetAt: nil)],
+            managedHomePath: managedHome.path
+        )
+        await store.upsert(managed)
+        let storedManagedValue = await store.account("managed")
+        let storedManaged = try XCTUnwrap(storedManagedValue)
+        XCTAssertEqual(storedManaged.accountID, accountID)
+        XCTAssertEqual(storedManaged.credentialAccountID, credentialOwner)
+
+        let standalone = try XCTUnwrap(
+            AccountImporter.standaloneCodexAuthAccounts(supportDirectory: root, now: now).first
+        )
+        XCTAssertEqual(standalone.accountID, credentialOwner)
+        XCTAssertEqual(standalone.credentialAccountID, credentialOwner)
+        XCTAssertEqual(standalone.credentialSource?.kind, .standaloneHome)
+        XCTAssertNotNil(StandaloneAccountRemoval.verifiedAuthURL(standalone, supportDirectory: root))
+
+        let adopted = await store.upsert(standalone)
+        XCTAssertEqual(adopted.accountID, accountID)
+        XCTAssertEqual(adopted.credentialAccountID, credentialOwner)
+        XCTAssertEqual(adopted.accessToken, standaloneTokens.accessToken)
+        XCTAssertEqual(adopted.credentialSource?.kind, .standaloneHome)
+        XCTAssertNil(adopted.managedHomePath)
+        XCTAssertEqual(adopted.usage, managed.usage)
+
+        let managedAgain = try XCTUnwrap(AccountImporter.codexBarAccounts([
+            CodexBarBridge.ManagedAccount(email: "managed@example.com", accountID: accountID, managedHomePath: managedHome.path)
+        ]).first)
+        let afterReconcile = await store.reconcileManagedAccount(
+            managedAgain,
+            presentAccountIDs: [accountID]
+        )
+        XCTAssertEqual(afterReconcile.accessToken, standaloneTokens.accessToken)
+        XCTAssertEqual(afterReconcile.credentialSource?.kind, .standaloneHome)
+        XCTAssertNil(afterReconcile.managedHomePath)
+    }
+
+    func testStandaloneHydrationAdoptsVerifiedBundleAndPreservesSelectedWorkspace() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-source-hydration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let credentialOwner = "credential-owner"
+        let storedTokens = Self.tokens("stored", expiry: now.addingTimeInterval(60), accountID: credentialOwner)
+        let sourceTokens = Self.tokens("source", expiry: now.addingTimeInterval(1_800), accountID: credentialOwner)
+        let home = try Self.makeStandaloneHome(root: root, tokens: sourceTokens)
+        let authPath = home.appendingPathComponent("auth.json")
+        let sourceBeforeHydration = try Data(contentsOf: authPath)
+        let usage = [UsageWindow(label: "5h", usedPercent: 27, windowSeconds: 18_000, resetAt: nil)]
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        await store.upsert(Account(
+            alias: "standalone",
+            accountID: "selected-workspace",
+            credentialAccountID: credentialOwner,
+            accessToken: storedTokens.accessToken,
+            refreshToken: storedTokens.refreshToken,
+            idToken: storedTokens.idToken,
+            needsLogin: true,
+            usage: usage,
+            credentialSource: AccountCredentialSource(kind: .standaloneHome, path: authPath.path)
+        ))
+
+        let hydratedValue = await store.hydrateFromManagedHome("standalone")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated.accountID, "selected-workspace")
+        XCTAssertEqual(hydrated.credentialAccountID, credentialOwner)
+        XCTAssertEqual(hydrated.accessToken, sourceTokens.accessToken)
+        XCTAssertEqual(hydrated.refreshToken, sourceTokens.refreshToken)
+        XCTAssertEqual(hydrated.idToken, sourceTokens.idToken)
+        XCTAssertEqual(hydrated.usage, usage)
+        XCTAssertTrue(hydrated.needsLogin)
+        XCTAssertEqual(hydrated.credentialSource?.kind, .standaloneHome)
+        XCTAssertEqual(try Data(contentsOf: authPath), sourceBeforeHydration)
+    }
+
+    func testUpdateTokensPreservesStandaloneSelectedWorkspaceAndOverlays() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-update-tokens-workspace-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let credentialOwner = "credential-owner"
+        let selectedWorkspace = "selected-workspace"
+        let currentTokens = Self.tokens("standalone-current", expiry: now.addingTimeInterval(3_600), accountID: credentialOwner)
+        let refreshedTokens = Self.tokens("standalone-refreshed", expiry: now.addingTimeInterval(7_200), accountID: credentialOwner)
+        let home = try Self.makeStandaloneHome(root: root, tokens: currentTokens)
+        let source = AccountCredentialSource(
+            kind: .standaloneHome,
+            path: home.appendingPathComponent("auth.json").path
+        )
+        let disabledUntil = now.addingTimeInterval(1_800)
+        let lastUsedAt = now.addingTimeInterval(-120)
+        let usage = [UsageWindow(label: "5h", usedPercent: 41, windowSeconds: 18_000, resetAt: disabledUntil)]
+        let usageStats = UsageStats(totalRequests: 3, inputTokens: 80, outputTokens: 55)
+        let usageHistory = [WindowSample(capturedAt: lastUsedAt, label: "5h", usedPercent: 41)]
+        let telemetryID = UUID()
+        let generation = UUID()
+        var account = Account(
+            alias: "standalone",
+            email: "owner@example.com",
+            accountID: selectedWorkspace,
+            credentialAccountID: credentialOwner,
+            accessToken: currentTokens.accessToken,
+            refreshToken: currentTokens.refreshToken,
+            idToken: currentTokens.idToken,
+            priority: 5,
+            disabledUntil: ["quota": disabledUntil],
+            needsLogin: true,
+            lastUsedAt: lastUsedAt,
+            usage: usage,
+            credentialSource: source,
+            routingEnabled: false,
+            telemetryID: telemetryID,
+            authGeneration: generation
+        )
+        account.usageStats = usageStats
+        account.usageHistory = usageHistory
+        account.lastServedByUs = lastUsedAt
+
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(url: storeURL, clock: { now })
+        await store.upsert(account)
+        let beforeValue = await store.account("standalone")
+        let before = try XCTUnwrap(beforeValue)
+
+        await store.updateTokens(
+            "standalone",
+            tokens: refreshedTokens,
+            clearNeedsLogin: false
+        )
+
+        let updatedValue = await store.account("standalone")
+        let updated = try XCTUnwrap(updatedValue)
+        XCTAssertEqual(updated.accountID, selectedWorkspace)
+        XCTAssertEqual(updated.credentialAccountID, credentialOwner)
+        XCTAssertEqual(updated.accessToken, refreshedTokens.accessToken)
+        XCTAssertEqual(updated.refreshToken, refreshedTokens.refreshToken)
+        XCTAssertEqual(updated.idToken, refreshedTokens.idToken)
+        XCTAssertEqual(updated.credentialSource, source)
+        XCTAssertEqual(updated.priority, before.priority)
+        XCTAssertEqual(updated.disabledUntil, before.disabledUntil)
+        XCTAssertEqual(updated.needsLogin, before.needsLogin)
+        XCTAssertEqual(updated.lastUsedAt, before.lastUsedAt)
+        XCTAssertEqual(updated.usage, before.usage)
+        XCTAssertEqual(updated.usageStats, before.usageStats)
+        XCTAssertEqual(updated.usageHistory, before.usageHistory)
+        XCTAssertEqual(updated.lastServedByUs, before.lastServedByUs)
+        XCTAssertEqual(updated.telemetryID, telemetryID)
+        XCTAssertNotEqual(updated.authGeneration, before.authGeneration)
+
+        let reloaded = AccountStore(url: storeURL, clock: { now })
+        let reloadedValue = await reloaded.account("standalone")
+        let reloadedAccount = try XCTUnwrap(reloadedValue)
+        XCTAssertEqual(reloadedAccount.accountID, selectedWorkspace)
+        XCTAssertEqual(reloadedAccount.credentialAccountID, credentialOwner)
+        XCTAssertEqual(reloadedAccount.accessToken, refreshedTokens.accessToken)
+        XCTAssertEqual(reloadedAccount.refreshToken, refreshedTokens.refreshToken)
+        XCTAssertEqual(reloadedAccount.idToken, refreshedTokens.idToken)
+        XCTAssertEqual(reloadedAccount.credentialSource, source)
+        XCTAssertEqual(reloadedAccount.usage, usage)
+        XCTAssertEqual(reloadedAccount.disabledUntil, ["quota": disabledUntil])
+        XCTAssertEqual(reloadedAccount.telemetryID, telemetryID)
+    }
+
+    func testLegacyNativeStandaloneSourceMigratesOnlyFromVerifiedHome() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-source-migration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let tokens = Self.tokens("legacy", expiry: now.addingTimeInterval(1_800), accountID: "legacy-account")
+        let home = try Self.makeStandaloneHome(root: root, tokens: tokens)
+        let legacy = Account(
+            alias: "legacy",
+            accountID: tokens.accountId,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            credentialSource: AccountCredentialSource(
+                kind: .nativeAuth,
+                path: home.appendingPathComponent("auth.json").path
+            )
+        )
+        let storeURL = root.appendingPathComponent("accounts.json")
+        try JSONEncoder.codex.encode(StoreData(accounts: [legacy])).write(to: storeURL)
+
+        let store = AccountStore(url: storeURL, clock: { now })
+        let migratedValue = await store.account("legacy")
+        let migrated = try XCTUnwrap(migratedValue)
+
+        XCTAssertEqual(migrated.credentialSource?.kind, .standaloneHome)
+        XCTAssertEqual(migrated.credentialSource?.path, home.appendingPathComponent("auth.json").path)
+    }
+
+    func testExpiredStandaloneHomeDoesNotDisplaceValidManagedOwner() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-invalid-precedence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "same-account"
+        let expiredTokens = Self.tokens("expired", expiry: now.addingTimeInterval(-60), accountID: accountID)
+        let managedTokens = Self.tokens("managed", expiry: now.addingTimeInterval(3_600), accountID: accountID)
+        let standaloneHome = try Self.makeStandaloneHome(root: root, tokens: expiredTokens)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        await store.upsert(Account(
+            alias: "standalone",
+            accountID: accountID,
+            accessToken: expiredTokens.accessToken,
+            refreshToken: expiredTokens.refreshToken,
+            idToken: expiredTokens.idToken,
+            credentialSource: AccountCredentialSource(
+                kind: .standaloneHome,
+                path: standaloneHome.appendingPathComponent("auth.json").path
+            )
+        ))
+
+        let managed = try XCTUnwrap(AccountImporter.codexBarAccounts([
+            CodexBarBridge.ManagedAccount(email: "managed@example.com", accountID: accountID, managedHomePath: managedHome.path)
+        ]).first)
+        let merged = await store.reconcileManagedAccount(managed, presentAccountIDs: [accountID])
+
+        XCTAssertEqual(merged.accessToken, managedTokens.accessToken)
+        XCTAssertEqual(merged.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(merged.managedHomePath, managedHome.path)
+    }
+
+    func testStandaloneRecoveryPreservesSelectedWorkspaceIdentity() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("standalone-recovery-workspace-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let credentialOwner = "credential-owner"
+        let tokens = Self.tokens("standalone", expiry: now.addingTimeInterval(1_800), accountID: credentialOwner)
+        let home = try Self.makeStandaloneHome(root: root, tokens: tokens)
+        let account = Account(
+            alias: "standalone",
+            accountID: "selected-workspace",
+            credentialAccountID: credentialOwner,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            needsLogin: true,
+            credentialSource: AccountCredentialSource(
+                kind: .standaloneHome,
+                path: home.appendingPathComponent("auth.json").path
+            )
+        )
+
+        let candidate = try XCTUnwrap(AuthenticationRecovery.candidate(for: account))
+
+        XCTAssertEqual(candidate.accountID, account.accountID)
+        XCTAssertEqual(candidate.credentialAccountID, credentialOwner)
+        XCTAssertTrue(AuthenticationRecovery.accepts(candidate, for: account, now: now))
+    }
+
+    func testAmbientNativeDuplicateCannotDisplaceManagedOwner() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ambient-precedence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let accountID = "same-account"
+        let managedTokens = Self.tokens("managed", expiry: Date().addingTimeInterval(60), accountID: accountID)
+        let ambientTokens = Self.tokens("ambient", expiry: Date().addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        let managed = try XCTUnwrap(AccountImporter.codexBarAccounts([
+            CodexBarBridge.ManagedAccount(email: "managed@example.com", accountID: accountID, managedHomePath: managedHome.path)
+        ]).first)
+        await store.reconcileManagedAccount(managed, presentAccountIDs: [accountID])
+        let ambient = Account(
+            alias: "ambient",
+            accountID: accountID,
+            accessToken: ambientTokens.accessToken,
+            refreshToken: ambientTokens.refreshToken,
+            idToken: ambientTokens.idToken,
+            credentialSource: AccountCredentialSource(
+                kind: .nativeAuth,
+                path: root.appendingPathComponent("ambient-auth.json").path
+            )
+        )
+
+        let merged = await store.upsert(ambient)
+
+        XCTAssertEqual(merged.accessToken, managedTokens.accessToken)
+        XCTAssertEqual(merged.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(merged.managedHomePath, managedHome.path)
+    }
+
+    private static func makeStandaloneHome(root: URL, tokens: CodexTokens) throws -> URL {
+        let homes = root.appendingPathComponent(CodexLoginLauncher.standaloneHomesDirectoryName, isDirectory: true)
+        let home = homes.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: homes.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
+        try CodexAuth.write(tokens, to: home.appendingPathComponent("auth.json"))
+        try Data("completed\n".utf8).write(to: home.appendingPathComponent(CodexLoginLauncher.successMarkerName))
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: home.appendingPathComponent(CodexLoginLauncher.successMarkerName).path)
+        return home
     }
 
     func testGenericUpsertDoesNotClearNeedsLoginWithoutUsageVerification() async throws {
@@ -487,4 +1092,9 @@ final class ManagedSourceReconciliationTests: XCTestCase {
             .replacingOccurrences(of: "=", with: "")
         return "e30.\(encoded).sig"
     }
+}
+
+private struct LegacyCredentialSourceFixture: Codable {
+    let kind: AccountCredentialSource.Kind
+    let path: String?
 }

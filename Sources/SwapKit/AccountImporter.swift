@@ -169,7 +169,7 @@ public enum AccountImporter {
                 from: tokens,
                 managedHomePath: nil,
                 credentialSource: AccountCredentialSource(
-                    kind: .nativeAuth,
+                    kind: .standaloneHome,
                     path: authPath.standardizedFileURL.path
                 )
             )
@@ -207,7 +207,11 @@ public enum AccountImporter {
             let path = account.credentialSource?.path ?? ""
             guard !key.isEmpty else { continue }
             if let current = selected[key] {
-                if expiry > current.expiry || (expiry == current.expiry && path < current.path) {
+                let currentPriority = credentialSourcePriority(current.account)
+                let incomingPriority = credentialSourcePriority(account)
+                if incomingPriority > currentPriority
+                    || (incomingPriority == currentPriority
+                        && (expiry > current.expiry || (expiry == current.expiry && path < current.path))) {
                     selected[key] = (account, expiry, path)
                 }
             } else {
@@ -217,6 +221,15 @@ public enum AccountImporter {
         return selected.values
             .map(\.account)
             .sorted { ($0.accountID, $0.alias) < ($1.accountID, $1.alias) }
+    }
+
+    private static func credentialSourcePriority(_ account: Account) -> Int {
+        switch account.credentialSource?.kind {
+        case .standaloneHome: return 3
+        case .managedHome: return 2
+        case .nativeAuth, .legacySnapshot: return 1
+        case .unknown, nil: return 0
+        }
     }
 
     /// Existing per-account bundles written by @loongphy/codex-auth at ~/.codex/accounts/*.auth.json (base64-named).

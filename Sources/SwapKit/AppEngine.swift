@@ -1145,7 +1145,8 @@ public actor AppEngine {
             )
             return .failed
         }
-        guard !externalAccountIDs.contains(account.accountID) else {
+        let credentialOwnerID = account.credentialAccountID ?? account.accountID
+        guard !externalAccountIDs.contains(credentialOwnerID) else {
             DiagnosticsLog.shared.record(
                 component: .accounts,
                 operation: .removeAccount,
@@ -1160,7 +1161,7 @@ public actor AppEngine {
             let homesLock = try StandaloneHomesLock.acquire(supportDirectory: supportDir)
             defer { homesLock.release() }
             let quarantine = try StandaloneAccountRemoval.quarantineHomes(
-                accountID: account.accountID,
+                accountID: credentialOwnerID,
                 supportDirectory: supportDir,
                 lock: homesLock
             )
@@ -1176,7 +1177,7 @@ public actor AppEngine {
                 )
                 return .failed
             }
-            guard !latestExternalAccountIDs.contains(account.accountID) else {
+            guard !latestExternalAccountIDs.contains(credentialOwnerID) else {
                 try quarantine.restore()
                 DiagnosticsLog.shared.record(
                     component: .accounts,
