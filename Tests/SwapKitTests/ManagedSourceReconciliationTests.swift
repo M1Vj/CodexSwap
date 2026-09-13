@@ -581,6 +581,22 @@ final class ManagedSourceReconciliationTests: XCTestCase {
         XCTAssertNil(adopted.managedHomePath)
         XCTAssertEqual(adopted.usage, managed.usage)
 
+        let nativeTokens = Self.tokens("native", expiry: now.addingTimeInterval(7_200), accountID: credentialOwner)
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try CodexAuth.write(nativeTokens, to: nativeAuth)
+        let native = Account(
+            alias: "ambient",
+            accountID: accountID,
+            accessToken: nativeTokens.accessToken,
+            refreshToken: nativeTokens.refreshToken,
+            idToken: nativeTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        let afterNative = await store.upsert(native)
+        XCTAssertEqual(afterNative.accessToken, standaloneTokens.accessToken)
+        XCTAssertEqual(afterNative.credentialSource?.kind, .standaloneHome)
+        XCTAssertNil(afterNative.managedHomePath)
+
         let managedAgain = try XCTUnwrap(AccountImporter.codexBarAccounts([
             CodexBarBridge.ManagedAccount(email: "managed@example.com", accountID: accountID, managedHomePath: managedHome.path)
         ]).first)
@@ -831,6 +847,8 @@ final class ManagedSourceReconciliationTests: XCTestCase {
             CodexBarBridge.ManagedAccount(email: "managed@example.com", accountID: accountID, managedHomePath: managedHome.path)
         ]).first)
         await store.reconcileManagedAccount(managed, presentAccountIDs: [accountID])
+        let ambientAuth = root.appendingPathComponent("ambient-auth.json")
+        try CodexAuth.write(ambientTokens, to: ambientAuth)
         let ambient = Account(
             alias: "ambient",
             accountID: accountID,
@@ -839,7 +857,7 @@ final class ManagedSourceReconciliationTests: XCTestCase {
             idToken: ambientTokens.idToken,
             credentialSource: AccountCredentialSource(
                 kind: .nativeAuth,
-                path: root.appendingPathComponent("ambient-auth.json").path
+                path: ambientAuth.path
             )
         )
 
@@ -848,6 +866,250 @@ final class ManagedSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(merged.accessToken, managedTokens.accessToken)
         XCTAssertEqual(merged.credentialSource?.kind, .managedHome)
         XCTAssertEqual(merged.managedHomePath, managedHome.path)
+    }
+
+    func testExpiredManagedOwnerCannotBePersistentlyDisplacedByNativeImport() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("expired-managed-persistent-owner-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "same-account"
+        let managedTokens = Self.tokens("expired-managed", expiry: now.addingTimeInterval(-60), accountID: accountID)
+        let nativeTokens = Self.tokens("valid-native", expiry: now.addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+        try CodexAuth.write(nativeTokens, to: nativeAuth)
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), clock: { now })
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: accountID,
+            accessToken: managedTokens.accessToken,
+            refreshToken: managedTokens.refreshToken,
+            idToken: managedTokens.idToken,
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+
+        let merged = await store.upsert(Account(
+            alias: "ambient",
+            accountID: accountID,
+            accessToken: nativeTokens.accessToken,
+            refreshToken: nativeTokens.refreshToken,
+            idToken: nativeTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        ))
+
+        XCTAssertEqual(merged.alias, "krisondaent")
+        XCTAssertEqual(merged.accessToken, managedTokens.accessToken)
+        XCTAssertEqual(merged.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(merged.managedHomePath, managedHome.path)
+    }
+
+    func testValidManagedHydrationDoesNotUseAmbientNativeCredential() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("valid-managed-no-native-fallback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "same-account"
+        let managedTokens = Self.tokens("valid-managed", expiry: now.addingTimeInterval(1_800), accountID: accountID)
+        let nativeTokens = Self.tokens("valid-native", expiry: now.addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedHome.appendingPathComponent("auth.json"))
+        try CodexAuth.write(nativeTokens, to: nativeAuth)
+        let native = Account(
+            alias: "ambient",
+            accountID: accountID,
+            accessToken: nativeTokens.accessToken,
+            refreshToken: nativeTokens.refreshToken,
+            idToken: nativeTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        let store = AccountStore(
+            url: root.appendingPathComponent("accounts.json"),
+            clock: { now },
+            ambientNativeAccountProvider: { native }
+        )
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: accountID,
+            accessToken: managedTokens.accessToken,
+            refreshToken: managedTokens.refreshToken,
+            idToken: managedTokens.idToken,
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+
+        let hydratedValue = await store.hydrateFromManagedHome("krisondaent")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated.accessToken, managedTokens.accessToken)
+        XCTAssertEqual(hydrated.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(hydrated.managedHomePath, managedHome.path)
+    }
+
+    func testUnreadableManagedHydrationUsesMatchingNativeRuntimeOverlay() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("unreadable-managed-native-fallback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "same-account"
+        let managedTokens = Self.tokens("missing-managed", expiry: now.addingTimeInterval(-60), accountID: accountID)
+        let nativeTokens = Self.tokens("valid-native", expiry: now.addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(nativeTokens, to: nativeAuth)
+        let native = Account(
+            alias: "ambient",
+            accountID: accountID,
+            accessToken: nativeTokens.accessToken,
+            refreshToken: nativeTokens.refreshToken,
+            idToken: nativeTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(
+            url: storeURL,
+            clock: { now },
+            ambientNativeAccountProvider: { native }
+        )
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: accountID,
+            accessToken: managedTokens.accessToken,
+            refreshToken: managedTokens.refreshToken,
+            idToken: managedTokens.idToken,
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+        let storeBefore = try Data(contentsOf: storeURL)
+
+        let hydratedValue = await store.hydrateFromManagedHome("krisondaent")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated.accessToken, nativeTokens.accessToken)
+        XCTAssertEqual(hydrated.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storeBefore)
+    }
+
+    func testExpiredManagedHydrationUsesMatchingNativeRuntimeOverlayWithoutMutation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("managed-native-runtime-fallback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let accountID = "same-account"
+        let managedTokens = Self.tokens("expired-managed", expiry: now.addingTimeInterval(-60), accountID: accountID)
+        let nativeTokens = Self.tokens("valid-native", expiry: now.addingTimeInterval(3_600), accountID: accountID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let managedAuth = managedHome.appendingPathComponent("auth.json")
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedAuth)
+        try CodexAuth.write(nativeTokens, to: nativeAuth)
+
+        let native = Account(
+            alias: "ambient",
+            accountID: accountID,
+            accessToken: nativeTokens.accessToken,
+            refreshToken: nativeTokens.refreshToken,
+            idToken: nativeTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        let usage = [UsageWindow(label: "5h", usedPercent: 100, windowSeconds: 18_000, resetAt: now)]
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(
+            url: storeURL,
+            clock: { now },
+            ambientNativeAccountProvider: { native }
+        )
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: accountID,
+            accessToken: managedTokens.accessToken,
+            refreshToken: managedTokens.refreshToken,
+            idToken: managedTokens.idToken,
+            usage: usage,
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+
+        let storeBefore = try Data(contentsOf: storeURL)
+        let managedBefore = try Data(contentsOf: managedAuth)
+        let nativeBefore = try Data(contentsOf: nativeAuth)
+        let hydratedValue = await store.hydrateFromManagedHome("krisondaent")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated.accessToken, nativeTokens.accessToken)
+        XCTAssertEqual(hydrated.refreshToken, nativeTokens.refreshToken)
+        XCTAssertEqual(hydrated.idToken, nativeTokens.idToken)
+        XCTAssertEqual(hydrated.accountID, accountID)
+        XCTAssertEqual(hydrated.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(hydrated.managedHomePath, managedHome.path)
+        XCTAssertEqual(hydrated.usage, usage)
+
+        let storedValue = await store.account("krisondaent")
+        let stored = try XCTUnwrap(storedValue)
+        XCTAssertEqual(stored.accessToken, managedTokens.accessToken)
+        XCTAssertEqual(stored.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storeBefore)
+        XCTAssertEqual(try Data(contentsOf: managedAuth), managedBefore)
+        XCTAssertEqual(try Data(contentsOf: nativeAuth), nativeBefore)
+    }
+
+    func testExpiredManagedHydrationRejectsMismatchedNativeRuntimeOverlay() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("managed-native-runtime-mismatch-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let managedID = "managed-account"
+        let nativeID = "other-account"
+        let managedTokens = Self.tokens("expired-managed", expiry: now.addingTimeInterval(-60), accountID: managedID)
+        let nativeTokens = Self.tokens("mismatched-native", expiry: now.addingTimeInterval(3_600), accountID: nativeID)
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let managedAuth = managedHome.appendingPathComponent("auth.json")
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managedTokens, to: managedAuth)
+        try CodexAuth.write(nativeTokens, to: nativeAuth)
+
+        let native = Account(
+            alias: "ambient",
+            accountID: nativeID,
+            accessToken: nativeTokens.accessToken,
+            refreshToken: nativeTokens.refreshToken,
+            idToken: nativeTokens.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        let storeURL = root.appendingPathComponent("accounts.json")
+        let store = AccountStore(
+            url: storeURL,
+            clock: { now },
+            ambientNativeAccountProvider: { native }
+        )
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: managedID,
+            accessToken: managedTokens.accessToken,
+            refreshToken: managedTokens.refreshToken,
+            idToken: managedTokens.idToken,
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+
+        let storeBefore = try Data(contentsOf: storeURL)
+        let hydratedValue = await store.hydrateFromManagedHome("krisondaent")
+        let hydrated = try XCTUnwrap(hydratedValue)
+
+        XCTAssertEqual(hydrated.accessToken, managedTokens.accessToken)
+        XCTAssertEqual(hydrated.credentialSource?.kind, .managedHome)
+        XCTAssertEqual(hydrated.managedHomePath, managedHome.path)
+        XCTAssertEqual(try Data(contentsOf: storeURL), storeBefore)
     }
 
     private static func makeStandaloneHome(root: URL, tokens: CodexTokens) throws -> URL {

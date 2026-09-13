@@ -34,6 +34,136 @@ final class AgentCLITests: XCTestCase {
         XCTAssertThrowsError(try AgentCLIParser.parse(["agent", "account", "switch"]))
     }
 
+    func testAccountShowExposesOnlySanitizedCredentialOwnershipDiagnostics() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLICredentialDiagnostics-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: "selected-workspace",
+            credentialAccountID: "credential-owner",
+            accessToken: "token",
+            managedHomePath: "/private/managed-home"
+        ))
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil }
+        )
+
+        let result = await cli.run(["agent", "accounts", "show", "krisondaent", "--json"])
+
+        guard case .object(let data)? = result.envelope.data else {
+            return XCTFail("missing account data")
+        }
+        XCTAssertEqual(data["credentialOwner"], .string("codexbar_managed"))
+        XCTAssertEqual(data["accountIdentityRelation"], .string("distinct"))
+        XCTAssertEqual(data["managedCredentialState"], .string("unreadable"))
+        XCTAssertEqual(data["managedCredentialIssue"], .string("source_unreadable"))
+        XCTAssertEqual(data["managedCredentialRelation"], .string("unknown"))
+        XCTAssertEqual(data["managedRosterSource"], .string("missing"))
+        XCTAssertFalse(String(describing: data).contains("selected-workspace"))
+        XCTAssertFalse(String(describing: data).contains("credential-owner"))
+        XCTAssertFalse(String(describing: data).contains("/private/managed-home"))
+    }
+
+    func testAccountShowDiagnosesCurrentManagedCredentialWithoutExposingPrivateValues() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLICurrentManagedDiagnostics-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let managedHome = directory.appendingPathComponent("managed-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        let tokens = managedHomeTokens(
+            label: "current",
+            expiry: Date().addingTimeInterval(3_600),
+            accountID: "credential-owner"
+        )
+        try CodexAuth.write(tokens, to: managedHome.appendingPathComponent("auth.json"))
+        let roster = directory.appendingPathComponent("managed-codex-accounts.json")
+        try Data("""
+        {"accounts":[{"email":"krisondaent@example.com","workspaceAccountID":"selected-workspace","managedHomePath":"\(managedHome.path)"}]}
+        """.utf8).write(to: roster)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: "selected-workspace",
+            credentialAccountID: "credential-owner",
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            idToken: tokens.idToken,
+            managedHomePath: managedHome.path
+        ))
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil },
+            managedRosterURLProvider: { roster }
+        )
+
+        let result = await cli.run(["agent", "accounts", "show", "krisondaent", "--json"])
+
+        guard case .object(let data)? = result.envelope.data else {
+            return XCTFail("missing account data")
+        }
+        XCTAssertEqual(data["managedCredentialState"], .string("valid"))
+        XCTAssertEqual(data["managedCredentialIssue"], .string("none"))
+        XCTAssertEqual(data["managedCredentialRelation"], .string("matching"))
+        XCTAssertEqual(data["managedRosterSource"], .string("current"))
+        XCTAssertFalse(String(describing: data).contains("selected-workspace"))
+        XCTAssertFalse(String(describing: data).contains("credential-owner"))
+        XCTAssertFalse(String(describing: data).contains(managedHome.path))
+    }
+
+    func testAccountShowRejectsWrongOwnerManagedCredentialWithoutExposingIdentity() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentCLIWrongOwnerDiagnostics-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let managedHome = directory.appendingPathComponent("managed-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        let tokens = managedHomeTokens(
+            label: "wrong-owner",
+            expiry: Date().addingTimeInterval(3_600),
+            accountID: "other-credential-owner"
+        )
+        try CodexAuth.write(tokens, to: managedHome.appendingPathComponent("auth.json"))
+        let roster = directory.appendingPathComponent("managed-codex-accounts.json")
+        try Data("""
+        {"accounts":[{"email":"krisondaent@example.com","workspaceAccountID":"selected-workspace","managedHomePath":"\(managedHome.path)"}]}
+        """.utf8).write(to: roster)
+        let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(
+            alias: "krisondaent",
+            accountID: "selected-workspace",
+            credentialAccountID: "expected-credential-owner",
+            accessToken: "stored-token",
+            managedHomePath: managedHome.path
+        ))
+        let cli = AgentCLI(
+            store: store,
+            settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
+            supportDir: directory,
+            runtimeURLProvider: { nil },
+            managedRosterURLProvider: { roster }
+        )
+
+        let result = await cli.run(["agent", "accounts", "show", "krisondaent", "--json"])
+
+        guard case .object(let data)? = result.envelope.data else {
+            return XCTFail("missing account data")
+        }
+        XCTAssertEqual(data["managedCredentialState"], .string("invalid"))
+        XCTAssertEqual(data["managedCredentialIssue"], .string("credential_owner_mismatch"))
+        XCTAssertEqual(data["managedCredentialRelation"], .string("different"))
+        XCTAssertEqual(data["managedRosterSource"], .string("current"))
+        let rendered = String(describing: data)
+        XCTAssertFalse(rendered.contains("other-credential-owner"))
+        XCTAssertFalse(rendered.contains("expected-credential-owner"))
+        XCTAssertFalse(rendered.contains(managedHome.path))
+    }
+
     func testParserRecognisesUsageLimitShowAndSetFlags() throws {
         let reference = "acct-0123456789abcdef"
         let show = try AgentCLIParser.parse(["agent", "account", "usage-limit", "show", reference])

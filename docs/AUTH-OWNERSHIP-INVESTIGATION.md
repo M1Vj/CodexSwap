@@ -161,6 +161,39 @@ Primary sources checked September 12:
 - First-message sign-out report: `https://github.com/openai/codex/issues/40918`
 - First-interaction refresh invalidation report: `https://github.com/openai/codex/issues/41171`
 
+## September 13 live-source divergence and runtime-only recovery
+
+Sanitized comparison isolated a narrower failure than quota exhaustion. CodexSwap's
+canonical CodexBar-managed record still pointed to the current roster entry, but its
+access JWT was expired. CodexBar returned fresh usage for the same visible account
+because its visible-account projection can substitute an exact matching live-system
+credential over the managed row. Public Codex source continues to classify ordinary
+quota exhaustion as HTTP 429 rather than logout or token revocation. The five-hour
+boundary therefore exposed stale credential state; it is not established as its cause.
+
+CodexSwap now performs a bounded, read-only fallback when a managed credential is
+unreadable or invalid. It accepts the current native Codex credential only when the
+source file is valid, the candidate exactly matches that bounded file, and its
+credential owner matches the managed account. The credential is overlaid for the
+request only. CodexSwap does not refresh it, write it back, replace the managed owner,
+change the selected workspace, or use CodexBar as a quota service. A valid standalone
+CodexSwap login remains canonical and higher priority.
+
+This follows the same safety shape as OpenClaw's merged same-account Codex CLI
+fallback: use an already-valid owner-provided credential at runtime without persisting
+it into the canonical profile. It also avoids the persistent source takeover that
+would make ambient native state outrank a CodexBar-managed owner merely because the
+managed access token expired.
+
+Primary sources checked September 13:
+
+- CodexBar visible-account source projection: `https://github.com/steipete/CodexBar/blob/0cfda1690e423a51b95e18abd4631fcb49c7095e/Sources/CodexBarCore/Providers/Codex/CodexVisibleAccountProjection.swift#L178-L230`
+- CodexBar managed-workspace renewal gap: `https://github.com/steipete/CodexBar/issues/3523`
+- CodexBar credential-source mismatch repair: `https://github.com/steipete/CodexBar/issues/3558` and `https://github.com/steipete/CodexBar/pull/3560`
+- OpenClaw same-account runtime-only fallback: `https://github.com/openclaw/openclaw/pull/82117`
+- Codex ordinary quota-exhaustion classification: `https://github.com/openai/codex/blob/a592c38c16cdd7623dacc9168926ebccedfb67d3/codex-rs/codex-api/src/api_bridge.rs#L131-L196`
+- Codex WHAM bearer and account-header construction: `https://github.com/openai/codex/blob/a592c38c16cdd7623dacc9168926ebccedfb67d3/codex-rs/backend-client/src/client.rs#L245-L289`
+
 ## Stale-response quarantine guard
 
 A deterministic local fixture reproduced a separate race: after the proxy checked

@@ -98,11 +98,14 @@ public enum AccountImporter {
 
     /// The account Codex is currently logged in as, read live from ~/.codex/auth.json.
     public static func currentCodexAccount(priority: Int = 0) -> Account? {
-        guard let file = try? CodexAuth.read(), let tokens = file.tokens, !tokens.accessToken.isEmpty else { return nil }
+        let authURL = CodexAuth.authPath().standardizedFileURL
+        guard let file = StandaloneAccountRemoval.readBoundedAuthFile(authURL),
+              let tokens = file.tokens,
+              !tokens.accessToken.isEmpty else { return nil }
         return account(
             from: tokens,
             priority: priority,
-            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: CodexAuth.authPath().standardizedFileURL.path)
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: authURL.path)
         )
     }
 

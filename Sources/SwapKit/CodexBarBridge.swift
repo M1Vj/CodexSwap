@@ -162,7 +162,7 @@ public enum CodexBarBridge {
 
     /// The current tokens CodexBar holds for a managed home, or nil if unreadable/empty.
     public static func readTokens(home: String) -> CodexTokens? {
-        guard let file = try? CodexAuth.read(authURL(forHome: home)), let tokens = file.tokens,
+        guard let file = StandaloneAccountRemoval.readBoundedAuthFile(authURL(forHome: home)), let tokens = file.tokens,
               !tokens.accessToken.isEmpty else { return nil }
         return tokens
     }

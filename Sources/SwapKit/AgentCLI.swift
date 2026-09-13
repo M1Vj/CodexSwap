@@ -652,6 +652,7 @@ public struct AgentCLI: Sendable {
     private let supportDir: URL
     private let engine: AppEngine
     private let runtimeURLProvider: @Sendable () -> URL?
+    private let managedRosterURLProvider: @Sendable () -> URL
     /// Test-only interleaving seam used to model another store/process changing
     /// state after the initial CLI projection but before the write-time check.
     private let beforeUsageLimitWrite: (@Sendable () async -> Void)?
@@ -664,7 +665,8 @@ public struct AgentCLI: Sendable {
         warmupService: QuotaWarmupService = QuotaWarmupService(),
         configManager: CodexConfigManager = CodexConfigManager(),
         supportDir: URL = AppPaths.supportDir(),
-        runtimeURLProvider: @escaping @Sendable () -> URL? = RuntimeHandoff.readProxyURL
+        runtimeURLProvider: @escaping @Sendable () -> URL? = RuntimeHandoff.readProxyURL,
+        managedRosterURLProvider: @escaping @Sendable () -> URL = CodexBarBridge.accountsFile
     ) {
         self.init(
             store: store,
@@ -675,6 +677,7 @@ public struct AgentCLI: Sendable {
             configManager: configManager,
             supportDir: supportDir,
             runtimeURLProvider: runtimeURLProvider,
+            managedRosterURLProvider: managedRosterURLProvider,
             beforeUsageLimitWrite: nil
         )
     }
@@ -690,6 +693,7 @@ public struct AgentCLI: Sendable {
         configManager: CodexConfigManager = CodexConfigManager(),
         supportDir: URL = AppPaths.supportDir(),
         runtimeURLProvider: @escaping @Sendable () -> URL? = RuntimeHandoff.readProxyURL,
+        managedRosterURLProvider: @escaping @Sendable () -> URL = CodexBarBridge.accountsFile,
         beforeUsageLimitWrite: (@Sendable () async -> Void)?
     ) {
         self.store = store
@@ -700,6 +704,7 @@ public struct AgentCLI: Sendable {
         self.configManager = configManager
         self.supportDir = supportDir
         self.runtimeURLProvider = runtimeURLProvider
+        self.managedRosterURLProvider = managedRosterURLProvider
         self.beforeUsageLimitWrite = beforeUsageLimitWrite
         let coordinator = QuotaResetCoordinator(
             accountStore: store,
@@ -909,6 +914,36 @@ public struct AgentCLI: Sendable {
             "needsLogin": .bool(entry.account.needsLogin),
             "draining": .bool(draining.contains(entry.account.alias)),
         ]
+        let credentialOwner: String
+        switch entry.account.credentialSource?.kind {
+        case .managedHome: credentialOwner = "codexbar_managed"
+        case .standaloneHome: credentialOwner = "codexswap_standalone"
+        case .nativeAuth: credentialOwner = "external_native"
+        case .legacySnapshot: credentialOwner = "legacy_snapshot"
+        case .unknown, nil: credentialOwner = "unknown"
+        }
+        let logicalAccountID = entry.account.accountID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let credentialAccountID = entry.account.credentialAccountID?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let accountIdentityRelation: String
+        if credentialAccountID.isEmpty {
+            accountIdentityRelation = "credential_missing"
+        } else if logicalAccountID.isEmpty {
+            accountIdentityRelation = "logical_missing"
+        } else if credentialAccountID == logicalAccountID {
+            accountIdentityRelation = "same"
+        } else {
+            accountIdentityRelation = "distinct"
+        }
+        object["credentialOwner"] = .string(credentialOwner)
+        object["accountIdentityRelation"] = .string(accountIdentityRelation)
+        if entry.account.credentialSource?.kind == .managedHome {
+            let diagnostics = managedCredentialDiagnostics(for: entry.account)
+            object["managedCredentialState"] = .string(diagnostics.credentialState)
+            object["managedCredentialIssue"] = .string(diagnostics.credentialIssue)
+            object["managedCredentialRelation"] = .string(diagnostics.credentialRelation)
+            object["managedRosterSource"] = .string(diagnostics.rosterSource)
+        }
         // Unsafe aliases are intentionally replaced with a numbered display
         // label. The label is presentation-only; mutations resolve only the
         // opaque `ref` (or an exact safe alias), never `Account N`.
@@ -928,6 +963,80 @@ public struct AgentCLI: Sendable {
         object["usage"] = .array(windows)
         object["sticky"] = .bool(entry.account.alias == stickyAlias)
         return .object(object)
+    }
+
+    private func managedCredentialDiagnostics(for account: Account) -> (
+        credentialState: String,
+        credentialIssue: String,
+        credentialRelation: String,
+        rosterSource: String
+    ) {
+        guard let sourcePath = account.credentialSource?.path ?? account.managedHomePath else {
+            return ("unreadable", "source_unreadable", "unknown", "unavailable")
+        }
+        let homePath = URL(fileURLWithPath: sourcePath).lastPathComponent == "auth.json"
+            ? URL(fileURLWithPath: sourcePath).deletingLastPathComponent().path
+            : sourcePath
+        let tokens = CodexBarBridge.readTokens(home: homePath)
+        let credentialState: String
+        let credentialIssue: String
+        let credentialRelation: String
+        if let tokens {
+            let claimedID = JWT.identity(fromAccessToken: tokens.accessToken).accountID
+            let sourceOwner = claimedID ?? (tokens.accountId.isEmpty ? nil : tokens.accountId)
+            let canonicalOwner = account.credentialAccountID
+                ?? JWT.identity(fromAccessToken: account.accessToken).accountID
+                ?? (account.accountID.isEmpty ? nil : account.accountID)
+            let bundleValid = AccountImporter.managedCredentialBundleIsValid(tokens)
+            let ownerMatches = sourceOwner != nil && canonicalOwner != nil && sourceOwner == canonicalOwner
+            credentialState = bundleValid && ownerMatches ? "valid" : "invalid"
+            if tokens.accessToken.isEmpty {
+                credentialIssue = "access_missing"
+            } else if tokens.refreshToken.isEmpty {
+                credentialIssue = "refresh_missing"
+            } else if let expiry = JWT.expiry(tokens.accessToken), expiry <= Date() {
+                credentialIssue = "access_expired"
+            } else if JWT.expiry(tokens.accessToken) == nil {
+                credentialIssue = "access_expiry_missing"
+            } else if sourceOwner == nil {
+                credentialIssue = "credential_identity_missing"
+            } else if canonicalOwner == nil {
+                credentialIssue = "credential_owner_missing"
+            } else if !ownerMatches {
+                credentialIssue = "credential_owner_mismatch"
+            } else {
+                if !tokens.accountId.isEmpty, tokens.accountId != sourceOwner {
+                    credentialIssue = "credential_identity_mismatch"
+                } else {
+                    credentialIssue = "none"
+                }
+            }
+            credentialRelation = tokens.accessToken == account.accessToken
+                && tokens.refreshToken == account.refreshToken
+                && tokens.idToken == account.idToken ? "matching" : "different"
+        } else {
+            credentialState = "unreadable"
+            credentialIssue = "source_unreadable"
+            credentialRelation = "unknown"
+        }
+
+        let rosterSource: String
+        switch CodexBarBridge.readManagedAccountsSnapshot(from: managedRosterURLProvider()) {
+        case .failure:
+            rosterSource = "unavailable"
+        case .success(let snapshot):
+            let sameLogicalAccount = snapshot.accounts.filter { $0.accountID == account.accountID }
+            if sameLogicalAccount.contains(where: { $0.managedHomePath == homePath }) {
+                rosterSource = "current"
+            } else if sameLogicalAccount.isEmpty {
+                rosterSource = "missing"
+            } else if sameLogicalAccount.count == 1 {
+                rosterSource = "different"
+            } else {
+                rosterSource = "ambiguous"
+            }
+        }
+        return (credentialState, credentialIssue, credentialRelation, rosterSource)
     }
 
     private static func safeWindowLabel(_ raw: String, fallbackIndex: Int, privateValues: Set<String> = []) -> String {

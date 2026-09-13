@@ -100,6 +100,7 @@ public actor AccountStore {
     private let clock: @Sendable () -> Date
     private let persistenceWriter: AccountStorePersistenceWriter
     private let beforeReserveBestEligibleTouch: (@Sendable (String) async -> Void)?
+    private let ambientNativeAccountProvider: @Sendable () -> Account?
     private var data: StoreData
     /// The last document this actor loaded or successfully persisted. A write
     /// can be based on an older in-memory snapshot when another process has
@@ -147,7 +148,8 @@ public actor AccountStore {
             clock: clock,
             persistenceWriter: { raw, target in
                 try Self.persistUnlockedThrowing(raw, to: target)
-            }
+            },
+            ambientNativeAccountProvider: { AccountImporter.currentCodexAccount() }
         )
     }
 
@@ -166,7 +168,25 @@ public actor AccountStore {
             persistenceWriter: { raw, target in
                 try Self.persistUnlockedThrowing(raw, to: target)
             },
-            beforeReserveBestEligibleTouch: beforeReserveBestEligibleTouch
+            beforeReserveBestEligibleTouch: beforeReserveBestEligibleTouch,
+            ambientNativeAccountProvider: { AccountImporter.currentCodexAccount() }
+        )
+    }
+
+    init(
+        url: URL = AppPaths.storeFile(),
+        strategy: RotationStrategy = .priority,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        ambientNativeAccountProvider: @escaping @Sendable () -> Account?
+    ) {
+        self.init(
+            url: url,
+            strategy: strategy,
+            clock: clock,
+            persistenceWriter: { raw, target in
+                try Self.persistUnlockedThrowing(raw, to: target)
+            },
+            ambientNativeAccountProvider: ambientNativeAccountProvider
         )
     }
 
@@ -177,12 +197,14 @@ public actor AccountStore {
         strategy: RotationStrategy = .priority,
         clock: @escaping @Sendable () -> Date = { Date() },
         persistenceWriter: @escaping AccountStorePersistenceWriter,
-        beforeReserveBestEligibleTouch: (@Sendable (String) async -> Void)? = nil
+        beforeReserveBestEligibleTouch: (@Sendable (String) async -> Void)? = nil,
+        ambientNativeAccountProvider: @escaping @Sendable () -> Account? = { AccountImporter.currentCodexAccount() }
     ) {
         self.url = url
         self.clock = clock
         self.persistenceWriter = persistenceWriter
         self.beforeReserveBestEligibleTouch = beforeReserveBestEligibleTouch
+        self.ambientNativeAccountProvider = ambientNativeAccountProvider
         self.strategy = strategy
         var loaded = AccountStore.loadFrom(url) ?? StoreData()
         let migrationDate = clock()
@@ -1590,6 +1612,44 @@ public actor AccountStore {
         return true
     }
 
+    private static func credentialAuthURL(for source: AccountCredentialSource) -> URL? {
+        guard let rawPath = source.path,
+              rawPath.hasPrefix("/"),
+              !rawPath.contains("\0") else { return nil }
+        let path = URL(fileURLWithPath: rawPath, isDirectory: source.kind == .managedHome)
+        if source.kind == .managedHome, path.lastPathComponent != "auth.json" {
+            return path.appendingPathComponent("auth.json", isDirectory: false)
+        }
+        return path
+    }
+
+    private static func credentialSourceTokens(_ source: AccountCredentialSource) -> CodexTokens? {
+        guard let authURL = credentialAuthURL(for: source) else { return nil }
+        return StandaloneAccountRemoval.readBoundedAuthFile(authURL)?.tokens
+    }
+
+    private static func credentialOwner(for account: Account) -> String? {
+        let owner = account.credentialAccountID
+            ?? JWT.identity(fromAccessToken: account.accessToken).accountID
+            ?? (account.accountID.isEmpty ? nil : account.accountID)
+        guard let owner, !owner.isEmpty else { return nil }
+        return owner
+    }
+
+    private static func credentialBundleIsValid(
+        _ account: Account,
+        tokens: CodexTokens,
+        now: Date
+    ) -> Bool {
+        guard AccountImporter.managedCredentialBundleIsValid(tokens, now: now),
+              let owner = credentialOwner(for: account),
+              let claimed = JWT.identity(fromAccessToken: tokens.accessToken).accountID
+                  ?? (tokens.accountId.isEmpty ? nil : tokens.accountId),
+              claimed == owner,
+              tokens.accountId.isEmpty || tokens.accountId == owner else { return false }
+        return true
+    }
+
     private static func credentialSourcePriority(
         _ account: Account,
         supportDirectory: URL,
@@ -1971,6 +2031,7 @@ public actor AccountStore {
               !path.isEmpty else {
             return current
         }
+        let now = clock()
         let sourceURL: URL
         switch source.kind {
         case .managedHome:
@@ -1982,25 +2043,20 @@ public actor AccountStore {
             return current
         }
         let file: CodexAuthFile?
-        if source.kind == .standaloneHome {
-            file = StandaloneAccountRemoval.readBoundedAuthFile(sourceURL)
-        } else {
-            file = try? CodexAuth.read(sourceURL)
-        }
-        guard let file,
-              let tokens = file.tokens,
-              !tokens.accessToken.isEmpty else {
+        file = StandaloneAccountRemoval.readBoundedAuthFile(sourceURL)
+        guard let file, let tokens = file.tokens, !tokens.accessToken.isEmpty else {
+            if source.kind == .managedHome {
+                return runtimeNativeFallback(for: current, now: now)
+            }
             return current
         }
         let claimedAccountID = JWT.identity(fromAccessToken: tokens.accessToken).accountID
         guard !current.accountID.isEmpty else { return current }
         switch source.kind {
         case .managedHome:
-            let currentCredentialAccountID = current.credentialAccountID
-                ?? JWT.identity(fromAccessToken: current.accessToken).accountID
-            guard AccountImporter.managedCredentialBundleIsValid(tokens, now: clock()),
-                  let currentCredentialAccountID,
-                  (claimedAccountID ?? tokens.accountId) == currentCredentialAccountID else { return current }
+            guard Self.credentialBundleIsValid(current, tokens: tokens, now: now) else {
+                return runtimeNativeFallback(for: current, now: now)
+            }
         case .standaloneHome:
             let currentCredentialAccountID = current.credentialAccountID ?? current.accountID
             guard StandaloneAccountRemoval.verifiedAuthURL(
@@ -2023,7 +2079,7 @@ public actor AccountStore {
             || tokens.idToken != current.idToken
         let expiryAllowsAdoption = theirs > ours
             || (source.kind == .managedHome && theirs == ours)
-        if bundleChanged, expiryAllowsAdoption, theirs > clock() {
+        if bundleChanged, expiryAllowsAdoption, theirs > now {
             data.accounts[i].idToken = tokens.idToken
             data.accounts[i].accessToken = tokens.accessToken
             data.accounts[i].refreshToken = tokens.refreshToken
@@ -2034,6 +2090,29 @@ public actor AccountStore {
             persist()
         }
         return data.accounts[i]
+    }
+
+    private func runtimeNativeFallback(for current: Account, now: Date) -> Account {
+        guard Self.credentialSource(for: current)?.kind == .managedHome,
+              let candidate = ambientNativeAccountProvider(),
+              let source = Self.credentialSource(for: candidate),
+              source.kind == .nativeAuth,
+              let tokens = Self.credentialSourceTokens(source),
+              candidate.accessToken == tokens.accessToken,
+              candidate.refreshToken == tokens.refreshToken,
+              candidate.idToken == tokens.idToken,
+              Self.credentialBundleIsValid(candidate, tokens: tokens, now: now),
+              let currentOwner = Self.credentialOwner(for: current),
+              let candidateOwner = Self.credentialOwner(for: candidate),
+              currentOwner == candidateOwner else {
+            return current
+        }
+        var fallback = current
+        fallback.accessToken = candidate.accessToken
+        fallback.refreshToken = candidate.refreshToken
+        fallback.idToken = candidate.idToken
+        fallback.credentialAccountID = current.credentialAccountID ?? candidate.credentialAccountID ?? currentOwner
+        return fallback
     }
 
     public func managedHome(_ alias: String) -> String? { account(alias)?.managedHomePath }
