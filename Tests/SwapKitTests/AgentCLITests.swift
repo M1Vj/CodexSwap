@@ -38,7 +38,10 @@ final class AgentCLITests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentCLICredentialDiagnostics-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let store = AccountStore(url: directory.appendingPathComponent("accounts.json"))
+        let roster = directory.appendingPathComponent("managed-codex-accounts.json")
+        try Data("{\"accounts\":[]}".utf8).write(to: roster)
         await store.upsert(Account(
             alias: "krisondaent",
             accountID: "selected-workspace",
@@ -50,7 +53,8 @@ final class AgentCLITests: XCTestCase {
             store: store,
             settingsStore: SettingsStore(url: directory.appendingPathComponent("settings.json")),
             supportDir: directory,
-            runtimeURLProvider: { nil }
+            runtimeURLProvider: { nil },
+            managedRosterURLProvider: { roster }
         )
 
         let result = await cli.run(["agent", "accounts", "show", "krisondaent", "--json"])
