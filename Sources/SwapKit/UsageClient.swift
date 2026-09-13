@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public protocol UsageFetching: Sendable {
     func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow]
@@ -10,11 +13,36 @@ public struct UsageClient: UsageFetching, Sendable {
 
     private let session: URLSession
     private let url: URL
+    private let sessionOwner: UsageSessionOwner?
 
-    public init(session: URLSession = .shared, url: URL = UsageClient.endpoint) {
+    public init(url: URL = UsageClient.endpoint) {
+        let sessionOwner = UsageSessionOwner(sessionDidBecomeInvalid: {}, onDeinit: {})
+        self.session = sessionOwner.session
+        self.url = url
+        self.sessionOwner = sessionOwner
+    }
+
+    public init(session: URLSession, url: URL = UsageClient.endpoint) {
         self.session = session
         self.url = url
+        self.sessionOwner = nil
     }
+
+    init(
+        ownedSessionDidBecomeInvalid: @escaping @Sendable () -> Void,
+        ownedSessionOwnerDidDeinit: @escaping @Sendable () -> Void,
+        url: URL = UsageClient.endpoint
+    ) {
+        let sessionOwner = UsageSessionOwner(
+            sessionDidBecomeInvalid: ownedSessionDidBecomeInvalid,
+            onDeinit: ownedSessionOwnerDidDeinit
+        )
+        self.session = sessionOwner.session
+        self.url = url
+        self.sessionOwner = sessionOwner
+    }
+
+    var configurationForTesting: URLSessionConfiguration { session.configuration }
 
     public enum UsageError: Error, Sendable { case unauthorized, http(Int), malformed }
 
@@ -22,6 +50,8 @@ public struct UsageClient: UsageFetching, Sendable {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = 20
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         if !accountID.isEmpty { req.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id") }
         req.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
@@ -73,5 +103,55 @@ public struct UsageClient: UsageFetching, Sendable {
             return Int(exactly: value)
         }
         return nil
+    }
+}
+
+private final class UsageSessionOwner: @unchecked Sendable {
+    let session: URLSession
+    private let onDeinit: @Sendable () -> Void
+
+    init(
+        sessionDidBecomeInvalid: @escaping @Sendable () -> Void,
+        onDeinit: @escaping @Sendable () -> Void
+    ) {
+        self.onDeinit = onDeinit
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        session = URLSession(
+            configuration: configuration,
+            delegate: UsageRedirectDelegate(onSessionInvalidated: sessionDidBecomeInvalid),
+            delegateQueue: nil
+        )
+    }
+
+    deinit {
+        session.invalidateAndCancel()
+        onDeinit()
+    }
+}
+
+final class UsageRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let onSessionInvalidated: @Sendable () -> Void
+
+    init(onSessionInvalidated: @escaping @Sendable () -> Void = {}) {
+        self.onSessionInvalidated = onSessionInvalidated
+    }
+
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        onSessionInvalidated()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }

@@ -162,6 +162,10 @@ public struct QuotaResetClient: QuotaResetServing, Sendable {
     private func request(url: URL, method: String, accessToken: String, accountID: String) -> URLRequest {
         var request = URLRequest(url: url, timeoutInterval: 15)
         request.httpMethod = method
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("codex-1", forHTTPHeaderField: "OpenAI-Beta")
+        request.setValue("CodexSwap", forHTTPHeaderField: "originator")
         request.setValue("CodexSwap/QuotaResetClient", forHTTPHeaderField: "User-Agent")
         if !accessToken.isEmpty { request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         let normalizedAccountID = accountID.trimmingCharacters(in: .whitespacesAndNewlines)

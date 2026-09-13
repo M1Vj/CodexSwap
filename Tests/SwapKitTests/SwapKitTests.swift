@@ -2935,6 +2935,99 @@ final class UsageParseTests: XCTestCase {
     }
 }
 
+final class UsageClientRequestContractTests: XCTestCase {
+    override func tearDown() {
+        QuotaResetURLProtocol.handler = nil
+        QuotaResetURLProtocol.failure = nil
+        QuotaResetURLProtocol.requestCount = 0
+        super.tearDown()
+    }
+
+    func testFetchBuildsFreshRequestContract() async throws {
+        QuotaResetURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url, UsageClient.endpoint)
+            XCTAssertEqual(request.timeoutInterval, 20)
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"), "account")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), UsageClient.userAgent)
+            return (200, Data(#"{"rate_limit":{"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_at":1783000000}}}"#.utf8))
+        }
+
+        let client = UsageClient(session: QuotaResetURLProtocol.session(), url: UsageClient.endpoint)
+        let windows = try await client.fetch(accessToken: "token", accountID: "account")
+
+        XCTAssertEqual(windows.map(\.usedPercent), [12])
+    }
+
+    func testOwnedSessionUsesEphemeralNoCacheStorage() {
+        let configuration = UsageClient().configurationForTesting
+
+        XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+        XCTAssertNil(configuration.urlCache)
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertFalse(configuration.httpShouldSetCookies)
+        XCTAssertNil(configuration.urlCredentialStorage)
+    }
+
+    func testOwnedSessionRejectsRedirectsBeforeCredentialsCanBeForwarded() throws {
+        let delegate = UsageRedirectDelegate()
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.dataTask(with: UsageClient.endpoint)
+        defer {
+            task.cancel()
+            session.invalidateAndCancel()
+        }
+        let redirectResponse = try XCTUnwrap(HTTPURLResponse(
+            url: UsageClient.endpoint,
+            statusCode: 302,
+            httpVersion: nil,
+            headerFields: ["Location": "/redirected"]
+        ))
+        let redirectTargets = [
+            "https://chatgpt.com/backend-api/wham/usage?redirected=true",
+            "https://example.test/usage",
+            "http://chatgpt.com/backend-api/wham/usage",
+        ]
+
+        for target in redirectTargets {
+            var request = URLRequest(url: try XCTUnwrap(URL(string: target)))
+            request.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
+            var completionInvocationCount = 0
+            var completionRequest: URLRequest?
+            delegate.urlSession(
+                session,
+                task: task,
+                willPerformHTTPRedirection: redirectResponse,
+                newRequest: request,
+                completionHandler: {
+                    completionInvocationCount += 1
+                    completionRequest = $0
+                }
+            )
+            XCTAssertEqual(completionInvocationCount, 1, "Redirect completion must be invoked exactly once for \(target)")
+            XCTAssertNil(completionRequest, "Redirect must be rejected before a credential-bearing follow-up to \(target)")
+        }
+    }
+
+    func testDefaultClientInvalidatesSessionAndReleasesOwnerWhenClientLeavesScope() {
+        let sessionInvalidated = expectation(description: "owned URLSession invalidated")
+        let sessionOwnerReleased = expectation(description: "owned URLSession owner released")
+
+        do {
+            let client = UsageClient(
+                ownedSessionDidBecomeInvalid: { sessionInvalidated.fulfill() },
+                ownedSessionOwnerDidDeinit: { sessionOwnerReleased.fulfill() }
+            )
+            withExtendedLifetime(client) {}
+        }
+
+        wait(for: [sessionInvalidated, sessionOwnerReleased], timeout: 1)
+    }
+}
+
 final class LimitDetectionTests: XCTestCase {
     private func buf(_ s: String) -> ByteBuffer { ByteBuffer(bytes: Array(s.utf8)) }
 
@@ -5671,7 +5764,10 @@ final class QuotaResetClientTests: XCTestCase {
             XCTAssertEqual(request.httpMethod, "GET")
             XCTAssertEqual(request.url, QuotaResetClient.defaultCreditsEndpoint)
             XCTAssertEqual(request.timeoutInterval, 15)
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
             XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "OpenAI-Beta"), "codex-1")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "originator"), "CodexSwap")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
             XCTAssertNil(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"))
             XCTAssertNotNil(request.value(forHTTPHeaderField: "User-Agent"))
@@ -5685,6 +5781,10 @@ final class QuotaResetClientTests: XCTestCase {
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.url, QuotaResetClient.defaultConsumeEndpoint)
             XCTAssertEqual(request.timeoutInterval, 15)
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "OpenAI-Beta"), "codex-1")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "originator"), "CodexSwap")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
             XCTAssertEqual(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"), "acct")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
