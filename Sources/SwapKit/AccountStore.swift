@@ -704,6 +704,10 @@ public actor AccountStore {
     private static func accountMatchStrength(_ lhs: Account, _ rhs: Account) -> Int {
         if !lhs.accountID.isEmpty && !rhs.accountID.isEmpty && lhs.accountID == rhs.accountID {
             if accountsConflict(lhs, rhs) { return 0 }
+            if !lhs.userID.isEmpty && !rhs.userID.isEmpty && lhs.userID == rhs.userID { return 6 }
+            if !lhs.email.isEmpty && !rhs.email.isEmpty
+                && lhs.email.caseInsensitiveCompare(rhs.email) == .orderedSame { return 5 }
+            if lhs.alias == rhs.alias { return 4 }
             return 3
         }
         if lhs.telemetryID != Account.missingTelemetryID,

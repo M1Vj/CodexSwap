@@ -59,10 +59,10 @@ struct TopLevelRequestMetadata {
 
 func scanTopLevelRequestMetadata(from data: Data, maxScanBytes: Int = 1_048_576) -> TopLevelRequestMetadata {
     var result = TopLevelRequestMetadata()
-    let limit = min(data.count, maxScanBytes)
-    guard limit > 2 else { return result }
+    let limit = min(data.endIndex, data.startIndex + maxScanBytes)
+    guard (limit - data.startIndex) > 2 else { return result }
 
-    var idx = 0
+    var idx = data.startIndex
     while idx < limit && (data[idx] == 0x20 || data[idx] == 0x09 || data[idx] == 0x0A || data[idx] == 0x0D) {
         idx += 1
     }

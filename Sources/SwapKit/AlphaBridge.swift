@@ -1281,7 +1281,7 @@ enum ZstdRuntime {
                     )
                 }
             }
-            if isErrorFn(written) == 0, written > 0 {
+            if isErrorFn(written) == 0, written >= 0 {
                 output.removeSubrange(written..<output.count)
                 return output
             }
