@@ -80,6 +80,7 @@ struct QuotaResetsSettingsView: View {
     private func warmupAllowed(_ account: Account) -> Bool {
         !model.settings.warmupExcludedAccounts.contains(account.id)
             && !model.settings.warmupExcludedAccounts.contains(account.alias)
+            && (account.accountID.isEmpty || !model.settings.warmupExcludedAccounts.contains(account.accountID))
     }
 
     private func warmupAllowedBinding(_ account: Account) -> Binding<Bool> {
@@ -88,7 +89,7 @@ struct QuotaResetsSettingsView: View {
             set: { allowed in
                 var excluded = model.settings.warmupExcludedAccounts
                 if allowed {
-                    excluded.removeAll { $0 == account.id || $0 == account.alias }
+                    excluded.removeAll { $0 == account.id || $0 == account.alias || (!account.accountID.isEmpty && $0 == account.accountID) }
                 } else if !excluded.contains(account.id) {
                     excluded.append(account.id)
                 }

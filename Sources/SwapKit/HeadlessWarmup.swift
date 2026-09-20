@@ -212,7 +212,8 @@ public enum HeadlessWarmup {
     ) -> HeadlessWarmupAccountStatus {
         if !account.routingEnabled { return .skippedRoutingDisabled }
         if settings.warmupExcludedAccounts.contains(account.id)
-            || settings.warmupExcludedAccounts.contains(account.alias) {
+            || settings.warmupExcludedAccounts.contains(account.alias)
+            || (!account.accountID.isEmpty && settings.warmupExcludedAccounts.contains(account.accountID)) {
             return .skippedExcluded
         }
         guard eligible else { return .skipped }

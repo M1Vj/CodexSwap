@@ -49,6 +49,7 @@ public enum AccountImporter {
             alias: alias,
             email: email,
             accountID: id.accountID ?? tokens.accountId,
+            userID: id.userID ?? "",
             planType: id.planType,
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken,
@@ -176,7 +177,10 @@ public enum AccountImporter {
                     path: authPath.standardizedFileURL.path
                 )
             )
-            let key = identityAccountID
+            let userDiscriminator = (identity.userID?.isEmpty == false ? identity.userID : nil)
+                ?? (identity.email?.isEmpty == false ? identity.email : nil)
+                ?? authPath.path
+            let key = identityAccountID.isEmpty ? userDiscriminator : "\(identityAccountID):\(userDiscriminator)"
             let sourcePath = authPath.standardizedFileURL.path
             if let existing = candidates[key] {
                 if expiry > existing.expiry || (expiry == existing.expiry && sourcePath < existing.path) {
@@ -188,7 +192,12 @@ public enum AccountImporter {
         }
         return candidates.values
             .map(\.account)
-            .sorted { ($0.accountID, $0.alias) < ($1.accountID, $1.alias) }
+            .sorted {
+                if $0.accountID != $1.accountID { return $0.accountID < $1.accountID }
+                if $0.userID != $1.userID { return $0.userID < $1.userID }
+                if $0.email != $1.email { return $0.email < $1.email }
+                return $0.alias < $1.alias
+            }
     }
 
     public static func newestCodexAuthAccounts(
@@ -205,7 +214,13 @@ public enum AccountImporter {
     private static func newestAccounts(_ accounts: [Account]) -> [Account] {
         var selected: [String: (account: Account, expiry: Date, path: String)] = [:]
         for account in accounts {
-            let key = account.accountID.isEmpty ? "alias:\(account.alias)" : "id:\(account.accountID)"
+            let key: String
+            if account.accountID.isEmpty {
+                key = "alias:\(account.alias)"
+            } else {
+                let user = !account.userID.isEmpty ? account.userID : account.email
+                key = user.isEmpty ? "id:\(account.accountID)" : "id:\(account.accountID):\(user)"
+            }
             let expiry = JWT.expiry(account.accessToken) ?? .distantPast
             let path = account.credentialSource?.path ?? ""
             guard !key.isEmpty else { continue }
@@ -223,7 +238,12 @@ public enum AccountImporter {
         }
         return selected.values
             .map(\.account)
-            .sorted { ($0.accountID, $0.alias) < ($1.accountID, $1.alias) }
+            .sorted {
+                if $0.accountID != $1.accountID { return $0.accountID < $1.accountID }
+                if $0.userID != $1.userID { return $0.userID < $1.userID }
+                if $0.email != $1.email { return $0.email < $1.email }
+                return $0.alias < $1.alias
+            }
     }
 
     private static func credentialSourcePriority(_ account: Account) -> Int {

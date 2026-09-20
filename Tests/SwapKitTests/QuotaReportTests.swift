@@ -450,10 +450,11 @@ final class QuotaReportTests: XCTestCase {
         )
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
+        let account = Account(alias: "alpha", accountID: "alpha-id", accessToken: "stale")
         let report = try await service.fetch(
-            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "stale")],
+            accounts: [account],
             activeAlias: nil,
-            prefetched: ["alpha-id": snapshot]
+            prefetched: [account.id: snapshot]
         )
 
         XCTAssertEqual(report.accounts[0].usageStatus, .ok)
@@ -520,10 +521,11 @@ final class QuotaReportTests: XCTestCase {
         )
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
+        let account = Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)
         let report = try await service.fetch(
-            accounts: [Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)],
+            accounts: [account],
             activeAlias: "alpha",
-            prefetched: ["alpha-id": snapshot]
+            prefetched: [account.id: snapshot]
         )
 
         XCTAssertEqual(report.accounts[0].state, .active)
@@ -547,10 +549,11 @@ final class QuotaReportTests: XCTestCase {
         )
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
+        let account = Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")
         let report = try await service.fetch(
-            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")],
+            accounts: [account],
             activeAlias: nil,
-            prefetched: ["alpha-id": snapshot]
+            prefetched: [account.id: snapshot]
         )
 
         XCTAssertEqual(report.accounts[0].usageStatus, .ok)
@@ -575,10 +578,11 @@ final class QuotaReportTests: XCTestCase {
         )
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
+        let account = Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")
         let report = try await service.fetch(
-            accounts: [Account(alias: "alpha", accountID: "alpha-id", accessToken: "alpha-token")],
+            accounts: [account],
             activeAlias: nil,
-            prefetched: ["alpha-id": snapshot]
+            prefetched: [account.id: snapshot]
         )
 
         XCTAssertEqual(report.accounts[0].usageStatus, .ok)
@@ -601,10 +605,11 @@ final class QuotaReportTests: XCTestCase {
         )
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
+        let account = Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)
         let report = try await service.fetch(
-            accounts: [Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)],
+            accounts: [account],
             activeAlias: "alpha",
-            prefetched: ["alpha-id": snapshot]
+            prefetched: [account.id: snapshot]
         )
 
         XCTAssertEqual(report.accounts[0].state, .active)
@@ -628,10 +633,11 @@ final class QuotaReportTests: XCTestCase {
         )
         let service = QuotaReportService(usageService: usage, resetService: credits, clock: { now })
 
+        let account = Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)
         let report = try await service.fetch(
-            accounts: [Account(alias: "alpha", accountID: "alpha-id", needsLogin: true)],
+            accounts: [account],
             activeAlias: "alpha",
-            prefetched: ["alpha-id": snapshot]
+            prefetched: [account.id: snapshot]
         )
 
         XCTAssertEqual(report.accounts[0].state, .active)

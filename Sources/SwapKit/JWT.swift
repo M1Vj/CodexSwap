@@ -33,8 +33,21 @@ public enum JWT {
 
     public struct Identity: Sendable {
         public var accountID: String?
+        public var userID: String?
         public var email: String?
         public var planType: String?
+
+        public init(
+            accountID: String? = nil,
+            userID: String? = nil,
+            email: String? = nil,
+            planType: String? = nil
+        ) {
+            self.accountID = accountID
+            self.userID = userID
+            self.email = email
+            self.planType = planType
+        }
     }
 
     public static func identity(fromAccessToken token: String) -> Identity {
@@ -45,13 +58,19 @@ public enum JWT {
             ?? (authClaims?["chatgpt_account_id"] as? String)
             ?? (claims["chatgpt_account_id"] as? String)
             ?? (claims["account_id"] as? String)
+        let userID = (authClaims?["chatgpt_user_id"] as? String)
+            ?? (authClaims?["user_id"] as? String)
+            ?? (claims["chatgpt_user_id"] as? String)
+            ?? (claims["user_id"] as? String)
+            ?? (claims["https://api.openai.com/user_id"] as? String)
+            ?? (claims["sub"] as? String)
         let email = (profileClaims?["email"] as? String)
             ?? (claims["email"] as? String)
             ?? (claims["https://api.openai.com/email"] as? String)
         let planType = (claims["chatgpt_plan_type"] as? String)
             ?? (authClaims?["chatgpt_plan_type"] as? String)
             ?? (claims["https://api.openai.com/plan_type"] as? String)
-        return Identity(accountID: accountID, email: email, planType: planType)
+        return Identity(accountID: accountID, userID: userID, email: email, planType: planType)
     }
 
     static func base64URLDecode(_ s: String) -> Data? {

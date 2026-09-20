@@ -1591,7 +1591,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
         observed.usage = [UsageWindow(label: "Weekly", usedPercent: 3, windowSeconds: 604_800, resetAt: weeklyReset)]
         await service.updateObservedUsage(for: [observed], now: now.addingTimeInterval(5))
 
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertEqual(record?.primaryResetAt, weeklyReset)
         XCTAssertEqual(record?.secondaryResetAt, weeklyReset)
     }
@@ -1615,7 +1615,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         let dueAfterObservation = await service.hasDueAccount(in: [observed], now: now)
         XCTAssertFalse(dueAfterObservation)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertEqual(record?.primaryResetAt, reset)
         XCTAssertEqual(record?.observedPrimaryResetAt, reset)
         XCTAssertEqual(record?.stableObservationCount, 1)
@@ -1649,7 +1649,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
         let fourthPoll = thirdPoll.addingTimeInterval(60)
         await service.updateObservedUsage(for: [observed], now: thirdPoll)
         await service.updateObservedUsage(for: [observed], now: fourthPoll)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertEqual(record?.primaryResetAt, reset)
         XCTAssertEqual(record?.observedPrimaryResetAt, reset)
         XCTAssertEqual(record?.stableObservationCount, 2)
@@ -1680,7 +1680,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         let dueAfterMovingObservation = await service.hasDueAccount(in: [observed], now: secondPoll)
         XCTAssertTrue(dueAfterMovingObservation)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertEqual(record?.primaryResetAt, stale.addingTimeInterval(18_000))
         XCTAssertEqual(record?.observedPrimaryResetAt, movingReset)
         XCTAssertEqual(record?.stableObservationCount, 1)
@@ -1711,7 +1711,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
         await service.updateObservedUsage(for: [observed], now: finalPoll)
 
         let dueAfterMissingReset = await service.hasDueAccount(in: [observed], now: finalPoll)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertTrue(dueAfterMissingReset)
         XCTAssertEqual(record?.observedPrimaryResetAt, reset)
         XCTAssertEqual(record?.stableObservationCount, 1)
@@ -1737,14 +1737,14 @@ final class QuotaWarmupServiceTests: XCTestCase {
 
         observed.usage = [UsageWindow(label: "Weekly", usedPercent: 0, windowSeconds: 604_800, resetAt: weeklyReset)]
         await service.updateObservedUsage(for: [observed], now: absentPoll)
-        let absentRecord = await ledger.record(for: "id-a")
+        let absentRecord = await ledger.record(for: "a")
         XCTAssertEqual(absentRecord?.primaryResetAt, weeklyReset)
 
         observed.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: reset)]
         await service.updateObservedUsage(for: [observed], now: finalPoll)
 
         let dueAfterAbsentWindow = await service.hasDueAccount(in: [observed], now: finalPoll)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertTrue(dueAfterAbsentWindow)
         XCTAssertEqual(record?.observedPrimaryResetAt, reset)
         XCTAssertEqual(record?.stableObservationCount, 1)
@@ -1765,14 +1765,14 @@ final class QuotaWarmupServiceTests: XCTestCase {
         var observed = account("a", now: verifiedPoll)
         observed.usage = [UsageWindow(label: "5h", usedPercent: 1, windowSeconds: 18_000, resetAt: reset)]
         await service.updateObservedUsage(for: [observed], now: verifiedPoll)
-        let verifiedRecord = await ledger.record(for: "id-a")
+        let verifiedRecord = await ledger.record(for: "a")
         XCTAssertEqual(verifiedRecord?.outcome, .verified)
 
         observed.usage = []
         await service.updateObservedUsage(for: [observed], now: emptyPoll)
 
         let dueAfterEmptyUsage = await service.hasDueAccount(in: [observed], now: emptyPoll)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertTrue(dueAfterEmptyUsage)
         XCTAssertNil(record?.observedPrimaryResetAt)
         XCTAssertEqual(record?.stableObservationCount, 0)
@@ -1800,7 +1800,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
                 outcome: .pending,
                 attemptedAt: now.addingTimeInterval(-100)
             ),
-            for: "id-a"
+            for: "a"
         )
 
         var emptyUsage = account
@@ -1811,7 +1811,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
         let runnerCallsBeforeReset = await runner.calls()
         let dueBeforeReset = await service.hasDueAccount(in: [account], now: now)
         let dueAtWeeklyReset = await service.hasDueAccount(in: [account], now: weeklyReset)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
 
         XCTAssertEqual(account.usage, weeklyUsage)
         XCTAssertEqual(beforeReset.attempted, [])
@@ -1873,7 +1873,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
         let bare = Account(alias: "a", accountID: "id-a", accessToken: "token")
 
         let summary = await service.run(accounts: [bare], proxyURL: proxy, now: now)
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
 
         XCTAssertEqual(summary.warmed, [])
         XCTAssertEqual(summary.attempted, ["a"])
@@ -1887,7 +1887,7 @@ final class QuotaWarmupServiceTests: XCTestCase {
         missing.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)]
         let afterBackoff = now.addingTimeInterval(1_801)
         await service.updateObservedUsage(for: [missing], now: afterBackoff)
-        let pendingRecord = await ledger.record(for: "id-a")
+        let pendingRecord = await ledger.record(for: "a")
 
         XCTAssertEqual(pendingRecord?.outcome, .pending)
         let dueAfterBackoff = await service.hasDueAccount(in: [missing], now: afterBackoff)
@@ -1905,14 +1905,14 @@ final class QuotaWarmupServiceTests: XCTestCase {
         let summary = await service.run(accounts: [bare], proxyURL: proxy, now: now)
         XCTAssertEqual(summary.warmed, [])
         XCTAssertEqual(summary.attempted, ["bad"])
-        let attemptRecord = await ledger.record(for: "id-bad")
+        let attemptRecord = await ledger.record(for: "bad")
         XCTAssertNotNil(attemptRecord?.retryAfter)
 
         let reset = now.addingTimeInterval(9_000)
         var observed = bare
         observed.usage = [UsageWindow(label: "5h", usedPercent: 4, windowSeconds: 18_000, resetAt: reset)]
         await service.updateObservedUsage(for: [observed], now: now.addingTimeInterval(1))
-        let record = await ledger.record(for: "id-bad")
+        let record = await ledger.record(for: "bad")
 
         XCTAssertEqual(record?.outcome, .verified)
         XCTAssertNil(record?.retryAfter)
@@ -2228,7 +2228,7 @@ final class WarmupEngineTests: XCTestCase {
         let summary = await engine.warmAllAccountsNow(proxyURL: proxy)
         let usageCalls = await usage.calls()
         let snapshot = await engine.snapshot()
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
 
         XCTAssertEqual(summary.warmed, ["a"])
         XCTAssertEqual(usageCalls, ["id-a"])
@@ -2265,7 +2265,7 @@ final class WarmupEngineTests: XCTestCase {
                 outcome: .unknown,
                 attemptedAt: now.addingTimeInterval(-18_001)
             ),
-            for: "id-a"
+            for: "a"
         )
         let engine = AppEngine(
             store: store,
@@ -2282,7 +2282,7 @@ final class WarmupEngineTests: XCTestCase {
         let usageCalls = await usage.calls()
         XCTAssertEqual(runnerCalls, [])
         XCTAssertEqual(usageCalls, ["id-a"])
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertEqual(record?.outcome, .verified)
         XCTAssertEqual(record?.primaryResetAt, reset)
     }
@@ -2323,7 +2323,7 @@ final class WarmupEngineTests: XCTestCase {
                 outcome: .unknown,
                 attemptedAt: now.addingTimeInterval(-18_001)
             ),
-            for: "id-eligible"
+            for: "eligible"
         )
         let engine = AppEngine(
             store: store,
@@ -2390,7 +2390,7 @@ final class WarmupEngineTests: XCTestCase {
                 outcome: .unknown,
                 attemptedAt: now.addingTimeInterval(-18_001)
             ),
-            for: "id-managed"
+            for: "managed"
         )
         let engine = AppEngine(
             store: store,
@@ -2412,7 +2412,7 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertNil(summary)
         XCTAssertEqual(usageCalls, ["id-managed"])
         XCTAssertEqual(runnerCalls, [])
-        let record = await ledger.record(for: "id-managed")
+        let record = await ledger.record(for: "managed")
         XCTAssertEqual(record?.outcome, .verified)
         XCTAssertEqual(record?.primaryResetAt, reset)
     }
@@ -2461,7 +2461,7 @@ final class WarmupEngineTests: XCTestCase {
                 outcome: .verified,
                 attemptedAt: now.addingTimeInterval(-1)
             ),
-            for: "id-managed"
+            for: "managed"
         )
         let engine = AppEngine(
             store: store,
@@ -2516,7 +2516,7 @@ final class WarmupEngineTests: XCTestCase {
                 outcome: .verified,
                 attemptedAt: now.addingTimeInterval(-18_001)
             ),
-            for: "id-a"
+            for: "a"
         )
         let warmup = QuotaWarmupService(runner: runner, ledger: ledger)
         let engine = AppEngine(
@@ -2538,7 +2538,7 @@ final class WarmupEngineTests: XCTestCase {
         let usageCalls = await usage.calls()
         XCTAssertEqual(runnerCalls, [])
         XCTAssertEqual(usageCalls, ["id-a"])
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertEqual(record?.outcome, .pending)
         XCTAssertEqual(record?.primaryResetAt, now)
         XCTAssertNil(record?.observedPrimaryResetAt)
@@ -2590,7 +2590,7 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(summary.attempted, [])
         XCTAssertNil(summary.failed["a"])
         XCTAssertEqual(summary.skipped["a"], "access token expired")
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
         XCTAssertNil(record)
     }
 
@@ -2736,7 +2736,7 @@ final class WarmupEngineTests: XCTestCase {
 
         let summary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
         let persisted = await ledger.lastSummary()
-        let record = await ledger.record(for: "id-a")
+        let record = await ledger.record(for: "a")
 
         XCTAssertEqual(summary.warmed, [])
         XCTAssertEqual(summary.attempted, ["a"])

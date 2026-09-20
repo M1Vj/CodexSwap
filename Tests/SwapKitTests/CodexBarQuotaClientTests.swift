@@ -76,11 +76,10 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
         }
 
-        let snapshots = try await client.fetch(accounts: [
-            Account(alias: "alpha", email: "alpha@example.test", accountID: "alpha-id")
-        ])
+        let account = Account(alias: "alpha", email: "alpha@example.test", accountID: "alpha-id")
+        let snapshots = try await client.fetch(accounts: [account])
 
-        let snapshot = try XCTUnwrap(snapshots["alpha-id"])
+        let snapshot = try XCTUnwrap(snapshots[account.id])
         XCTAssertEqual(snapshot.windows?.map(\.windowSeconds), [18_000, 604_800])
         XCTAssertEqual(snapshot.windows?.map(\.label), ["5h", "Weekly"])
         XCTAssertEqual(snapshot.windows?.map(\.usedPercent), [35, 100])
@@ -101,13 +100,12 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
         }
 
-        let snapshots = try await client.fetch(accounts: [
-            Account(alias: "alice", email: "alice@example.test", accountID: "alice-id"),
-            Account(alias: "gamma", email: "beta@example.test", accountID: "beta-id"),
-        ])
+        let account1 = Account(alias: "alice", email: "alice@example.test", accountID: "alice-id")
+        let account2 = Account(alias: "gamma", email: "beta@example.test", accountID: "beta-id")
+        let snapshots = try await client.fetch(accounts: [account1, account2])
 
-        XCTAssertEqual(snapshots["alice-id"]?.windows?.first?.usedPercent, 10)
-        XCTAssertEqual(snapshots["beta-id"]?.windows?.first?.windowSeconds, 604_800)
+        XCTAssertEqual(snapshots[account1.id]?.windows?.first?.usedPercent, 10)
+        XCTAssertEqual(snapshots[account2.id]?.windows?.first?.windowSeconds, 604_800)
     }
 
     func testFetchIgnoresAmbiguousAndUnmatchedItems() async throws {
@@ -122,15 +120,14 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
         }
 
-        let snapshots = try await client.fetch(accounts: [
-            Account(alias: "shared", email: "one@example.test", accountID: "one-id"),
-            Account(alias: "other", email: "shared@example.test", accountID: "two-id"),
-            Account(alias: "unique", accountID: "three-id"),
-        ])
+        let account1 = Account(alias: "shared", email: "one@example.test", accountID: "one-id")
+        let account2 = Account(alias: "other", email: "shared@example.test", accountID: "two-id")
+        let account3 = Account(alias: "unique", accountID: "three-id")
+        let snapshots = try await client.fetch(accounts: [account1, account2, account3])
 
-        XCTAssertNil(snapshots["one-id"])
-        XCTAssertNil(snapshots["two-id"])
-        XCTAssertEqual(snapshots["three-id"]?.windows?.first?.usedPercent, 30)
+        XCTAssertNil(snapshots[account1.id])
+        XCTAssertNil(snapshots[account2.id])
+        XCTAssertEqual(snapshots[account3.id]?.windows?.first?.usedPercent, 30)
     }
 
     func testFetchRejectsMalformedOrOversizedOutputWithSafeError() async throws {
@@ -232,11 +229,10 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 1)
         }
 
-        let snapshots = try await client.fetch(accounts: [
-            Account(alias: "alpha", accountID: "alpha-id")
-        ])
+        let account = Account(alias: "alpha", accountID: "alpha-id")
+        let snapshots = try await client.fetch(accounts: [account])
 
-        XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 25)
+        XCTAssertEqual(snapshots[account.id]?.windows?.first?.usedPercent, 25)
         XCTAssertFalse(String(describing: snapshots).contains("RAW-PER-ACCOUNT-ERROR-MARKER"))
     }
 
@@ -251,13 +247,12 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
         }
 
-        let snapshots = try await client.fetch(accounts: [
-            Account(alias: "alpha", accountID: "alpha-id"),
-            Account(alias: "beta", accountID: "beta-id"),
-        ])
+        let account1 = Account(alias: "alpha", accountID: "alpha-id")
+        let account2 = Account(alias: "beta", accountID: "beta-id")
+        let snapshots = try await client.fetch(accounts: [account1, account2])
 
-        XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 25)
-        XCTAssertNil(snapshots["beta-id"])
+        XCTAssertEqual(snapshots[account1.id]?.windows?.first?.usedPercent, 25)
+        XCTAssertNil(snapshots[account2.id])
     }
 
     func testMalformedUsagePreservesValidCreditsForSameMatchedAccount() async throws {
@@ -274,10 +269,11 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
         }
 
-        let snapshots = try await client.fetch(accounts: [Account(alias: "alpha", accountID: "alpha-id")])
+        let account = Account(alias: "alpha", accountID: "alpha-id")
+        let snapshots = try await client.fetch(accounts: [account])
 
-        XCTAssertNil(snapshots["alpha-id"]?.windows)
-        XCTAssertEqual(snapshots["alpha-id"]?.resetCredits?.availableCount, 2)
+        XCTAssertNil(snapshots[account.id]?.windows)
+        XCTAssertEqual(snapshots[account.id]?.resetCredits?.availableCount, 2)
     }
 
     func testValidUsagePreservesMalformedCreditsForSameMatchedAccount() async throws {
@@ -294,10 +290,11 @@ final class CodexBarQuotaClientTests: XCTestCase {
             CodexBarCommandResult(stdout: Data(fixture.utf8), exitCode: 0)
         }
 
-        let snapshots = try await client.fetch(accounts: [Account(alias: "alpha", accountID: "alpha-id")])
+        let account = Account(alias: "alpha", accountID: "alpha-id")
+        let snapshots = try await client.fetch(accounts: [account])
 
-        XCTAssertEqual(snapshots["alpha-id"]?.windows?.first?.usedPercent, 10)
-        XCTAssertNil(snapshots["alpha-id"]?.resetCredits)
+        XCTAssertEqual(snapshots[account.id]?.windows?.first?.usedPercent, 10)
+        XCTAssertNil(snapshots[account.id]?.resetCredits)
     }
 
     func testAllMatchedDataMalformedAtExitZeroRemainsMalformedResponse() async throws {

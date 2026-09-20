@@ -1161,7 +1161,7 @@ public actor AppEngine {
             let homesLock = try StandaloneHomesLock.acquire(supportDirectory: supportDir)
             defer { homesLock.release() }
             let quarantine = try StandaloneAccountRemoval.quarantineHomes(
-                accountID: credentialOwnerID,
+                account: account,
                 supportDirectory: supportDir,
                 lock: homesLock
             )
@@ -1372,6 +1372,7 @@ public actor AppEngine {
             && !account.isUsageLimitReached
             && !settings.warmupExcludedAccounts.contains(account.id)
             && !settings.warmupExcludedAccounts.contains(account.alias)
+            && (account.accountID.isEmpty || !settings.warmupExcludedAccounts.contains(account.accountID))
     }
 
     /// Automatic warm-up may only spend quota on accounts the user has opted into:
@@ -1386,7 +1387,8 @@ public actor AppEngine {
         if account.isArchived { return "archived" }
         if !account.routingEnabled { return "routing disabled" }
         if settings.warmupExcludedAccounts.contains(account.id)
-            || settings.warmupExcludedAccounts.contains(account.alias) {
+            || settings.warmupExcludedAccounts.contains(account.alias)
+            || (!account.accountID.isEmpty && settings.warmupExcludedAccounts.contains(account.accountID)) {
             return "warm-up excluded"
         }
         if let reason = QuotaWarmupService.skipReason(account, now: now) {

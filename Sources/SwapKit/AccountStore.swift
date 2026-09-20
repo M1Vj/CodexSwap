@@ -690,11 +690,28 @@ public actor AccountStore {
         }
     }
 
+    private static func accountsConflict(_ lhs: Account, _ rhs: Account) -> Bool {
+        if !lhs.userID.isEmpty && !rhs.userID.isEmpty && lhs.userID != rhs.userID {
+            return true
+        }
+        if !lhs.email.isEmpty && !rhs.email.isEmpty
+            && lhs.email.caseInsensitiveCompare(rhs.email) != .orderedSame {
+            return true
+        }
+        return false
+    }
+
     private static func accountMatchStrength(_ lhs: Account, _ rhs: Account) -> Int {
-        if !lhs.accountID.isEmpty && !rhs.accountID.isEmpty && lhs.accountID == rhs.accountID { return 3 }
+        if !lhs.accountID.isEmpty && !rhs.accountID.isEmpty && lhs.accountID == rhs.accountID {
+            if accountsConflict(lhs, rhs) { return 0 }
+            return 3
+        }
         if lhs.telemetryID != Account.missingTelemetryID,
            rhs.telemetryID != Account.missingTelemetryID,
-           lhs.telemetryID == rhs.telemetryID { return 2 }
+           lhs.telemetryID == rhs.telemetryID {
+            if accountsConflict(lhs, rhs) { return 0 }
+            return 2
+        }
         if lhs.accountID.isEmpty || rhs.accountID.isEmpty { return lhs.alias == rhs.alias ? 1 : 0 }
         return 0
     }
@@ -711,6 +728,7 @@ public actor AccountStore {
         merged.alias = mergeValue(local.alias, baseline: baseline.alias, latest: latest.alias)
         merged.email = mergeValue(local.email, baseline: baseline.email, latest: latest.email)
         merged.accountID = mergeValue(local.accountID, baseline: baseline.accountID, latest: latest.accountID)
+        merged.userID = mergeValue(local.userID, baseline: baseline.userID, latest: latest.userID)
         merged.credentialAccountID = mergeValue(
             local.credentialAccountID,
             baseline: baseline.credentialAccountID,
@@ -1003,15 +1021,22 @@ public actor AccountStore {
 
     private static func accountsMatch(_ lhs: Account, _ rhs: Account) -> Bool {
         if !lhs.accountID.isEmpty && !rhs.accountID.isEmpty {
-            if lhs.accountID == rhs.accountID { return true }
+            if lhs.accountID == rhs.accountID {
+                if accountsConflict(lhs, rhs) { return false }
+                return true
+            }
             if lhs.telemetryID != Account.missingTelemetryID,
                rhs.telemetryID != Account.missingTelemetryID,
-               lhs.telemetryID == rhs.telemetryID { return true }
+               lhs.telemetryID == rhs.telemetryID {
+                return !accountsConflict(lhs, rhs)
+            }
             return false
         }
         if lhs.telemetryID != Account.missingTelemetryID,
            rhs.telemetryID != Account.missingTelemetryID,
-           lhs.telemetryID == rhs.telemetryID { return true }
+           lhs.telemetryID == rhs.telemetryID {
+            return !accountsConflict(lhs, rhs)
+        }
         return lhs.alias == rhs.alias
     }
 
@@ -2624,9 +2649,28 @@ public actor AccountStore {
             )
         }
         account.priority = AccountPriority.normalize(account.priority)
-        let matchingAccountID = data.accounts.firstIndex {
-            !$0.accountID.isEmpty && !account.accountID.isEmpty && $0.accountID == account.accountID
-        }
+        let matchingAccountID: Int? = {
+            guard !account.accountID.isEmpty else { return nil }
+            let candidates = data.accounts.indices.filter {
+                !data.accounts[$0].accountID.isEmpty
+                    && data.accounts[$0].accountID == account.accountID
+                    && !Self.accountsConflict(data.accounts[$0], account)
+            }
+            if !account.userID.isEmpty,
+               let userMatch = candidates.first(where: { data.accounts[$0].userID == account.userID }) {
+                return userMatch
+            }
+            if !account.email.isEmpty,
+               let emailMatch = candidates.first(where: {
+                   data.accounts[$0].email.caseInsensitiveCompare(account.email) == .orderedSame
+               }) {
+                return emailMatch
+            }
+            if let aliasMatch = candidates.first(where: { data.accounts[$0].alias == account.alias }) {
+                return aliasMatch
+            }
+            return candidates.count == 1 ? candidates[0] : nil
+        }()
         let matchingRetiredManagedSource: Int? = {
             guard acceptingManagedSource,
                   let presentManagedAccountIDs,
@@ -2647,11 +2691,22 @@ public actor AccountStore {
             let candidates = data.accounts.indices.filter {
                 data.accounts[$0].accountID != account.accountID
                     && data.accounts[$0].credentialAccountID == credentialAccountID
+                    && !Self.accountsConflict(data.accounts[$0], account)
+            }
+            if !account.userID.isEmpty,
+               let userMatch = candidates.first(where: { data.accounts[$0].userID == account.userID }) {
+                return userMatch
+            }
+            if !account.email.isEmpty,
+               let emailMatch = candidates.first(where: {
+                   data.accounts[$0].email.caseInsensitiveCompare(account.email) == .orderedSame
+               }) {
+                return emailMatch
             }
             if let aliasMatch = candidates.first(where: { data.accounts[$0].alias == account.alias }) {
                 return aliasMatch
             }
-            return candidates.count == 1 ? candidates[0] : nil
+            return candidates.count == 1 && (account.alias == data.accounts[candidates[0]].alias || (account.email.isEmpty && account.userID.isEmpty)) ? candidates[0] : nil
         }()
         let matchingIndex = matchingAccountID ?? matchingRetiredManagedSource ?? matchingCredentialOwner ?? matchingAlias.flatMap { index in
             guard account.accountID.isEmpty || data.accounts[index].accountID.isEmpty else { return nil }
@@ -2668,6 +2723,8 @@ public actor AccountStore {
             var merged = account
             merged.priority = existing.priority
             merged.alias = existing.alias
+            if merged.userID.isEmpty { merged.userID = existing.userID }
+            if merged.email.isEmpty { merged.email = existing.email }
             merged.routingEnabled = existing.routingEnabled
             merged.archivedAt = existing.archivedAt
             merged.routingPausedAt = existing.routingPausedAt
@@ -2788,10 +2845,7 @@ public actor AccountStore {
             persist()
             return data.accounts[i]
         }
-        if let existingIndex = matchingAlias,
-           !account.accountID.isEmpty,
-           !data.accounts[existingIndex].accountID.isEmpty,
-           data.accounts[existingIndex].accountID != account.accountID {
+        if matchingAlias != nil {
             let baseAlias = account.alias
             var candidate = "\(baseAlias)-2"
             var suffixIndex = 3

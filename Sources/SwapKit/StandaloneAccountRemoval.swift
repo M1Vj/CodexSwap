@@ -207,7 +207,29 @@ enum StandaloneAccountRemoval {
     }
 
     static func quarantineHomes(
+        account: Account,
+        supportDirectory: URL,
+        lock: StandaloneHomesLock,
+        fileManager: FileManager = .default
+    ) throws -> StandaloneAccountQuarantine {
+        let credentialOwnerID = account.credentialAccountID ?? account.accountID
+        let homePath = account.credentialSource?.path ?? account.managedHomePath
+        return try quarantineHomes(
+            accountID: credentialOwnerID,
+            targetHomePath: homePath,
+            targetUserID: account.userID.isEmpty ? nil : account.userID,
+            targetEmail: account.email.isEmpty ? nil : account.email,
+            supportDirectory: supportDirectory,
+            lock: lock,
+            fileManager: fileManager
+        )
+    }
+
+    static func quarantineHomes(
         accountID: String,
+        targetHomePath: String? = nil,
+        targetUserID: String? = nil,
+        targetEmail: String? = nil,
         supportDirectory: URL,
         lock: StandaloneHomesLock,
         fileManager: FileManager = .default
@@ -230,6 +252,16 @@ enum StandaloneAccountRemoval {
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         )
+
+        let normalizedTargetHomePath: String? = {
+            guard let targetHomePath, !targetHomePath.isEmpty else { return nil }
+            let url = URL(fileURLWithPath: targetHomePath).standardizedFileURL
+            if url.lastPathComponent == "auth.json" {
+                return url.deletingLastPathComponent().path
+            }
+            return url.path
+        }()
+
         let matches = entries.filter { home in
             guard UUID(uuidString: home.lastPathComponent) != nil,
                   isPrivateDirectory(home, fileManager: fileManager) else { return false }
@@ -242,8 +274,43 @@ enum StandaloneAccountRemoval {
                   let file = try? JSONDecoder().decode(CodexAuthFile.self, from: raw),
                   let tokens = file.tokens,
                   !tokens.accessToken.isEmpty,
-                  JWT.identity(fromAccessToken: tokens.accessToken).accountID == accountID,
                   tokens.accountId == accountID else { return false }
+            let identity = JWT.identity(fromAccessToken: tokens.accessToken)
+            guard identity.accountID == accountID else { return false }
+
+            let hasTarget = (normalizedTargetHomePath != nil)
+                || (targetUserID != nil && !targetUserID!.isEmpty)
+                || (targetEmail != nil && !targetEmail!.isEmpty)
+
+            if hasTarget {
+                let candidateHomePath = home.standardizedFileURL.path
+                let matchesHomePath = normalizedTargetHomePath != nil && candidateHomePath == normalizedTargetHomePath
+
+                let candidateUserID = identity.userID
+                let candidateEmail = identity.email
+
+                // Never quarantine a sibling user with a differing user ID
+                if let targetUserID, !targetUserID.isEmpty, let candidateUserID, !candidateUserID.isEmpty {
+                    if candidateUserID != targetUserID {
+                        return false
+                    }
+                }
+
+                // Never quarantine a sibling user with a differing email
+                if let targetEmail, !targetEmail.isEmpty, let candidateEmail, !candidateEmail.isEmpty {
+                    if candidateEmail != targetEmail {
+                        return false
+                    }
+                }
+
+                let matchesUserID = targetUserID != nil && !targetUserID!.isEmpty && candidateUserID == targetUserID
+                let matchesEmail = targetEmail != nil && !targetEmail!.isEmpty && candidateEmail == targetEmail
+
+                guard matchesHomePath || matchesUserID || matchesEmail else {
+                    return false
+                }
+            }
+
             return true
         }
         guard !matches.isEmpty else { throw StandaloneAccountRemovalError.sourceUnavailable }

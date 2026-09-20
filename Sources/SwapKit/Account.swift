@@ -306,6 +306,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     public var alias: String
     public var email: String
     public var accountID: String
+    public var userID: String
     public var credentialAccountID: String?
     public var planType: String?
     public var accessToken: String
@@ -336,12 +337,13 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
 
     public var isArchived: Bool { archivedAt != nil }
 
-    public var id: String { accountID.isEmpty ? alias : accountID }
+    public var id: String { alias }
 
     public init(
         alias: String,
         email: String = "",
         accountID: String = "",
+        userID: String = "",
         credentialAccountID: String? = nil,
         planType: String? = nil,
         accessToken: String = "",
@@ -364,6 +366,9 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         self.alias = alias
         self.email = email
         self.accountID = accountID
+        self.userID = !userID.isEmpty
+            ? userID
+            : (JWT.identity(fromAccessToken: accessToken).userID ?? "")
         self.credentialAccountID = credentialAccountID
             ?? JWT.identity(fromAccessToken: accessToken).accountID
             ?? (accountID.isEmpty ? nil : accountID)
@@ -391,7 +396,7 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case alias, email, accountID, credentialAccountID, planType, accessToken, refreshToken, idToken, priority
+        case alias, email, accountID, userID, credentialAccountID, planType, accessToken, refreshToken, idToken, priority
         case disabledUntil, needsLogin, lastUsedAt, usage, managedHomePath, credentialSource, routingEnabled
         case usageStats, usageHistory, lastServedByUs, archivedAt, routingPausedAt, telemetryID
         case usageLimitSettings, authGeneration
@@ -404,6 +409,10 @@ public struct Account: Codable, Sendable, Identifiable, Equatable {
         accountID = try c.decodeIfPresent(String.self, forKey: .accountID) ?? ""
         planType = try c.decodeIfPresent(String.self, forKey: .planType)
         accessToken = try c.decodeIfPresent(String.self, forKey: .accessToken) ?? ""
+        let decodedUserID = try c.decodeIfPresent(String.self, forKey: .userID) ?? ""
+        userID = decodedUserID.isEmpty && !accessToken.isEmpty
+            ? (JWT.identity(fromAccessToken: accessToken).userID ?? "")
+            : decodedUserID
         credentialAccountID = try c.decodeIfPresent(String.self, forKey: .credentialAccountID)
             ?? JWT.identity(fromAccessToken: accessToken).accountID
             ?? (accountID.isEmpty ? nil : accountID)
