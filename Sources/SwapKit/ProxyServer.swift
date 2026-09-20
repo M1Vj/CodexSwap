@@ -52,7 +52,170 @@ private func telemetryCategory(for mode: ProxyRequestMode) -> UsageTelemetryRequ
     return .interactive
 }
 
+struct TopLevelRequestMetadata {
+    var model: String?
+    var clientMetadata: [String: Any]?
+}
+
+func scanTopLevelRequestMetadata(from data: Data, maxScanBytes: Int = 1_048_576) -> TopLevelRequestMetadata {
+    var result = TopLevelRequestMetadata()
+    let limit = min(data.count, maxScanBytes)
+    guard limit > 2 else { return result }
+
+    var idx = 0
+    while idx < limit && (data[idx] == 0x20 || data[idx] == 0x09 || data[idx] == 0x0A || data[idx] == 0x0D) {
+        idx += 1
+    }
+    guard idx < limit, data[idx] == 0x7B else { return result }
+    idx += 1
+
+    while idx < limit {
+        while idx < limit && (data[idx] == 0x20 || data[idx] == 0x09 || data[idx] == 0x0A || data[idx] == 0x0D || data[idx] == 0x2C) {
+            idx += 1
+        }
+        guard idx < limit, data[idx] != 0x7D else { break }
+        guard data[idx] == 0x22 else { break }
+
+        idx += 1
+        let keyStart = idx
+        var keyEscaped = false
+        while idx < limit {
+            if keyEscaped {
+                keyEscaped = false
+            } else if data[idx] == 0x5C {
+                keyEscaped = true
+            } else if data[idx] == 0x22 {
+                break
+            }
+            idx += 1
+        }
+        guard idx < limit, data[idx] == 0x22 else { break }
+        let keyData = data[keyStart..<idx]
+        idx += 1
+
+        while idx < limit && (data[idx] == 0x20 || data[idx] == 0x09 || data[idx] == 0x0A || data[idx] == 0x0D) {
+            idx += 1
+        }
+        guard idx < limit, data[idx] == 0x3A else { break }
+        idx += 1
+
+        while idx < limit && (data[idx] == 0x20 || data[idx] == 0x09 || data[idx] == 0x0A || data[idx] == 0x0D) {
+            idx += 1
+        }
+        guard idx < limit else { break }
+
+        let key = String(decoding: keyData, as: UTF8.self)
+
+        if key == "model" {
+            if data[idx] == 0x22 {
+                idx += 1
+                let valStart = idx
+                var valEscaped = false
+                while idx < limit {
+                    if valEscaped {
+                        valEscaped = false
+                    } else if data[idx] == 0x5C {
+                        valEscaped = true
+                    } else if data[idx] == 0x22 {
+                        break
+                    }
+                    idx += 1
+                }
+                if idx < limit && data[idx] == 0x22 {
+                    result.model = String(decoding: data[valStart..<idx], as: UTF8.self)
+                    idx += 1
+                }
+            } else {
+                while idx < limit && data[idx] != 0x2C && data[idx] != 0x7D { idx += 1 }
+            }
+        } else if key == "client_metadata" {
+            if data[idx] == 0x7B {
+                let objStart = idx
+                var objDepth = 0
+                var inStr = false
+                var strEsc = false
+                while idx < limit {
+                    let b = data[idx]
+                    if inStr {
+                        if strEsc {
+                            strEsc = false
+                        } else if b == 0x5C {
+                            strEsc = true
+                        } else if b == 0x22 {
+                            inStr = false
+                        }
+                    } else {
+                        if b == 0x22 {
+                            inStr = true
+                        } else if b == 0x7B {
+                            objDepth += 1
+                        } else if b == 0x7D {
+                            objDepth -= 1
+                            if objDepth == 0 {
+                                idx += 1
+                                break
+                            }
+                        }
+                    }
+                    idx += 1
+                }
+                if objDepth == 0 {
+                    let metadataSlice = data[objStart..<idx]
+                    if let obj = try? JSONSerialization.jsonObject(with: metadataSlice) as? [String: Any] {
+                        result.clientMetadata = obj
+                    }
+                }
+            } else {
+                while idx < limit && data[idx] != 0x2C && data[idx] != 0x7D { idx += 1 }
+            }
+        } else {
+            if result.model != nil && result.clientMetadata != nil {
+                break
+            }
+            if data[idx] == 0x22 {
+                idx += 1
+                var inEsc = false
+                while idx < limit {
+                    if inEsc { inEsc = false }
+                    else if data[idx] == 0x5C { inEsc = true }
+                    else if data[idx] == 0x22 { idx += 1; break }
+                    idx += 1
+                }
+            } else if data[idx] == 0x7B || data[idx] == 0x5B {
+                let openChar = data[idx]
+                let closeChar: UInt8 = openChar == 0x7B ? 0x7D : 0x5D
+                var nestDepth = 0
+                var inStr = false
+                var inEsc = false
+                while idx < limit {
+                    let b = data[idx]
+                    if inStr {
+                        if inEsc { inEsc = false }
+                        else if b == 0x5C { inEsc = true }
+                        else if b == 0x22 { inStr = false }
+                    } else {
+                        if b == 0x22 { inStr = true }
+                        else if b == openChar { nestDepth += 1 }
+                        else if b == closeChar {
+                            nestDepth -= 1
+                            if nestDepth == 0 { idx += 1; break }
+                        }
+                    }
+                    idx += 1
+                }
+            } else {
+                while idx < limit && data[idx] != 0x2C && data[idx] != 0x7D { idx += 1 }
+            }
+        }
+    }
+    return result
+}
+
 private func telemetryModel(from body: Data) -> String {
+    let scanned = scanTopLevelRequestMetadata(from: body)
+    if let model = scanned.model {
+        return UsageTelemetryAttemptEvent.normalizeModel(model)
+    }
     guard body.count <= 1_048_576,
           let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
           let raw = object["model"] as? String else { return "other" }
@@ -472,9 +635,10 @@ private func structuredInteractiveKey(from value: Any?) -> String? {
 
 func interactiveTurnKey(headers: HTTPHeaders, body: Data) -> String? {
     var bodyLegacy: String?
-    if body.count <= 1_048_576,
-       let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-       let metadata = object["client_metadata"] as? [String: Any] {
+    let scanned = scanTopLevelRequestMetadata(from: body)
+    let metadata = scanned.clientMetadata
+        ?? (body.count <= 1_048_576 ? (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["client_metadata"] as? [String: Any] : nil)
+    if let metadata {
         if let threadKey = namespacedInteractiveKey(namespace: "thread", value: metadata["thread_id"]) {
             return threadKey
         }
@@ -743,8 +907,9 @@ public actor ProxyServer {
 
     /// Global aggregation ceiling for candidate JSON endpoints. This is
     /// intentionally distinct from `AlphaBridge.maxBodyBytes`, which applies
-    /// only after a bridged model has been resolved.
-    static let maxCandidateRequestBodyBytes = 64 * 1024 * 1024
+    /// only after a bridged model has been resolved. Matches upstream Cloudflare
+    /// and OpenAI gateway default request body ceiling of 100 MB.
+    static let maxCandidateRequestBodyBytes = 100 * 1024 * 1024
 
     private let store: AccountStore
     private let settingsProvider: @Sendable () async -> Settings
@@ -1196,15 +1361,6 @@ public actor ProxyServer {
         let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
         let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
 
-        // Interactive traffic is only served while Codex routing is enabled: with routing
-        // off, nothing legitimate points at this port, and silently serving a stale client
-        // would spend accounts the user never intended to touch. App-initiated task and
-        // warm-up requests carry their headers and are unaffected.
-        if refusesInteractiveTraffic(mode: mode, routingEnabled: await routingEnabledProvider()) {
-            try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap routing is disabled; enable \"Route Codex through CodexSwap\" in Settings")
-            return
-        }
-
         // Hardened Chat Completions passthrough for bridged models (opencode & friends):
         // retries pre-stream gateway failures, then streams verbatim. No account state.
         if head.method == .POST, rawPath.hasSuffix("/chat/completions"),
@@ -1239,7 +1395,21 @@ public actor ProxyServer {
             return
         }
 
-        let requestModel = telemetryModel(from: body)
+        // Interactive traffic is only served while Codex routing is enabled: with routing
+        // off, nothing legitimate points at this port, and silently serving a stale client
+        // would spend accounts the user never intended to touch. App-initiated task and
+        // warm-up requests carry their headers and are unaffected.
+        if refusesInteractiveTraffic(mode: mode, routingEnabled: await routingEnabledProvider()) {
+            try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap routing is disabled; enable \"Route Codex through CodexSwap\" in Settings")
+            return
+        }
+
+        let decodedCandidateBody = AlphaBridge.decodedRequestBody(
+            body,
+            contentEncoding: head.headers.first(name: "Content-Encoding"),
+            maxDecompressedBytes: ProxyServer.maxCandidateRequestBodyBytes
+        ) ?? body
+        let requestModel = telemetryModel(from: decodedCandidateBody)
         let rootRequestID = UUID()
         let requestCategory = telemetryCategory(for: mode)
         await routingLog.write(RoutingDecisionLogRecord(
@@ -1249,7 +1419,7 @@ public actor ProxyServer {
             reason: .requestStart
         ))
         let interactiveKey = mode == .normal && head.method == .POST && rawPath.hasSuffix("/responses")
-            ? interactiveTurnKey(headers: head.headers, body: body)
+            ? interactiveTurnKey(headers: head.headers, body: decodedCandidateBody)
             : nil
         let preferredTaskAlias = mode.taskRunID.flatMap { taskRunPins.alias(for: $0) }
 

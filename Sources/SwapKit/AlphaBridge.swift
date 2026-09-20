@@ -23,10 +23,14 @@ enum AlphaBridge {
     /// Decodes a request body per its Content-Encoding so the model ID can be read.
     /// Codex compresses large Responses bodies with zstd; Chat Completions gateways
     /// receive plain JSON from this lane. Returns nil when decoding fails.
-    static func decodedRequestBody(_ data: Data, contentEncoding: String?) -> Data? {
+    static func decodedRequestBody(
+        _ data: Data,
+        contentEncoding: String?,
+        maxDecompressedBytes: Int = AlphaBridge.maxBodyBytes
+    ) -> Data? {
         switch contentEncoding?.lowercased() {
         case "zstd", "zstandard":
-            return ZstdRuntime.decompress(data) ?? data
+            return ZstdRuntime.decompress(data, maxCapacity: maxDecompressedBytes) ?? data
         case nil, "", "identity":
             return data
         default:
@@ -1248,7 +1252,7 @@ enum ZstdRuntime {
         }
     }
 
-    static func decompress(_ data: Data) -> Data? {
+    static func decompress(_ data: Data, maxCapacity: Int = AlphaBridge.maxBodyBytes) -> Data? {
         resolve()
         guard let decompressFn, let frameSizeFn, let isErrorFn else { return nil }
         guard data.count > 4, data.starts(with: [0x28, 0xB5, 0x2F, 0xFD]) else { return nil }
@@ -1261,7 +1265,7 @@ enum ZstdRuntime {
             declared = UInt64(data.count) * 8
         }
         var capacity = Int(clamping: declared)
-        if capacity <= 0 || capacity > AlphaBridge.maxBodyBytes { capacity = AlphaBridge.maxBodyBytes }
+        if capacity <= 0 || capacity > maxCapacity { capacity = maxCapacity }
 
         while true {
             var output = Data(count: capacity)
@@ -1281,9 +1285,9 @@ enum ZstdRuntime {
                 output.removeSubrange(written..<output.count)
                 return output
             }
-            // ZSTD_error_dstSize_tooSmall -> grow once toward maxBodyBytes, then give up.
-            if capacity >= AlphaBridge.maxBodyBytes { return nil }
-            capacity = min(AlphaBridge.maxBodyBytes, capacity * 2)
+            // ZSTD_error_dstSize_tooSmall -> grow once toward maxCapacity, then give up.
+            if capacity >= maxCapacity { return nil }
+            capacity = min(maxCapacity, capacity * 2)
         }
     }
 }

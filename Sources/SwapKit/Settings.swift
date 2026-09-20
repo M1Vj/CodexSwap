@@ -167,7 +167,8 @@ public struct Settings: Codable, Sendable, Equatable {
             BridgedModel(
                 modelID: "x-preview-f-free",
                 displayName: "Ox Alpha Free",
-                baseURL: "https://opencode.ai/zen/v1"
+                baseURL: "https://opencode.ai/zen/v1",
+                enabled: false
             )
         ],
         metadataTelemetryEnabled: false
