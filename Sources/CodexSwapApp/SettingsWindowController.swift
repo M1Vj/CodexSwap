@@ -8,8 +8,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "CodexSwap Settings"
         window.styleMask = [.titled, .closable, .resizable]
-        window.setContentSize(NSSize(width: 760, height: 520))
-        window.minSize = NSSize(width: 720, height: 480)
+        window.setContentSize(NSSize(width: 860, height: 580))
+        window.minSize = NSSize(width: 780, height: 520)
         window.isReleasedWhenClosed = false
         window.center()
         window.standardWindowButton(.miniaturizeButton)?.isEnabled = false

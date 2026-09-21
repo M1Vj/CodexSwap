@@ -34,14 +34,15 @@ enum SettingsPane: String, CaseIterable, Identifiable {
 struct SettingsView: View {
     @ObservedObject var model: SettingsViewModel
     @State private var selection: SettingsPane = .general
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             List(SettingsPane.allCases, selection: $selection) { pane in
                 Label(pane.title, systemImage: pane.symbol)
                     .tag(pane)
             }
-            .navigationSplitViewColumnWidth(min: 145, ideal: 165)
+            .navigationSplitViewColumnWidth(min: 155, ideal: 175)
         } detail: {
             Group {
                 switch selection {
@@ -49,7 +50,7 @@ struct SettingsView: View {
                 case .accounts: AccountsSettingsView(model: model)
                 case .quotaAndResets: QuotaResetsSettingsView(model: model)
                 case .taskBoard: TaskBoardSettingsView(model: model)
-                case .diagnostics: DiagnosticsView()
+                case .diagnostics: DiagnosticsView(onBackToSettings: { selection = .general })
                 case .advanced: AdvancedSettingsView(model: model)
                 }
             }
@@ -57,7 +58,8 @@ struct SettingsView: View {
             .padding(24)
             .navigationTitle(selection.title)
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 780, minHeight: 520)
         .onChange(of: model.requestedPane) { _, pane in
             applyRequestedPane(pane)
         }

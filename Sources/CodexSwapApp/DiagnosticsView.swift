@@ -5,6 +5,8 @@ import UniformTypeIdentifiers
 import SwapKit
 
 struct DiagnosticsView: View {
+    var onBackToSettings: (() -> Void)? = nil
+
     @State private var snapshot: DiagnosticSnapshot?
     @State private var componentSelection = "all"
     @State private var minimumLevelSelection = DiagnosticLevel.debug.rawValue
@@ -29,7 +31,15 @@ struct DiagnosticsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .toolbar {
-            ToolbarItemGroup {
+            if let onBackToSettings {
+                ToolbarItem(placement: .navigation) {
+                    Button(action: onBackToSettings) {
+                        Label("Settings", systemImage: "chevron.left")
+                    }
+                    .help("Return to Settings")
+                }
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button("Refresh", systemImage: "arrow.clockwise") {
                     Task { await refreshSnapshot() }
                 }
@@ -56,17 +66,22 @@ struct DiagnosticsView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let onBackToSettings {
+                Button(action: onBackToSettings) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                        Text("Back to Settings")
+                    }
+                    .font(.subheadline.weight(.medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .padding(.bottom, 2)
+            }
             Text("Diagnostics")
                 .font(.title2.weight(.semibold))
-            Text("A bounded timeline of safe app, proxy, routing, account, quota, warmup, task, settings, and storage events. Credentials, prompts, response bodies, paths, and environment values are never included.")
+            Text("A bounded timeline of safe app, proxy, routing, and quota events. Sensitive data (credentials, prompts, response bodies) is never logged.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("Retention is bounded to 8 MiB across four rotating segments. Logging failures and dropped or truncated events are called out below.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("Health counters are for this process and reset after restart.")
-                .font(.caption)
                 .foregroundStyle(.secondary)
             if let exportMessage, !exportMessage.isEmpty {
                 Text(exportMessage)
@@ -140,7 +155,7 @@ struct DiagnosticsView: View {
                         Divider()
                     }
                 }
-                .frame(minWidth: 1_220, alignment: .leading)
+                .frame(minWidth: 780, alignment: .leading)
             }
             .overlay(alignment: .bottomLeading) {
                 Text("\(records.count) event\(records.count == 1 ? "" : "s") shown")
@@ -154,16 +169,16 @@ struct DiagnosticsView: View {
     }
 
     private var diagnosticsHeaderRow: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            tableHeader("Timestamp", width: 180)
-            tableHeader("Severity", width: 74)
-            tableHeader("Component", width: 110)
-            tableHeader("Operation", width: 130)
-            tableHeader("Outcome", width: 90)
-            tableHeader("Code", width: 100)
-            tableHeader("Correlation ID", width: 270)
-            tableHeader("Status", width: 72)
-            tableHeader("Duration", width: 90)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            tableHeader("Time", width: 110)
+            tableHeader("Severity", width: 65)
+            tableHeader("Component", width: 95)
+            tableHeader("Operation", width: 110)
+            tableHeader("Outcome", width: 80)
+            tableHeader("Code", width: 90)
+            tableHeader("Status", width: 55)
+            tableHeader("Duration", width: 65)
+            tableHeader("Correlation", width: 90)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -344,26 +359,33 @@ private struct DiagnosticsRow: View {
     let record: DiagnosticRecord
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(record.timestamp, format: .dateTime.year().month().day().hour().minute().second())
-                .frame(width: 180, alignment: .leading)
-            Text(humanized(record.level.rawValue))
-                .foregroundStyle(levelColor)
-                .frame(width: 74, alignment: .leading)
-            Text(humanized(record.component.rawValue))
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(record.timestamp, format: .dateTime.month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits))
                 .frame(width: 110, alignment: .leading)
+            Text(humanized(record.level.rawValue))
+                .fontWeight(.medium)
+                .foregroundStyle(levelColor)
+                .frame(width: 65, alignment: .leading)
+            Text(humanized(record.component.rawValue))
+                .frame(width: 95, alignment: .leading)
             Text(humanized(record.operation.rawValue))
-                .frame(width: 130, alignment: .leading)
+                .frame(width: 110, alignment: .leading)
             Text(humanized(record.outcome.rawValue))
-                .frame(width: 90, alignment: .leading)
+                .frame(width: 80, alignment: .leading)
             Text(humanized(record.code.rawValue))
-                .frame(width: 100, alignment: .leading)
-            Text(record.correlationID?.uuidString ?? "—")
-                .frame(width: 270, alignment: .leading)
-            Text(record.status.map { String($0) } ?? "—")
-                .frame(width: 72, alignment: .leading)
-            Text(durationText)
                 .frame(width: 90, alignment: .leading)
+            Text(record.status.map { String($0) } ?? "—")
+                .frame(width: 55, alignment: .leading)
+            Text(durationText)
+                .frame(width: 65, alignment: .leading)
+            if let cid = record.correlationID?.uuidString {
+                Text(String(cid.prefix(8)))
+                    .help(cid)
+                    .frame(width: 90, alignment: .leading)
+            } else {
+                Text("—")
+                    .frame(width: 90, alignment: .leading)
+            }
         }
         .font(.system(.caption, design: .monospaced))
         .textSelection(.enabled)

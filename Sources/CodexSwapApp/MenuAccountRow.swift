@@ -35,6 +35,13 @@ struct MenuAccountRow: View {
                     Text(alias)
                         .font(.system(size: 13, weight: isActive ? .semibold : .regular))
                         .lineLimit(1)
+                    if isSticky {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .help("Pinned manual override; double-click to release")
+                            .accessibilityLabel("Pinned manual override")
+                    }
                     if usageLimitSettings.enabled {
                         badge(
                             usageLimitBadgeLabel,
