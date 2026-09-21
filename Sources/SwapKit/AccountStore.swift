@@ -1738,9 +1738,12 @@ public actor AccountStore {
     }
 
     /// Shared ordering for picking the next account: priority strategy ranks by priority
-    /// first, round-robin spreads by least-recently-used; both tiebreak LRU then alias.
+    /// first, with ties broken stably by alias; round-robin spreads by least-recently-used.
     static func selectionOrder(_ a: Account, _ b: Account, strategy: RotationStrategy) -> Bool {
-        if strategy == .priority, a.priority != b.priority { return a.priority > b.priority }
+        if strategy == .priority {
+            if a.priority != b.priority { return a.priority > b.priority }
+            return a.alias.localizedCaseInsensitiveCompare(b.alias) == .orderedAscending
+        }
         let la = a.lastUsedAt ?? .distantPast
         let lb = b.lastUsedAt ?? .distantPast
         if la != lb { return la < lb }
@@ -1834,7 +1837,9 @@ public actor AccountStore {
                 (!hasEligibleDraining && active.priority == best.priority) {
                 return active
             }
-            activate(best.alias, now: now)
+            if data.activeAlias != best.alias {
+                activate(best.alias, now: now)
+            }
             return account(best.alias)
         case .roundRobin:
             let eligible = eligibleOrdered(now: now)

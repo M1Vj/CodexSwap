@@ -44,6 +44,9 @@ struct QuotaResetsSettingsView: View {
                 Picker("Interactive exhaustion policy", selection: interactivePolicyBinding) {
                     ExhaustionPolicyChoices()
                 }
+                Text("Controls what happens when the active account exhausts its quota. 'Stop and notify' keeps the account strictly pinned without switching on 429 quota exhaustion, halting and notifying you when limits are reached. 'Switch account first' and 'Use reset on current account first' fail over to the next eligible account.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
 
             SettingsSection(title: "Notifications") {

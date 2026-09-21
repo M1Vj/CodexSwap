@@ -22,6 +22,9 @@ struct GeneralSettingsView: View {
                     Text("Ranking (top rank first)").tag(RotationStrategy.priority)
                     Text("Round-robin (spread evenly)").tag(RotationStrategy.roundRobin)
                 }
+                Text("Ranking acts as a sticky hold on the highest-ranked eligible account (#1 first), exhausting it completely before moving to the next rank. Double-click an account in the menu to pin a manual override. Round-robin spreads concurrent requests evenly across eligible accounts.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 Toggle("Prefer accounts draining from other users", isOn: smartSwitchBinding)
                 Text("When enabled, CodexSwap polls every account each cycle and floats shared accounts whose quota is falling without your own traffic to the front of the rotation, ahead of their ranking position.")
                     .font(.callout)

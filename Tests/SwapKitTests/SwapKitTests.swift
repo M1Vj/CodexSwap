@@ -3922,6 +3922,124 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertTrue(selections.allSatisfy(\.leaseReservedBySelection))
     }
 
+    func testPriorityInteractiveSessionsStickToHighestRankedAccount() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("priority-interactive-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("rank1", priority: 10))
+        await store.upsert(account("rank2", priority: 5))
+        await store.upsert(account("rank3", priority: 1))
+
+        let settings = Settings.default
+        let server = ProxyServer(store: store, settingsProvider: { settings })
+
+        async let subagent1 = server.reserveInteractiveAccount(key: "thread-1", settings: settings)
+        async let subagent2 = server.reserveInteractiveAccount(key: "thread-2", settings: settings)
+        async let subagent3 = server.reserveInteractiveAccount(key: "thread-3", settings: settings)
+
+        let results = await [subagent1, subagent2, subagent3].compactMap { $0 }
+        XCTAssertEqual(results.count, 3)
+        XCTAssertTrue(results.allSatisfy { $0.alias == "rank1" })
+        let active = await store.activeAlias()
+        XCTAssertEqual(active, "rank1")
+        for result in results { await store.releaseRoutingLease(result.alias) }
+        await server.stop()
+    }
+
+    func testPriorityConcurrentSubagentsUnderHeavyLoadNeverRotateFromHighestRank() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("priority-load-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("rank1", priority: 10))
+        await store.upsert(account("rank2", priority: 5))
+        await store.upsert(account("rank3", priority: 1))
+
+        let settings = Settings.default
+        let server = ProxyServer(store: store, settingsProvider: { settings })
+
+        let threads = (1...10).map { "subagent-thread-\($0)" }
+        let tasks = await withTaskGroup(of: Account?.self, returning: [Account].self) { group in
+            for thread in threads {
+                group.addTask {
+                    await server.reserveInteractiveAccount(key: thread, settings: settings)
+                }
+            }
+            var collected: [Account] = []
+            for await acc in group {
+                if let acc { collected.append(acc) }
+            }
+            return collected
+        }
+
+        XCTAssertEqual(tasks.count, 10)
+        XCTAssertTrue(tasks.allSatisfy { $0.alias == "rank1" }, "All 10 parallel subagent requests must stick strictly to rank1 under priority strategy")
+        let active = await store.activeAlias()
+        XCTAssertEqual(active, "rank1")
+        for acc in tasks { await store.releaseRoutingLease(acc.alias) }
+        await server.stop()
+    }
+
+    func testPriorityInteractiveSessionsFailoverToNextRankWhenExhausted() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("priority-failover-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("rank1", priority: 10))
+        await store.upsert(account("rank2", priority: 5))
+
+        let settings = Settings.default
+        let server = ProxyServer(store: store, settingsProvider: { settings })
+
+        let first = await server.reserveInteractiveAccount(key: "thread-1", settings: settings)
+        XCTAssertEqual(first?.alias, "rank1")
+        if let first { await store.releaseRoutingLease(first.alias) }
+
+        await store.markLimited("rank1", limit: "rateLimit", resetAt: Date().addingTimeInterval(3600), fallbackCooldown: 3600)
+
+        // Same thread that previously used rank1 must cleanly fail over to rank2
+        let sameThreadNext = await server.reserveInteractiveAccount(key: "thread-1", settings: settings)
+        XCTAssertEqual(sameThreadNext?.alias, "rank2")
+        if let sameThreadNext { await store.releaseRoutingLease(sameThreadNext.alias) }
+
+        // A new thread also routes to rank2 while rank1 is limited
+        let next = await server.reserveInteractiveAccount(key: "thread-2", settings: settings)
+        XCTAssertEqual(next?.alias, "rank2")
+        if let next { await store.releaseRoutingLease(next.alias) }
+
+        // When rank1 limit clears, new requests immediately return to the highest rank
+        await store.setActive("rank1")
+        let recovered = await server.reserveInteractiveAccount(key: "thread-3", settings: settings)
+        XCTAssertEqual(recovered?.alias, "rank1")
+        if let recovered { await store.releaseRoutingLease(recovered.alias) }
+
+        await server.stop()
+    }
+
+    func testPriorityInteractiveSessionsHonorExplicitStickyPinOverride() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("priority-sticky-override-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("rank1", priority: 10))
+        await store.upsert(account("rank2", priority: 5))
+
+        _ = await store.toggleStickyAlias("rank2")
+
+        let settings = Settings.default
+        let server = ProxyServer(store: store, settingsProvider: { settings })
+
+        async let subagent1 = server.reserveInteractiveAccount(key: "thread-1", settings: settings)
+        async let subagent2 = server.reserveInteractiveAccount(key: "thread-2", settings: settings)
+
+        let results = await [subagent1, subagent2].compactMap { $0 }
+        XCTAssertTrue(results.allSatisfy { $0.alias == "rank2" })
+        for result in results { await store.releaseRoutingLease(result.alias) }
+        await server.stop()
+    }
+
+    func testPrioritySelectionOrderBreaksTiesStablyByAliasWithoutLRUAlternation() async {
+        let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("priority-tiebreak-\(UUID().uuidString).json"), strategy: .priority)
+        await store.upsert(account("alpha", priority: 5))
+        await store.upsert(account("beta", priority: 5))
+
+        let first = await store.current()
+        XCTAssertEqual(first?.alias, "alpha")
+
+        await store.touchLastUsed("alpha", now: Date())
+        let second = await store.current()
+        XCTAssertEqual(second?.alias, "alpha")
+    }
+
     func testPausedTaskRunPinIsOverriddenOnNextSelection() async {
         let store = AccountStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("paused-task-pin-\(UUID().uuidString).json"))
         await store.upsert(account("a"))

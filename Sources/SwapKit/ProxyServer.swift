@@ -424,10 +424,10 @@ func reserveProxyAccount(
     switch mode {
     case .normal:
         if await store.stickyAlias() != nil {
-            return await store.reserveCurrent(avoidingLeased: true, now: now)
+            return await store.reserveCurrent(avoidingLeased: false, now: now)
         }
         if await store.currentDrainingHoldAlias() != nil {
-            return await store.reserveCurrent(avoidingLeased: true, now: now)
+            return await store.reserveCurrent(avoidingLeased: false, now: now)
         }
         if requestModel == "gpt-5.6-luna",
            let opportunity = await store.reserveLunaOpportunity(now: now) {
@@ -1022,12 +1022,12 @@ public actor ProxyServer {
         // selection so the next request observes it.
         await store.setStrategy(settings.rotationStrategy)
         if await store.stickyAlias() != nil,
-           let held = await store.reserveCurrent(avoidingLeased: true) {
+           let held = await store.reserveCurrent(avoidingLeased: false) {
             await interactiveSelector.bind(key, alias: held.alias, preserving: key)
             return held
         }
         if await store.currentDrainingHoldAlias() != nil,
-           let held = await store.reserveCurrent(avoidingLeased: true) {
+           let held = await store.reserveCurrent(avoidingLeased: false) {
             await interactiveSelector.bind(key, alias: held.alias, preserving: key)
             return held
         }
@@ -2262,7 +2262,7 @@ public actor ProxyServer {
             excluding: alias,
             primaryThreshold: settings.primaryThresholdPercent,
             secondaryThreshold: settings.secondaryThresholdPercent,
-            avoidingLeased: true
+            avoidingLeased: mode.isTask ? true : (settings.rotationStrategy == .roundRobin)
         )
     }
 
