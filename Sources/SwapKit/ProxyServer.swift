@@ -856,6 +856,27 @@ private enum ProxyAttemptResult: Sendable {
     case retryTransient(account: Account, retries: Int)
 }
 
+private enum ProxyStreamRelayFailure: Error {
+    case upstreamBody(cancelled: Bool)
+    case downstreamHead(cancelled: Bool)
+    case downstreamBody(cancelled: Bool)
+    case downstreamEnd(cancelled: Bool)
+
+    var diagnostic: (outcome: DiagnosticOutcome, code: DiagnosticCode) {
+        switch self {
+        case .upstreamBody(let cancelled):
+            return cancelled ? (.cancelled, .none) : (.failed, .network)
+        case .downstreamHead(let cancelled), .downstreamBody(let cancelled), .downstreamEnd(let cancelled):
+            return cancelled ? (.cancelled, .none) : (.failed, .unknown)
+        }
+    }
+
+    var rootOutcome: UsageTelemetryRootOutcome {
+        diagnostic.outcome == .cancelled ? .cancelled : .failure
+    }
+
+}
+
 /// Tracks account aliases already attempted by one root request. The tracker is
 /// intentionally scoped to `serveRequest`, rather than the proxy actor, so
 /// concurrent roots cannot exclude one another's accounts.
@@ -919,6 +940,7 @@ public actor ProxyServer {
     private let freshAlternative: @Sendable (_ currentAlias: String, _ allowedAliases: [String]?) async -> Account?
     private let standaloneCredentialRenewal: @Sendable (Account, Bool) async -> StandaloneCredentialRenewalResult
     private let telemetry: UsageTelemetryStore?
+    private let diagnosticsLog: DiagnosticsLog
     private let routingLog: RoutingDecisionLog
     private let config: Config
     private let group: MultiThreadedEventLoopGroup
@@ -978,6 +1000,7 @@ public actor ProxyServer {
         sink: ProxyEventSink = NullEventSink(),
         verbose: Bool = false,
         telemetry: UsageTelemetryStore? = nil,
+        diagnosticsLog: DiagnosticsLog = .shared,
         routingLog: RoutingDecisionLog? = nil,
         standaloneCredentialRenewal: @escaping @Sendable (Account, Bool) async -> StandaloneCredentialRenewalResult = { _, _ in .notOwned }
     ) {
@@ -991,6 +1014,7 @@ public actor ProxyServer {
         self.standaloneCredentialRenewal = standaloneCredentialRenewal
         self.sink = sink
         self.telemetry = telemetry
+        self.diagnosticsLog = diagnosticsLog
         self.routingLog = routingLog ?? RoutingDecisionLog()
         self.verbose = verbose
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -1513,17 +1537,36 @@ public actor ProxyServer {
                     attemptedAccounts: attemptedAccounts
                 )
             } catch {
+                let terminalStatus: Int?
+                var terminalOutcome = UsageTelemetryRootOutcome.failure
+                if let relayFailure = error as? ProxyStreamRelayFailure {
+                    terminalStatus = nil
+                    terminalOutcome = relayFailure.rootOutcome
+                    let diagnostic = relayFailure.diagnostic
+                    diagnosticsLog.record(
+                        component: .proxy,
+                        operation: .request,
+                        outcome: diagnostic.outcome,
+                        level: diagnostic.outcome == .failed ? .warning : .info,
+                        code: diagnostic.code,
+                        correlationID: rootRequestID,
+                        status: nil,
+                        count: attempts
+                    )
+                } else {
+                    terminalStatus = Int(HTTPResponseStatus.badGateway.code)
+                }
                 await telemetry?.recordRootTerminal(.init(
                     rootRequestID: rootRequestID,
                     finishedAt: Date(),
                     category: requestCategory,
-                    outcome: .failure,
+                    outcome: terminalOutcome,
                     attemptCount: attempts
                 ))
                 await recordRoutingTerminal(
                     rootRequestID: rootRequestID,
                     attemptCount: attempts,
-                    status: Int(HTTPResponseStatus.badGateway.code),
+                    status: terminalStatus,
                     account: account,
                     outcome: .failure
                 )
@@ -2397,10 +2440,26 @@ public actor ProxyServer {
     ) async throws {
         let headers = filteredResponseHeaders(response.headers)
         let respHead = HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)
-        try await outbound.write(.head(respHead))
+        do {
+            try await outbound.write(.head(respHead))
+        } catch {
+            throw ProxyStreamRelayFailure.downstreamHead(cancelled: Task.isCancelled)
+        }
         var scanner = SSEUsageScanner()
-        for try await chunk in response.body {
-            try await outbound.write(.body(.byteBuffer(chunk)))
+        var iterator = response.body.makeAsyncIterator()
+        while true {
+            let chunk: ByteBuffer?
+            do {
+                chunk = try await iterator.next()
+            } catch {
+                throw ProxyStreamRelayFailure.upstreamBody(cancelled: Task.isCancelled)
+            }
+            guard let chunk else { break }
+            do {
+                try await outbound.write(.body(.byteBuffer(chunk)))
+            } catch {
+                throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
+            }
             scanner.feed(chunk)
             if let sample = scanner.consume() {
                 await sink.handle(ProxyEvent(
@@ -2424,7 +2483,11 @@ public actor ProxyServer {
                 usage: sample
             ))
         }
-        try await outbound.write(.end(nil))
+        do {
+            try await outbound.write(.end(nil))
+        } catch {
+            throw ProxyStreamRelayFailure.downstreamEnd(cancelled: Task.isCancelled)
+        }
     }
 
     private func deliverBuffered(_ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, status: HTTPResponseStatus, headers upstreamHeaders: HTTPHeaders, body: ByteBuffer) async throws {
@@ -2500,18 +2563,45 @@ public actor ProxyServer {
         classified: sending ClassifiedResponseBody
     ) async throws {
         let headers = filteredResponseHeaders(upstreamHeaders)
-        try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
+        do {
+            try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
+        } catch {
+            throw ProxyStreamRelayFailure.downstreamHead(cancelled: Task.isCancelled)
+        }
         if classified.prefix.readableBytes > 0 {
-            try await outbound.write(.body(.byteBuffer(classified.prefix)))
+            do {
+                try await outbound.write(.body(.byteBuffer(classified.prefix)))
+            } catch {
+                throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
+            }
         }
         if let remainder = classified.boundaryRemainder, remainder.readableBytes > 0 {
-            try await outbound.write(.body(.byteBuffer(remainder)))
+            do {
+                try await outbound.write(.body(.byteBuffer(remainder)))
+            } catch {
+                throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
+            }
         }
         var iterator = classified.iterator
-        while let chunk = try await iterator.next() {
-            try await outbound.write(.body(.byteBuffer(chunk)))
+        while true {
+            let chunk: ByteBuffer?
+            do {
+                chunk = try await iterator.next()
+            } catch {
+                throw ProxyStreamRelayFailure.upstreamBody(cancelled: Task.isCancelled)
+            }
+            guard let chunk else { break }
+            do {
+                try await outbound.write(.body(.byteBuffer(chunk)))
+            } catch {
+                throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
+            }
         }
-        try await outbound.write(.end(nil))
+        do {
+            try await outbound.write(.end(nil))
+        } catch {
+            throw ProxyStreamRelayFailure.downstreamEnd(cancelled: Task.isCancelled)
+        }
     }
 }
 
