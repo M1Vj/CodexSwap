@@ -997,6 +997,8 @@ public actor ProxyServer {
         var cfg = HTTPClient.Configuration()
         cfg.timeout = .init(connect: .seconds(15))
         cfg.httpVersion = .http1Only
+        // Parallel Codex and T3 streams can occupy the default eight HTTP/1 slots.
+        cfg.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 32
         self.httpClient = HTTPClient(eventLoopGroupProvider: .shared(group), configuration: cfg)
     }
 
