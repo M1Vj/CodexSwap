@@ -729,7 +729,7 @@ public struct CodexTaskPolicyMaterializer: Sendable {
         )
     }
 
-    private func rewriteOverlay(
+    func rewriteOverlay(
         _ data: Data,
         alphaUltraEnabled: Bool,
         bridgedModels: [BridgedModel]

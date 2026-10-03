@@ -507,6 +507,32 @@ func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHead
     return headers
 }
 
+/// Minimal debug-models-schema catalog built only from the bridged roster.
+/// Fallback for when the upstream models payload cannot be merged into
+/// (empty/invalid upstream catalog), so opencode-origin slugs still surface.
+private func synthesizedBridgedCatalog(_ bridged: [BridgedModel]) -> Data {
+    let enabled = bridged
+        .filter { $0.enabled && !$0.modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var seen = Set<String>()
+    let entries: [[String: Any]] = enabled.compactMap { model in
+        let id = model.modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard seen.insert(id).inserted else { return nil }
+        return [
+            "slug": id,
+            "display_name": model.displayName.isEmpty ? id : model.displayName,
+            "description": "CodexSwap bridged model",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                ["effort": "low", "description": "Provider-native low reasoning"],
+                ["effort": "high", "description": "Provider-native high reasoning"],
+                ["effort": "max", "description": "Provider-native max reasoning"],
+            ],
+        ]
+    }
+    let root: [String: Any] = ["models": entries]
+    return (try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted])) ?? Data("{\"models\":[]}".utf8)
+}
+
 /// Token totals extracted from one completed upstream response.
 public struct ProxyUsageSample: Sendable, Equatable {
     public let model: String
@@ -1363,6 +1389,93 @@ public actor ProxyServer {
         }
 
         let settings = await settingsProvider()
+
+        // GET model catalog interception: the Codex CLI reads its model list
+        // from this upstream path, but upstream only knows Codex slugs. Fetch
+        // the same upstream payload with the reserved account, then merge the
+        // bridged + local-dispatcher models into it using the same debug-models
+        // schema the overlay materializer writes.
+        if head.method == .GET, rawPath.hasSuffix("/backend-api/codex/models") {
+            Task { _ = await LocalDispatcherRegistry.shared.refreshIfStale() }
+            let bridgedModels = settings.bridgedModels + LocalDispatcherRegistry.shared.snapshot()
+            guard let account = await reserveProxyAccount(
+                store: store,
+                mode: .normal,
+                requestModel: "other",
+                primaryThreshold: settings.primaryThresholdPercent,
+                secondaryThreshold: settings.secondaryThresholdPercent
+            ) else {
+                try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
+                return
+            }
+            await recordSelection(account.alias, mode: .normal, interactiveKey: nil)
+            log("GET \(rawPath) -> merged catalog via account=\(account.alias)")
+            let target = targetURL(for: rawPath, query: query)
+            do {
+                var currentAccount = account
+                var tokenRefreshed = false
+                var outcome: (status: HTTPResponseStatus, headers: HTTPHeaders, body: ByteBuffer)?
+                while outcome == nil {
+                    let attemptAccount = currentAccount
+                    let (status, headers, buffered) = try await withRoutingLease(store: store, alias: attemptAccount.alias) {
+                        let response = try await forward(head: head, body: Data(), account: attemptAccount, target: target)
+                        let collected = try await collect(response.body, cap: 8 * 1024 * 1024)
+                        return (response.status, response.headers, collected)
+                    }
+                    if status == .unauthorized, !tokenRefreshed {
+                        tokenRefreshed = true
+                        if let recovered = await self.recoverManagedAccount(currentAccount, store: store) {
+                            currentAccount = recovered
+                            continue
+                        }
+                        if case let .renewed(renewed) = await self.standaloneCredentialRenewal(currentAccount, false) {
+                            currentAccount = renewed
+                            continue
+                        }
+                        outcome = (status, headers, buffered)
+                    } else {
+                        outcome = (status, headers, buffered)
+                    }
+                }
+                guard let outcome else { return }
+                let status = outcome.status
+                let headers = outcome.headers
+                let buffered = outcome.body
+                guard status == .ok else {
+                    try await deliverBuffered(outbound, status: status, headers: headers, body: buffered)
+                    return
+                }
+                if let merged = try? CodexTaskPolicyMaterializer().rewriteOverlay(
+                    Data(buffered.readableBytesView),
+                    alphaUltraEnabled: false,
+                    bridgedModels: bridgedModels
+                ).0 {
+                    var jsonHeaders = HTTPHeaders()
+                    jsonHeaders.add(name: "content-type", value: "application/json")
+                    try await deliverBuffered(
+                        outbound,
+                        status: status,
+                        headers: jsonHeaders,
+                        body: ByteBuffer(data: merged)
+                    )
+                } else if !bridgedModels.isEmpty {
+                    var jsonHeaders = HTTPHeaders()
+                    jsonHeaders.add(name: "content-type", value: "application/json")
+                    try await deliverBuffered(
+                        outbound,
+                        status: .ok,
+                        headers: jsonHeaders,
+                        body: ByteBuffer(data: synthesizedBridgedCatalog(bridgedModels))
+                    )
+                } else {
+                    try await deliverBuffered(outbound, status: status, headers: headers, body: buffered)
+                }
+            } catch {
+                try await writeError(outbound, status: .badGateway, message: "upstream request failed: \(error)")
+            }
+            return
+        }
+
         let alphaResolution: AlphaBridge.BridgedModelResolution
         if head.method == .POST,
            (rawPath.hasSuffix("/chat/completions") || rawPath.hasSuffix("/responses")) {
