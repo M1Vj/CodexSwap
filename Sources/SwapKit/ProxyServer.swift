@@ -1369,9 +1369,8 @@ public actor ProxyServer {
             alphaResolution = AlphaBridge.resolveEntry(
                 in: body,
                 contentEncoding: head.headers.first(name: "Content-Encoding"),
-                catalog: settings.bridgedModels + LocalDispatcherRegistry.shared.snapshot()
+                catalog: settings.bridgedModels
             )
-            Task { _ = await LocalDispatcherRegistry.shared.refreshIfStale() }
         } else {
             alphaResolution = .none
         }

@@ -23,22 +23,11 @@ enum AlphaPassthrough {
         guard let base = BridgedModel.validatedBaseURL(entry.baseURL) else {
             return try await writePlainError(outbound, status: .internalServerError, message: "Bridged model has an invalid base URL")
         }
-        let upstreamURL = LocalDispatcher.isDispatcherBaseURL(entry.baseURL)
-            ? LocalDispatcher.chatCompletionsURL(forBaseURL: entry.baseURL)
-            : base.appendingPathComponent("chat/completions")
-        guard let upstreamURL else {
-            return try await writePlainError(outbound, status: .internalServerError, message: "Bridged model has an invalid base URL")
-        }
-        var request = HTTPClientRequest(url: upstreamURL.absoluteString)
+        var request = HTTPClientRequest(url: base.appendingPathComponent("chat/completions").absoluteString)
         request.method = .POST
         request.headers.add(name: "Content-Type", value: "application/json")
         if !entry.apiKey.isEmpty {
             request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
-        }
-        if LocalDispatcher.isDispatcherBaseURL(entry.baseURL) {
-            for (name, value) in LocalDispatcher.identityHeaders() {
-                request.headers.add(name: name, value: value)
-            }
         }
         request.body = .bytes(ByteBuffer(bytes: body))
 

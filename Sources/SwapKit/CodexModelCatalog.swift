@@ -123,18 +123,15 @@ public struct CodexModelCatalogService: Sendable {
     private let runner: any CodexCommandRunning
     private let bridgedModels: [BridgedModel]
     private let alphaUltraEnabled: Bool
-    private let dispatcherModelsProvider: @Sendable () async -> [BridgedModel]
 
     public init(
         runner: any CodexCommandRunning = FoundationCodexCommandRunner(),
         bridgedModels: [BridgedModel] = [],
-        alphaUltraEnabled: Bool = false,
-        dispatcherModelsProvider: @escaping @Sendable () async -> [BridgedModel] = { [] }
+        alphaUltraEnabled: Bool = false
     ) {
         self.runner = runner
         self.bridgedModels = bridgedModels
         self.alphaUltraEnabled = alphaUltraEnabled
-        self.dispatcherModelsProvider = dispatcherModelsProvider
     }
 
     public func load() async throws -> [CodexModelDescriptor] {
@@ -166,10 +163,9 @@ public struct CodexModelCatalogService: Sendable {
         }
 
         do {
-            let dispatcherModels = await dispatcherModelsProvider()
             return try Self.parse(
                 result.stdout,
-                bridgedModels: bridgedModels + dispatcherModels,
+                bridgedModels: bridgedModels,
                 alphaUltraEnabled: alphaUltraEnabled
             )
         } catch let error as CodexModelCatalogError {
