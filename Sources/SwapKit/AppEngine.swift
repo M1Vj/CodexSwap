@@ -202,7 +202,7 @@ public actor AppEngine {
                     allowedAliases: allowedAliases,
                     runID: runID,
                     parentModelID: task.model,
-                    bridgedModels: settings.bridgedModels
+                    bridgedModels: settings.bridgedModels + LocalDispatcherRegistry.shared.snapshot()
                 )
             }
         )
@@ -334,6 +334,7 @@ public actor AppEngine {
         }
         self.proxy = proxy
         if let url = await proxy.proxyURL() { RuntimeHandoff.writeProxyURL(url) }
+        _ = await LocalDispatcherRegistry.shared.refreshIfStale(maxAge: 0)
 
         // Store migration has completed in AccountStore's initializer. Archive due
         // paused accounts before any periodic quota/reset/warm-up network work.

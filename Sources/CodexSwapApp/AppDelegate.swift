@@ -188,7 +188,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let context = try CodexSubagentPolicyRuntimeResolver.resolve()
                 let catalog = try await CodexModelCatalogService(
                     bridgedModels: currentSettings.bridgedModels,
-                    alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
+                    alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled,
+                    dispatcherModelsProvider: { LocalDispatcherRegistry.shared.snapshot() }
                 ).load()
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 let parentProviderFamily = try context.parentProviderFamily(catalog: catalog)
@@ -232,8 +233,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let context = try CodexSubagentPolicyRuntimeResolver.resolve()
                 let catalog = try await CodexModelCatalogService(
                     bridgedModels: currentSettings.bridgedModels,
-                    alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
-                        || (viewModel.subagentPolicyPresentation.providerProfileFamily == .bridged && draft.alphaUltraEnabled)
+                    alphaUltraEnabled: (currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
+                        || (viewModel.subagentPolicyPresentation.providerProfileFamily == .bridged && draft.alphaUltraEnabled)),
+                    dispatcherModelsProvider: { LocalDispatcherRegistry.shared.snapshot() }
                 ).load()
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 let parentProviderFamily = try context.parentProviderFamily(catalog: catalog)
@@ -323,7 +325,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let freshContext = try CodexSubagentPolicyRuntimeResolver.resolve()
                     let freshCatalog = try await CodexModelCatalogService(
                         bridgedModels: freshSettings.bridgedModels,
-                        alphaUltraEnabled: freshSettings.subagentModelPolicy.bridged.alphaUltraEnabled
+                        alphaUltraEnabled: freshSettings.subagentModelPolicy.bridged.alphaUltraEnabled,
+                        dispatcherModelsProvider: { LocalDispatcherRegistry.shared.snapshot() }
                     ).load()
                     guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                     let freshParentProviderFamily = try freshContext.parentProviderFamily(catalog: freshCatalog)
