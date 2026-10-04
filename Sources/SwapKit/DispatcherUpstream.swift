@@ -55,14 +55,43 @@ public struct DispatcherUpstream: Sendable {
             let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
             let data = object["data"] as? [[String: Any]]
         else { return [] }
+        let chatBase = chatCompletionsBaseURL(from: baseURL)
         return data.compactMap { entry in
             guard let id = entry["id"] as? String, !id.isEmpty else { return nil }
             return BridgedModel(
                 modelID: id,
                 displayName: id,
-                baseURL: baseURL,
-                upstream: .responsesPassthrough
+                baseURL: chatBase,
+                upstream: .chatCompletions
             )
+        }
+    }
+
+    /// Chat-Completions base for dispatcher entries. The dispatcher serves chat
+    /// at `/zen/v1/chat/completions`, while `baseURL` points at the dispatcher
+    /// root, so entries carry the versioned base the bridge appends to.
+    /// Every dispatcher model is reachable over chat (chat-only models only
+    /// over chat), so entries use the translation wire; the bridge translates
+    /// Codex Responses requests with the caller's tools/prompts only.
+    public static func chatCompletionsBaseURL(from baseURL: String) -> String {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if trimmed.hasSuffix("/zen/v1") { return trimmed }
+        return trimmed + "/zen/v1"
+    }
+
+    /// True when an entry points at the local dispatcher, which requires the
+    /// `x-opencode-*` session identity headers on every call.
+    public static func isDispatcherEntry(_ entry: BridgedModel) -> Bool {
+        guard let url = BridgedModel.validatedBaseURL(entry.baseURL),
+              let host = url.host?.lowercased(),
+              url.port == 58444
+        else { return false }
+        if host == "localhost" || host == "::1" { return true }
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4, octets[0] == "127" else { return false }
+        return octets.dropFirst().allSatisfy { part in
+            !part.isEmpty && part.allSatisfy(\.isNumber)
         }
     }
 

@@ -12,7 +12,7 @@ final class DispatcherRouterTests: XCTestCase {
     func testPerModelUpstreamSelectionResolvesCorrectWire() {
         let catalog: [BridgedModel] = [
             BridgedModel(modelID: "claude-local", baseURL: "https://opencode.ai/zen/v1"),
-            BridgedModel(modelID: "gpt-6-luna", baseURL: DispatcherUpstream.defaultBaseURL, upstream: .responsesPassthrough),
+            BridgedModel(modelID: "gpt-6-luna", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
         ]
         let bridgedBody = Data(#"{"model":"claude-local","stream":true,"input":"hi"}"#.utf8)
         let dispatcherBody = Data(#"{"model":"gpt-6-luna","stream":true,"input":"hi"}"#.utf8)
@@ -27,13 +27,21 @@ final class DispatcherRouterTests: XCTestCase {
         guard case let .matched(dispatcherEntry) = dispatcherModel else {
             return XCTFail("expected a dispatcher match")
         }
-        XCTAssertEqual(dispatcherEntry.upstream, .responsesPassthrough)
+        XCTAssertEqual(dispatcherEntry.upstream, .chatCompletions, "dispatcher roster entries must use the chat-completions translation wire so Codex Responses requests reach chat-only models")
     }
 
-    // MARK: - Dispatcher relay preserves the caller model id
+    // MARK: - Dispatcher translation posts zen chat with identity headers
 
-    func testDispatcherRelayPreservesCallerModelIdAndIdentityHeaders() async throws {
-        let upstream = RecordingUpstream()
+    func testDispatcherTranslationPostsZenChatWithIdentityHeaders() async throws {
+        let chatSSE = """
+        data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"gpt-6-luna","choices":[{"index":0,"delta":{"role":"assistant","content":"PONG"}}]}
+
+        data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"gpt-6-luna","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}
+
+        data: [DONE]
+
+        """
+        let upstream = RecordingUpstream(responseBody: chatSSE, contentType: "text/event-stream")
         let upstreamURL = try await upstream.start()
         defer { Task { await upstream.stop() } }
 
@@ -41,33 +49,46 @@ final class DispatcherRouterTests: XCTestCase {
         let entry = BridgedModel(
             modelID: "gpt-6-luna",
             baseURL: upstreamURL.absoluteString,
-            upstream: .responsesPassthrough
+            upstream: .chatCompletions
         )
         let body = Data(#"{"model":"gpt-6-luna","stream":true,"input":"hello"}"#.utf8)
+        let identity = DispatcherUpstream.identityHeaders()
 
-        try await AlphaPassthrough.handle(
+        try await AlphaBridge.handle(
             entry: entry,
             body: body,
             httpClient: HTTPClient.shared,
             outbound: writer,
-            pathSuffix: "codex/responses",
-            extraHeaders: DispatcherUpstream.identityHeaders()
+            sink: NullEventSink(),
+            extraHeaders: identity
         )
 
         let recorded = await upstream.waitForRecorded()
-        XCTAssertEqual(recorded?.uri, "/codex/responses")
-        XCTAssertEqual(recorded?.body, body, "dispatcher relay must forward the caller's body verbatim")
+        XCTAssertEqual(recorded?.uri, "/chat/completions", "translation must target the chat-completions wire, never codex/responses")
+        let upstreamJSON = try XCTUnwrap(try recorded.map { try JSONSerialization.jsonObject(with: $0.body) as? [String: Any] } as? [String: Any])
+        XCTAssertEqual(upstreamJSON["model"] as? String, "gpt-6-luna", "translation must preserve the caller's model id")
+        XCTAssertNotNil(upstreamJSON["messages"], "translation must convert Responses input into chat messages")
+        XCTAssertNil(upstreamJSON["input"], "translation must not leak the Responses input shape upstream")
         let headers = recorded?.headers ?? [:]
-        if let session = headers["x-opencode-session"] {
-            XCTAssertTrue(session.hasPrefix("ses_"), "dispatcher requires the ses_ session identity")
-            XCTAssertEqual(session.dropFirst(4).count, 26)
-        } else {
-            XCTFail("missing x-opencode-session header")
-        }
+        XCTAssertEqual(headers["x-opencode-session"], identity["x-opencode-session"])
         XCTAssertEqual(headers["x-opencode-client"], "codexswap")
         XCTAssertEqual(headers["x-opencode-project"], "codexswap")
         XCTAssertNotNil(headers["x-opencode-request"])
-        XCTAssertEqual(headers["content-type"], "application/json")
+        XCTAssertNotEqual(entry.upstream, .responsesPassthrough, "dispatcher entries must take the translation lane, never the verbatim relay")
+    }
+
+    // MARK: - Translation carries only the caller's Codex tools and prompts
+
+    func testDispatcherTranslationUsesCallerToolsOnly() throws {
+        let body = Data(#"{"model":"gpt-6-luna","stream":false,"instructions":"Be brief.","tools":[{"type":"function","name":"codex_tool","description":"caller tool","parameters":{"type":"object","properties":{}}}],"input":"hi"}"#.utf8)
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(fromResponsesData: body, model: "gpt-6-luna"))
+        let messages = try XCTUnwrap(payload["messages"] as? [[String: Any]])
+        XCTAssertTrue(messages.contains { ($0["role"] as? String) == "system" && ($0["content"] as? String) == "Be brief." }, "caller instructions must become the system prompt")
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 1, "only the caller's Codex tools may travel upstream; never opencode's")
+        let functionName = (tools.first?["function"] as? [String: Any])?["name"] as? String
+        XCTAssertEqual(functionName, "codex_tool")
+        XCTAssertEqual(payload["model"] as? String, "gpt-6-luna")
     }
 
     // MARK: - Catalog merge
@@ -78,9 +99,9 @@ final class DispatcherRouterTests: XCTestCase {
             DispatcherUpstream.mergingDispatcherSlugs(
                 upstreamCatalogBody: Data(genuine.utf8),
                 dispatcherModels: [
-                    BridgedModel(modelID: "gpt-6-luna", baseURL: "http://127.0.0.1:58444", upstream: .responsesPassthrough),
-                    BridgedModel(modelID: "gpt-5.6-sol", baseURL: "http://127.0.0.1:58444", upstream: .responsesPassthrough),
-                    BridgedModel(modelID: "claude-fable-5", baseURL: "http://127.0.0.1:58444", upstream: .responsesPassthrough),
+                    BridgedModel(modelID: "gpt-6-luna", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+                    BridgedModel(modelID: "gpt-5.6-sol", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+                    BridgedModel(modelID: "claude-fable-5", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
                 ]
             )
         )
@@ -93,9 +114,9 @@ final class DispatcherRouterTests: XCTestCase {
         XCTAssertEqual(dispatcherEntry["slug"] as? String, "gpt-6-luna")
     }
 
-    // MARK: - Roster fetch maps to responses-passthrough bridged models
+    // MARK: - Roster fetch maps to zen chat-wire bridged models
 
-    func testDispatcherRosterFetchMapsIDsToResponsesPassthrough() async throws {
+    func testDispatcherRosterFetchMapsIDsToZenChatWire() async throws {
         let upstream = RecordingUpstream()
         let upstreamURL = try await upstream.start(
             responseBody: #"{"object":"list","data":[{"id":"gpt-6-luna","owned_by":"opencode"},{"id":"gpt-5.6-sol","owned_by":"opencode"}]}"#,
@@ -105,7 +126,8 @@ final class DispatcherRouterTests: XCTestCase {
 
         let models = await DispatcherUpstream(baseURL: upstreamURL.absoluteString).models(httpClient: HTTPClient.shared)
         XCTAssertEqual(models.map(\.modelID), ["gpt-6-luna", "gpt-5.6-sol"])
-        XCTAssertTrue(models.allSatisfy { $0.upstream == .responsesPassthrough })
+        XCTAssertTrue(models.allSatisfy { $0.upstream == .chatCompletions })
+        XCTAssertTrue(models.allSatisfy { $0.baseURL.hasSuffix("/zen/v1") })
         XCTAssertTrue(models.allSatisfy { $0.enabled })
     }
 }

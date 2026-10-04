@@ -860,7 +860,8 @@ extension AlphaBridge {
         outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         sink: ProxyEventSink,
         log: (@Sendable (String) -> Void)? = nil,
-        diagnosticsLog: DiagnosticsLog = .shared
+        diagnosticsLog: DiagnosticsLog = .shared,
+        extraHeaders: [String: String] = [:]
     ) async throws {
         let correlationID = UUID()
         let startedAt = Date()
@@ -934,6 +935,9 @@ extension AlphaBridge {
         request.headers.add(name: "Content-Type", value: "application/json")
         if !entry.apiKey.isEmpty {
             request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
+        }
+        for (name, value) in extraHeaders {
+            request.headers.add(name: name, value: value)
         }
         request.body = .bytes(ByteBuffer(bytes: payloadData))
 

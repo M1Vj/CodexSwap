@@ -1388,8 +1388,10 @@ public actor ProxyServer {
         let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
 
         // Explicit upstream routing: bridged entries declared with the responses
-        // passthrough wire relay the caller's body verbatim to the dispatcher,
-        // preserving the caller's model id. Codex models never match this branch
+        // passthrough wire relay the caller's body verbatim, preserving the
+        // caller's model id. Dispatcher roster entries use the chat-completions
+        // wire (zen/v1) so they skip this branch and reach the translation lane
+        // below. Codex models never match this branch
         // (they are ordinary catalog entries, not bridged entries).
         if head.method == .POST,
            (rawPath.hasSuffix("/responses") || rawPath.hasSuffix("/chat/completions")),
@@ -1409,6 +1411,8 @@ public actor ProxyServer {
 
         // Hardened Chat Completions passthrough for bridged models (opencode & friends):
         // retries pre-stream gateway failures, then streams verbatim. No account state.
+        // Dispatcher-origin entries (live roster, zen/v1 chat base) carry the
+        // dispatcher's session identity headers; other bridged entries relay as-is.
         if head.method == .POST, rawPath.hasSuffix("/chat/completions"),
            case let .matched(passthroughEntry) = alphaResolution {
             log("POST \(rawPath) -> alpha passthrough model=\(passthroughEntry.modelID)")
@@ -1416,13 +1420,19 @@ public actor ProxyServer {
                 entry: passthroughEntry,
                 body: body,
                 httpClient: self.httpClient,
-                outbound: outbound
+                outbound: outbound,
+                extraHeaders: DispatcherUpstream.isDispatcherEntry(passthroughEntry)
+                    ? DispatcherUpstream.identityHeaders() : [:]
             )
             return
         }
 
         // Free-model bridge: routed models translate Responses<->Chat against their own
         // gateway and never touch account selection, tokens, or rotation.
+        // Dispatcher-origin entries translate the caller's Responses request into
+        // the zen chat-completions wire (which every dispatcher model speaks) using
+        // only the caller's tools and instructions, so chat-only models stream back
+        // as Responses without ever seeing opencode's tools or prompts.
         if head.method == .POST, rawPath.hasSuffix("/responses"),
            case let .matched(bridgedEntry) = alphaResolution {
             log("POST \(rawPath) -> alpha bridge model=\(bridgedEntry.modelID)")
@@ -1436,7 +1446,9 @@ public actor ProxyServer {
                 body: decodedBody,
                 httpClient: self.httpClient,
                 outbound: outbound,
-                sink: eventSink
+                sink: eventSink,
+                extraHeaders: DispatcherUpstream.isDispatcherEntry(bridgedEntry)
+                    ? DispatcherUpstream.identityHeaders() : [:]
             )
             return
         }
