@@ -18,16 +18,21 @@ enum AlphaPassthrough {
         entry: BridgedModel,
         body: Data,
         httpClient: HTTPClient,
-        outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>
+        outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        pathSuffix: String = "chat/completions",
+        extraHeaders: [String: String] = [:]
     ) async throws {
         guard let base = BridgedModel.validatedBaseURL(entry.baseURL) else {
             return try await writePlainError(outbound, status: .internalServerError, message: "Bridged model has an invalid base URL")
         }
-        var request = HTTPClientRequest(url: base.appendingPathComponent("chat/completions").absoluteString)
+        var request = HTTPClientRequest(url: base.appendingPathComponent(pathSuffix).absoluteString)
         request.method = .POST
         request.headers.add(name: "Content-Type", value: "application/json")
         if !entry.apiKey.isEmpty {
             request.headers.add(name: "Authorization", value: "Bearer \(entry.apiKey)")
+        }
+        for (name, value) in extraHeaders {
+            request.headers.add(name: name, value: value)
         }
         request.body = .bytes(ByteBuffer(bytes: body))
 

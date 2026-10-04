@@ -2,6 +2,7 @@ import AppKit
 import UserNotifications
 import ServiceManagement
 import SwapKit
+import AsyncHTTPClient
 
 enum AccountArchiveMenuPresentation {
     static func activeAccounts(from accounts: [Account]) -> [Account] {
@@ -187,7 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 let context = try CodexSubagentPolicyRuntimeResolver.resolve()
                 let catalog = try await CodexModelCatalogService(
-                    bridgedModels: currentSettings.bridgedModels,
+                    bridgedModels: await DispatcherCatalogCache.shared.mergedBridgedModels(settings: currentSettings, httpClient: HTTPClient.shared),
                     alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
                 ).load()
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
@@ -231,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }
                 let context = try CodexSubagentPolicyRuntimeResolver.resolve()
                 let catalog = try await CodexModelCatalogService(
-                    bridgedModels: currentSettings.bridgedModels,
+                    bridgedModels: await DispatcherCatalogCache.shared.mergedBridgedModels(settings: currentSettings, httpClient: HTTPClient.shared),
                     alphaUltraEnabled: currentSettings.subagentModelPolicy.bridged.alphaUltraEnabled
                         || (viewModel.subagentPolicyPresentation.providerProfileFamily == .bridged && draft.alphaUltraEnabled)
                 ).load()
@@ -322,7 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let freshSettings = await SettingsStoreBridge.current()
                     let freshContext = try CodexSubagentPolicyRuntimeResolver.resolve()
                     let freshCatalog = try await CodexModelCatalogService(
-                        bridgedModels: freshSettings.bridgedModels,
+                        bridgedModels: await DispatcherCatalogCache.shared.mergedBridgedModels(settings: freshSettings, httpClient: HTTPClient.shared),
                         alphaUltraEnabled: freshSettings.subagentModelPolicy.bridged.alphaUltraEnabled
                     ).load()
                     guard viewModel.isCurrentSubagentPolicyOperation(generation) else { return }

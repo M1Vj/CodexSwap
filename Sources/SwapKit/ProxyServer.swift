@@ -1369,7 +1369,7 @@ public actor ProxyServer {
             alphaResolution = AlphaBridge.resolveEntry(
                 in: body,
                 contentEncoding: head.headers.first(name: "Content-Encoding"),
-                catalog: settings.bridgedModels
+                catalog: await DispatcherCatalogCache.shared.mergedBridgedModels(settings: settings, httpClient: self.httpClient)
             )
         } else {
             alphaResolution = .none
@@ -1386,6 +1386,26 @@ public actor ProxyServer {
 
         let loopbackOnly = config.host == "127.0.0.1" || config.host == "::1" || config.host == "localhost"
         let mode = proxyRequestMode(headers: head.headers, method: head.method, path: rawPath, loopbackOnly: loopbackOnly)
+
+        // Explicit upstream routing: bridged entries declared with the responses
+        // passthrough wire relay the caller's body verbatim to the dispatcher,
+        // preserving the caller's model id. Codex models never match this branch
+        // (they are ordinary catalog entries, not bridged entries).
+        if head.method == .POST,
+           (rawPath.hasSuffix("/responses") || rawPath.hasSuffix("/chat/completions")),
+           case let .matched(dispatcherEntry) = alphaResolution,
+           dispatcherEntry.upstream == .responsesPassthrough {
+            log("POST \(rawPath) -> dispatcher relay model=\(dispatcherEntry.modelID)")
+            try await AlphaPassthrough.handle(
+                entry: dispatcherEntry,
+                body: body,
+                httpClient: self.httpClient,
+                outbound: outbound,
+                pathSuffix: "codex/responses",
+                extraHeaders: DispatcherUpstream.identityHeaders()
+            )
+            return
+        }
 
         // Hardened Chat Completions passthrough for bridged models (opencode & friends):
         // retries pre-stream gateway failures, then streams verbatim. No account state.
@@ -1799,6 +1819,18 @@ public actor ProxyServer {
                     )
                     return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
                 }
+                if head.method == .GET, path == "/backend-api/codex/models",
+                   resp.status.code >= 200, resp.status.code < 300 {
+                    let upstreamCatalog = try await collect(resp.body, cap: 8 * 1024 * 1024)
+                let dispatcherModels = await DispatcherCatalogCache.shared.models(httpClient: self.httpClient)
+                if let merged = DispatcherUpstream.mergingDispatcherSlugs(
+                    upstreamCatalogBody: Data(buffer: upstreamCatalog),
+                    dispatcherModels: dispatcherModels
+                ) {
+                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: ByteBuffer(data: merged))
+                        return .completed(outcome: .success, status: Int(resp.status.code))
+                    }
+                }
                 await self.publishServedActivity(account.alias, mode: mode)
                 if bindSelectionOnSuccess, resp.status.code >= 200, resp.status.code < 300 {
                     await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -2154,6 +2186,18 @@ public actor ProxyServer {
                 alias: account.alias,
                 requestKey: interactiveKey
             )
+            if head.method == .GET, path == "/backend-api/codex/models",
+               resp.status.code >= 200, resp.status.code < 300 {
+                let upstreamCatalog = try await collect(resp.body, cap: 8 * 1024 * 1024)
+                let dispatcherModels = await DispatcherCatalogCache.shared.models(httpClient: self.httpClient)
+                if let merged = DispatcherUpstream.mergingDispatcherSlugs(
+                    upstreamCatalogBody: Data(buffer: upstreamCatalog),
+                    dispatcherModels: dispatcherModels
+                ) {
+                    try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: ByteBuffer(data: merged))
+                    return .completed(outcome: .success, status: Int(resp.status.code))
+                }
+            }
             try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
             return .completed(
                 outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure,

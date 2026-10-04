@@ -9,6 +9,11 @@ public enum QuotaExhaustionPolicy: String, Codable, Sendable, CaseIterable {
 /// A non-Codex model served through the proxy's translation lane
 /// (Responses API on the client side, Chat Completions upstream).
 public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
+    public enum UpstreamWire: String, Codable, Sendable {
+        case chatCompletions
+        case responsesPassthrough
+    }
+
     public var modelID: String
     public var displayName: String
     /// Base URL ending at the version segment, e.g. https://opencode.ai/zen/v1
@@ -16,6 +21,8 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
     /// Optional bearer credential; empty means anonymous (typical for free tiers).
     public var apiKey: String
     public var enabled: Bool
+    /// Which upstream wire protocol this bridged model speaks.
+    public var upstream: UpstreamWire
     /// Optional pricing in currency units per million input tokens (nil/0 = free tier).
     public var inputPricePerMillion: Double?
     /// Optional pricing in currency units per million output tokens.
@@ -31,6 +38,7 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
         baseURL: String,
         apiKey: String = "",
         enabled: Bool = true,
+        upstream: UpstreamWire = .chatCompletions,
         inputPricePerMillion: Double? = nil,
         outputPricePerMillion: Double? = nil,
         cachedInputPricePerMillion: Double? = nil,
@@ -41,6 +49,7 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.enabled = enabled
+        self.upstream = upstream
         self.inputPricePerMillion = inputPricePerMillion
         self.outputPricePerMillion = outputPricePerMillion
         self.cachedInputPricePerMillion = cachedInputPricePerMillion
@@ -48,6 +57,20 @@ public struct BridgedModel: Codable, Sendable, Equatable, Identifiable {
     }
 
     public var id: String { modelID }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modelID = try c.decode(String.self, forKey: .modelID)
+        displayName = try c.decodeIfPresent(String.self, forKey: .displayName) ?? modelID
+        baseURL = try c.decode(String.self, forKey: .baseURL)
+        apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        upstream = try c.decodeIfPresent(UpstreamWire.self, forKey: .upstream) ?? .chatCompletions
+        inputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .inputPricePerMillion)
+        outputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .outputPricePerMillion)
+        cachedInputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .cachedInputPricePerMillion)
+        cacheWriteInputPricePerMillion = try c.decodeIfPresent(Double.self, forKey: .cacheWriteInputPricePerMillion)
+    }
 
     /// Returns a bridged endpoint URL only when its transport is safe for use by
     /// the proxy. Remote gateways must use HTTPS; plain HTTP is limited to
