@@ -362,22 +362,92 @@ final class AlphaBridgeTests: XCTestCase {
         XCTAssertTrue((fn["description"] as? String)?.hasPrefix("[collaboration]") == true)
     }
 
-    func testChatPayloadRejectsDuplicateFlattenedNamesAcrossNamespaces() {
+    func testChatPayloadQualifiesDuplicateFlattenedNamesAcrossNamespaces() throws {
         let request = #"{"model":"m","tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent"}]},{"type":"namespace","name":"other","tools":[{"name":"spawn_agent"}]}],"input":"hi"}"#
 
-        XCTAssertNil(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        let names = tools.compactMap { (($0["function"] as? [String: Any])?["name"] as? String) }
+        XCTAssertEqual(names.count, 2, "both namespaced tools stay callable")
+        XCTAssertEqual(Set(names).count, 2, "renamed tools must be distinct")
+        XCTAssertTrue(names.contains("spawn_agent"), "first occurrence keeps its bare name")
+        let namespaces = try XCTUnwrap(payload["x_tool_namespaces"] as? [String: String])
+        XCTAssertEqual(namespaces["spawn_agent"], "collaboration")
+        let renamed = try XCTUnwrap(names.first { $0 != "spawn_agent" })
+        XCTAssertEqual(namespaces[renamed], "other")
+        let originals = try XCTUnwrap(payload["x_tool_original_names"] as? [String: String])
+        XCTAssertEqual(originals[renamed], "spawn_agent")
     }
 
-    func testChatPayloadRejectsNamespaceAndOrdinaryFunctionNameCollision() {
+    func testChatPayloadPrefersFlatNameOverNamespaceCollision() throws {
         let request = #"{"model":"m","tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent"}]},{"type":"function","name":"spawn_agent"}],"input":"hi"}"#
 
-        XCTAssertNil(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        let names = tools.compactMap { (($0["function"] as? [String: Any])?["name"] as? String) }
+        XCTAssertEqual(names.count, 2, "flat and namespaced tools both stay callable")
+        XCTAssertTrue(names.contains("spawn_agent"), "flat tool keeps its bare name")
+        let namespaces = try XCTUnwrap(payload["x_tool_namespaces"] as? [String: String])
+        XCTAssertNil(namespaces["spawn_agent"], "bare name belongs to the flat tool")
+        let renamed = try XCTUnwrap(names.first { $0 != "spawn_agent" })
+        XCTAssertEqual(namespaces[renamed], "collaboration")
     }
 
-    func testChatPayloadRejectsDuplicateNamesWithinOneNamespace() {
+    func testChatPayloadQualifiesDuplicateNamesWithinOneNamespace() throws {
         let request = #"{"model":"m","tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent"},{"name":"spawn_agent"}]}],"input":"hi"}"#
 
-        XCTAssertNil(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+        let payload = try XCTUnwrap(AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"))
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        let names = tools.compactMap { (($0["function"] as? [String: Any])?["name"] as? String) }
+        XCTAssertEqual(names.count, 2)
+        XCTAssertEqual(Set(names).count, 2, "renamed tools must be distinct")
+        XCTAssertTrue(names.contains("spawn_agent"))
+    }
+
+    func testChatPayloadResolvesFlatPlusNamespaceWaitAgentCollision() throws {
+        // Exact live repro: flat wait_agent plus a collab namespace tool
+        // whose inner function is also named wait_agent.
+        let request = #"{"model":"m","tools":[{"type":"function","name":"wait_agent"},{"type":"namespace","name":"collab","tools":[{"name":"wait_agent"}]}],"input":"hi"}"#
+
+        let payload = try XCTUnwrap(
+            AlphaBridge.chatPayload(fromResponsesData: Data(request.utf8), model: "m"),
+            "a name collision must never fail the request"
+        )
+        let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+        let names = tools.compactMap { (($0["function"] as? [String: Any])?["name"] as? String) }
+        XCTAssertEqual(names, ["wait_agent", "collab__wait_agent"])
+        let namespaces = try XCTUnwrap(payload["x_tool_namespaces"] as? [String: String])
+        XCTAssertEqual(namespaces["collab__wait_agent"], "collab")
+        let originals = try XCTUnwrap(payload["x_tool_original_names"] as? [String: String])
+        XCTAssertEqual(originals["collab__wait_agent"], "wait_agent")
+    }
+
+    func testSSETranslatorDemapsRenamedToolCallToBareName() throws {
+        var translator = AlphaSSETranslator(
+            model: "m",
+            toolNamespaces: ["collab__wait_agent": "collab"],
+            toolOriginalNames: ["collab__wait_agent": "wait_agent"]
+        )
+        var collected = Data()
+        for chunk in [
+            #"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_w","function":{"name":"collab__wait_agent","arguments":"{}"}}]}}]}"#,
+            #"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            collected += translator.feed(ByteBuffer(string: chunk + "\n\n"))
+        }
+        collected += translator.finishFeed()
+        let events = String(decoding: collected, as: UTF8.self)
+
+        let doneItem = try XCTUnwrap(events.components(separatedBy: "\n")
+            .first { $0.contains(#""type":"response.output_item.done""#) }
+            .flatMap { line -> [String: Any]? in
+                let json = line.replacingOccurrences(of: "data: ", with: "")
+                guard let event = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else { return nil }
+                return event["item"] as? [String: Any]
+            })
+        XCTAssertEqual(doneItem["name"] as? String, "wait_agent", "Codex receives the bare tool name")
+        XCTAssertEqual(doneItem["namespace"] as? String, "collab")
     }
 
     func testEffortValidation() {

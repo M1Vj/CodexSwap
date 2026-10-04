@@ -238,74 +238,132 @@ enum AlphaBridge {
         if let responseTools = root["tools"] as? [[String: Any]] {
             var customToolNames: [String] = []
             var toolNamespaces: [String: String] = [:]
+            var toolOriginalNames: [String: String] = [:]
             var seenToolNames = Set<String>()
-            var hasAmbiguousToolNames = false
 
-            func registerToolName(_ name: String, namespace: String? = nil) -> Bool {
-                guard seenToolNames.insert(name).inserted else {
-                    hasAmbiguousToolNames = true
-                    return false
+            // Duplicate tool names occur routinely: the Codex CLI ships both
+            // flat function tools and namespace tools whose inner functions
+            // share names (e.g. a flat wait_agent plus collab/wait_agent).
+            // Flat tools keep their bare names; colliding namespace inners are
+            // deterministically qualified as `<namespace>__<name>` (numeric
+            // suffix on further collision) so every tool stays callable and
+            // the request never fails.
+            func uniqueToolName(_ desired: String, namespace: String? = nil) -> String {
+                if !seenToolNames.contains(desired) {
+                    seenToolNames.insert(desired)
+                    if let namespace, !namespace.isEmpty {
+                        toolNamespaces[desired] = namespace
+                    }
+                    return desired
                 }
-                if let namespace {
-                    toolNamespaces[name] = namespace
+                if let namespace, !namespace.isEmpty {
+                    let qualified = "\(namespace)__\(desired)"
+                    if !seenToolNames.contains(qualified) {
+                        seenToolNames.insert(qualified)
+                        toolNamespaces[qualified] = namespace
+                        toolOriginalNames[qualified] = desired
+                        return qualified
+                    }
+                    var suffix = 2
+                    while seenToolNames.contains("\(qualified)__\(suffix)") { suffix += 1 }
+                    let suffixed = "\(qualified)__\(suffix)"
+                    seenToolNames.insert(suffixed)
+                    toolNamespaces[suffixed] = namespace
+                    toolOriginalNames[suffixed] = desired
+                    return suffixed
                 }
-                return true
+                var suffix = 2
+                while seenToolNames.contains("\(desired)__\(suffix)") { suffix += 1 }
+                let suffixed = "\(desired)__\(suffix)"
+                seenToolNames.insert(suffixed)
+                return suffixed
             }
 
-            let mapped = responseTools.flatMap { tool -> [[String: Any]] in
-                switch tool["type"] as? String {
-                case "function":
-                    guard let name = tool["name"] as? String, !name.isEmpty,
-                          registerToolName(name) else { return [] }
-                    var function: [String: Any] = ["name": name]
-                    if let description = tool["description"] as? String { function["description"] = description }
-                    if let parameters = tool["parameters"] { function["parameters"] = parameters }
-                    return [["type": "function", "function": function]]
-                case "custom", "freeform":
-                    // Codex freeform tools (e.g. apply_patch) carry raw-text calls;
-                    // adapt to a single-string-argument function so Chat backends
-                    // can drive them.
-                    guard let name = tool["name"] as? String, !name.isEmpty,
-                          registerToolName(name) else { return [] }
-                    customToolNames.append(name)
-                    var function: [String: Any] = [
-                        "name": name,
-                        "parameters": [
-                            "type": "object",
-                            "properties": ["input": ["type": "string"]],
-                            "required": ["input"],
-                        ],
-                    ]
-                    if let description = tool["description"] as? String { function["description"] = description }
-                    if let format = tool["format"] { function["x-freeform-format"] = format }
-                    return [["type": "function", "function": function]]
-                case "namespace":
-                    // Multi-agent v2 ships collaboration tools inside a namespace;
-                    // flatten the inner function defs so the model can call them
-                    // directly (spawn_agent / wait_agent / send_input / ...).
-                    let nsName = (tool["name"] as? String) ?? ""
-                    guard let inner = tool["tools"] as? [[String: Any]] else { return [] }
-                    return inner.compactMap { f -> [String: Any]? in
-                        guard let fname = f["name"] as? String, !fname.isEmpty,
-                              registerToolName(fname, namespace: nsName) else { return nil }
-                        var function: [String: Any] = ["name": fname]
-                        if let description = f["description"] as? String {
+            let mapped: [[String: Any]] = {
+                // Collect every emitted tool definition in input order, then
+                // assign Chat-side names flat-first: ordinary function/custom
+                // tools keep their bare names even when a namespace tool listed
+                // earlier shares the name; the colliding namespace inner takes
+                // `<namespace>__<name>`. Emission stays in input order.
+                struct PendingTool {
+                    let seq: Int
+                    let kind: String
+                    let source: [String: Any]
+                    let namespace: String?
+                }
+                var pending: [PendingTool] = []
+                for tool in responseTools {
+                    switch tool["type"] as? String {
+                    case "function", "custom", "freeform":
+                        guard let name = tool["name"] as? String, !name.isEmpty else { continue }
+                        pending.append(PendingTool(seq: pending.count, kind: tool["type"] as? String ?? "function", source: tool, namespace: nil))
+                    case "namespace":
+                        let nsName = (tool["name"] as? String) ?? ""
+                        guard let inner = tool["tools"] as? [[String: Any]] else { continue }
+                        for f in inner {
+                            guard (f["name"] as? String)?.isEmpty == false else { continue }
+                            pending.append(PendingTool(seq: pending.count, kind: "namespaced", source: f, namespace: nsName))
+                        }
+                    default:
+                        // Hosted tools (web_search etc.) have no Chat equivalent here.
+                        continue
+                    }
+                }
+                var chatNames = [Int: String]()
+                for entry in pending where entry.namespace == nil {
+                    let name = entry.source["name"] as? String ?? ""
+                    chatNames[entry.seq] = uniqueToolName(name)
+                }
+                for entry in pending where entry.namespace != nil {
+                    let name = entry.source["name"] as? String ?? ""
+                    chatNames[entry.seq] = uniqueToolName(name, namespace: entry.namespace)
+                }
+                return pending.sorted(by: { $0.seq < $1.seq }).compactMap { entry -> [String: Any]? in
+                    guard let chatName = chatNames[entry.seq] else { return nil }
+                    switch entry.kind {
+                    case "custom", "freeform":
+                        // Codex freeform tools (e.g. apply_patch) carry raw-text calls;
+                        // adapt to a single-string-argument function so Chat backends
+                        // can drive them.
+                        customToolNames.append(chatName)
+                        var function: [String: Any] = [
+                            "name": chatName,
+                            "parameters": [
+                                "type": "object",
+                                "properties": ["input": ["type": "string"]],
+                                "required": ["input"],
+                            ],
+                        ]
+                        if let description = entry.source["description"] as? String { function["description"] = description }
+                        if let format = entry.source["format"] { function["x-freeform-format"] = format }
+                        return ["type": "function", "function": function]
+                    case "namespaced":
+                        // Multi-agent v2 ships collaboration tools inside a namespace;
+                        // flatten the inner function defs so the model can call them
+                        // directly (spawn_agent / wait_agent / send_input / ...).
+                        let nsName = entry.namespace ?? ""
+                        var function: [String: Any] = ["name": chatName]
+                        if let description = entry.source["description"] as? String {
                             function["description"] = "[\(nsName)] \(description)"
                         }
-                        if let parameters = f["parameters"] { function["parameters"] = parameters }
+                        if let parameters = entry.source["parameters"] { function["parameters"] = parameters }
+                        return ["type": "function", "function": function]
+                    default:
+                        var function: [String: Any] = ["name": chatName]
+                        if let description = entry.source["description"] as? String { function["description"] = description }
+                        if let parameters = entry.source["parameters"] { function["parameters"] = parameters }
                         return ["type": "function", "function": function]
                     }
-                default:
-                    // Hosted tools (web_search etc.) have no Chat equivalent here.
-                    return []
                 }
-            }
-            guard !hasAmbiguousToolNames else { return nil }
+            }()
             if !mapped.isEmpty {
                 payload["tools"] = mapped
                 payload["x_custom_tool_names"] = customToolNames
                 if !toolNamespaces.isEmpty {
                     payload["x_tool_namespaces"] = toolNamespaces
+                }
+                if !toolOriginalNames.isEmpty {
+                    payload["x_tool_original_names"] = toolOriginalNames
                 }
             }
         }
@@ -458,6 +516,9 @@ struct AlphaSSETranslator {
     private(set) var responseID: String
     private let model: String
     private let toolNamespaces: [String: String]
+    /// Maps a renamed Chat tool name back to its original Responses tool name.
+    /// Populated only when a collision forced a rename; empty otherwise.
+    private let toolOriginalNames: [String: String]
     let createdAt: Int
     private var createdEmitted = false
     private var messageStarted = false
@@ -491,11 +552,13 @@ struct AlphaSSETranslator {
     init(
         model: String,
         customTools: Set<String> = [],
-        toolNamespaces: [String: String] = [:]
+        toolNamespaces: [String: String] = [:],
+        toolOriginalNames: [String: String] = [:]
     ) {
         self.model = model
         self.customTools = customTools
         self.toolNamespaces = toolNamespaces
+        self.toolOriginalNames = toolOriginalNames
         responseID = "resp_\(UUID().uuidString)"
         messageItemID = "msg_\(UUID().uuidString)"
         createdAt = Int(Date().timeIntervalSince1970)
@@ -683,11 +746,18 @@ struct AlphaSSETranslator {
         1 + (toolOrder.firstIndex(of: index) ?? 0)
     }
 
-    private func decorateNamespacedToolItem(_ item: inout [String: Any], name: String) {
-        guard let namespace = toolNamespaces[name] else { return }
+    /// Restores the original Responses tool name for a Chat-side tool name.
+    /// Collisions are renamed forward as `<namespace>__<name>`; the model calls
+    /// the renamed tool, but Codex must receive the bare name plus namespace.
+    private func responseToolName(forChatName chatName: String) -> String {
+        toolOriginalNames[chatName] ?? chatName
+    }
+
+    private func decorateNamespacedToolItem(_ item: inout [String: Any], name: String) {        guard let namespace = toolNamespaces[name] else { return }
         item["namespace"] = namespace
+        let originalName = toolOriginalNames[name] ?? name
         if namespace == "collaboration",
-           ["spawn_agent", "send_message", "followup_task"].contains(name) {
+           ["spawn_agent", "send_message", "followup_task"].contains(originalName) {
             // Chat backends return plaintext JSON arguments. Mark the protected
             // collaboration fields as intentionally plaintext so Codex forwards
             // the task/message body as input_text instead of encrypted_content.
@@ -703,7 +773,7 @@ struct AlphaSSETranslator {
             "id": entry.itemID,
             "type": itemType,
             "call_id": entry.callID,
-            "name": entry.name,
+            "name": responseToolName(forChatName: entry.name),
             "arguments": "",
             "status": "in_progress",
         ]
@@ -733,7 +803,7 @@ struct AlphaSSETranslator {
                 "id": entry.itemID,
                 "type": customTools.contains(entry.name) ? "custom_tool_call" : "function_call",
                 "call_id": entry.callID,
-                "name": entry.name,
+                "name": responseToolName(forChatName: entry.name),
                 "arguments": entry.arguments,
                 "status": "completed",
             ]
@@ -799,7 +869,7 @@ struct AlphaSSETranslator {
                 "id": entry.itemID,
                 "type": itemType,
                 "call_id": entry.callID,
-                "name": entry.name,
+                "name": responseToolName(forChatName: entry.name),
                 "arguments": callArguments,
                 "status": "completed",
             ]
@@ -918,6 +988,10 @@ extension AlphaBridge {
         if let namespaces = payload.removeValue(forKey: "x_tool_namespaces") as? [String: String] {
             toolNamespaces = namespaces
         }
+        var toolOriginalNames: [String: String] = [:]
+        if let originals = payload.removeValue(forKey: "x_tool_original_names") as? [String: String] {
+            toolOriginalNames = originals
+        }
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
             recordFinal(outcome: .failed, level: .warning, code: .invalidInput, status: 400)
             try await writeHTTPError(outbound, status: .badRequest, code: "invalid_request", message: "Uninterpretable Responses request")
@@ -947,7 +1021,8 @@ extension AlphaBridge {
         var translator = AlphaSSETranslator(
             model: entry.modelID,
             customTools: customToolNames,
-            toolNamespaces: toolNamespaces
+            toolNamespaces: toolNamespaces,
+            toolOriginalNames: toolOriginalNames
         )
         var headWritten = false
 
