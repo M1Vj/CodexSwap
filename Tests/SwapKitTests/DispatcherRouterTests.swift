@@ -114,6 +114,50 @@ final class DispatcherRouterTests: XCTestCase {
         XCTAssertEqual(dispatcherEntry["slug"] as? String, "gpt-6-luna")
     }
 
+    func testMergingDispatcherSlugsForcesListedVisibility() throws {
+        let genuine = #"{"models":[{"slug":"hidden-internal","visibility":"hide","list":null,"marker":"hidden"},{"slug":"gpt-5.6-sol","visibility":"list","list":true,"marker":"listed","x":1}]}"#
+        let merged = try XCTUnwrap(
+            DispatcherUpstream.mergingDispatcherSlugs(
+                upstreamCatalogBody: Data(genuine.utf8),
+                dispatcherModels: [
+                    BridgedModel(modelID: "space-bunny-free", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+                ]
+            )
+        )
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: merged) as? [String: Any])
+        let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+        let dispatcherEntry = try XCTUnwrap(models.first { ($0["slug"] as? String) == "space-bunny-free" })
+        XCTAssertEqual(dispatcherEntry["visibility"] as? String, "list", "dispatcher entries must be served selectable, never hidden")
+        XCTAssertEqual(dispatcherEntry["list"] as? Bool, true, "dispatcher entries must be served selectable, never unlisted")
+        XCTAssertEqual(dispatcherEntry["marker"] as? String, "listed", "dispatcher entries must clone a genuinely listed entry, not the hidden first entry")
+        let hidden = try XCTUnwrap(models.first { ($0["slug"] as? String) == "hidden-internal" })
+        XCTAssertEqual(hidden["visibility"] as? String, "hide", "genuine entries must pass through untouched")
+        let listed = try XCTUnwrap(models.first { ($0["slug"] as? String) == "gpt-5.6-sol" })
+        XCTAssertEqual(listed["visibility"] as? String, "list", "genuine entries must pass through untouched")
+        XCTAssertEqual(listed["list"] as? Bool, true)
+    }
+
+    func testMergingDispatcherSlugsTreatsLiveNullListAsListed() throws {
+        // Live backend-api shape: even listed entries carry `list: null`
+        // (gpt-5.6-sol is visibility list with null list); only visibility
+        // discriminates, so the listed-with-null entry must win as template.
+        let genuine = #"{"models":[{"slug":"gpt-reserve","visibility":"hide","list":null,"marker":"hidden"},{"slug":"gpt-5.6-sol","visibility":"list","list":null,"marker":"listed","x":1}]}"#
+        let merged = try XCTUnwrap(
+            DispatcherUpstream.mergingDispatcherSlugs(
+                upstreamCatalogBody: Data(genuine.utf8),
+                dispatcherModels: [
+                    BridgedModel(modelID: "space-bunny-free", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+                ]
+            )
+        )
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: merged) as? [String: Any])
+        let models = try XCTUnwrap(object["models"] as? [[String: Any]])
+        let dispatcherEntry = try XCTUnwrap(models.first { ($0["slug"] as? String) == "space-bunny-free" })
+        XCTAssertEqual(dispatcherEntry["marker"] as? String, "listed", "live listed-with-null entry must win as template over the hidden first entry")
+        XCTAssertEqual(dispatcherEntry["visibility"] as? String, "list")
+        XCTAssertEqual(dispatcherEntry["list"] as? Bool, true)
+    }
+
     // MARK: - Roster fetch maps to zen chat-wire bridged models
 
     func testDispatcherRosterFetchMapsIDsToZenChatWire() async throws {

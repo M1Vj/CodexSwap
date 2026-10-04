@@ -97,9 +97,18 @@ public struct DispatcherUpstream: Sendable {
 
     /// Merges dispatcher-origin slugs into the upstream codex catalog JSON
     /// (`{"models":[...]}`). Genuine entries pass through untouched; each
-    /// dispatcher slug clones the first genuine entry's field shape with `slug`
-    /// replaced, which is the shape Codex already consumes. Duplicates win for
-    /// the genuine entry.
+    /// dispatcher slug clones a genuinely listed entry's field shape with
+    /// `slug` replaced and `visibility`/`list` forced selectable, which is the
+    /// shape Codex already consumes. Duplicates win for the genuine entry.
+    static func isListedCatalogEntry(_ entry: [String: Any]) -> Bool {
+        guard (entry["visibility"] as? String) == "list" else { return false }
+        // The backend-api models schema carries `list: null` even on listed
+        // entries (verified live: gpt-5.6-sol is visibility list with null
+        // list); only an explicit false means unlisted.
+        if let listed = entry["list"] as? Bool { return listed }
+        return true
+    }
+
     public static func mergingDispatcherSlugs(
         upstreamCatalogBody: Data,
         dispatcherModels: [BridgedModel]
@@ -110,11 +119,14 @@ public struct DispatcherUpstream: Sendable {
             !models.isEmpty
         else { return nil }
         let existing = Set(models.compactMap { $0["slug"] as? String })
+        let template = models.first(where: isListedCatalogEntry) ?? models[0]
         var added: [String] = []
         for entry in dispatcherModels where entry.enabled {
             if existing.contains(entry.modelID) { continue }
-            var clone = models[0]
+            var clone = template
             clone["slug"] = entry.modelID
+            clone["visibility"] = "list"
+            clone["list"] = true
             models.append(clone)
             added.append(entry.modelID)
         }
