@@ -2225,7 +2225,7 @@ public actor AccountStore {
         if windows.isEmpty, !data.accounts[i].usage.isEmpty { return }
         let previousWindows = data.accounts[i].usage
         let previouslyCapped = data.accounts[i].isUsageLimitReached
-        let mergedWindows = Self.mergeUsageWindows(previous: previousWindows, current: windows)
+        let mergedWindows = Self.mergeUsageWindows(previous: previousWindows, current: windows, now: clock())
         let resetLabels = Self.usageResetOrDecreaseLabels(previous: previousWindows, current: mergedWindows)
         if !resetLabels.isEmpty {
             drainingAliases.remove(alias)
@@ -2384,12 +2384,14 @@ public actor AccountStore {
         return changed
     }
 
-    private static func mergeUsageWindows(previous: [UsageWindow], current: [UsageWindow]) -> [UsageWindow] {
+    private static func mergeUsageWindows(previous: [UsageWindow], current: [UsageWindow], now: Date) -> [UsageWindow] {
         let normalizedPrevious = stableUsageWindows(previous)
         guard !current.isEmpty else { return normalizedPrevious }
         let normalizedCurrent = stableUsageWindows(current)
         let currentKeys = Set(normalizedCurrent.map(usageWindowIdentity))
-        let retained = normalizedPrevious.filter { !currentKeys.contains(usageWindowIdentity($0)) }
+        let retained = normalizedPrevious.filter {
+            !currentKeys.contains(usageWindowIdentity($0)) && ($0.resetAt.map { $0 > now } ?? true)
+        }
         return normalizedCurrent + retained
     }
 

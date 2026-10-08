@@ -29,7 +29,9 @@ struct StandaloneCredentialRenewal: Sendable {
     func renew(
         _ account: Account,
         store: AccountStore,
-        force: Bool = false
+        force: Bool = false,
+        leadTime: TimeInterval = 0,
+        now: Date = Date()
     ) async -> StandaloneCredentialRenewalResult {
         let correlationID = UUID()
         DiagnosticsLog.shared.record(
@@ -55,7 +57,8 @@ struct StandaloneCredentialRenewal: Sendable {
         }
         defer { homesLock.release() }
 
-        guard StandaloneAccountRemoval.verifiedAuthURL(account, supportDirectory: supportDirectory) == authURL,
+        guard !Task.isCancelled,
+              StandaloneAccountRemoval.verifiedAuthURL(account, supportDirectory: supportDirectory) == authURL,
               let source = boundedRead(authURL),
               let file = try? JSONDecoder().decode(CodexAuthFile.self, from: source),
               var tokens = file.tokens,
@@ -65,7 +68,7 @@ struct StandaloneCredentialRenewal: Sendable {
         }
 
         if tokens.accessToken != account.accessToken,
-           (JWT.expiry(tokens.accessToken) ?? .distantPast) > Date(),
+           (JWT.expiry(tokens.accessToken) ?? .distantPast) > now,
            let adopted = await store.commitStandaloneRefresh(
                snapshot: account,
                sourcePath: authURL.path,
@@ -74,20 +77,39 @@ struct StandaloneCredentialRenewal: Sendable {
            ) {
             return terminal(.renewed(adopted), correlationID: correlationID)
         }
-        if !force, (JWT.expiry(tokens.accessToken) ?? .distantPast) > Date() {
+        if !force, (JWT.expiry(tokens.accessToken) ?? .distantPast).timeIntervalSince(now) > leadTime {
             return terminal(.renewed(account), correlationID: correlationID)
         }
 
         do {
-            var refreshed = try await refresh(tokens.refreshToken)
+            guard !Task.isCancelled else { return terminal(.unavailable, correlationID: correlationID) }
+            let refreshToken = tokens.refreshToken
+            // Redemption must finish once sent: cancellation could lose rotated tokens.
+            var refreshed = try await Task { [refresh] in
+                try await refresh(refreshToken)
+            }.value
             if refreshed.idToken.isEmpty { refreshed.idToken = tokens.idToken }
             guard credentialIdentityMatches(refreshed, accountID: credentialAccountID),
-                  (JWT.expiry(refreshed.accessToken) ?? .distantPast) > Date() else {
+                  (JWT.expiry(refreshed.accessToken) ?? .distantPast) > now else {
                 return terminal(.unavailable, correlationID: correlationID, code: .invalidInput)
             }
             try CodexAuth.updateTokensPreservingDocument(refreshed, at: authURL, expectedSource: source)
             tokens = refreshed
         } catch RefreshError.sessionInvalidated {
+            // Another owner may have rotated the source while the request was in flight.
+            if let newerSource = boundedRead(authURL),
+               let newer = (try? JSONDecoder().decode(CodexAuthFile.self, from: newerSource))?.tokens,
+               newer.accessToken != tokens.accessToken,
+               credentialIdentityMatches(newer, accountID: credentialAccountID),
+               (JWT.expiry(newer.accessToken) ?? .distantPast) > now,
+               let adopted = await store.commitStandaloneRefresh(
+                   snapshot: account,
+                   sourcePath: authURL.path,
+                   credentialAccountID: credentialAccountID,
+                   tokens: newer
+               ) {
+                return terminal(.renewed(adopted), correlationID: correlationID)
+            }
             return terminal(.invalidated, correlationID: correlationID, code: .unauthorized)
         } catch {
             return terminal(.unavailable, correlationID: correlationID, code: .network)

@@ -47,7 +47,9 @@ public struct UsageResetPresentation: Sendable {
     /// Unknown durations still receive the full localized date and time.
     public func appCaption(windowSeconds: Int?, resetAt: Date?) -> String? {
         guard let resetAt else { return nil }
-        guard resetAt > now else { return "resetting…" }
+        guard resetAt > now else {
+            return now.timeIntervalSince(resetAt) <= 900 ? "resetting…" : "awaiting update"
+        }
         return "Resets \(formatted(resetAt, windowSeconds: windowSeconds))"
     }
 
@@ -55,7 +57,9 @@ public struct UsageResetPresentation: Sendable {
     /// optional duration.
     public func cliCaption(windowSeconds: Int?, resetAt: Date?) -> String {
         guard let resetAt else { return "-" }
-        guard resetAt > now else { return "resetting" }
+        guard resetAt > now else {
+            return now.timeIntervalSince(resetAt) <= 900 ? "resetting" : "awaiting update"
+        }
         return "Resets \(formatted(resetAt, windowSeconds: windowSeconds))"
     }
 
