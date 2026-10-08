@@ -91,6 +91,89 @@ final class DispatcherRouterTests: XCTestCase {
         XCTAssertEqual(payload["model"] as? String, "gpt-6-luna")
     }
 
+    // MARK: - Routable bridged models
+
+    func testRoutableBridgedModelsLetsCodexSlugsWinCollisions() {
+        let declared = [BridgedModel(modelID: "x-preview-f-free", baseURL: "https://opencode.ai/zen/v1")]
+        let dispatcher = [
+            BridgedModel(modelID: "gpt-6.1-sol", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+            BridgedModel(modelID: "muse-spark-1.3", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+        ]
+
+        let routable = DispatcherCatalogCache.routableBridgedModels(
+            declared: declared,
+            dispatcher: dispatcher,
+            codexSlugs: ["gpt-6.1-sol", "gpt-6-luna"]
+        )
+
+        XCTAssertEqual(routable.map(\.modelID), ["x-preview-f-free", "muse-spark-1.3"])
+    }
+
+    func testRoutableBridgedModelsFailsClosedWhenCodexCatalogIsUnavailable() {
+        let declared = [BridgedModel(modelID: "x-preview-f-free", baseURL: "https://opencode.ai/zen/v1")]
+        let dispatcher = [
+            BridgedModel(modelID: "gpt-6.1-sol", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+            BridgedModel(modelID: "muse-spark-1.3", baseURL: "http://127.0.0.1:58444/zen/v1", upstream: .chatCompletions),
+        ]
+
+        let routable = DispatcherCatalogCache.routableBridgedModels(
+            declared: declared,
+            dispatcher: dispatcher,
+            codexSlugs: []
+        )
+
+        XCTAssertEqual(routable.map(\.modelID), ["x-preview-f-free"], "an unknown codex catalog must never let the dispatcher roster shadow codex models")
+        let body = Data(#"{"model":"gpt-6.1-sol","stream":true,"input":"hi"}"#.utf8)
+        guard case .none = AlphaBridge.resolveEntry(in: body, catalog: routable) else {
+            return XCTFail("codex model traffic must stay on account routing")
+        }
+    }
+
+    func testCatalogCacheRoutesAndListsOnlyNonCodexDispatcherModels() async throws {
+        let upstream = RecordingUpstream()
+        let upstreamURL = try await upstream.start(
+            responseBody: #"{"object":"list","data":[{"id":"gpt-6.1-sol"},{"id":"muse-spark-1.3"}]}"#,
+            contentType: "application/json"
+        )
+        defer { Task { await upstream.stop() } }
+        let slugCache = CodexCatalogSlugCache(loader: { ["gpt-6.1-sol"] })
+        let cache = DispatcherCatalogCache(
+            ttlSeconds: 60,
+            upstream: DispatcherUpstream(baseURL: upstreamURL.absoluteString),
+            codexSlugs: slugCache
+        )
+        var settings = Settings.default
+        settings.bridgedModels = []
+
+        let routable = await cache.mergedBridgedModels(settings: settings, httpClient: HTTPClient.shared)
+        XCTAssertEqual(routable.map(\.modelID), ["muse-spark-1.3"])
+        let listed = await cache.routableDispatcherModels(httpClient: HTTPClient.shared)
+        XCTAssertEqual(listed.map(\.modelID), ["muse-spark-1.3"], "/models must advertise exactly what routing accepts")
+    }
+
+    func testCatalogCacheFailsClosedForRoutingAndListingWhenCodexCatalogFails() async throws {
+        struct LaunchFailure: Error {}
+        let upstream = RecordingUpstream()
+        let upstreamURL = try await upstream.start(
+            responseBody: #"{"object":"list","data":[{"id":"gpt-6.1-sol"},{"id":"muse-spark-1.3"}]}"#,
+            contentType: "application/json"
+        )
+        defer { Task { await upstream.stop() } }
+        let slugCache = CodexCatalogSlugCache(loader: { throw LaunchFailure() })
+        let cache = DispatcherCatalogCache(
+            ttlSeconds: 60,
+            upstream: DispatcherUpstream(baseURL: upstreamURL.absoluteString),
+            codexSlugs: slugCache
+        )
+        var settings = Settings.default
+        settings.bridgedModels = [BridgedModel(modelID: "x-preview-f-free", baseURL: "https://opencode.ai/zen/v1")]
+
+        let routable = await cache.mergedBridgedModels(settings: settings, httpClient: HTTPClient.shared)
+        XCTAssertEqual(routable.map(\.modelID), ["x-preview-f-free"])
+        let listed = await cache.routableDispatcherModels(httpClient: HTTPClient.shared)
+        XCTAssertEqual(listed.map(\.modelID), [])
+    }
+
     // MARK: - Catalog merge
 
     func testMergingDispatcherSlugsAppendsAndDedupes() throws {

@@ -382,6 +382,35 @@ final class CodexModelCatalogTests: XCTestCase {
         }
     }
 
+    func testFoundationRunnerExtendsPathSoScriptLaunchersFindTheirInterpreter() async throws {
+        let runner = FoundationCodexCommandRunner(binary: "/bin/sh")
+
+        let result = try await runner.run(
+            arguments: ["-c", "printf %s \"$PATH\""],
+            timeout: .seconds(2),
+            maxOutputBytes: 4_096
+        )
+
+        let expected = ProcessWarmupRunner.executableSearchPath(
+            binary: "/bin/sh",
+            inheritedPath: ProcessInfo.processInfo.environment["PATH"]
+        )
+        XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), expected, "npm's codex.js needs node from Homebrew even under launchd's minimal PATH")
+    }
+
+    func testParseSlugsKeepsEverySlugIncludingUnassignableModels() throws {
+        let data = Data(#"{"models":[{"slug":"gpt-6.1-sol","supported_reasoning_levels":[{"effort":"high"}]},{"slug":"codex-auto-review"},{"slug":""},{"display_name":"no slug"}]}"#.utf8)
+
+        XCTAssertEqual(try CodexModelCatalogService.parseSlugs(data), ["gpt-6.1-sol", "codex-auto-review"])
+        XCTAssertEqual(try CodexModelCatalogService.parse(data).map(\.modelID), ["gpt-6.1-sol"], "load() still drops models without reasoning levels; the routing guard must not")
+    }
+
+    func testParseSlugsRejectsMalformedCatalog() {
+        XCTAssertThrowsError(try CodexModelCatalogService.parseSlugs(Data("not json".utf8))) { error in
+            XCTAssertEqual(error as? CodexModelCatalogError, .malformedJSON)
+        }
+    }
+
     func testFoundationRunnerReportsLaunchFailureForInvalidExecutable() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("codex-catalog-invalid-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: url) }

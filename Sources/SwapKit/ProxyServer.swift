@@ -1834,7 +1834,7 @@ public actor ProxyServer {
                 if head.method == .GET, path == "/backend-api/codex/models",
                    resp.status.code >= 200, resp.status.code < 300 {
                     let upstreamCatalog = try await collect(resp.body, cap: 8 * 1024 * 1024)
-                let dispatcherModels = await DispatcherCatalogCache.shared.models(httpClient: self.httpClient)
+                let dispatcherModels = await DispatcherCatalogCache.shared.routableDispatcherModels(httpClient: self.httpClient)
                 if let merged = DispatcherUpstream.mergingDispatcherSlugs(
                     upstreamCatalogBody: Data(buffer: upstreamCatalog),
                     dispatcherModels: dispatcherModels
@@ -2201,7 +2201,7 @@ public actor ProxyServer {
             if head.method == .GET, path == "/backend-api/codex/models",
                resp.status.code >= 200, resp.status.code < 300 {
                 let upstreamCatalog = try await collect(resp.body, cap: 8 * 1024 * 1024)
-                let dispatcherModels = await DispatcherCatalogCache.shared.models(httpClient: self.httpClient)
+                let dispatcherModels = await DispatcherCatalogCache.shared.routableDispatcherModels(httpClient: self.httpClient)
                 if let merged = DispatcherUpstream.mergingDispatcherSlugs(
                     upstreamCatalogBody: Data(buffer: upstreamCatalog),
                     dispatcherModels: dispatcherModels

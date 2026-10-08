@@ -135,26 +135,104 @@ public struct DispatcherUpstream: Sendable {
     }
 }
 
-/// Caches the genuine codex slug set (from `codex debug models`) for one cache window
-/// so dispatcher-origin routing never shadows a codex model.
+/// Caches the genuine codex slug set (from `codex debug models`) so dispatcher-origin
+/// routing never shadows a codex model.
 actor CodexCatalogSlugCache {
+    typealias Loader = @Sendable () async throws -> Set<String>
+
+    private enum LoadOutcome: Sendable {
+        case loaded(Set<String>)
+        case failed
+        case cancelled
+    }
+
     static let shared = CodexCatalogSlugCache()
-    private var cached: (fetchedAt: Date, slugs: Set<String>)?
 
-    private init() {}
+    private let loader: Loader
+    private let refreshInterval: TimeInterval
+    private let maximumStaleness: TimeInterval
+    private let now: @Sendable () -> Date
+    private var lastSuccess: (fetchedAt: Date, slugs: Set<String>)?
+    private var lastAttemptAt: Date?
+    private var inFlight: Task<LoadOutcome, Never>?
 
+    init(
+        refreshInterval: TimeInterval = 60,
+        maximumStaleness: TimeInterval = 600,
+        now: @escaping @Sendable () -> Date = { Date() },
+        loader: @escaping Loader = { try await CodexModelCatalogService().loadSlugs() }
+    ) {
+        self.refreshInterval = refreshInterval
+        self.maximumStaleness = maximumStaleness
+        self.now = now
+        self.loader = loader
+    }
+
+    /// Failed loads back off for one refresh interval so a broken `codex` launch is
+    /// not respawned per request, while the last good set ages out after
+    /// `maximumStaleness` so slugs added by a Codex upgrade cannot stay shadowed.
     func slugs() async -> Set<String> {
-        if let cached, Date().timeIntervalSince(cached.fetchedAt) < 60 {
-            return cached.slugs
+        if let lastAttemptAt, now().timeIntervalSince(lastAttemptAt) < refreshInterval {
+            return usableSlugs()
         }
-        do {
-            let descriptors = try await CodexModelCatalogService().load()
-            let slugs = Set(descriptors.map(\.modelID))
-            cached = (Date(), slugs)
-            return slugs
-        } catch {
-            return cached?.slugs ?? []
+        let task = startLoadIfNeeded()
+        record(await task.value, from: task)
+        return usableSlugs()
+    }
+
+    /// Non-blocking read for the `/models` endpoint. `codex debug models` may refresh
+    /// its catalog through this proxy, so while a discovery runs `/models` gets no
+    /// dispatcher entries; otherwise they would be recorded as genuine codex slugs.
+    func peekSlugs() -> Set<String> {
+        guard inFlight == nil else { return [] }
+        let isDue = lastAttemptAt.map { now().timeIntervalSince($0) >= refreshInterval } ?? true
+        if isDue {
+            let task = startLoadIfNeeded()
+            Task { record(await task.value, from: task) }
         }
+        return usableSlugs()
+    }
+
+    /// The load belongs to the cache rather than to whichever request started it, so a
+    /// cancelled caller cannot abort discovery for callers still waiting on it; the
+    /// subprocess is bounded by its own command timeout.
+    private func startLoadIfNeeded() -> Task<LoadOutcome, Never> {
+        if let inFlight { return inFlight }
+        let loader = self.loader
+        let task = Task<LoadOutcome, Never> {
+            do {
+                return .loaded(try await loader())
+            } catch is CancellationError {
+                return .cancelled
+            } catch {
+                return .failed
+            }
+        }
+        inFlight = task
+        return task
+    }
+
+    /// Joined callers can resume before the caller that started the load, so whichever
+    /// resumes first records the outcome, exactly once per load.
+    private func record(_ outcome: LoadOutcome, from task: Task<LoadOutcome, Never>) {
+        guard inFlight == task else { return }
+        inFlight = nil
+        switch outcome {
+        case .loaded(let slugs):
+            lastSuccess = (now(), slugs)
+            lastAttemptAt = now()
+        case .failed:
+            lastAttemptAt = now()
+        case .cancelled:
+            break
+        }
+    }
+
+    private func usableSlugs() -> Set<String> {
+        guard let lastSuccess,
+              now().timeIntervalSince(lastSuccess.fetchedAt) < maximumStaleness
+        else { return [] }
+        return lastSuccess.slugs
     }
 }
 
@@ -166,10 +244,16 @@ public actor DispatcherCatalogCache {
     private var cachedAt: Date?
     private let ttlSeconds: TimeInterval
     private let upstream: DispatcherUpstream
+    private let codexSlugs: CodexCatalogSlugCache
 
     public init(ttlSeconds: TimeInterval = 60, upstream: DispatcherUpstream = DispatcherUpstream()) {
+        self.init(ttlSeconds: ttlSeconds, upstream: upstream, codexSlugs: .shared)
+    }
+
+    init(ttlSeconds: TimeInterval, upstream: DispatcherUpstream, codexSlugs: CodexCatalogSlugCache) {
         self.ttlSeconds = ttlSeconds
         self.upstream = upstream
+        self.codexSlugs = codexSlugs
     }
 
     public func models(httpClient: HTTPClient) async -> [BridgedModel] {
@@ -182,15 +266,41 @@ public actor DispatcherCatalogCache {
         return fresh
     }
 
-    /// Merged bridged catalog: user-declared bridged models plus the live
-    /// dispatcher roster, minus any slug the genuine codex catalog already
-    /// serves so codex account routing always wins collisions.
+    /// Merged bridged catalog: user-declared bridged models plus the routable
+    /// dispatcher roster (see `routableBridgedModels`).
     public func mergedBridgedModels(
         settings: Settings,
         httpClient: HTTPClient
     ) async -> [BridgedModel] {
         let dispatcher = await models(httpClient: httpClient)
-        let codexSlugs = await CodexCatalogSlugCache.shared.slugs()
-        return settings.bridgedModels + dispatcher.filter { !codexSlugs.contains($0.modelID) }
+        return Self.routableBridgedModels(
+            declared: settings.bridgedModels,
+            dispatcher: dispatcher,
+            codexSlugs: await codexSlugs.slugs()
+        )
+    }
+
+    /// Dispatcher entries safe to advertise in `/models`, kept identical to the
+    /// routable set so Codex never lists a model the proxy would not route.
+    public func routableDispatcherModels(httpClient: HTTPClient) async -> [BridgedModel] {
+        let dispatcher = await models(httpClient: httpClient)
+        return Self.routableBridgedModels(
+            declared: [],
+            dispatcher: dispatcher,
+            codexSlugs: await codexSlugs.peekSlugs()
+        )
+    }
+
+    /// Codex slugs win collisions, and the dispatcher fails closed: without a known
+    /// codex slug set its roster (which mirrors codex slugs such as `gpt-6.1-sol`)
+    /// would hijack codex traffic away from account routing and Responses-only
+    /// features like remote compaction.
+    static func routableBridgedModels(
+        declared: [BridgedModel],
+        dispatcher: [BridgedModel],
+        codexSlugs: Set<String>
+    ) -> [BridgedModel] {
+        guard !codexSlugs.isEmpty else { return declared }
+        return declared + dispatcher.filter { !codexSlugs.contains($0.modelID) }
     }
 }
