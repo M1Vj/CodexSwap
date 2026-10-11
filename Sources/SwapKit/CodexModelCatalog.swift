@@ -135,6 +135,37 @@ public struct CodexModelCatalogService: Sendable {
     }
 
     public func load() async throws -> [CodexModelDescriptor] {
+        let stdout = try await runCatalogCommand()
+        do {
+            return try Self.parse(
+                stdout,
+                bridgedModels: bridgedModels,
+                alphaUltraEnabled: alphaUltraEnabled
+            )
+        } catch let error as CodexModelCatalogError {
+            throw error
+        } catch {
+            throw CodexModelCatalogError.malformedJSON
+        }
+    }
+
+    /// Every slug the Codex catalog reports, including entries `load()` drops as
+    /// unassignable, so routing guards never miss a genuine codex model.
+    public func loadSlugs() async throws -> Set<String> {
+        try Self.parseSlugs(try await runCatalogCommand())
+    }
+
+    public static func parseSlugs(_ data: Data) throws -> Set<String> {
+        let raw: RawCatalog
+        do {
+            raw = try JSONDecoder().decode(RawCatalog.self, from: data)
+        } catch {
+            throw CodexModelCatalogError.malformedJSON
+        }
+        return Set(raw.models.elements.compactMap { nonEmpty($0.slug) })
+    }
+
+    private func runCatalogCommand() async throws -> Data {
         let result: CodexCommandResult
         do {
             result = try await runner.run(
@@ -161,18 +192,7 @@ public struct CodexModelCatalogService: Sendable {
         guard result.exitCode == 0 else {
             throw CodexModelCatalogError.execution(.nonZeroExit(status: result.exitCode))
         }
-
-        do {
-            return try Self.parse(
-                result.stdout,
-                bridgedModels: bridgedModels,
-                alphaUltraEnabled: alphaUltraEnabled
-            )
-        } catch let error as CodexModelCatalogError {
-            throw error
-        } catch {
-            throw CodexModelCatalogError.malformedJSON
-        }
+        return result.stdout
     }
 
     public static func parse(
@@ -455,6 +475,14 @@ public struct FoundationCodexCommandRunner: CodexCommandRunning {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
         process.arguments = arguments
+        // GUI launches inherit launchd's minimal PATH, so script launchers such as
+        // the npm `codex.js` (`#!/usr/bin/env node`) cannot find their interpreter.
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = ProcessWarmupRunner.executableSearchPath(
+            binary: binary,
+            inheritedPath: environment["PATH"]
+        )
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()

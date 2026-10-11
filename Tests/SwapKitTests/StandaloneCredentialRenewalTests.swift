@@ -29,6 +29,42 @@ private actor ExecutorProgressProbe {
     func value() -> Int { marks }
 }
 
+private actor StandaloneCancellationGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var entered = false
+    func hold() async {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
+private final class StandaloneHTTPRefreshGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var entered = false
+    private var released = false
+
+    func hold() {
+        condition.lock()
+        entered = true
+        while !released { condition.wait() }
+        condition.unlock()
+    }
+
+    func isEntered() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return entered
+    }
+
+    func release() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 final class StandaloneCredentialRenewalTests: XCTestCase {
     private var roots: [URL] = []
 
@@ -219,6 +255,130 @@ final class StandaloneCredentialRenewalTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.authURL), before)
         let callCount = await stub.callCount()
         XCTAssertEqual(callCount, 1)
+    }
+
+    func testCallerCancellationDuringRefreshPersistsAndCommitsRotatedTokens() async throws {
+        let fixture = try await makeFixture(label: "R1", expiry: Date().addingTimeInterval(-60))
+        let fresh = tokens("R2", expiry: Date().addingTimeInterval(86_400))
+        let gate = StandaloneCancellationGate()
+        let calls = ExecutorProgressProbe()
+        let renewal = StandaloneCredentialRenewal(supportDirectory: fixture.support) { _ in
+            await calls.mark()
+            await gate.hold()
+            try Task.checkCancellation()
+            return fresh
+        }
+        let task = Task { await renewal.renew(fixture.account, store: fixture.store, force: true) }
+        let deadline = Date().addingTimeInterval(2)
+        while !(await gate.entered), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let entered = await gate.entered
+        XCTAssertTrue(entered)
+        task.cancel()
+        await gate.release()
+        let result = await task.value
+        guard case .renewed(let renewed) = result else { return XCTFail("rotation must survive caller cancellation") }
+        XCTAssertEqual(renewed.tokens, fresh)
+        XCTAssertEqual(try CodexAuth.read(fixture.authURL).tokens, fresh)
+        let stored = await fixture.store.account(fixture.account.alias)
+        XCTAssertEqual(stored?.tokens, fresh)
+        XCTAssertFalse(stored?.needsLogin ?? true)
+        let reloadedStore = AccountStore(url: fixture.support.appendingPathComponent("accounts.json"), ambientNativeAccountProvider: { nil })
+        let reloaded = await reloadedStore.account(fixture.account.alias)
+        XCTAssertEqual(reloaded?.tokens, fresh)
+        let attempts = await calls.value()
+        XCTAssertEqual(attempts, 1)
+    }
+
+    func testCallerCancellationAfterHTTPRequestIsSentPreservesRotatedTokens() async throws {
+        let fixture = try await makeFixture(label: "HTTP-R1", expiry: Date().addingTimeInterval(-60))
+        let fresh = tokens("HTTP-R2", expiry: Date().addingTimeInterval(86_400))
+        let gate = StandaloneHTTPRefreshGate()
+        TokenRefreshURLProtocol.setHandler { _ in
+            gate.hold()
+            let response = ["access_token": fresh.accessToken, "refresh_token": fresh.refreshToken, "id_token": fresh.idToken]
+            return (200, try! JSONSerialization.data(withJSONObject: response))
+        }
+        let session = TokenRefreshURLProtocol.session()
+        defer {
+            gate.release()
+            TokenRefreshURLProtocol.setHandler(nil)
+            session.invalidateAndCancel()
+        }
+        let renewal = StandaloneCredentialRenewal(supportDirectory: fixture.support, refresher: TokenRefresher(
+            session: session, url: URL(string: "https://auth.openai.test/oauth/token")!
+        ))
+        let task = Task { await renewal.renew(fixture.account, store: fixture.store, force: true) }
+        let deadline = Date().addingTimeInterval(2)
+        while !gate.isEntered(), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertTrue(gate.isEntered(), "the HTTP refresh request must have been sent before cancellation")
+        task.cancel()
+        gate.release()
+        let result = await task.value
+        guard case .renewed(let renewed) = result else { return XCTFail("the sent HTTP request must finish and preserve rotation") }
+        XCTAssertEqual(renewed.tokens, fresh)
+        XCTAssertEqual(try CodexAuth.read(fixture.authURL).tokens, fresh)
+        let reloadedStore = AccountStore(url: fixture.support.appendingPathComponent("accounts.json"), ambientNativeAccountProvider: { nil })
+        let committed = await reloadedStore.account(fixture.account.alias)
+        XCTAssertEqual(committed?.tokens, fresh)
+    }
+
+    func testProactiveTickRenewsIdleStandaloneTwentyHoursBeforeExpiry() async throws {
+        let fixture = try await makeFixture(label: "idle", expiry: Date().addingTimeInterval(20 * 3_600))
+        let fresh = tokens("rotated-idle", expiry: Date().addingTimeInterval(3 * 86_400))
+        let stub = StandaloneRefreshStub(outcome: .success(fresh))
+        let renewal = StandaloneCredentialRenewal(supportDirectory: fixture.support) { token in
+            try await stub.refresh(token)
+        }
+        let coordinator = CredentialRenewalCoordinator(store: fixture.store, standaloneRenewal: renewal) { _ in
+            XCTFail("standalone must not launch the owner CLI")
+            return false
+        }
+        let engine = AppEngine(
+            store: fixture.store,
+            settingsStore: SettingsStore(url: fixture.support.appendingPathComponent("settings.json")),
+            usage: AppEngineRecoveryUsageStub(),
+            configManager: CodexConfigManager(codexHome: fixture.support, supportDir: fixture.support),
+            taskStore: TaskStore(url: fixture.support.appendingPathComponent("tasks.json")),
+            taskRunning: TaskRunner(),
+            autoLog: AutomationLog(url: fixture.support.appendingPathComponent("automation.log")),
+            supportDir: fixture.support,
+            networkCheck: { true },
+            credentialRenewalCoordinator: coordinator
+        )
+
+        await engine.proactiveCredentialRenewalTick()
+
+        let calls = await stub.callCount()
+        let stored = await fixture.store.account(fixture.account.alias)
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(stored?.accessToken, fresh.accessToken)
+        XCTAssertEqual(stored?.refreshToken, fresh.refreshToken)
+        XCTAssertEqual(try CodexAuth.read(fixture.authURL).tokens, fresh)
+    }
+
+    func testRejectedReusedRefreshAdoptsNewerSourceWithoutRetry() async throws {
+        let fixture = try await makeFixture(label: "reused", expiry: Date().addingTimeInterval(-60))
+        let fresh = tokens("owner-rotated", expiry: Date().addingTimeInterval(86_400))
+        let calls = ExecutorProgressProbe()
+        let authURL = fixture.authURL
+        let renewal = StandaloneCredentialRenewal(supportDirectory: fixture.support) { _ in
+            await calls.mark()
+            try CodexAuth.write(fresh, to: authURL)
+            let error = Data(#"{"error":{"code":"refresh_token_reused"}}"#.utf8)
+            XCTAssertEqual(TokenRefresher.errorCode(error), "refresh_token_reused")
+            throw RefreshError.sessionInvalidated
+        }
+
+        let result = await renewal.renew(fixture.account, store: fixture.store)
+
+        guard case .renewed(let renewed) = result else { return XCTFail("expected newer source adoption") }
+        XCTAssertEqual(renewed.tokens, fresh)
+        let count = await calls.value()
+        XCTAssertEqual(count, 1)
     }
 
     private func makeFixture(label: String, expiry: Date) async throws -> (

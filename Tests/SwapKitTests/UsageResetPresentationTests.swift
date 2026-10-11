@@ -108,6 +108,18 @@ final class UsageResetPresentationTests: XCTestCase {
         XCTAssertEqual(formatter.cliCaption(for: expired), "resetting")
     }
 
+    func testElapsedResetShowsProgressOnlyForFifteenMinutes() {
+        let formatter = presentation(locale: "en_US")
+        let recent = window(seconds: 18_000, resetAt: now.addingTimeInterval(-120))
+        let old = window(seconds: 18_000, resetAt: now.addingTimeInterval(-1_200))
+        let boundary = window(seconds: 18_000, resetAt: now.addingTimeInterval(-900))
+        XCTAssertEqual(formatter.appCaption(for: recent), "resetting…")
+        XCTAssertEqual(formatter.cliCaption(for: recent), "resetting")
+        XCTAssertEqual(formatter.appCaption(for: boundary), "resetting…")
+        XCTAssertEqual(formatter.appCaption(for: old), "awaiting update")
+        XCTAssertEqual(formatter.cliCaption(for: old), "awaiting update")
+    }
+
     func testMachineQuotaJSONPreservesExactResetTimestamp() throws {
         let reset = now.addingTimeInterval(5 * 60 * 60)
         let report = CodexQuotaReport(

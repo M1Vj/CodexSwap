@@ -121,6 +121,7 @@ public actor AppEngine {
     private let usage: any UsageFetching
     private let refresher: TokenRefresher
     private let standaloneCredentialRenewal: StandaloneCredentialRenewal
+    private let credentialRenewalCoordinator: CredentialRenewalCoordinator
     private let configManager: CodexConfigManager
     private let warmupService: QuotaWarmupService
     private let quotaResetCoordinator: QuotaResetCoordinator
@@ -133,6 +134,9 @@ public actor AppEngine {
     private let networkCheck: @Sendable () -> Bool
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
+    private var credentialRenewalTask: Task<Void, Never>?
+    private var credentialRenewalInProgress = false
+    private var elapsedUsagePolledAt: [String: Date] = [:]
     private var onEvent: (@Sendable (AppEvent) -> Void)?
     private var watcher: CodexBarWatcher?
     private var warmupInProgress = false
@@ -169,9 +173,14 @@ public actor AppEngine {
         self.settingsStore = settingsStore
         self.usage = usage
         self.refresher = refresher
-        self.standaloneCredentialRenewal = StandaloneCredentialRenewal(
+        let standaloneCredentialRenewal = StandaloneCredentialRenewal(
             supportDirectory: supportDir,
             refresher: refresher
+        )
+        self.standaloneCredentialRenewal = standaloneCredentialRenewal
+        self.credentialRenewalCoordinator = CredentialRenewalCoordinator(
+            store: store,
+            standaloneRenewal: standaloneCredentialRenewal
         )
         self.configManager = configManager
         self.warmupService = warmupService
@@ -222,15 +231,21 @@ public actor AppEngine {
         supportDir: URL = AppPaths.supportDir(),
         proxyForTesting: ProxyServer? = nil,
         beforeTaskLaunch: (@Sendable (String) async -> Void)? = nil,
-        networkCheck: (@Sendable () -> Bool)? = nil
+        networkCheck: (@Sendable () -> Bool)? = nil,
+        credentialRenewalCoordinator: CredentialRenewalCoordinator? = nil
     ) {
         self.store = store
         self.settingsStore = settingsStore
         self.usage = usage
         self.refresher = refresher
-        self.standaloneCredentialRenewal = StandaloneCredentialRenewal(
+        let standaloneCredentialRenewal = StandaloneCredentialRenewal(
             supportDirectory: supportDir,
             refresher: refresher
+        )
+        self.standaloneCredentialRenewal = standaloneCredentialRenewal
+        self.credentialRenewalCoordinator = credentialRenewalCoordinator ?? CredentialRenewalCoordinator(
+            store: store,
+            standaloneRenewal: standaloneCredentialRenewal
         )
         self.configManager = configManager
         self.warmupService = warmupService
@@ -369,14 +384,18 @@ public actor AppEngine {
         }
         await autoLog.write("lifecycle", "engine start reconciled \(recoveredCount) interrupted task(s)")
         startPoller()
+        startCredentialRenewalScheduler()
     }
 
     public func stop() async {
+        credentialRenewalTask?.cancel()
+        credentialRenewalTask = nil
+        pollerTask?.cancel()
+        pollerTask = nil
+        await credentialRenewalCoordinator.closeAdmission()
         DiagnosticsLog.shared.record(component: .proxy, operation: .lifecycle, outcome: .cancelled)
         watcher?.stop()
         watcher = nil
-        pollerTask?.cancel()
-        pollerTask = nil
         let runningIDs = await taskRunner.runningIDs()
         let shutdownRunIDs = (await taskStore.all())
             .filter { runningIDs.contains($0.id) }
@@ -1483,6 +1502,7 @@ public actor AppEngine {
             emit(.snapshotChanged)
             return
         }
+        await proactiveCredentialRenewalTick()
         let settings = await settingsStore.get()
         await pollUsage(activeOnly: !settings.smartSwitchEnabled)
         if settings.automaticallyWarmAccounts, let url = await proxy?.proxyURL() {
@@ -1577,14 +1597,16 @@ public actor AppEngine {
 
     func recoverBlockedAuthentication() async {
         for account in await store.all() where account.needsLogin && account.routingEnabled && !account.isArchived {
-            let standaloneResult = await standaloneCredentialRenewal.renew(account, store: store, force: true)
-            switch standaloneResult {
+            let renewalResult = await credentialRenewalCoordinator.renew(account, force: true)
+            switch renewalResult {
             case .renewed:
-                needsLoginNotified.remove(account.alias)
-                continue
+                if account.credentialSource?.kind == .standaloneHome {
+                    needsLoginNotified.remove(account.alias)
+                    continue
+                }
             case .invalidated:
                 continue
-            case .notOwned, .unavailable:
+            case .notRenewable, .unavailable:
                 break
             }
             if await AuthenticationRecovery.recoverFromSource(alias: account.alias, store: store, usage: usage) == .committed {
@@ -2472,6 +2494,31 @@ public actor AppEngine {
 
     // MARK: - Poller
 
+    func proactiveCredentialRenewalTick(now: Date = Date()) async {
+        guard networkCheck(), !credentialRenewalInProgress else { return }
+        credentialRenewalInProgress = true
+        defer { credentialRenewalInProgress = false }
+        for account in await store.activeAccounts() where account.routingEnabled {
+            guard !Task.isCancelled else { break }
+            guard (JWT.expiry(account.accessToken) ?? .distantPast).timeIntervalSince(now) <= 86_400 else { continue }
+            _ = await credentialRenewalCoordinator.renew(account, leadTime: 86_400, now: now)
+        }
+        emit(.snapshotChanged)
+    }
+
+    private func startCredentialRenewalScheduler() {
+        credentialRenewalTask?.cancel()
+        credentialRenewalTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let deadline = ContinuousClock.now.advanced(by: .seconds(900))
+                guard self != nil else { return }
+                await self?.proactiveCredentialRenewalTick()
+                do { try await Task.sleep(until: deadline, clock: .continuous) }
+                catch { return }
+            }
+        }
+    }
+
     private func startPoller() {
         pollerTask?.cancel()
         pollerTask = Task { [weak self] in
@@ -2530,7 +2577,7 @@ public actor AppEngine {
     }
 
     @discardableResult
-    private func pollUsage(
+    func pollUsage(
         activeOnly: Bool,
         aliases: Set<String>? = nil,
         settingsOverride: Settings? = nil,
@@ -2550,22 +2597,40 @@ public actor AppEngine {
         var assessments: [DrainAssessment] = []
         var refreshedAccounts: [Account] = []
         for storedAccount in accounts {
-            if activeOnly && storedAccount.alias != activeAlias { continue }
-            if let aliases, !aliases.contains(storedAccount.alias) { continue }
+            guard !Task.isCancelled else { break }
+            let selected = (!activeOnly || storedAccount.alias == activeAlias)
+                && (aliases?.contains(storedAccount.alias) ?? true)
+            let elapsed = storedAccount.usage.contains { ($0.resetAt.map { $0 <= now }) ?? false }
+            let elapsedPollDue = elapsed
+                && now.timeIntervalSince(elapsedUsagePolledAt[storedAccount.alias] ?? .distantPast) >= 300
+            guard selected || (aliases == nil && storedAccount.routingEnabled && elapsedPollDue) else { continue }
+            guard !storedAccount.needsLogin else { continue }
+            if elapsed { elapsedUsagePolledAt[storedAccount.alias] = now }
             var acc = storedAccount
             if acc.managedHomePath != nil || acc.credentialSource?.kind == .managedHome,
                let hydrated = await store.hydrateFromManagedHome(acc.alias) {
                 acc = hydrated
             }
-            guard !acc.accessToken.isEmpty else { continue }
-            guard !JWT.isStale(acc.accessToken, now: now) else { continue }
+            if JWT.isStale(acc.accessToken, now: now) {
+                guard case .renewed(let renewed) = await credentialRenewalCoordinator.renew(acc, leadTime: 30, now: now) else { continue }
+                acc = renewed
+            }
             // A needs-login account rejects every usage call; polling it wastes a request
             // per tick until the user signs in again.
             guard !acc.needsLogin else { continue }
             let operationID = UUID()
             let startedAt = Date()
             do {
-                let windows = try await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID)
+                let windows: [UsageWindow]
+                do {
+                    windows = try await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID)
+                } catch UsageClient.UsageError.unauthorized {
+                    guard case .renewed(let renewed) = await credentialRenewalCoordinator.renew(acc, force: true, now: now) else {
+                        throw UsageClient.UsageError.unauthorized
+                    }
+                    acc = renewed
+                    windows = try await usage.fetch(accessToken: acc.accessToken, accountID: acc.accountID)
+                }
                 DiagnosticsLog.shared.record(component: .quota, operation: .usageFetch, outcome: .succeeded, level: .debug, correlationID: operationID, durationMilliseconds: Int(max(0, Date().timeIntervalSince(startedAt)) * 1_000), count: windows.count)
                 if windows.isEmpty {
                     // AccountStore intentionally retains the dashboard's last non-empty
