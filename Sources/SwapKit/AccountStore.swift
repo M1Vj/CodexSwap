@@ -2122,6 +2122,7 @@ public actor AccountStore {
             drainingAliases.remove(alias)
             drainingObservedAt.removeValue(forKey: alias)
             persist()
+            return index(alias).map { data.accounts[$0] }
         }
         return data.accounts[i]
     }
