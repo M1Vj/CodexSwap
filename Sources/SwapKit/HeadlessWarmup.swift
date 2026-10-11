@@ -118,7 +118,7 @@ public enum HeadlessWarmup {
                 && QuotaWarmupService.usageAllowsWarmup($0)
         }
         let recheck: QuotaWarmupService.AccountRecheck = { [store, settings, now] account in
-            guard let fresh = await store.account(account.alias) else {
+            guard let fresh = await store.hydrateFromManagedHome(account.alias) else {
                 return "account unavailable"
             }
             if let reason = QuotaWarmupService.skipReason(fresh, now: now) {

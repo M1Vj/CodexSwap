@@ -2202,6 +2202,72 @@ final class WarmupEngineTests: XCTestCase {
         XCTAssertEqual(calls, ["enabled"])
     }
 
+    func testWarmupRecheckUsesNativeOverlayForExpiredManagedHome() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-native-overlay-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date()
+        func ownerToken(_ label: String, expiry: Date) -> String {
+            let payload = try! JSONSerialization.data(withJSONObject: [
+                "exp": Int(expiry.timeIntervalSince1970),
+                "account_id": "managed-id",
+                "jti": label,
+            ])
+            let encoded = payload.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            return "e30.\(encoded).sig"
+        }
+        let managed = CodexTokens(idToken: "id-managed", accessToken: ownerToken("expired", expiry: now.addingTimeInterval(-3_600)), refreshToken: "refresh-managed", accountId: "managed-id")
+        let native = CodexTokens(idToken: "id-native", accessToken: ownerToken("native", expiry: now.addingTimeInterval(3_600)), refreshToken: "refresh-native", accountId: "managed-id")
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managed, to: managedHome.appendingPathComponent("auth.json"))
+        try CodexAuth.write(native, to: nativeAuth)
+        let ambient = Account(
+            alias: "ambient",
+            accountID: "managed-id",
+            accessToken: native.accessToken,
+            refreshToken: native.refreshToken,
+            idToken: native.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"), ambientNativeAccountProvider: { ambient })
+        await store.upsert(Account(
+            alias: "pinned",
+            accountID: "managed-id",
+            accessToken: managed.accessToken,
+            refreshToken: managed.refreshToken,
+            idToken: managed.idToken,
+            priority: 1,
+            usage: [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: now.addingTimeInterval(18_000))],
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+        _ = await store.toggleStickyAlias("pinned")
+        let runner = FakeWarmupRunner()
+        let engine = AppEngine(
+            store: store,
+            settingsStore: SettingsStore(url: root.appendingPathComponent("settings.json")),
+            usage: FakeUsageFetcher(),
+            configManager: CodexConfigManager(codexHome: root.appendingPathComponent("codex"), supportDir: root),
+            warmupService: QuotaWarmupService(
+                runner: runner,
+                ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")),
+                lockURL: root.appendingPathComponent("warmup.lock")
+            )
+        )
+
+        let summary = await engine.warmAllAccountsNow(proxyURL: URL(string: "http://127.0.0.1:58432")!)
+        let calls = await runner.calls()
+        let stored = await store.account("pinned")
+
+        XCTAssertEqual(calls, ["pinned"])
+        XCTAssertNil(summary.skipped["pinned"])
+        XCTAssertEqual(stored?.accessToken, managed.accessToken, "the native overlay must not be persisted")
+    }
+
     func testManualWarmupForcesRunRefreshesUsageAndPublishesSummary() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("warmup-engine-\(UUID().uuidString)")
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))

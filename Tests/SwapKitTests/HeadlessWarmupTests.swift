@@ -280,6 +280,114 @@ final class HeadlessWarmupTests: XCTestCase {
         XCTAssertEqual(laterRecordAfter, laterRecordBefore)
     }
 
+    func testRecheckAcceptsNativeOverlayForExpiredManagedHome() async throws {
+        let fixture = try await NativeOverlayWarmupFixture(nativeOwner: "managed-id")
+        defer { fixture.cleanUp() }
+
+        _ = await HeadlessWarmup.run(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            store: fixture.store,
+            settings: .default,
+            warmupService: fixture.service,
+            targetAliases: ["managed"],
+            now: Date()
+        )
+
+        let calls = await fixture.runner.calls()
+        let stored = await AccountStore(url: fixture.root.appendingPathComponent("accounts.json")).account("managed")
+        XCTAssertEqual(calls, ["managed"])
+        XCTAssertEqual(stored?.accessToken, fixture.expiredManagedToken, "the overlay stays runtime-only")
+    }
+
+    func testRecheckStillRejectsExpiredManagedHomeWithoutMatchingNativeOwner() async throws {
+        let fixture = try await NativeOverlayWarmupFixture(nativeOwner: "other-id")
+        defer { fixture.cleanUp() }
+
+        _ = await HeadlessWarmup.run(
+            proxyURL: URL(string: "http://127.0.0.1:58432")!,
+            store: fixture.store,
+            settings: .default,
+            warmupService: fixture.service,
+            targetAliases: ["managed"],
+            now: Date()
+        )
+
+        let calls = await fixture.runner.calls()
+        XCTAssertEqual(calls, [])
+    }
+
+}
+
+private struct NativeOverlayWarmupFixture {
+    let root: URL
+    let store: AccountStore
+    let runner = RecordingWarmupRunner()
+    let service: QuotaWarmupService
+    let expiredManagedToken: String
+
+    init(nativeOwner: String) async throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("headless-warmup-native-overlay-\(UUID().uuidString)")
+        let now = Date()
+        let managedHome = root.appendingPathComponent("managed-home", isDirectory: true)
+        let nativeAuth = root.appendingPathComponent("native-auth.json")
+        expiredManagedToken = ownerJWT(expiry: now.addingTimeInterval(-3_600), accountID: "managed-id", label: "expired-managed")
+        let managed = CodexTokens(idToken: "id-managed", accessToken: expiredManagedToken, refreshToken: "refresh-managed", accountId: "managed-id")
+        let native = CodexTokens(
+            idToken: "id-native",
+            accessToken: ownerJWT(expiry: now.addingTimeInterval(3_600), accountID: nativeOwner, label: "valid-native"),
+            refreshToken: "refresh-native",
+            accountId: nativeOwner
+        )
+        try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
+        try CodexAuth.write(managed, to: managedHome.appendingPathComponent("auth.json"))
+        try CodexAuth.write(native, to: nativeAuth)
+        let ambient = Account(
+            alias: "ambient",
+            accountID: nativeOwner,
+            accessToken: native.accessToken,
+            refreshToken: native.refreshToken,
+            idToken: native.idToken,
+            credentialSource: AccountCredentialSource(kind: .nativeAuth, path: nativeAuth.path)
+        )
+        store = AccountStore(
+            url: root.appendingPathComponent("accounts.json"),
+            ambientNativeAccountProvider: { ambient }
+        )
+        await store.upsert(Account(
+            alias: "managed",
+            accountID: "managed-id",
+            accessToken: managed.accessToken,
+            refreshToken: managed.refreshToken,
+            idToken: managed.idToken,
+            usage: warmupUsage(now: now),
+            managedHomePath: managedHome.path,
+            credentialSource: AccountCredentialSource(kind: .managedHome, path: managedHome.path)
+        ))
+        service = QuotaWarmupService(
+            runner: runner,
+            ledger: WarmupLedgerStore(url: root.appendingPathComponent("warmup.json")),
+            lockURL: root.appendingPathComponent("warmup.lock")
+        )
+    }
+
+    func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private func ownerJWT(expiry: Date, accountID: String, label: String) -> String {
+    let payload = try! JSONSerialization.data(withJSONObject: [
+        "exp": Int(expiry.timeIntervalSince1970),
+        "account_id": accountID,
+        "jti": label,
+    ])
+    let encoded = payload
+        .base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    return "e30.\(encoded).sig"
 }
 
 private func fakeJWT(expiry: TimeInterval, signature: String) -> String {
