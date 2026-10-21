@@ -1301,10 +1301,13 @@ public actor ProxyServer {
             while let first = try await iterator.next() {
                 guard case .head(let head) = first else { continue }
                 if proxyRequestBodyExceedsAggregationLimit(head) {
-                    try await self.writeError(
+                    let declaredBytes = head.headers.first(name: "Content-Length")
+                        .flatMap { Int64($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                    let detail = declaredBytes.map { "declared Content-Length \($0) bytes" }
+                        ?? "declared Content-Length exceeds the limit (exact size unavailable)"
+                    try await self.writeBodyLimitError(
                         outbound,
-                        status: .payloadTooLarge,
-                        message: "request body exceeds the proxy limit"
+                        detail: detail
                     )
                     return
                 }
@@ -1318,10 +1321,9 @@ public actor ProxyServer {
                     switch part {
                     case .body(let chunk):
                         guard body.append(chunk) else {
-                            try await self.writeError(
+                            try await self.writeBodyLimitError(
                                 outbound,
-                                status: .payloadTooLarge,
-                                message: "request body exceeds the proxy limit"
+                                detail: "received body exceeds \(aggregationLimit) bytes during aggregation"
                             )
                             return
                         }
@@ -1333,6 +1335,23 @@ public actor ProxyServer {
                 try await self.serveRequest(head: head, body: bodyData, outbound: outbound)
             }
         }
+    }
+
+    private func writeBodyLimitError(
+        _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        detail: String
+    ) async throws {
+        // Record before writing so a disconnected client cannot hide the rejection.
+        // DiagnosticRecord.count clamps at 1,000,000, so it cannot hold these byte counts.
+        diagnosticsLog.record(
+            component: .proxy, operation: .request, outcome: .failed,
+            level: .warning, code: .invalidInput, status: 413
+        )
+        let limit = Self.maxCandidateRequestBodyBytes
+        try await writeError(
+            outbound, status: .payloadTooLarge,
+            message: "request body exceeds the proxy limit: limit \(limit / (1024 * 1024)) MiB (\(limit) bytes); \(detail)"
+        )
     }
 
     private func upstreamFor(path: String) -> URL {

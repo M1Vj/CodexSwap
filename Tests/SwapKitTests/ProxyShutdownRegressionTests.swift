@@ -31,9 +31,12 @@ final class ProxyShutdownRegressionTests: XCTestCase {
     func testProxyHandlerReturns413ForOversizedDeclaredCandidateBodyBeforeUpstream() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        let upstream = HangingHeaderUpstream()
+        defer { Task { await upstream.stop() } }
         var config = ProxyServer.Config()
         config.port = 0
-        config.upstream = URL(string: "http://127.0.0.1:1")!
+        config.upstream = try await upstream.start()
+        config.apiUpstream = config.upstream
         let server = makeServer(root: root, config: config)
         try await server.start()
         defer { Task { await server.stop() } }
@@ -50,17 +53,24 @@ final class ProxyShutdownRegressionTests: XCTestCase {
             headers: headers
         )
 
-        let status = try await sendRawProxyRequest(port: port, head: head, chunks: [])
-        XCTAssertEqual(status, .payloadTooLarge)
+        let response = try await sendRawProxyRequest(port: port, head: head, chunks: [])
+        XCTAssertEqual(response.status, .payloadTooLarge)
+        XCTAssertEqual(response.body, "request body exceeds the proxy limit: limit 100 MiB (104857600 bytes); declared Content-Length 104857601 bytes")
+        assertSizeRejectionDiagnostic(root: root)
+        let upstreamConnections = await upstream.acceptedConnectionCount()
+        XCTAssertEqual(upstreamConnections, 0)
         await server.stop()
     }
 
     func testProxyHandlerReturns413WhenChunkedCandidateBodyCrossesCap() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
+        let upstream = HangingHeaderUpstream()
+        defer { Task { await upstream.stop() } }
         var config = ProxyServer.Config()
         config.port = 0
-        config.upstream = URL(string: "http://127.0.0.1:1")!
+        config.upstream = try await upstream.start()
+        config.apiUpstream = config.upstream
         let server = makeServer(root: root, config: config)
         try await server.start()
         defer { Task { await server.stop() } }
@@ -77,7 +87,7 @@ final class ProxyShutdownRegressionTests: XCTestCase {
             headers: headers
         )
 
-        let status = try await sendRawProxyRequest(
+        let response = try await sendRawProxyRequest(
             port: port,
             head: head,
             chunks: [
@@ -85,8 +95,83 @@ final class ProxyShutdownRegressionTests: XCTestCase {
                 ByteBuffer(string: "x"),
             ]
         )
-        XCTAssertEqual(status, .payloadTooLarge)
+        XCTAssertEqual(response.status, .payloadTooLarge)
+        XCTAssertEqual(response.body, "request body exceeds the proxy limit: limit 100 MiB (104857600 bytes); received body exceeds 104857600 bytes during aggregation")
+        assertSizeRejectionDiagnostic(root: root)
+        let upstreamConnections = await upstream.acceptedConnectionCount()
+        XCTAssertEqual(upstreamConnections, 0)
         await server.stop()
+    }
+
+    func testCandidateRequestBodyLimitAllowsExactDeclaredAndReceivedSize() {
+        let limit = ProxyServer.maxCandidateRequestBodyBytes
+        let head = HTTPRequestHead(
+            version: .http1_1, method: .POST, uri: "/backend-api/codex/responses",
+            headers: ["Content-Length": String(limit)]
+        )
+        XCTAssertFalse(proxyRequestBodyExceedsAggregationLimit(head))
+        var accumulator = ProxyRequestBodyAccumulator(limit: limit)
+        XCTAssertTrue(accumulator.append(ByteBuffer(repeating: 0x61, count: limit)))
+        XCTAssertEqual(accumulator.bytes.count, limit)
+        XCTAssertTrue(accumulator.append(ByteBuffer()))
+        XCTAssertFalse(accumulator.append(ByteBuffer(string: "x")))
+        XCTAssertEqual(accumulator.bytes.count, limit)
+    }
+
+    func testProxyHandlerAllowsExactLimitBodyThroughToNormalRoutingGate() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let server = makeServer(root: root, routingEnabled: false)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let boundPort = await server.port()
+        let limit = ProxyServer.maxCandidateRequestBodyBytes
+        let head = HTTPRequestHead(
+            version: .http1_1, method: .POST, uri: "/backend-api/codex/responses",
+            headers: ["Host": "127.0.0.1", "Content-Length": String(limit)]
+        )
+        let response = try await sendRawProxyRequest(
+            port: XCTUnwrap(boundPort), head: head,
+            chunks: [ByteBuffer(repeating: 0x20, count: limit)]
+        )
+        XCTAssertEqual(response.status, .serviceUnavailable)
+        XCTAssertTrue(response.body.contains("CodexSwap routing is disabled"))
+        let diagnostics = DiagnosticsLog(url: root.appendingPathComponent("diagnostics.jsonl"))
+        XCTAssertTrue(diagnostics.snapshot().records.isEmpty)
+        await server.stop()
+    }
+
+    func testProxyHandlerReportsOverflowingDeclaredLengthWithoutEchoingHeader() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let server = makeServer(root: root)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let boundPort = await server.port()
+        let head = HTTPRequestHead(
+            version: .http1_1, method: .POST, uri: "/backend-api/codex/responses",
+            headers: ["Host": "127.0.0.1", "Content-Length": "9223372036854775808"]
+        )
+        let response = try await sendRawProxyRequest(port: XCTUnwrap(boundPort), head: head, chunks: [])
+        XCTAssertEqual(response.status, .payloadTooLarge)
+        XCTAssertEqual(response.body, "request body exceeds the proxy limit: limit 100 MiB (104857600 bytes); declared Content-Length exceeds the limit (exact size unavailable)")
+        assertSizeRejectionDiagnostic(root: root)
+        await server.stop()
+    }
+
+    private func assertSizeRejectionDiagnostic(root: URL, file: StaticString = #filePath, line: UInt = #line) {
+        let diagnostics = DiagnosticsLog(url: root.appendingPathComponent("diagnostics.jsonl"))
+        let records = diagnostics.snapshot().records
+        XCTAssertEqual(records.count, 1, file: file, line: line)
+        guard let record = records.first else { return }
+        XCTAssertEqual(record.component, .proxy, file: file, line: line)
+        XCTAssertEqual(record.operation, .request, file: file, line: line)
+        XCTAssertEqual(record.outcome, .failed, file: file, line: line)
+        XCTAssertEqual(record.code, .invalidInput, file: file, line: line)
+        XCTAssertEqual(record.status, 413, file: file, line: line)
+        // The existing count field clamps at 1,000,000; it cannot represent body bytes.
+        XCTAssertNil(record.count, file: file, line: line)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("routing.jsonl").path), file: file, line: line)
     }
 
     func testCandidateRequestBodyLimitRejectsChunkCrossingWithoutAppendingPastCap() {
@@ -424,9 +509,14 @@ final class ProxyShutdownRegressionTests: XCTestCase {
         return root
     }
 
-    private func makeServer(root: URL, config: ProxyServer.Config = .init()) -> ProxyServer {
+    private func makeServer(root: URL, config: ProxyServer.Config = .init(), routingEnabled: Bool = true) -> ProxyServer {
         let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
-        return ProxyServer(store: store, config: config, settingsProvider: { .default })
+        return ProxyServer(
+            store: store, config: config, settingsProvider: { .default },
+            routingEnabledProvider: { routingEnabled },
+            diagnosticsLog: DiagnosticsLog(url: root.appendingPathComponent("diagnostics.jsonl")),
+            routingLog: RoutingDecisionLog(url: root.appendingPathComponent("routing.jsonl"))
+        )
     }
 
     private func makeStartedServer() async throws -> (root: URL, server: ProxyServer) {
@@ -556,6 +646,8 @@ private actor HangingHeaderUpstream {
 
     func port() -> Int? { channel?.localAddress?.port }
 
+    func acceptedConnectionCount() -> Int { connectionTasks.count }
+
     func stop() async {
         let serving = servingTask
         serving?.cancel()
@@ -601,7 +693,7 @@ private func sendRawProxyRequest(
     port: Int,
     head: HTTPRequestHead,
     chunks: [ByteBuffer]
-) async throws -> HTTPResponseStatus {
+) async throws -> (status: HTTPResponseStatus, body: String) {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     do {
         let channel = try await ClientBootstrap(group: group)
@@ -625,14 +717,15 @@ private func sendRawProxyRequest(
             try await outbound.write(.end(nil))
 
             var responseStatus: HTTPResponseStatus?
+            var responseBody = ByteBuffer()
             for try await part in inbound {
                 switch part {
                 case .head(let responseHead): responseStatus = responseHead.status
-                case .end: return try XCTUnwrap(responseStatus)
-                case .body: break
+                case .end: return (try XCTUnwrap(responseStatus), String(decoding: responseBody.readableBytesView, as: UTF8.self))
+                case .body(var chunk): responseBody.writeBuffer(&chunk)
                 }
             }
-            return try XCTUnwrap(responseStatus)
+            return (try XCTUnwrap(responseStatus), String(decoding: responseBody.readableBytesView, as: UTF8.self))
         }
         try await group.shutdownGracefully()
         return status
