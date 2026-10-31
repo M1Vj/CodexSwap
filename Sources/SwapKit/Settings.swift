@@ -133,6 +133,7 @@ public struct Settings: Codable, Sendable, Equatable {
     public var automaticallyWarmAccounts: Bool
     public var warmupExcludedAccounts: [String]
     public var automaticallyResetExhaustedAccounts: Bool
+    public var automaticallyResetExpiringCredits: Bool
     public var interactiveExhaustionPolicy: QuotaExhaustionPolicy
     public var taskBoardExhaustionPolicy: QuotaExhaustionPolicy
     public var autoResetProtectedAccounts: [String]
@@ -173,6 +174,7 @@ public struct Settings: Codable, Sendable, Equatable {
         automaticallyWarmAccounts: false,
         warmupExcludedAccounts: [],
         automaticallyResetExhaustedAccounts: false,
+        automaticallyResetExpiringCredits: false,
         interactiveExhaustionPolicy: .resetCurrentFirst,
         taskBoardExhaustionPolicy: .stopAndNotify,
         autoResetProtectedAccounts: [],
@@ -212,6 +214,7 @@ public struct Settings: Codable, Sendable, Equatable {
         automaticallyWarmAccounts: Bool,
         warmupExcludedAccounts: [String],
         automaticallyResetExhaustedAccounts: Bool = false,
+        automaticallyResetExpiringCredits: Bool = false,
         interactiveExhaustionPolicy: QuotaExhaustionPolicy = .resetCurrentFirst,
         taskBoardExhaustionPolicy: QuotaExhaustionPolicy = .stopAndNotify,
         autoResetProtectedAccounts: [String] = [],
@@ -243,6 +246,7 @@ public struct Settings: Codable, Sendable, Equatable {
         self.automaticallyWarmAccounts = automaticallyWarmAccounts
         self.warmupExcludedAccounts = warmupExcludedAccounts
         self.automaticallyResetExhaustedAccounts = automaticallyResetExhaustedAccounts
+        self.automaticallyResetExpiringCredits = automaticallyResetExpiringCredits
         self.interactiveExhaustionPolicy = interactiveExhaustionPolicy
         self.taskBoardExhaustionPolicy = taskBoardExhaustionPolicy
         self.autoResetProtectedAccounts = autoResetProtectedAccounts
@@ -279,6 +283,7 @@ public struct Settings: Codable, Sendable, Equatable {
         automaticallyWarmAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyWarmAccounts) ?? d.automaticallyWarmAccounts
         warmupExcludedAccounts = try c.decodeIfPresent([String].self, forKey: .warmupExcludedAccounts) ?? d.warmupExcludedAccounts
         automaticallyResetExhaustedAccounts = try c.decodeIfPresent(Bool.self, forKey: .automaticallyResetExhaustedAccounts) ?? d.automaticallyResetExhaustedAccounts
+        automaticallyResetExpiringCredits = try c.decodeIfPresent(Bool.self, forKey: .automaticallyResetExpiringCredits) ?? d.automaticallyResetExpiringCredits
         let interactivePolicyRaw = try c.decodeIfPresent(String.self, forKey: .interactiveExhaustionPolicy)
         interactiveExhaustionPolicy = interactivePolicyRaw.flatMap(QuotaExhaustionPolicy.init(rawValue:)) ?? d.interactiveExhaustionPolicy
         let taskBoardPolicyRaw = try c.decodeIfPresent(String.self, forKey: .taskBoardExhaustionPolicy)

@@ -849,6 +849,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             addStandaloneAccount: { [weak self] in self?.addStandaloneAccount() },
             setAutomaticWarmup: { [weak self] enabled in self?.setAutomaticWarmup(enabled) },
             setAutomaticReset: { [weak self] enabled in self?.updateSettings { $0.automaticallyResetExhaustedAccounts = enabled } },
+            setAutomaticExpiryReset: { [weak self] enabled in self?.updateSettings { $0.automaticallyResetExpiringCredits = enabled } },
             setInteractiveExhaustionPolicy: { [weak self] policy in self?.updateSettings { $0.interactiveExhaustionPolicy = policy } },
             setTaskBoardExhaustionPolicy: { [weak self] policy in self?.updateSettings { $0.taskBoardExhaustionPolicy = policy } },
             setWarmupExcludedAccounts: { [weak self] aliases in
