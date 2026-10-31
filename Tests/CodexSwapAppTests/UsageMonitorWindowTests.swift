@@ -123,6 +123,52 @@ final class UsageMonitorWindowTests: XCTestCase {
         XCTAssertEqual(afterSuccess.estimatedCost, 220.0 / 1_000_000, accuracy: 1e-12)
     }
 
+    func testLocalUsageCostProjectionMultiModelSumsOnlyVerifiedPricedAndTruthfulPresentation() {
+        var totals = LocalUsageTotals()
+        totals.sessionCount = 2
+        totals.inputTokens = 2000
+        totals.outputTokens = 200
+        totals.cachedInputCompleteness = .complete
+        totals.cacheWriteInputCompleteness = .complete
+
+        // Model 1: gpt-5.6-sol (verified pricing: $4 in, $0.40 cached, $5 write, $20 out)
+        var sol = LocalModelUsage()
+        sol.inputTokens = 1000
+        sol.cachedInputTokens = 200
+        sol.cacheWriteInputTokens = 100
+        sol.outputTokens = 100
+        sol.cachedInputCompleteness = .complete
+        sol.cacheWriteInputCompleteness = .complete
+        totals.byModel["gpt-5.6-sol"] = sol
+
+        // Model 2: gpt-6-preview (unverified/unknown pricing)
+        var unknownModel = LocalModelUsage()
+        unknownModel.inputTokens = 1000
+        unknownModel.outputTokens = 100
+        unknownModel.cachedInputCompleteness = .complete
+        unknownModel.cacheWriteInputCompleteness = .complete
+        totals.byModel["gpt-6-preview"] = unknownModel
+
+        totals.models = ["gpt-5.6-sol", "gpt-6-preview"]
+
+        // Must sum ONLY verified-priced model; unknown model contributes 0
+        let cost = LocalUsageCostProjection.estimatedCost(for: totals)
+        let uncachedIn = (1000.0 - 200.0 - 100.0) * 4.0
+        let cachedIn = 200.0 * 0.4
+        let writeIn = 100.0 * 5.0
+        let out = 100.0 * 20.0
+        let expectedSolCost = (uncachedIn + cachedIn + writeIn + out) / 1_000_000
+        XCTAssertEqual(cost, expectedSolCost, accuracy: 1e-12)
+
+        // Availability must be partial due to unpriced model
+        let avail = LocalUsageCostProjection.availability(for: totals)
+        XCTAssertEqual(avail, .partial)
+
+        // UI text presentation must truthful display "unpriced", not guessed dollars
+        let text = LocalUsageCostProjection.text(for: totals)
+        XCTAssertEqual(text, "unpriced")
+    }
+
     func testLocalUsageCostIncludesCacheWrites() {
         var totals = LocalUsageTotals()
         totals.inputTokens = 100

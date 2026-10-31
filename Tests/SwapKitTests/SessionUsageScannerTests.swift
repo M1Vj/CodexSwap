@@ -190,4 +190,160 @@ final class SessionUsageScannerTests: XCTestCase {
         )
         XCTAssertEqual(totals.sessionCount, 0)
     }
+
+    func testMultiModelSessionTurnAttributionAndCost() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let multiModelSession = [
+            #"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":100},"last_token_usage":{"input_tokens":1000,"output_tokens":100}}}}"#,
+            #"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"output_tokens":300},"last_token_usage":{"input_tokens":2000,"output_tokens":200}}}}"#
+        ].joined(separator: "\n")
+        try writeSession(multiModelSession, home: home, year: y, month: m, day: d, name: "multimodel.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+        XCTAssertEqual(totals.sessionCount, 1)
+        XCTAssertEqual(totals.inputTokens, 3000)
+        XCTAssertEqual(totals.outputTokens, 300)
+        XCTAssertEqual(totals.models, ["gpt-5.6-luna", "gpt-5.6-sol"])
+
+        let solUsage = try XCTUnwrap(totals.byModel["gpt-5.6-sol"])
+        XCTAssertEqual(solUsage.inputTokens, 1000)
+        XCTAssertEqual(solUsage.outputTokens, 100)
+
+        let lunaUsage = try XCTUnwrap(totals.byModel["gpt-5.6-luna"])
+        XCTAssertEqual(lunaUsage.inputTokens, 2000)
+        XCTAssertEqual(lunaUsage.outputTokens, 200)
+
+        let solCost = 1000.0 * 4.0 / 1_000_000 + 100.0 * 20.0 / 1_000_000
+        let lunaCost = 2000.0 * 0.2 / 1_000_000 + 200.0 * 1.2 / 1_000_000
+        let expectedTotalCost = solCost + lunaCost
+
+        // Uses real LocalUsageCostProjection rather than reimplementing calculation
+        let calculatedCost = LocalUsageCostProjection.estimatedCost(for: totals)
+        XCTAssertEqual(calculatedCost, expectedTotalCost, accuracy: 1e-12)
+    }
+
+    func testScannerDeduplicatesIdenticalCumulativeRecordsWithoutInflatingByModel() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        // Two identical lines with same cumulative numbers and last_token_usage present
+        let duplicateLines = [
+            #"{"type":"turn_context","payload":{"model":"gpt-4o"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20},"last_token_usage":{"input_tokens":100,"output_tokens":20}}}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20},"last_token_usage":{"input_tokens":100,"output_tokens":20}}}}"#
+        ].joined(separator: "\n")
+        try writeSession(duplicateLines, home: home, year: y, month: m, day: d, name: "duplicate.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+        XCTAssertEqual(totals.sessionCount, 1)
+        XCTAssertEqual(totals.inputTokens, 100)
+        XCTAssertEqual(totals.outputTokens, 20)
+
+        let modelUsage = try XCTUnwrap(totals.byModel["gpt-4o"])
+        XCTAssertEqual(modelUsage.inputTokens, 100, "Identical cumulative event must not inflate byModel")
+        XCTAssertEqual(modelUsage.outputTokens, 20)
+    }
+
+    func testScannerCumulativeDeltaTransitionsAndModelSwitch() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        let session = [
+            #"{"type":"turn_context","payload":{"model":"gpt-4o"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"output_tokens":10}}}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":25}}}}"#,
+            #"{"type":"turn_context","payload":{"model":"gpt-4o-mini"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"output_tokens":50}}}}"#
+        ].joined(separator: "\n")
+        try writeSession(session, home: home, year: y, month: m, day: d, name: "deltas.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+        XCTAssertEqual(totals.inputTokens, 150)
+        XCTAssertEqual(totals.outputTokens, 50)
+
+        let gpt4o = try XCTUnwrap(totals.byModel["gpt-4o"])
+        XCTAssertEqual(gpt4o.inputTokens, 100)
+        XCTAssertEqual(gpt4o.outputTokens, 25)
+
+        let mini = try XCTUnwrap(totals.byModel["gpt-4o-mini"])
+        XCTAssertEqual(mini.inputTokens, 50)
+        XCTAssertEqual(mini.outputTokens, 25)
+
+        // Per-model sums reconcile to aggregate totals
+        let totalInputSum = totals.byModel.values.reduce(0) { $0 + $1.inputTokens }
+        let totalOutputSum = totals.byModel.values.reduce(0) { $0 + $1.outputTokens }
+        XCTAssertEqual(totalInputSum, totals.inputTokens)
+        XCTAssertEqual(totalOutputSum, totals.outputTokens)
+    }
+
+    func testScannerMissingCacheYieldsPartialCompleteness() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        // Event 1 has cache, Event 2 omits cache fields
+        let session = [
+            #"{"type":"turn_context","payload":{"model":"gpt-4o"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":5}},"last_token_usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":5}}}}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":40}}}}"#
+        ].joined(separator: "\n")
+        try writeSession(session, home: home, year: y, month: m, day: d, name: "mixed_cache.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+        XCTAssertEqual(totals.cachedInputTokens, 10)
+        XCTAssertEqual(totals.cacheWriteInputTokens, 5)
+        // Mixed missing cache must yield partial completeness across the session
+        XCTAssertEqual(totals.cachedInputCompleteness, .partial)
+        XCTAssertEqual(totals.cacheWriteInputCompleteness, .partial)
+    }
+
+    func testScannerCounterRegressionReconcilesUnallocatedTokensToUnknown() throws {
+        let home = makeHome()
+        let (y, m, d) = calendarDate(daysAgo: 0)
+        // Event 1 has 100 in, Event 2 has 60 in (counter regression / out of order)
+        let session = [
+            #"{"type":"turn_context","payload":{"model":"gpt-4o"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}}}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":60,"output_tokens":10}}}}"#
+        ].joined(separator: "\n")
+        try writeSession(session, home: home, year: y, month: m, day: d, name: "regression.jsonl")
+
+        let totals = SessionUsageScanner.scan(home: home, days: 7)
+        XCTAssertEqual(totals.inputTokens, 100)
+        XCTAssertEqual(totals.outputTokens, 20)
+
+        // Sum of per-model tokens must reconcile to aggregate totals
+        let sumInput = totals.byModel.values.reduce(0) { $0 + $1.inputTokens }
+        let sumOutput = totals.byModel.values.reduce(0) { $0 + $1.outputTokens }
+        XCTAssertEqual(sumInput, totals.inputTokens)
+        XCTAssertEqual(sumOutput, totals.outputTokens)
+    }
+
+    func testLocalUsageTotalsFallbackMergeWithMultipleModelsAttributesToUnknown() {
+        var lhs = LocalUsageTotals()
+        lhs.sessionCount = 1
+        lhs.inputTokens = 50
+        lhs.outputTokens = 10
+        lhs.byModel["gpt-4o"] = LocalModelUsage(inputTokens: 50, outputTokens: 10)
+        lhs.models = ["gpt-4o"]
+
+        // rhs has no byModel, but 2 models in models list
+        var rhs = LocalUsageTotals()
+        rhs.sessionCount = 1
+        rhs.inputTokens = 100
+        rhs.outputTokens = 20
+        rhs.models = ["gpt-4o", "gpt-5.6-sol"]
+
+        lhs += rhs
+
+        XCTAssertEqual(lhs.inputTokens, 150)
+        XCTAssertEqual(lhs.outputTokens, 30)
+        // Multi-model legacy totals must NOT be fully attributed to the first model
+        let gpt4o = try! XCTUnwrap(lhs.byModel["gpt-4o"])
+        XCTAssertEqual(gpt4o.inputTokens, 50)
+        let unknown = try! XCTUnwrap(lhs.byModel["unknown"])
+        XCTAssertEqual(unknown.inputTokens, 100)
+
+        let sumInput = lhs.byModel.values.reduce(0) { $0 + $1.inputTokens }
+        XCTAssertEqual(sumInput, lhs.inputTokens)
+    }
 }

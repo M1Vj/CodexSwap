@@ -323,4 +323,18 @@ final class UsageTelemetryTests: XCTestCase {
         XCTAssertTrue(thirty.dailyAttemptAggregates.allSatisfy { $0.utcOffsetSeconds == TimeZone.current.secondsFromGMT(for: $0.dayStart) || $0.utcOffsetSeconds == 0 })
         XCTAssertEqual(lifetime.lifetimeAttemptAggregates.reduce(0) { $0 + $1.attempts }, 2)
     }
+
+    func testNormalizeModelMapsSnapshotsAndBindsUnknown() {
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-5.6-sol"), "gpt-5.6-sol")
+        // Unverified / synthetic date snapshots are not guessed; they bind honestly to other
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-5.6-sol-2026-02-15"), "other")
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-5.6-sol-latest"), "other")
+        // Verified snapshot aliases normalize to explicit verified models
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-4o-2024-08-06"), "gpt-4o-2024-08-06")
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-4o-2024-05-13"), "gpt-4o-2024-05-13")
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-4o-mini"), "gpt-4o-mini")
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("o1-preview"), "o1-preview")
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("unknown-model"), "other")
+        XCTAssertEqual(UsageTelemetryAttemptEvent.normalizeModel("gpt-5-unauthorized-suffix"), "other")
+    }
 }

@@ -385,7 +385,7 @@ struct UsageMonitorView: View {
     }
 
     private var footer: some View {
-        Text("Telemetry is opt-in, metadata-only, local to this Mac, and never uploaded. Costs are estimates from versioned published list pricing, not invoices. Latency includes local and network time. Token volume, speed, and cost do not measure interactive quality or productivity.")
+        Text("Telemetry is opt-in, metadata-only, local to this Mac, and never uploaded. Costs estimate Standard short-context list rates with 30-minute cache writes, not invoices; service tiers, long-context premiums, and 12-hour writes are not included. Latency includes local and network time. Token volume, speed, and cost do not measure interactive quality or productivity.")
             .font(.caption)
             .foregroundStyle(.secondary)
             .padding(.top, 4)
@@ -901,13 +901,7 @@ private struct PoolSummaryCard: View {
     }
 
     private var localEstimatedCost: Double {
-        UsageAnalytics.estimatedCost(
-            inputTokens: localTotals.inputTokens,
-            cachedInputTokens: localTotals.cachedInputCompleteness == .unknown ? nil : localTotals.cachedInputTokens,
-            cacheWriteInputTokens: localTotals.cacheWriteInputCompleteness == .unknown ? nil : localTotals.cacheWriteInputTokens,
-            outputTokens: localTotals.outputTokens,
-            model: localTotals.models.first ?? "unknown"
-        )
+        LocalUsageCostProjection.estimatedCost(for: localTotals)
     }
 
     private func metric(_ value: String, label: String, color: Color = .primary) -> some View {
@@ -1104,21 +1098,7 @@ private struct WindowMeter: View {
     }
 }
 
-enum LocalUsageCostProjection {
-    static func estimatedCost(for totals: LocalUsageTotals) -> Double {
-        UsageAnalytics.estimatedCost(
-            inputTokens: totals.inputTokens,
-            cachedInputTokens: totals.cachedInputCompleteness == .unknown ? nil : totals.cachedInputTokens,
-            cacheWriteInputTokens: totals.cacheWriteInputCompleteness == .unknown ? nil : totals.cacheWriteInputTokens,
-            outputTokens: totals.outputTokens,
-            model: totals.models.first ?? "unknown"
-        )
-    }
-
-    static func availability(for totals: LocalUsageTotals) -> CostAvailability {
-        UsageAnalytics.costAvailability(totals)
-    }
-
+extension LocalUsageCostProjection {
     static func text(
         for totals: LocalUsageTotals,
         prefix: String = "~$",

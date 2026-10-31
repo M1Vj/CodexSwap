@@ -565,7 +565,9 @@ private struct UsageShareRow {
 ///
 /// All prices are ESTIMATES mapped from published OpenAI list pricing; Codex subscription
 /// traffic does not produce real invoices, so these numbers only support rough comparisons
-/// between accounts and models. Unknown models fall back to `fallback`.
+/// between accounts and models. Rates represent Standard short-context pricing and
+/// 30-minute cache writes; service tiers, long-context premiums, and 12-hour writes
+/// are not represented. Aggregate availability checks leave unknown models unpriced.
 public struct ModelPrice: Sendable, Equatable {
     public let inputPerMillion: Double
     public let cachedInputPerMillion: Double
@@ -646,29 +648,56 @@ public enum UsageAnalytics {
     // Terra's model page documents the >272K and 1.25x cache-write multipliers;
     // Sol/Luna use the same published family contract.
     public static let modelPricing: [String: ModelPrice] = [
+        // Standard short-context/30-minute write rates, verified 2026-10-31:
+        // https://developers.openai.com/api/docs/pricing
+        "gpt-6-astra": ModelPrice(inputPerMillion: 10.0, cachedInputPerMillion: 1.0, outputPerMillion: 50.0, cacheWriteInputPerMillion: 12.5),
+        "gpt-6.1-sol": ModelPrice(inputPerMillion: 2.0, cachedInputPerMillion: 0.1, outputPerMillion: 10.0, cacheWriteInputPerMillion: 2.5),
+        "gpt-6.1-terra": ModelPrice(inputPerMillion: 1.0, cachedInputPerMillion: 0.05, outputPerMillion: 5.0, cacheWriteInputPerMillion: 1.25),
+        "gpt-6-luna": ModelPrice(inputPerMillion: 0.1, cachedInputPerMillion: 0.01, outputPerMillion: 0.5, cacheWriteInputPerMillion: 0.125),
         "gpt-5.6-sol": ModelPrice(inputPerMillion: 4.0, cachedInputPerMillion: 0.4, outputPerMillion: 20.0, cacheWriteInputPerMillion: 5.0),
         "gpt-5.6-terra": ModelPrice(inputPerMillion: 2.0, cachedInputPerMillion: 0.2, outputPerMillion: 12.0, cacheWriteInputPerMillion: 2.5),
         "gpt-5.6-luna": ModelPrice(inputPerMillion: 0.2, cachedInputPerMillion: 0.02, outputPerMillion: 1.2, cacheWriteInputPerMillion: 0.25),
-        "gpt-5.6": ModelPrice(inputPerMillion: 4.0, cachedInputPerMillion: 0.4, outputPerMillion: 20.0, cacheWriteInputPerMillion: 5.0),
-        "gpt-5.5-codex": ModelPrice(inputPerMillion: 1.25, cachedInputPerMillion: 0.125, outputPerMillion: 10.0),
-        "gpt-5.5": ModelPrice(inputPerMillion: 1.25, cachedInputPerMillion: 0.125, outputPerMillion: 10.0),
+        // Verified base and exact snapshot: https://developers.openai.com/api/docs/models/gpt-5.5
+        "gpt-5.5": ModelPrice(inputPerMillion: 5.0, cachedInputPerMillion: 0.5, outputPerMillion: 30.0),
+        "gpt-5.5-2026-04-23": ModelPrice(inputPerMillion: 5.0, cachedInputPerMillion: 0.5, outputPerMillion: 30.0),
         "gpt-5-codex": ModelPrice(inputPerMillion: 1.25, cachedInputPerMillion: 0.125, outputPerMillion: 10.0),
         "gpt-5": ModelPrice(inputPerMillion: 1.25, cachedInputPerMillion: 0.125, outputPerMillion: 10.0),
         "gpt-5-mini": ModelPrice(inputPerMillion: 0.25, cachedInputPerMillion: 0.025, outputPerMillion: 2.0),
         "gpt-5-nano": ModelPrice(inputPerMillion: 0.05, cachedInputPerMillion: 0.005, outputPerMillion: 0.4),
+        // Active published OpenAI models and verified snapshots (Source: https://openai.com/api/pricing/ accessed 2026-10-31):
+        "gpt-4o": ModelPrice(inputPerMillion: 2.50, cachedInputPerMillion: 1.25, outputPerMillion: 10.0),
+        "gpt-4o-2024-08-06": ModelPrice(inputPerMillion: 2.50, cachedInputPerMillion: 1.25, outputPerMillion: 10.0),
+        "gpt-4o-2024-05-13": ModelPrice(inputPerMillion: 5.00, cachedInputPerMillion: 2.50, outputPerMillion: 15.0),
+        "gpt-4o-mini": ModelPrice(inputPerMillion: 0.15, cachedInputPerMillion: 0.075, outputPerMillion: 0.60),
+        "gpt-4o-mini-2024-07-18": ModelPrice(inputPerMillion: 0.15, cachedInputPerMillion: 0.075, outputPerMillion: 0.60),
+        "o1": ModelPrice(inputPerMillion: 15.0, cachedInputPerMillion: 7.50, outputPerMillion: 60.0),
+        "o1-2024-12-17": ModelPrice(inputPerMillion: 15.0, cachedInputPerMillion: 7.50, outputPerMillion: 60.0),
+        "o1-preview": ModelPrice(inputPerMillion: 15.0, cachedInputPerMillion: 7.50, outputPerMillion: 60.0),
+        "o1-preview-2024-09-12": ModelPrice(inputPerMillion: 15.0, cachedInputPerMillion: 7.50, outputPerMillion: 60.0),
+        "o1-mini": ModelPrice(inputPerMillion: 1.10, cachedInputPerMillion: 0.55, outputPerMillion: 4.40),
+        "o1-mini-2024-09-12": ModelPrice(inputPerMillion: 1.10, cachedInputPerMillion: 0.55, outputPerMillion: 4.40),
+        "o3-mini": ModelPrice(inputPerMillion: 1.10, cachedInputPerMillion: 0.55, outputPerMillion: 4.40),
+        "o3-mini-2025-01-31": ModelPrice(inputPerMillion: 1.10, cachedInputPerMillion: 0.55, outputPerMillion: 4.40),
     ]
 
-    /// Price applied when a model is missing from the table (longest-prefix match first).
+    /// Price applied when a model is missing from the table (legacy fallback).
     public static let fallbackPrice = ModelPrice(inputPerMillion: 1.25, cachedInputPerMillion: 0.125, outputPerMillion: 10.0)
 
-    /// Returns only a known model price. Unlike `price(for:)`, this does not use the
+    /// Resolves canonical base model for an exact known model or verified snapshot alias.
+    /// Unverified snapshots or arbitrary suffixes return nil so pricing remains truthful.
+    public static func canonicalModel(for model: String) -> String? {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return nil }
+        if modelPricing[trimmed] != nil { return trimmed }
+        return nil
+    }
+
+    /// Returns only a known model price. Unlike , this does not use the
     /// compatibility fallback, so callers can distinguish measured pricing from an
     /// unsupported/future model.
     public static func knownPrice(for model: String) -> ModelPrice? {
-        guard !model.isEmpty else { return nil }
-        if let exact = modelPricing[model] { return exact }
-        let candidates = modelPricing.filter { model.hasPrefix($0.key) }
-        return candidates.max(by: { $0.key.count < $1.key.count })?.value
+        guard let canonical = canonicalModel(for: model) else { return nil }
+        return modelPricing[canonical]
     }
 
     public static func price(for model: String) -> ModelPrice {
@@ -761,12 +790,13 @@ public enum UsageAnalytics {
             .filter { $0.requests > 0 }
             .sorted(by: canonicalRowOrder)
             .reduce(0) { partial, row in
-                partial + estimatedCost(
+                guard let price = knownPrice(for: row.model) else { return partial }
+                return partial + estimatedCost(
                     inputTokens: row.inputTokens,
                     cachedInputTokens: row.cachedInputCompleteness == .unknown ? nil : row.cachedInputTokens,
                     cacheWriteInputTokens: row.cacheWriteInputCompleteness == .unknown ? nil : row.cacheWriteInputTokens,
                     outputTokens: row.outputTokens,
-                    model: row.model
+                    price: price
                 )
             }
     }
@@ -809,10 +839,11 @@ public enum UsageAnalytics {
     /// aggregate non-numeric while retaining known model estimates elsewhere.
     public static func costAvailability(_ totals: LocalUsageTotals) -> CostAvailability {
         guard totals.sessionCount > 0 else { return .unknown }
-        guard !totals.models.isEmpty else { return .unavailable }
-        let priced = totals.models.filter { knownPrice(for: $0) != nil }
+        let models = totals.byModel.isEmpty ? totals.models : Array(totals.byModel.keys)
+        guard !models.isEmpty else { return .unavailable }
+        let priced = models.filter { knownPrice(for: $0) != nil }
         if priced.isEmpty { return .unavailable }
-        return priced.count == totals.models.count ? .complete : .partial
+        return priced.count == models.count ? .complete : .partial
     }
 
     /// Consumption rate in percent-of-window per hour, from the oldest to newest sample of one window.

@@ -6,14 +6,16 @@ final class UsageAnalyticsTests: XCTestCase {
         WindowSample(capturedAt: now.addingTimeInterval(-minutesAgo * 60), label: label, usedPercent: used)
     }
 
-    func testPriceMatchesExactAndPrefixAndFallback() {
+    func testPriceMatchesExactModelsAndLegacyFallback() {
         XCTAssertEqual(UsageAnalytics.price(for: "gpt-5").inputPerMillion, 1.25)
         XCTAssertEqual(UsageAnalytics.price(for: "gpt-5-mini").outputPerMillion, 2.0)
         XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6-sol").inputPerMillion, 4.0)
-        XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6").inputPerMillion, 4.0)
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5.6"))
+        XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6"), UsageAnalytics.fallbackPrice)
         XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6-terra").outputPerMillion, 12.0)
         XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6-luna").cachedInputPerMillion, 0.02)
-        XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6-sol-2026-01"), UsageAnalytics.modelPricing["gpt-5.6-sol"])
+        XCTAssertEqual(UsageAnalytics.price(for: "gpt-4o-2024-05-13"), UsageAnalytics.modelPricing["gpt-4o-2024-05-13"])
+        XCTAssertEqual(UsageAnalytics.price(for: "gpt-5.6-sol-2026-01"), UsageAnalytics.fallbackPrice)
         XCTAssertEqual(UsageAnalytics.price(for: "unknown-model"), UsageAnalytics.fallbackPrice)
     }
 
@@ -616,6 +618,107 @@ final class UsageAnalyticsTests: XCTestCase {
         let metrics = UsageAnalytics.capacityMetrics(accounts: [account], scope: .active, now: now)
 
         XCTAssertEqual(try XCTUnwrap(metrics.windows.first).resetAt, reset)
+    }
+
+    func testPublishedGPT6StandardPricesUseExactCanonicalModels() throws {
+        let cases: [(String, ModelPrice, Double)] = [
+            ("gpt-6-astra", ModelPrice(inputPerMillion: 10, cachedInputPerMillion: 1,
+                                      outputPerMillion: 50, cacheWriteInputPerMillion: 12.5), 93.5),
+            ("gpt-6.1-sol", ModelPrice(inputPerMillion: 2, cachedInputPerMillion: 0.1,
+                                      outputPerMillion: 10, cacheWriteInputPerMillion: 2.5), 18.6),
+            ("gpt-6.1-terra", ModelPrice(inputPerMillion: 1, cachedInputPerMillion: 0.05,
+                                        outputPerMillion: 5, cacheWriteInputPerMillion: 1.25), 9.3),
+            ("gpt-6-luna", ModelPrice(inputPerMillion: 0.1, cachedInputPerMillion: 0.01,
+                                     outputPerMillion: 0.5, cacheWriteInputPerMillion: 0.125), 0.935)
+        ]
+        for (model, expectedPrice, expectedCost) in cases {
+            XCTAssertEqual(UsageAnalytics.canonicalModel(for: model), model)
+            XCTAssertEqual(UsageAnalytics.knownPrice(for: model), expectedPrice)
+            XCTAssertEqual(UsageAnalytics.estimatedCost(
+                inputTokens: 5_000_000, cachedInputTokens: 1_000_000,
+                cacheWriteInputTokens: 1_000_000, outputTokens: 1_000_000, model: model
+            ), expectedCost, accuracy: 0.000001)
+            XCTAssertNil(UsageAnalytics.knownPrice(for: model + "-latest"))
+            XCTAssertNil(UsageAnalytics.knownPrice(for: model + "-2026-10-31"))
+        }
+    }
+
+    func testPublishedGPT55PricesAndUnverifiedAliasesRemainDistinct() {
+        let expected = ModelPrice(inputPerMillion: 5, cachedInputPerMillion: 0.5, outputPerMillion: 30)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-5.5"), expected)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-5.5-2026-04-23"), expected)
+        XCTAssertEqual(UsageAnalytics.estimatedCost(
+            inputTokens: 2_000_000, cachedInputTokens: 1_000_000,
+            outputTokens: 1_000_000, model: "gpt-5.5"
+        ), 35.5, accuracy: 0.000001)
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5.5-codex"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5.6"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5.5-2026-04-24"))
+    }
+
+    func testCanonicalModelAndKnownPriceStrictMatching() {
+        // Exact active published models
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-4o")?.inputPerMillion, 2.50)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-4o")?.outputPerMillion, 10.0)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-4o-mini")?.inputPerMillion, 0.15)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "o1")?.inputPerMillion, 15.0)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "o1-mini")?.inputPerMillion, 1.10)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "o3-mini")?.inputPerMillion, 1.10)
+
+        // Explicit verified snapshots with rates distinct from base
+        XCTAssertEqual(UsageAnalytics.canonicalModel(for: "gpt-4o-2024-08-06"), "gpt-4o-2024-08-06")
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-4o-2024-08-06")?.inputPerMillion, 2.50)
+        XCTAssertEqual(UsageAnalytics.canonicalModel(for: "gpt-4o-2024-05-13"), "gpt-4o-2024-05-13")
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-4o-2024-05-13")?.inputPerMillion, 5.00)
+        XCTAssertEqual(UsageAnalytics.knownPrice(for: "gpt-4o-2024-05-13")?.outputPerMillion, 15.0)
+
+        // No broad numeric-suffix or latest guessing: unverified snapshots return nil
+        XCTAssertNil(UsageAnalytics.canonicalModel(for: "gpt-5.6-sol-2026-02-15"))
+        XCTAssertNil(UsageAnalytics.canonicalModel(for: "gpt-5.6-sol-latest"))
+        XCTAssertNil(UsageAnalytics.canonicalModel(for: "gpt-5-20260101"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5.6-sol-2026-02-15"))
+
+        // Unpublished names and unknown variants return nil honestly (no guessed dollars)
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-6"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-6-codex"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5-foo"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5-custom-variant"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "gpt-5.6-sol-preview"))
+        XCTAssertNil(UsageAnalytics.knownPrice(for: "unknown-ai-model"))
+    }
+
+    func testEstimatedCostForStatsSumsOnlyVerifiedPricedContributions() {
+        var stats = UsageStats()
+        stats.totalRequests = 2
+        stats.models = [
+            ModelUsage(model: "gpt-4o", requests: 1, inputTokens: 1_000_000, outputTokens: 100_000),
+            ModelUsage(model: "gpt-6-preview", requests: 1, inputTokens: 1_000_000, outputTokens: 100_000)
+        ]
+        // gpt-4o: 1M in * 2.50 + 0.1M out * 10 = .50 + .00 = .50
+        // gpt-6-preview is unknown and must NOT contribute guessed fallback rates
+        let cost = UsageAnalytics.estimatedCost(stats)
+        XCTAssertEqual(cost, 3.50, accuracy: 1e-6)
+        XCTAssertEqual(UsageAnalytics.costAvailability(stats), .partial)
+    }
+
+    func testLocalUsageTotalsCostAvailabilityMultiModel() {
+        var totals = LocalUsageTotals()
+        totals.sessionCount = 1
+
+        // 1. All models priced -> .complete
+        totals.byModel["gpt-5.6-sol"] = LocalModelUsage(inputTokens: 100, outputTokens: 50)
+        totals.byModel["gpt-4o"] = LocalModelUsage(inputTokens: 200, outputTokens: 20)
+        XCTAssertEqual(UsageAnalytics.costAvailability(totals), .complete)
+
+        // 2. Mixed known and unknown -> .partial
+        totals.byModel["future-unknown-model"] = LocalModelUsage(inputTokens: 50, outputTokens: 10)
+        XCTAssertEqual(UsageAnalytics.costAvailability(totals), .partial)
+
+        // 3. Only unknown -> .unavailable
+        var unpricedTotals = LocalUsageTotals()
+        unpricedTotals.sessionCount = 1
+        unpricedTotals.byModel["future-unknown-model"] = LocalModelUsage(inputTokens: 50, outputTokens: 10)
+        XCTAssertEqual(UsageAnalytics.costAvailability(unpricedTotals), .unavailable)
     }
 }
 
