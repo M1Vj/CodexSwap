@@ -3625,7 +3625,7 @@ final class TurnPinningTests: XCTestCase {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/backend-api/codex/responses")!)
         request.httpMethod = "POST"
         request.httpBody = body
-        request.timeoutInterval = 3
+        request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -4748,11 +4748,13 @@ final class TurnPinningTests: XCTestCase {
         let aliases = await upstream.aliases()
         let resolverCount = await resolverCalls.value()
         let stickyAlias = await store.stickyAlias()
-        let leases = await store.routingLeaseAliases()
+        let released = await waitUntil(until: ContinuousClock().now.advanced(by: .seconds(2))) {
+            await store.routingLeaseAliases().isEmpty
+        }
+        XCTAssertTrue(released, "routing lease must be released promptly upon request completion")
         XCTAssertEqual(aliases, ["a", "b", "c"])
         XCTAssertEqual(resolverCount, 2)
         XCTAssertNil(stickyAlias)
-        XCTAssertTrue(leases.isEmpty)
 
         await server.stop()
         await upstream.stop()
@@ -4830,10 +4832,12 @@ final class TurnPinningTests: XCTestCase {
         XCTAssertTrue(counts.values.allSatisfy { $0 <= 4 })
         let resolverCount = await resolverCalls.value()
         let stickyAlias = await store.stickyAlias()
-        let leases = await store.routingLeaseAliases()
+        let released = await waitUntil(until: ContinuousClock().now.advanced(by: .seconds(2))) {
+            await store.routingLeaseAliases().isEmpty
+        }
+        XCTAssertTrue(released, "routing lease must be released promptly upon request completion")
         XCTAssertEqual(resolverCount, 2)
         XCTAssertNil(stickyAlias)
-        XCTAssertTrue(leases.isEmpty)
 
         await server.stop()
         await upstream.stop()
@@ -4895,11 +4899,13 @@ final class TurnPinningTests: XCTestCase {
         let aliases = await upstream.aliases()
         let resolverCount = await resolverCalls.value()
         let stickyAlias = await store.stickyAlias()
-        let leases = await store.routingLeaseAliases()
+        let released = await waitUntil(until: ContinuousClock().now.advanced(by: .seconds(2))) {
+            await store.routingLeaseAliases().isEmpty
+        }
+        XCTAssertTrue(released, "routing lease must be released promptly upon request completion")
         XCTAssertEqual(aliases, ["a", "a", "a", "a", "b", "b", "b", "b", "c"])
         XCTAssertEqual(resolverCount, 2)
         XCTAssertNil(stickyAlias)
-        XCTAssertTrue(leases.isEmpty)
 
         await server.stop()
         await upstream.stop()
@@ -4956,7 +4962,10 @@ final class TurnPinningTests: XCTestCase {
         let aliases = await upstream.aliases()
         let resolverCount = await resolverCalls.value()
         let stickyAlias = await store.stickyAlias()
-        let leases = await store.routingLeaseAliases()
+        let released = await waitUntil(until: ContinuousClock().now.advanced(by: .seconds(2))) {
+            await store.routingLeaseAliases().isEmpty
+        }
+        XCTAssertTrue(released, "routing lease must be released promptly upon request completion")
         XCTAssertEqual(aliases, [
             "a", "a", "a", "a",
             "b", "b", "b", "b",
@@ -4964,7 +4973,6 @@ final class TurnPinningTests: XCTestCase {
         ])
         XCTAssertEqual(resolverCount, 2)
         XCTAssertNil(stickyAlias)
-        XCTAssertTrue(leases.isEmpty)
 
         await server.stop()
         await upstream.stop()

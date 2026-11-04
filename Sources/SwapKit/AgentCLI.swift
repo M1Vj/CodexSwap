@@ -2020,6 +2020,7 @@ public struct AgentCLI: Sendable {
         "launchAtLogin": .bool,
         "automaticallyWarmAccounts": .bool,
         "automaticallyResetExhaustedAccounts": .bool,
+        "automaticallyResetExpiringCredits": .bool,
         "interactiveExhaustionPolicy": .exhaustionPolicy,
         "notifyOnNeedsLogin": .bool,
         "smartSwitchEnabled": .bool,
@@ -2125,6 +2126,7 @@ public struct AgentCLI: Sendable {
         case "launchAtLogin": return .bool(settings.launchAtLogin)
         case "automaticallyWarmAccounts": return .bool(settings.automaticallyWarmAccounts)
         case "automaticallyResetExhaustedAccounts": return .bool(settings.automaticallyResetExhaustedAccounts)
+        case "automaticallyResetExpiringCredits": return .bool(settings.automaticallyResetExpiringCredits)
         case "interactiveExhaustionPolicy": return .string(settings.interactiveExhaustionPolicy.rawValue)
         case "notifyOnNeedsLogin": return .bool(settings.notifyOnNeedsLogin)
         case "smartSwitchEnabled": return .bool(settings.smartSwitchEnabled)
@@ -2148,6 +2150,7 @@ public struct AgentCLI: Sendable {
         case "launchAtLogin": if case .bool(let value) = value { settings.launchAtLogin = value }
         case "automaticallyWarmAccounts": if case .bool(let value) = value { settings.automaticallyWarmAccounts = value }
         case "automaticallyResetExhaustedAccounts": if case .bool(let value) = value { settings.automaticallyResetExhaustedAccounts = value }
+        case "automaticallyResetExpiringCredits": if case .bool(let value) = value { settings.automaticallyResetExpiringCredits = value }
         case "interactiveExhaustionPolicy":
             if case .string(let raw) = value, let policy = QuotaExhaustionPolicy(rawValue: raw) { settings.interactiveExhaustionPolicy = policy }
         case "notifyOnNeedsLogin": if case .bool(let value) = value { settings.notifyOnNeedsLogin = value }

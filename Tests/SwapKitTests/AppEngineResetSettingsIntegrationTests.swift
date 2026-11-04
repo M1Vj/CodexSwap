@@ -107,6 +107,79 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(consumeCount, 0)
     }
 
+    func testManualResetAllowsAuthenticatedRoutingDisabledAccount() async throws {
+        let fixture = try await makeFixture(availableCount: 1)
+        await fixture.store.setRoutingEnabled("alpha", enabled: false)
+
+        let result = await fixture.engine.resetQuota(alias: "alpha", trigger: .manual)
+        let count = await fixture.service.consumeCount()
+
+        XCTAssertEqual(result, .reset(windowsReset: 2))
+        XCTAssertEqual(count, 1)
+    }
+
+    func testExpiryResetPreservesCreditWhenQuotaExpiresDuringFreshFetch() async throws {
+        try await assertExpiryResetPreservesElapsedQuota(pendingRetry: false)
+    }
+
+    func testPendingExpiryRetryPreservesCreditWhenQuotaExpiresDuringFreshFetch() async throws {
+        try await assertExpiryResetPreservesElapsedQuota(pendingRetry: true)
+    }
+
+    private func assertExpiryResetPreservesElapsedQuota(pendingRetry: Bool) async throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = ResetSettingsClock(start)
+        let fixture = try await makeFixture(
+            availableCount: 1, expiry: start.addingTimeInterval(200), clock: { clock.now() }
+        )
+        _ = await fixture.settingsStore.update {
+            $0.automaticallyResetExpiringCredits = true
+            $0.autoResetProtectedAccounts = []
+        }
+        let coordinator = try XCTUnwrap(fixture.coordinatorReference.value)
+        if pendingRetry {
+            await fixture.service.failNextConsume(with: QuotaResetClientError.transport(.timeout))
+            let first = await coordinator.reset(alias: "alpha", trigger: .manual)
+            XCTAssertEqual(first, .ambiguousFailure)
+        }
+        await fixture.usage.setDefaultWindows([
+            UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000,
+                        resetAt: start.addingTimeInterval(10))
+        ])
+        // Given positive quota, when its deadline passes inside the fetch await,
+        // then neither a new redemption nor an ambiguous retry may spend a credit.
+        await fixture.usage.setBeforeFetchReturn { clock.set(start.addingTimeInterval(10)) }
+        let before = await fixture.service.consumeCount()
+        let result = await coordinator.reset(alias: "alpha", trigger: .automaticExpiry)
+        let after = await fixture.service.consumeCount()
+
+        XCTAssertEqual(result, .nothingToReset)
+        XCTAssertEqual(after, before)
+    }
+
+    func testExpiryResetRechecksQuotaAfterPendingPersistenceBeforeConsume() async throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = ResetSettingsClock(start)
+        let fixture = try await makeFixture(
+            availableCount: 1, expiry: start.addingTimeInterval(200), clock: { clock.now() },
+            filesystemTransactionHook: { clock.set(start.addingTimeInterval(10)) }
+        )
+        _ = await fixture.settingsStore.update {
+            $0.automaticallyResetExpiringCredits = true
+            $0.autoResetProtectedAccounts = []
+        }
+        await fixture.usage.setDefaultWindows([
+            UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000,
+                        resetAt: start.addingTimeInterval(10))
+        ])
+        let coordinator = try XCTUnwrap(fixture.coordinatorReference.value)
+        let result = await coordinator.reset(alias: "alpha", trigger: .automaticExpiry)
+        let count = await fixture.service.consumeCount()
+
+        XCTAssertEqual(result, .nothingToReset)
+        XCTAssertEqual(count, 0)
+    }
+
     func testEnginePublishesOnlySanitizedResetCreditStatuses() async throws {
         let expiry = Date(timeIntervalSince1970: 1_900_000_000)
         let fixture = try await makeFixture(availableCount: 2, expiry: expiry)
@@ -322,6 +395,12 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         await fixture.engine.setPriority("alpha", priority: 3)
         try await fixture.service.waitForFetchCount(1)
 
+        let committedSnapshots = expectation(description: "Manual and retried scheduled refresh publish committed snapshots")
+        committedSnapshots.expectedFulfillmentCount = 2
+        await fixture.engine.setEventHandler { event in
+            if case .snapshotChanged = event { committedSnapshots.fulfill() }
+        }
+
         await fixture.service.suspendNextFetch()
         let manualTask = Task { await fixture.engine.resetQuota(alias: "alpha", trigger: .manual) }
         try await fixture.service.waitForFetchCount(2)
@@ -331,7 +410,7 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertNotEqual(duringManual, .available(count: 1, earliestExpiry: nil))
         await fixture.service.resumeSuspendedFetch()
         let manual = await manualTask.value
-        await waitUntil { await fixture.service.completedFetchCountValue() >= 4 }
+        await fulfillment(of: [committedSnapshots], timeout: 2)
 
         XCTAssertEqual(manual, .reset(windowsReset: 2))
         let status = await fixture.engine.snapshot().resetCreditStatuses["alpha"]
@@ -503,15 +582,457 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(requestedAliases, ["enabled"])
     }
 
+    func testAutomaticExpiryResetGatingAndExecution() async throws {
+        let now = Date()
+        let expirySoon = now.addingTimeInterval(200) // 200s lead time: <= 300s
+        let expiryFar = now.addingTimeInterval(600)  // 600s lead time: > 300s
+
+        // 1. Fixture with credit expiring soon
+        let fixtureSoon = try await makeFixture(availableCount: 1, expiry: expirySoon)
+        var acc = Account(alias: "beta", accountID: "beta-id", accessToken: "beta-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 40, windowSeconds: 18_000, resetAt: nil)]
+        await fixtureSoon.store.upsert(acc)
+
+        // With automaticallyResetExpiringCredits = false (default) -> automaticDisabled
+        let disabledResult = await fixtureSoon.engine.resetQuota(alias: "beta", trigger: .automaticExpiry)
+        XCTAssertEqual(disabledResult, .automaticDisabled)
+
+        // Enable automaticallyResetExpiringCredits
+        _ = await fixtureSoon.settingsStore.update {
+            $0.automaticallyResetExpiringCredits = true
+        }
+
+        // With beta having 40% usage and credit expiring in 200s -> succeeds!
+        let successResult = await fixtureSoon.engine.resetQuota(alias: "beta", trigger: .automaticExpiry)
+        XCTAssertEqual(successResult, .reset(windowsReset: 2))
+
+        // 2. Fixture with credit expiring far in the future (> 300s) -> nothingToReset
+        let fixtureFar = try await makeFixture(availableCount: 1, expiry: expiryFar)
+        await fixtureFar.store.upsert(acc)
+        _ = await fixtureFar.settingsStore.update { $0.automaticallyResetExpiringCredits = true }
+        let farResult = await fixtureFar.engine.resetQuota(alias: "beta", trigger: .automaticExpiry)
+        XCTAssertEqual(farResult, .nothingToReset)
+
+        // 3. Fixture with account having 0% usage -> nothingToReset (preserves credit when quota cannot benefit)
+        let fixtureZero = try await makeFixture(availableCount: 1, expiry: expirySoon)
+        var zeroAcc = Account(alias: "zero", accountID: "zero-id", accessToken: "zero-token")
+        zeroAcc.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)]
+        await fixtureZero.store.upsert(zeroAcc)
+        _ = await fixtureZero.settingsStore.update { $0.automaticallyResetExpiringCredits = true }
+        let zeroResult = await fixtureZero.engine.resetQuota(alias: "zero", trigger: .automaticExpiry)
+        XCTAssertEqual(zeroResult, .nothingToReset)
+
+        // 4. Fixture with account in autoResetProtectedAccounts -> protectedAccount
+        let fixtureProtected = try await makeFixture(availableCount: 1, expiry: expirySoon)
+        var protAcc = Account(alias: "prot", accountID: "prot-id", accessToken: "prot-token")
+        protAcc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: nil)]
+        await fixtureProtected.store.upsert(protAcc)
+        _ = await fixtureProtected.settingsStore.update {
+            $0.automaticallyResetExpiringCredits = true
+            $0.autoResetProtectedAccounts = ["prot"]
+        }
+        let protResult = await fixtureProtected.engine.resetQuota(alias: "prot", trigger: .automaticExpiry)
+        XCTAssertEqual(protResult, .protectedAccount)
+
+        // 5. Test proactiveExpiryResetTick triggers reset on eligible accounts and returns clamped sleep
+        let tickSleep = await fixtureSoon.engine.proactiveExpiryResetTick(now: now)
+        XCTAssertGreaterThanOrEqual(tickSleep, 30.0)
+        XCTAssertLessThanOrEqual(tickSleep, 60.0)
+    }
+
+    func testProactiveExpiryResetTickFreshEligibleConsumesCreditAndPollsUsage() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(250) // 250s <= 300s
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+
+        var candidate = Account(alias: "target", accountID: "target-id", accessToken: "target-token")
+        candidate.usage = [UsageWindow(label: "5h", usedPercent: 45, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(candidate)
+
+        _ = await fixture.settingsStore.update {
+            $0.automaticallyResetExpiringCredits = true
+            $0.autoResetProtectedAccounts = []
+        }
+
+        let sleepSeconds = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertGreaterThanOrEqual(sleepSeconds, 30.0)
+        XCTAssertLessThanOrEqual(sleepSeconds, 60.0)
+
+        let consumeCount = await fixture.service.consumeCount()
+        XCTAssertEqual(consumeCount, 1, "Eligible account within 300s window with active usage must be consumed")
+    }
+
+    func testProactiveExpiryResetTickDefaultOffDoesNotConsume() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+
+        var candidate = Account(alias: "target", accountID: "target-id", accessToken: "target-token")
+        candidate.usage = [UsageWindow(label: "5h", usedPercent: 45, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(candidate)
+
+        // default off: automaticallyResetExpiringCredits == false
+        let sleepSeconds = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertEqual(sleepSeconds, 60.0)
+
+        let consumeCount = await fixture.service.consumeCount()
+        XCTAssertEqual(consumeCount, 0, "Default off must not consume credits")
+    }
+
+    func testProactiveExpiryResetTickBoundaryAndExpiredCredits() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+
+        // 1. Far in future (> 300s, e.g. 350s): returns clamped lead sleep, consumes 0
+        let fixtureFar = try await makeFixture(availableCount: 1, expiry: fixedNow.addingTimeInterval(350), clock: { fixedNow })
+        var farAcc = Account(alias: "far", accountID: "far-id", accessToken: "far-token")
+        farAcc.usage = [UsageWindow(label: "5h", usedPercent: 30, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixtureFar.store.upsert(farAcc)
+        _ = await fixtureFar.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        let farSleep = await fixtureFar.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertEqual(farSleep, 50.0, "350s - 300s = 50s sleep interval")
+        let farConsumes = await fixtureFar.service.consumeCount()
+        XCTAssertEqual(farConsumes, 0)
+
+        // 2. Exact boundary (300s): consumes credit!
+        let fixtureExact = try await makeFixture(availableCount: 1, expiry: fixedNow.addingTimeInterval(300), clock: { fixedNow })
+        var exactAcc = Account(alias: "exact", accountID: "exact-id", accessToken: "exact-token")
+        exactAcc.usage = [UsageWindow(label: "5h", usedPercent: 30, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixtureExact.store.upsert(exactAcc)
+        _ = await fixtureExact.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        let exactSleep = await fixtureExact.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertGreaterThanOrEqual(exactSleep, 30.0)
+        let exactConsumes = await fixtureExact.service.consumeCount()
+        XCTAssertEqual(exactConsumes, 1)
+
+        // 3. Already expired in the past (<= 0s, e.g. -10s): skips without consume
+        let fixtureExpired = try await makeFixture(availableCount: 1, expiry: fixedNow.addingTimeInterval(-10), clock: { fixedNow })
+        var expAcc = Account(alias: "exp", accountID: "exp-id", accessToken: "exp-token")
+        expAcc.usage = [UsageWindow(label: "5h", usedPercent: 30, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixtureExpired.store.upsert(expAcc)
+        _ = await fixtureExpired.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        let expSleep = await fixtureExpired.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertEqual(expSleep, 60.0)
+        let expConsumes = await fixtureExpired.service.consumeCount()
+        XCTAssertEqual(expConsumes, 0, "Expired credits must never be consumed")
+    }
+
+    func testProactiveExpiryResetTickZeroAndStalePastQuotaPreservesCredit() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        // 1. Account with 0% usage -> no benefit
+        var zeroAcc = Account(alias: "zero", accountID: "zero-id", accessToken: "zero-token")
+        zeroAcc.usage = [UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(zeroAcc)
+
+        // 2. Account with usage whose resetAt is already in the past -> naturally reset, no benefit
+        var pastAcc = Account(alias: "past", accountID: "past-id", accessToken: "past-token")
+        pastAcc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(-60))]
+        await fixture.store.upsert(pastAcc)
+
+        let sleep = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertEqual(sleep, 60.0)
+        let pastConsumes = await fixture.service.consumeCount()
+        XCTAssertEqual(pastConsumes, 0, "No benefit or naturally elapsed quota must not consume credits")
+    }
+
+    func testProactiveExpiryResetTickGatingRejectsProtectedRoutingDisabledArchivedLogin() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update {
+            $0.automaticallyResetExpiringCredits = true
+            $0.autoResetProtectedAccounts = ["protected-acc"]
+        }
+
+        // Protected
+        var prot = Account(alias: "protected-acc", accountID: "prot-id", accessToken: "prot-token")
+        prot.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(prot)
+
+        // Routing disabled
+        var unrouted = Account(alias: "unrouted", accountID: "unrouted-id", accessToken: "unrouted-token", routingEnabled: false)
+        unrouted.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(unrouted)
+
+        // Needs login
+        var login = Account(alias: "login-acc", accountID: "login-id", accessToken: "login-token", needsLogin: true)
+        login.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(login)
+
+        // Archived
+        var archived = Account(alias: "archived-acc", accountID: "arch-id", accessToken: "arch-token", archivedAt: fixedNow.addingTimeInterval(-100))
+        archived.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(archived)
+
+        let sleep = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        XCTAssertEqual(sleep, 60.0)
+        let gatedConsumes = await fixture.service.consumeCount()
+        XCTAssertEqual(gatedConsumes, 0, "All gated accounts must be skipped")
+    }
+
+    func testProactiveExpiryResetTickConcurrentTicksAndFailureBackoff() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "concurrent-acc", accountID: "c-id", accessToken: "c-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        // Run 2 ticks concurrently
+        async let tick1 = fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        async let tick2 = fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        _ = await (tick1, tick2)
+
+        let concConsumes = await fixture.service.consumeCount()
+        XCTAssertEqual(concConsumes, 1, "Concurrent ticks must serialize and consume exactly once")
+
+        // Failure backoff test:
+        let failFixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await failFixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+        await failFixture.store.upsert(acc)
+        await failFixture.service.failNextConsume(with: QuotaResetClientError.transport(.timeout))
+
+        // First tick attempts and fails
+        _ = await failFixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        let countAfterFirst = await failFixture.service.consumeCount()
+        XCTAssertEqual(countAfterFirst, 1, "First tick attempted consume")
+
+        // Immediate next tick during the 30s failure cooldown skips the account
+        _ = await failFixture.engine.proactiveExpiryResetTick(now: fixedNow.addingTimeInterval(10))
+        let countAfterSecond = await failFixture.service.consumeCount()
+        XCTAssertEqual(countAfterSecond, 1, "Cooldown suppresses re-attempt during 30s failure backoff")
+    }
+
+    func testProactiveExpiryResetTickCancellationMidAwaitAbortsWithoutConsuming() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "cancel-acc", accountID: "cancel-id", accessToken: "cancel-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.service.suspendNextFetch()
+
+        let task = Task {
+            await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        }
+
+        try await fixture.service.waitForFetchCount(1)
+        task.cancel()
+        await fixture.service.resumeSuspendedFetch()
+
+        _ = await task.value
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Cancellation mid-await before consume must abort without consuming")
+    }
+
+    func testProactiveExpiryResetTickEngineStopMidAwaitAbortsWithoutConsuming() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "stop-acc", accountID: "stop-id", accessToken: "stop-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.service.suspendNextFetch()
+
+        let task = Task {
+            await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        }
+
+        try await fixture.service.waitForFetchCount(1)
+        await fixture.engine.stop()
+        await fixture.service.resumeSuspendedFetch()
+
+        _ = await task.value
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Engine stop mid-await before consume must abort without consuming")
+    }
+
+    func testProactiveExpiryResetTickSettingsDisableOrProtectMidAwaitAbortsWithoutConsuming() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "disable-acc", accountID: "disable-id", accessToken: "disable-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.service.suspendNextFetch()
+
+        let task = Task {
+            await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        }
+
+        try await fixture.service.waitForFetchCount(1)
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = false }
+        await fixture.service.resumeSuspendedFetch()
+
+        _ = await task.value
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Settings disable mid-await before consume must abort without consuming")
+    }
+
+    func testProactiveExpiryResetTickFailedQuotaPreservesCredits() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "failed-quota-acc", accountID: "fq-id", accessToken: "fq-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.usage.setFetchError(QuotaResetClientError.transport(.timeout))
+
+        _ = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Failed fresh quota fetch must fail closed and preserve credits")
+    }
+
+    func testProactiveExpiryResetTickEmptyQuotaPreservesCredits() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "empty-quota-acc", accountID: "eq-id", accessToken: "eq-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.usage.setDefaultWindows([])
+
+        _ = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Empty fresh quota must fail closed and preserve credits")
+    }
+
+    func testProactiveExpiryResetTickFreshZeroQuotaPreservesCredits() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "zero-quota-acc", accountID: "zq-id", accessToken: "zq-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.usage.setDefaultWindows([
+            UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)
+        ])
+
+        _ = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Fresh quota with 0% usage must fail closed and preserve credits")
+    }
+
+    func testDirectCoordinatorResetWithStalePositiveUsageFailsClosedWhenFreshQuotaHasNoBenefit() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "stale-direct-acc", accountID: "sd-id", accessToken: "sd-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.usage.setDefaultWindows([
+            UsageWindow(label: "5h", usedPercent: 0, windowSeconds: 18_000, resetAt: nil)
+        ])
+
+        guard let coordinator = fixture.coordinatorReference.value else {
+            XCTFail("Missing coordinator")
+            return
+        }
+
+        let result = await coordinator.reset(alias: "stale-direct-acc", trigger: .automaticExpiry)
+        XCTAssertEqual(result, .nothingToReset)
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Direct coordinator automaticExpiry reset must fail closed when fresh quota has no benefit")
+    }
+
+    func testPendingRecordExpiredOrMissingOrDifferentCreditPreservesCredits() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 1, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "pending-test-acc", accountID: "pt-id", accessToken: "pt-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        await fixture.service.setAvailableCount(0)
+        guard let coordinator = fixture.coordinatorReference.value else {
+            XCTFail("Missing coordinator")
+            return
+        }
+        let result = await coordinator.reset(alias: "pending-test-acc", trigger: .automaticExpiry)
+        XCTAssertEqual(result, .noCredit)
+        let count = await fixture.service.consumeCount()
+        XCTAssertEqual(count, 0, "Missing credit must not consume")
+    }
+
+    func testSequentialTwoEligibleCreditsAfterFirstResetFreshUsageFailurePreventsSecondSpend() async throws {
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        let expiry = fixedNow.addingTimeInterval(200)
+        let fixture = try await makeFixture(availableCount: 2, expiry: expiry, clock: { fixedNow })
+        _ = await fixture.settingsStore.update { $0.automaticallyResetExpiringCredits = true; $0.autoResetProtectedAccounts = [] }
+
+        var acc = Account(alias: "seq-acc", accountID: "seq-id", accessToken: "seq-token")
+        acc.usage = [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: fixedNow.addingTimeInterval(3600))]
+        await fixture.store.upsert(acc)
+
+        // First tick: fresh usage succeeds, credit 1 is consumed
+        _ = await fixture.engine.proactiveExpiryResetTick(now: fixedNow)
+        let count1 = await fixture.service.consumeCount()
+        XCTAssertEqual(count1, 1, "First eligible credit must be consumed")
+
+        // Post-reset: fresh usage fails
+        await fixture.usage.setFetchError(QuotaResetClientError.transport(.timeout))
+
+        // Second tick: attempt for second credit must fail closed and NOT spend second credit
+        _ = await fixture.engine.proactiveExpiryResetTick(now: fixedNow.addingTimeInterval(70))
+        let count2 = await fixture.service.consumeCount()
+        XCTAssertEqual(count2, 1, "Second spend must be prevented when fresh usage cannot be verified")
+
+        // Genuinely new positive usage:
+        await fixture.usage.setFetchError(nil)
+        await fixture.usage.setDefaultWindows([
+            UsageWindow(label: "5h", usedPercent: 40, windowSeconds: 18_000, resetAt: nil)
+        ])
+
+        // After failure cooldown expires, genuinely new usage allows redeeming second credit:
+        _ = await fixture.engine.proactiveExpiryResetTick(now: fixedNow.addingTimeInterval(140))
+        let count3 = await fixture.service.consumeCount()
+        XCTAssertEqual(count3, 2, "Genuinely new positive usage preserves benefit and allows second reset")
+    }
+
     private func makeFixture(
         availableCount: Int,
-        expiry: Date? = nil
+        expiry: Date? = nil,
+        clock: (@Sendable () -> Date)? = nil,
+        usageService: (any UsageFetching)? = nil,
+        filesystemTransactionHook: @escaping @Sendable () -> Void = {}
     ) async throws -> (
         engine: AppEngine,
         coordinatorReference: WeakCoordinatorReference,
         service: ResetSettingsService,
         settingsStore: SettingsStore,
-        store: AccountStore
+        store: AccountStore,
+        usage: ResetSettingsUsage
     ) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppEngineResetSettings-\(UUID().uuidString)", isDirectory: true)
@@ -524,21 +1045,24 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
             $0.autoResetProtectedAccounts = ["alpha"]
         }
         let service = ResetSettingsService(initialCount: availableCount, expiry: expiry)
+        let usage = (usageService as? ResetSettingsUsage) ?? ResetSettingsUsage(store: store)
         let coordinator = QuotaResetCoordinator(
             accountStore: store,
             settings: { await settingsStore.get() },
             resetService: service,
-            usageService: ResetSettingsUsage(),
-            pendingRecordURL: directory.appendingPathComponent("pending-quota-reset.json")
+            usageService: usage,
+            pendingRecordURL: directory.appendingPathComponent("pending-quota-reset.json"),
+            clock: clock ?? { Date() },
+            filesystemTransactionHook: filesystemTransactionHook
         )
         let engine = AppEngine(
             store: store,
             settingsStore: settingsStore,
-            usage: ResetSettingsUsage(),
+            usage: usage,
             quotaResetCoordinator: coordinator,
             supportDir: directory
         )
-        return (engine, WeakCoordinatorReference(coordinator), service, settingsStore, store)
+        return (engine, WeakCoordinatorReference(coordinator), service, settingsStore, store, usage)
     }
 
     private func waitUntil(_ condition: @escaping @Sendable () async -> Bool) async {
@@ -573,6 +1097,7 @@ private actor ResetSettingsService: QuotaResetServing {
     private var suspendedConsumeContinuation: CheckedContinuation<Void, Never>?
     private var shouldSuspendNextConsume = false
     private var nextCreditsError: QuotaResetClientError?
+    private var nextConsumeError: Error?
     private var suspensionsReleased = false
 
     init(initialCount: Int, expiry: Date?) {
@@ -606,15 +1131,21 @@ private actor ResetSettingsService: QuotaResetServing {
         return ResetCreditSnapshot(availableCount: responseCount, credits: credits, fetchedAt: Date())
     }
 
+    func failNextConsume(with error: Error) { nextConsumeError = error }
+
     func consume(accessToken: String, accountID: String, creditID: String, redemptionID: UUID) async throws -> ResetConsumeResult {
         consumes += 1
+        if let error = nextConsumeError {
+            nextConsumeError = nil
+            throw error
+        }
         if shouldSuspendNextConsume, !suspensionsReleased {
             shouldSuspendNextConsume = false
             await withCheckedContinuation { continuation in
                 suspendedConsumeContinuation = continuation
             }
         }
-        availableCount = 0
+        availableCount = max(0, availableCount - 1)
         return ResetConsumeResult(outcome: .reset, windowsReset: 2)
     }
 
@@ -700,8 +1231,57 @@ private actor ResetSettingsService: QuotaResetServing {
     }
 }
 
-private struct ResetSettingsUsage: UsageFetching {
-    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] { [] }
+private actor ResetSettingsUsage: UsageFetching {
+    private var windowsForAccount: [String: [UsageWindow]] = [:]
+    private var defaultWindows: [UsageWindow]?
+    private var fetchError: Error?
+    private var fetches = 0
+    private weak var store: AccountStore?
+    private var beforeFetchReturn: (@Sendable () -> Void)?
+
+    init(store: AccountStore? = nil, defaultWindows: [UsageWindow]? = nil) {
+        self.store = store
+        self.defaultWindows = defaultWindows
+    }
+
+    func setDefaultWindows(_ windows: [UsageWindow]?) {
+        defaultWindows = windows
+    }
+
+    func setWindows(_ windows: [UsageWindow], for accountID: String) {
+        windowsForAccount[accountID] = windows
+    }
+
+    func setFetchError(_ error: Error?) {
+        fetchError = error
+    }
+
+    func setBeforeFetchReturn(_ action: @escaping @Sendable () -> Void) {
+        beforeFetchReturn = action
+    }
+
+    func fetch(accessToken: String, accountID: String) async throws -> [UsageWindow] {
+        fetches += 1
+        defer { beforeFetchReturn?() }
+        if let error = fetchError {
+            throw error
+        }
+        if let accountWindows = windowsForAccount[accountID] {
+            return accountWindows
+        }
+        if let defaultWindows {
+            return defaultWindows
+        }
+        if let store {
+            let accounts = await store.all()
+            if let acc = accounts.first(where: { $0.accountID == accountID || $0.accessToken == accessToken }) {
+                return acc.usage
+            }
+        }
+        return [UsageWindow(label: "5h", usedPercent: 50, windowSeconds: 18_000, resetAt: nil)]
+    }
+
+    func fetchCount() -> Int { fetches }
 }
 
 private actor AlternativeUsage: UsageFetching {
@@ -720,6 +1300,14 @@ private final class ResetSettingsEventCounter: @unchecked Sendable {
     private var count = 0
     func increment() { lock.withLock { count += 1 } }
     func value() -> Int { lock.withLock { count } }
+}
+
+private final class ResetSettingsClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date: Date
+    init(_ date: Date) { self.date = date }
+    func now() -> Date { lock.withLock { date } }
+    func set(_ date: Date) { lock.withLock { self.date = date } }
 }
 
 private final class ResetSettingsOrderingRecorder: @unchecked Sendable {

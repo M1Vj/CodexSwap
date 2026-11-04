@@ -41,6 +41,10 @@ struct QuotaResetsSettingsView: View {
                 Text("Per-account protection in Accounts prevents automatic resets only; manual reset remains available.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                Toggle("Automatically use reset credits before expiry", isOn: automaticExpiryResetBinding)
+                Text("Automatically redeems available reset credits ~5 minutes before they expire, provided the account has active usage that can benefit.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 Picker("Interactive exhaustion policy", selection: interactivePolicyBinding) {
                     ExhaustionPolicyChoices()
                 }
@@ -68,6 +72,10 @@ struct QuotaResetsSettingsView: View {
 
     private var automaticResetBinding: Binding<Bool> {
         Binding(get: { model.settings.automaticallyResetExhaustedAccounts }, set: { model.actions.setAutomaticReset($0) })
+    }
+
+    private var automaticExpiryResetBinding: Binding<Bool> {
+        Binding(get: { model.settings.automaticallyResetExpiringCredits }, set: { model.actions.setAutomaticExpiryReset($0) })
     }
 
     private var interactivePolicyBinding: Binding<QuotaExhaustionPolicy> {

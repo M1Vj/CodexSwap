@@ -42,6 +42,23 @@ public struct ResetCreditSnapshot: Sendable, Equatable {
         }
     }
 
+    public func earliestUnexpiredAvailable(now: Date = Date()) -> ResetCredit? {
+        credits.filter { credit in
+            guard credit.isAvailable else { return false }
+            if let expiresAt = credit.expiresAt {
+                return expiresAt > now
+            }
+            return true
+        }.min { lhs, rhs in
+            switch (lhs.expiresAt, rhs.expiresAt) {
+            case let (left?, right?): left == right ? lhs.id < rhs.id : left < right
+            case (_?, nil): true
+            case (nil, _?): false
+            case (nil, nil): lhs.id < rhs.id
+            }
+        }
+    }
+
     public init(availableCount: Int, totalEarnedCount: Int? = nil, credits: [ResetCredit], fetchedAt: Date) {
         self.availableCount = availableCount
         self.totalEarnedCount = totalEarnedCount

@@ -5,7 +5,7 @@ import Darwin
 import Glibc
 #endif
 
-public enum ResetTrigger: Sendable, Equatable { case manual, automatic }
+public enum ResetTrigger: Sendable, Equatable { case manual, automatic, automaticExpiry }
 
 public enum ResetAttemptResult: Sendable, Equatable {
     case reset(windowsReset: Int)
@@ -53,6 +53,7 @@ public actor QuotaResetCoordinator {
     private var statuses: [String: QuotaResetCoordinatorStatus] = [:]
     private var inFlight: [String: Task<ResetAttemptResult, Never>] = [:]
     private var latestRefreshGeneration: UInt64 = 0
+    private var admissionClosed = false
 
     public init(
         accountStore: AccountStore,
@@ -79,8 +80,20 @@ public actor QuotaResetCoordinator {
         self.pending = Self.loadPending(from: pendingRecordURL)
     }
 
+    public func currentClockDate() -> Date { clock() }
     public func cachedCreditSnapshots() -> [String: ResetCreditSnapshot] { snapshots }
     public func cachedStatuses() -> [String: QuotaResetCoordinatorStatus] { statuses }
+
+    public func closeAdmission() {
+        admissionClosed = true
+        for operation in inFlight.values {
+            operation.cancel()
+        }
+    }
+
+    public func openAdmission() {
+        admissionClosed = false
+    }
 
     public func waitForInFlightResets() async {
         let operations = Array(inFlight.values)
@@ -114,21 +127,27 @@ public actor QuotaResetCoordinator {
         for account in selected {
             guard let fresh = await accountStore.hydrateFromManagedHome(account.alias), !fresh.accessToken.isEmpty else {
                 failureCount += 1
-                if refreshGeneration == latestRefreshGeneration { statuses[account.alias] = .failed }
+                statuses[account.alias] = .failed
+                snapshots.removeValue(forKey: account.alias)
                 continue
             }
-            if refreshGeneration == latestRefreshGeneration { statuses[account.alias] = .refreshing }
+            statuses[account.alias] = .refreshing
             do {
                 let snapshot = try await resetService.credits(accessToken: fresh.accessToken, accountID: fresh.accountID)
-                guard refreshGeneration == latestRefreshGeneration else { continue }
-                snapshots[account.alias] = snapshot
-                statuses[account.alias] = .ready
+                if refreshGeneration == latestRefreshGeneration {
+                    snapshots[account.alias] = snapshot
+                    statuses[account.alias] = .ready
+                }
             } catch {
                 failureCount += 1
-                if refreshGeneration == latestRefreshGeneration { statuses[account.alias] = .failed }
+                if refreshGeneration == latestRefreshGeneration {
+                    statuses[account.alias] = .failed
+                    snapshots.removeValue(forKey: account.alias)
+                }
             }
         }
         let isCurrent = refreshGeneration == latestRefreshGeneration
+        let success = failureCount == 0
         let outcome: DiagnosticOutcome
         let code: DiagnosticCode
         if !isCurrent {
@@ -151,7 +170,7 @@ public actor QuotaResetCoordinator {
             durationMilliseconds: Self.diagnosticsDurationMilliseconds(since: startedAt),
             count: selected.count
         )
-        return isCurrent
+        return isCurrent && success
     }
 
     public func reset(alias: String, trigger: Trigger, generation: UInt64? = nil) async -> ResetAttemptResult {
@@ -163,6 +182,11 @@ public actor QuotaResetCoordinator {
             outcome: .started,
             correlationID: correlationID
         )
+        guard !admissionClosed, !Task.isCancelled else {
+            let result: ResetAttemptResult = .cancelled
+            recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+            return result
+        }
         // Keep direct reset callers on the same archive boundary as the poller.
         _ = await accountStore.archiveDueAccounts()
         let normalizedAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -176,14 +200,27 @@ public actor QuotaResetCoordinator {
             recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
             return result
         }
-        if trigger == .automatic {
+        if trigger == .automatic || trigger == .automaticExpiry {
             let current = await settings()
-            guard current.automaticallyResetExhaustedAccounts else {
-                let result: ResetAttemptResult = .automaticDisabled
+            if trigger == .automatic {
+                guard current.automaticallyResetExhaustedAccounts else {
+                    let result: ResetAttemptResult = .automaticDisabled
+                    recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+                    return result
+                }
+            } else if trigger == .automaticExpiry {
+                guard current.automaticallyResetExpiringCredits else {
+                    let result: ResetAttemptResult = .automaticDisabled
+                    recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
+                    return result
+                }
+            }
+            guard currentAccount.routingEnabled else {
+                let result: ResetAttemptResult = .accountUnavailable
                 recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
                 return result
             }
-            guard currentAccount.routingEnabled else {
+            guard !currentAccount.needsLogin else {
                 let result: ResetAttemptResult = .accountUnavailable
                 recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
                 return result
@@ -196,7 +233,11 @@ public actor QuotaResetCoordinator {
             }
         }
         if let operation = inFlight[normalizedAlias] {
-            let result = await operation.value
+            let result = await withTaskCancellationHandler {
+                await operation.value
+            } onCancel: {
+                operation.cancel()
+            }
             diagnosticsLog.record(
                 component: .quota,
                 operation: .reset,
@@ -210,15 +251,20 @@ public actor QuotaResetCoordinator {
         }
         let operationGeneration = generation ?? reserveOperationGeneration()
         latestRefreshGeneration = max(latestRefreshGeneration, operationGeneration)
-        let operation = Task { await self.performReset(alias: normalizedAlias, generation: operationGeneration) }
+        let operation = Task { await self.performReset(alias: normalizedAlias, trigger: trigger, generation: operationGeneration) }
         inFlight[normalizedAlias] = operation
-        let result = await operation.value
+        let result = await withTaskCancellationHandler {
+            await operation.value
+        } onCancel: {
+            operation.cancel()
+        }
         inFlight.removeValue(forKey: normalizedAlias)
         recordResetResult(result, correlationID: correlationID, startedAt: startedAt)
         return result
     }
 
-    private func performReset(alias normalizedAlias: String, generation: UInt64) async -> ResetAttemptResult {
+    private func performReset(alias normalizedAlias: String, trigger: Trigger, generation: UInt64) async -> ResetAttemptResult {
+        guard !admissionClosed, !Task.isCancelled else { return .cancelled }
         guard let account = await accountStore.hydrateFromManagedHome(normalizedAlias),
               !account.isArchived,
               !account.accessToken.isEmpty else {
@@ -226,27 +272,65 @@ public actor QuotaResetCoordinator {
         }
 
         let record: PendingRecord
+        let selectedCredit: ResetCredit
+        var expiryUsageWindows: [UsageWindow] = []
+
         if let existing = pending[normalizedAlias] {
-            switch await reconcile(existing, account: account, generation: generation) {
-            case .available: break
-            case .unavailable:
+            let fresh: ResetCreditSnapshot
+            do {
+                fresh = try await resetService.credits(accessToken: account.accessToken, accountID: account.accountID)
+                snapshots[normalizedAlias] = fresh
+                statuses[normalizedAlias] = .ready
+            } catch is CancellationError {
+                return .cancelled
+            } catch {
+                statuses[normalizedAlias] = .failed
+                return .ambiguousFailure
+            }
+
+            guard !admissionClosed, !Task.isCancelled else { return .cancelled }
+
+            guard let matching = fresh.credits.first(where: { $0.id == existing.creditID && $0.isAvailable }) else {
                 _ = clearPending(alias: normalizedAlias)
                 return .alreadyRedeemed
-            case .failed: return .ambiguousFailure
-            case .cancelled: return .cancelled
             }
+
+            let now = clock()
+            if trigger == .automaticExpiry {
+                guard let expiresAt = matching.expiresAt else { return .nothingToReset }
+                let leadTime = expiresAt.timeIntervalSince(now)
+                guard leadTime > 0 && leadTime <= 300 else { return .nothingToReset }
+
+                let usageWindows: [UsageWindow]
+                do {
+                    usageWindows = try await usageService.fetch(accessToken: account.accessToken, accountID: account.accountID)
+                } catch is CancellationError {
+                    return .cancelled
+                } catch {
+                    return .networkFailure
+                }
+                guard !usageWindows.isEmpty else { return .nothingToReset }
+                await accountStore.updateUsage(normalizedAlias, windows: usageWindows)
+                expiryUsageWindows = usageWindows
+                let benefitNow = clock()
+                let hasBenefit = usageWindows.contains { w in
+                    w.usedPercent > 0 && (w.resetAt == nil || w.resetAt! > benefitNow)
+                }
+                guard hasBenefit else { return .nothingToReset }
+            }
+
             record = existing
+            selectedCredit = matching
         } else {
             let fresh: ResetCreditSnapshot
             do {
                 fresh = try await resetService.credits(accessToken: account.accessToken, accountID: account.accountID)
-                if generation == latestRefreshGeneration {
-                    snapshots[normalizedAlias] = fresh
-                    statuses[normalizedAlias] = .ready
-                }
-            } catch is CancellationError { return .cancelled }
-            catch let error as QuotaResetClientError {
-                if generation == latestRefreshGeneration { statuses[normalizedAlias] = .failed }
+                snapshots[normalizedAlias] = fresh
+                statuses[normalizedAlias] = .ready
+            } catch is CancellationError {
+                return .cancelled
+            } catch let error as QuotaResetClientError {
+                statuses[normalizedAlias] = .failed
                 switch error {
                 case .unauthorized: return .authorizationFailed
                 case .httpStatus(let status) where status == 401 || status == 403: return .authorizationFailed
@@ -254,23 +338,94 @@ public actor QuotaResetCoordinator {
                 default: return .failed
                 }
             } catch {
-                if generation == latestRefreshGeneration { statuses[normalizedAlias] = .failed }
+                statuses[normalizedAlias] = .failed
                 return .failed
             }
-            guard let credit = fresh.earliestAvailable else { return .noCredit }
+
+            guard !admissionClosed, !Task.isCancelled else { return .cancelled }
+
+            let now = clock()
+            guard let credit = fresh.earliestUnexpiredAvailable(now: now) else { return .noCredit }
+            if trigger == .automaticExpiry {
+                guard let expiresAt = credit.expiresAt else { return .nothingToReset }
+                let leadTime = expiresAt.timeIntervalSince(now)
+                guard leadTime > 0 && leadTime <= 300 else { return .nothingToReset }
+
+                let usageWindows: [UsageWindow]
+                do {
+                    usageWindows = try await usageService.fetch(accessToken: account.accessToken, accountID: account.accountID)
+                } catch is CancellationError {
+                    return .cancelled
+                } catch {
+                    return .networkFailure
+                }
+                guard !usageWindows.isEmpty else { return .nothingToReset }
+                await accountStore.updateUsage(normalizedAlias, windows: usageWindows)
+                expiryUsageWindows = usageWindows
+                let benefitNow = clock()
+                let hasBenefit = usageWindows.contains { w in
+                    w.usedPercent > 0 && (w.resetAt == nil || w.resetAt! > benefitNow)
+                }
+                guard hasBenefit else { return .nothingToReset }
+            }
+
+            selectedCredit = credit
             record = PendingRecord(alias: normalizedAlias, redemptionID: uuid(), creditID: credit.id, createdAt: clock())
+        }
+
+        // Pre-redemption fresh policy & cancellation checks:
+        guard !admissionClosed, !Task.isCancelled else { return .cancelled }
+        guard let currentAccount = await accountStore.hydrateFromManagedHome(normalizedAlias),
+              !currentAccount.isArchived,
+              !currentAccount.accessToken.isEmpty else {
+            return .accountUnavailable
+        }
+        if trigger == .automatic || trigger == .automaticExpiry {
+            guard currentAccount.routingEnabled, !currentAccount.needsLogin else { return .accountUnavailable }
+            let current = await settings()
+            if trigger == .automatic {
+                guard current.automaticallyResetExhaustedAccounts else { return .automaticDisabled }
+            } else if trigger == .automaticExpiry {
+                guard current.automaticallyResetExpiringCredits else { return .automaticDisabled }
+            }
+            let protected = Set(current.autoResetProtectedAccounts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+            guard !protected.contains(normalizedAlias.lowercased()) else { return .protectedAccount }
+        }
+
+        guard !admissionClosed, !Task.isCancelled else { return .cancelled }
+
+        if pending[normalizedAlias] == nil {
             var candidate = pending
             candidate[normalizedAlias] = record
             guard persistPending(candidate, clearing: false) else { return .failed }
             pending = candidate
         }
 
+        guard !admissionClosed, !Task.isCancelled else { return .cancelled }
+
+        // Recheck time-sensitive benefit after all awaits and pending persistence.
+        if trigger == .automaticExpiry {
+            let currentNow = clock()
+            guard selectedCredit.isAvailable else { return .noCredit }
+            guard let expiresAt = selectedCredit.expiresAt else { return .nothingToReset }
+            let lead = expiresAt.timeIntervalSince(currentNow)
+            guard lead > 0 && lead <= 300 else { return .nothingToReset }
+            guard expiryUsageWindows.contains(where: {
+                $0.usedPercent > 0 && ($0.resetAt == nil || $0.resetAt! > currentNow)
+            }) else { return .nothingToReset }
+        }
+
         do {
-            let consumed = try await resetService.consume(accessToken: account.accessToken, accountID: account.accountID, creditID: record.creditID, redemptionID: record.redemptionID)
+            let consumed = try await resetService.consume(
+                accessToken: currentAccount.accessToken,
+                accountID: currentAccount.accountID,
+                creditID: record.creditID,
+                redemptionID: record.redemptionID
+            )
             let terminalGeneration = reserveOperationGeneration()
             await refreshAfterTerminal(
                 alias: normalizedAlias,
-                account: account,
+                account: currentAccount,
                 selectedCreditID: record.creditID,
                 generation: terminalGeneration
             )
@@ -281,14 +436,15 @@ public actor QuotaResetCoordinator {
             case .alreadyRedeemed: return .alreadyRedeemed
             }
         } catch is CancellationError {
-            _ = await reconcileAfterAmbiguous(record, account: account, generation: generation)
+            _ = await reconcileAfterAmbiguous(record, account: currentAccount, generation: generation)
             return .cancelled
         } catch is QuotaResetClientError {
-            return await reconcileAfterAmbiguous(record, account: account, generation: generation)
+            return await reconcileAfterAmbiguous(record, account: currentAccount, generation: generation)
         } catch {
-            return await reconcileAfterAmbiguous(record, account: account, generation: generation)
+            return await reconcileAfterAmbiguous(record, account: currentAccount, generation: generation)
         }
     }
+
 
     private enum Reconciliation { case available, unavailable, failed, cancelled }
 
@@ -296,10 +452,8 @@ public actor QuotaResetCoordinator {
         let outcome: Reconciliation
         do {
             let fresh = try await resetService.credits(accessToken: account.accessToken, accountID: account.accountID)
-            if generation == latestRefreshGeneration {
-                snapshots[record.alias] = fresh
-                statuses[record.alias] = .ready
-            }
+            snapshots[record.alias] = fresh
+            statuses[record.alias] = .ready
             outcome = fresh.credits.contains { $0.id == record.creditID && $0.isAvailable } ? .available : .unavailable
         } catch is CancellationError {
             outcome = .cancelled
@@ -336,10 +490,8 @@ public actor QuotaResetCoordinator {
         var provedTerminal = false
         do {
             let fresh = try await resetService.credits(accessToken: account.accessToken, accountID: account.accountID)
-            if generation == latestRefreshGeneration {
-                snapshots[alias] = fresh
-                statuses[alias] = .ready
-            }
+            snapshots[alias] = fresh
+            statuses[alias] = .ready
             provedTerminal = !fresh.credits.contains { $0.id == selectedCreditID && $0.isAvailable }
         } catch {
             if generation == latestRefreshGeneration { statuses[alias] = .failed }

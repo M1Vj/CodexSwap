@@ -135,6 +135,9 @@ public actor AppEngine {
     private var proxy: ProxyServer?
     private var pollerTask: Task<Void, Never>?
     private var credentialRenewalTask: Task<Void, Never>?
+    private var expiryResetTask: Task<Void, Never>?
+    private static let expiryResetFailureCooldown: TimeInterval = 60.0
+    private var expiryResetFailures: [String: Date] = [:]
     private var credentialRenewalInProgress = false
     private var elapsedUsagePolledAt: [String: Date] = [:]
     private var onEvent: (@Sendable (AppEvent) -> Void)?
@@ -383,16 +386,21 @@ public actor AppEngine {
             await autoLog.write("lifecycle", "recovered interrupted task \(Self.taskLabel(recovered))")
         }
         await autoLog.write("lifecycle", "engine start reconciled \(recoveredCount) interrupted task(s)")
+        await quotaResetCoordinator.openAdmission()
         startPoller()
         startCredentialRenewalScheduler()
+        startExpiryResetScheduler()
     }
 
     public func stop() async {
         credentialRenewalTask?.cancel()
         credentialRenewalTask = nil
+        expiryResetTask?.cancel()
+        expiryResetTask = nil
         pollerTask?.cancel()
         pollerTask = nil
         await credentialRenewalCoordinator.closeAdmission()
+        await quotaResetCoordinator.closeAdmission()
         DiagnosticsLog.shared.record(component: .proxy, operation: .lifecycle, outcome: .cancelled)
         watcher?.stop()
         watcher = nil
@@ -688,6 +696,8 @@ public actor AppEngine {
         }
         let resetPolicyChanged = previous.automaticallyResetExhaustedAccounts
             != current.automaticallyResetExhaustedAccounts
+            || previous.automaticallyResetExpiringCredits
+            != current.automaticallyResetExpiringCredits
             || previous.autoResetProtectedAccounts != current.autoResetProtectedAccounts
         guard resetPolicyChanged else { return }
         emit(.snapshotChanged)
@@ -2517,6 +2527,96 @@ public actor AppEngine {
                 catch { return }
             }
         }
+    }
+
+    private func startExpiryResetScheduler() {
+        expiryResetTask?.cancel()
+        expiryResetTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let sleepSeconds = await self.proactiveExpiryResetTick()
+                let deadline = ContinuousClock.now.advanced(by: .seconds(sleepSeconds))
+                do { try await Task.sleep(until: deadline, clock: .continuous) }
+                catch { return }
+            }
+        }
+    }
+
+    @discardableResult
+    public func proactiveExpiryResetTick(now: Date? = nil) async -> TimeInterval {
+        let currentSettings = await settingsStore.get()
+        guard currentSettings.automaticallyResetExpiringCredits else {
+            return 60.0
+        }
+        _ = await archiveDueAccounts()
+        let effectiveNow: Date
+        if let now {
+            effectiveNow = now
+        } else {
+            effectiveNow = await quotaResetCoordinator.currentClockDate()
+        }
+        let active = await store.activeAccounts()
+        let protected = Set(currentSettings.autoResetProtectedAccounts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        var earliestFutureExpiryLead: TimeInterval?
+
+        for account in active {
+            guard !account.isArchived,
+                  account.routingEnabled,
+                  !account.needsLogin,
+                  !protected.contains(account.alias.lowercased()) else { continue }
+
+            if let failureCooldown = expiryResetFailures[account.alias], failureCooldown > effectiveNow {
+                continue
+            }
+
+            let hasBenefit = account.usage.contains { window in
+                window.usedPercent > 0 && (window.resetAt == nil || window.resetAt! > effectiveNow)
+            }
+            guard hasBenefit else { continue }
+
+            let refreshed = await quotaResetCoordinator.refreshCredits(aliases: [account.alias])
+            guard refreshed else {
+                expiryResetFailures[account.alias] = effectiveNow.addingTimeInterval(Self.expiryResetFailureCooldown)
+                continue
+            }
+            let statuses = await quotaResetCoordinator.cachedStatuses()
+            guard statuses[account.alias] == .ready else {
+                expiryResetFailures[account.alias] = effectiveNow.addingTimeInterval(Self.expiryResetFailureCooldown)
+                continue
+            }
+
+            let snapshots = await quotaResetCoordinator.cachedCreditSnapshots()
+            guard let snap = snapshots[account.alias],
+                  let credit = snap.earliestUnexpiredAvailable(now: effectiveNow),
+                  let expiresAt = credit.expiresAt else { continue }
+
+            let leadTime = expiresAt.timeIntervalSince(effectiveNow)
+            if leadTime > 0 && leadTime <= 300 {
+                guard !Task.isCancelled else { return 60.0 }
+
+                let result = await quotaResetCoordinator.reset(alias: account.alias, trigger: .automaticExpiry)
+                switch result {
+                case .reset:
+                    expiryResetFailures.removeValue(forKey: account.alias)
+                    // Prevent multiple expiring credits drained due to stale quota:
+                    await pollUsage(activeOnly: false)
+                    await quotaResetCoordinator.refreshCredits(aliases: [account.alias])
+                    emit(.snapshotChanged)
+                case .failed, .networkFailure, .ambiguousFailure:
+                    expiryResetFailures[account.alias] = effectiveNow.addingTimeInterval(Self.expiryResetFailureCooldown)
+                default:
+                    break
+                }
+            } else if leadTime > 300 {
+                let secondsUntilLead = leadTime - 300
+                earliestFutureExpiryLead = min(earliestFutureExpiryLead ?? secondsUntilLead, secondsUntilLead)
+            }
+        }
+
+        if let earliest = earliestFutureExpiryLead {
+            return min(max(earliest, 30.0), 60.0)
+        }
+        return 60.0
     }
 
     private func startPoller() {

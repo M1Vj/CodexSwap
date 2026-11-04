@@ -27,6 +27,7 @@ struct SettingsActions {
     let addStandaloneAccount: () -> Void
     let setAutomaticWarmup: (Bool) -> Void
     let setAutomaticReset: (Bool) -> Void
+    var setAutomaticExpiryReset: (Bool) -> Void = { _ in }
     let setInteractiveExhaustionPolicy: (QuotaExhaustionPolicy) -> Void
     let setTaskBoardExhaustionPolicy: (QuotaExhaustionPolicy) -> Void
     let setWarmupExcludedAccounts: ([String]) -> Void

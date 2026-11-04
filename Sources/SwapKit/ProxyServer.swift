@@ -968,6 +968,7 @@ public actor ProxyServer {
     private var lastActivityAt: Date?
     private var lastActivityAlias: String?
     private let interactiveSelector = InteractiveTurnSelector()
+    private var recordedTelemetryAttempts: [UUID: Set<Int>] = [:]
     private var taskRunPins = TaskRunPins()
 
     public struct Activity: Sendable {
@@ -1805,18 +1806,8 @@ public actor ProxyServer {
                 return .completed(outcome: .failure, status: Int(HTTPResponseStatus.badGateway.code))
             }
 
-            await self.recordTelemetryAttempt(
-                rootRequestID: rootRequestID,
-                attemptIndex: attemptIndex,
-                startedAt: attemptStartedAt,
-                finishedAt: Date(),
-                account: account,
-                model: requestModel,
-                category: requestCategory,
-                outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .httpError,
-                status: Int(resp.status.code),
-                errorClass: self.telemetryErrorClass(for: resp.status)
-            )
+            // Non-2xx attempts are recorded terminally upon relay completion,
+            // stream cancellation, or retry decision to guarantee exactly-one observation.
 
             // A quota reset decision permits exactly one replay. Its response is
             // final; alternative-account replays remain eligible for the bounded
@@ -1843,6 +1834,18 @@ public actor ProxyServer {
                             ))
                         }
                     }
+                    await self.recordTelemetryAttempt(
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        startedAt: attemptStartedAt,
+                        finishedAt: Date(),
+                        account: account,
+                        model: requestModel,
+                        category: requestCategory,
+                        outcome: .httpError,
+                        status: 401,
+                        errorClass: .authentication
+                    )
                     try await writeError(
                         outbound,
                         status: .serviceUnavailable,
@@ -1858,6 +1861,18 @@ public actor ProxyServer {
                     upstreamCatalogBody: Data(buffer: upstreamCatalog),
                     dispatcherModels: dispatcherModels
                 ) {
+                        await self.recordTelemetryAttempt(
+                            rootRequestID: rootRequestID,
+                            attemptIndex: attemptIndex,
+                            startedAt: attemptStartedAt,
+                            finishedAt: Date(),
+                            account: account,
+                            model: requestModel,
+                            category: requestCategory,
+                            outcome: .success,
+                            status: Int(resp.status.code),
+                            errorClass: nil
+                        )
                         try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: ByteBuffer(data: merged))
                         return .completed(outcome: .success, status: Int(resp.status.code))
                     }
@@ -1866,7 +1881,16 @@ public actor ProxyServer {
                 if bindSelectionOnSuccess, resp.status.code >= 200, resp.status.code < 300 {
                     await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                 }
-                try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
+                try await self.streamResponse(
+                    outbound,
+                    response: resp,
+                    account: account,
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    attemptStartedAt: attemptStartedAt,
+                    requestModel: requestModel,
+                    requestCategory: requestCategory
+                )
                 return .completed(
                     outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure,
                     status: Int(resp.status.code)
@@ -1911,6 +1935,18 @@ public actor ProxyServer {
                     }
                     await burn.clear(alias: account.alias)
                     if mode.isTask {
+                        await self.recordTelemetryAttempt(
+                            rootRequestID: rootRequestID,
+                            attemptIndex: attemptIndex,
+                            startedAt: attemptStartedAt,
+                            finishedAt: Date(),
+                            account: account,
+                            model: requestModel,
+                            category: requestCategory,
+                            outcome: .httpError,
+                            status: 401,
+                            errorClass: .authentication
+                        )
                         if let next = try await self.taskFailover(from: account, mode: mode, outbound: outbound, status: resp.status, headers: resp.headers, errBody: errBody) {
                             return .retry(
                                 account: next,
@@ -1925,6 +1961,18 @@ public actor ProxyServer {
                         )
                     }
                     if mode.isWarmup {
+                        await self.recordTelemetryAttempt(
+                            rootRequestID: rootRequestID,
+                            attemptIndex: attemptIndex,
+                            startedAt: attemptStartedAt,
+                            finishedAt: Date(),
+                            account: account,
+                            model: requestModel,
+                            category: requestCategory,
+                            outcome: .httpError,
+                            status: 401,
+                            errorClass: .authentication
+                        )
                         let quarantine = await store.markNeedsLoginOnlyIfCurrent(account)
                         if case .stale(let current, _) = quarantine,
                            let current,
@@ -1946,6 +1994,18 @@ public actor ProxyServer {
                         )
                         return .completed(outcome: .failure, status: Int(HTTPResponseStatus.serviceUnavailable.code))
                     }
+                    await self.recordTelemetryAttempt(
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        startedAt: attemptStartedAt,
+                        finishedAt: Date(),
+                        account: account,
+                        model: requestModel,
+                        category: requestCategory,
+                        outcome: .httpError,
+                        status: 401,
+                        errorClass: .authentication
+                    )
                     if let next = try await self.failover(from: account, reason: .needsLogin, outbound: outbound, errBody: errBody) {
                         account = next
                         await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -1972,6 +2032,18 @@ public actor ProxyServer {
             }
 
             if resp.status == .unauthorized {
+                await self.recordTelemetryAttempt(
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    startedAt: attemptStartedAt,
+                    finishedAt: Date(),
+                    account: account,
+                    model: requestModel,
+                    category: requestCategory,
+                    outcome: .httpError,
+                    status: 401,
+                    errorClass: .authentication
+                )
                 _ = try await collect(resp.body, cap: 64 * 1024)
                 let quarantine = await store.markNeedsLoginOnlyIfCurrent(account)
                 if case .quarantined = quarantine {
@@ -2020,7 +2092,18 @@ public actor ProxyServer {
                     ))
                     let (limit, resetAt) = limitInfo(headers: resp.headers, body: classified.prefix)
                     if mode.isWarmup {
-                        try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                        try await self.streamClassifiedResponse(
+                        outbound,
+                        status: resp.status,
+                        headers: resp.headers,
+                        classified: classified,
+                        account: account,
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        attemptStartedAt: attemptStartedAt,
+                        requestModel: requestModel,
+                        requestCategory: requestCategory
+                    )
                         return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
 
@@ -2030,7 +2113,19 @@ public actor ProxyServer {
                     // successful quota reset.
                     if exhaustionHandled {
                         guard !finalReplay else {
-                            try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                            try await self.streamClassifiedResponse(
+                        outbound,
+                        status: resp.status,
+                        headers: resp.headers,
+                        classified: classified,
+                        account: account,
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        attemptStartedAt: attemptStartedAt,
+                        requestModel: requestModel,
+                        requestCategory: requestCategory,
+                        hasUsageLimit: hasUsageLimit
+                    )
                             return .completed(outcome: .failure, status: Int(resp.status.code))
                         }
                         await store.markLimited(account.alias, limit: limit, resetAt: resetAt, fallbackCooldown: TimeInterval(settings.defaultCooldownSeconds))
@@ -2057,7 +2152,19 @@ public actor ProxyServer {
                                 reason: .noAlternative,
                                 accountTelemetryID: account.telemetryID
                             ))
-                            try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                            try await self.streamClassifiedResponse(
+                        outbound,
+                        status: resp.status,
+                        headers: resp.headers,
+                        classified: classified,
+                        account: account,
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        attemptStartedAt: attemptStartedAt,
+                        requestModel: requestModel,
+                        requestCategory: requestCategory,
+                        hasUsageLimit: hasUsageLimit
+                    )
                             return .completed(outcome: .failure, status: Int(resp.status.code))
                         }
                         await routingLog.write(RoutingDecisionLogRecord(
@@ -2073,6 +2180,18 @@ public actor ProxyServer {
                             accountTelemetryID: account.telemetryID,
                             targetAccountTelemetryID: alternative.telemetryID
                         ))
+                        await self.recordTelemetryAttempt(
+                            rootRequestID: rootRequestID,
+                            attemptIndex: attemptIndex,
+                            startedAt: attemptStartedAt,
+                            finishedAt: Date(),
+                            account: account,
+                            model: requestModel,
+                            category: requestCategory,
+                            outcome: .httpError,
+                            status: Int(resp.status.code),
+                            errorClass: hasUsageLimit ? .quotaExhausted : .rateLimit
+                        )
                         await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
                         account = alternative
                         await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -2106,6 +2225,18 @@ public actor ProxyServer {
                     )
                     switch outcome.decision {
                     case .retryCurrent:
+                        await self.recordTelemetryAttempt(
+                            rootRequestID: rootRequestID,
+                            attemptIndex: attemptIndex,
+                            startedAt: attemptStartedAt,
+                            finishedAt: Date(),
+                            account: account,
+                            model: requestModel,
+                            category: requestCategory,
+                            outcome: .httpError,
+                            status: Int(resp.status.code),
+                            errorClass: hasUsageLimit ? .quotaExhausted : .rateLimit
+                        )
                         tokenRefreshed = false
                         finalReplay = true
                         return .retry(
@@ -2128,7 +2259,19 @@ public actor ProxyServer {
                                 reason: .noAlternative,
                                 accountTelemetryID: account.telemetryID
                             ))
-                            try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                            try await self.streamClassifiedResponse(
+                        outbound,
+                        status: resp.status,
+                        headers: resp.headers,
+                        classified: classified,
+                        account: account,
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        attemptStartedAt: attemptStartedAt,
+                        requestModel: requestModel,
+                        requestCategory: requestCategory,
+                        hasUsageLimit: hasUsageLimit
+                    )
                             return .completed(outcome: .failure, status: Int(resp.status.code))
                         }
                         await routingLog.write(RoutingDecisionLogRecord(
@@ -2144,6 +2287,18 @@ public actor ProxyServer {
                             accountTelemetryID: account.telemetryID,
                             targetAccountTelemetryID: alternative.telemetryID
                         ))
+                        await self.recordTelemetryAttempt(
+                            rootRequestID: rootRequestID,
+                            attemptIndex: attemptIndex,
+                            startedAt: attemptStartedAt,
+                            finishedAt: Date(),
+                            account: account,
+                            model: requestModel,
+                            category: requestCategory,
+                            outcome: .httpError,
+                            status: Int(resp.status.code),
+                            errorClass: hasUsageLimit ? .quotaExhausted : .rateLimit
+                        )
                         await sink.handle(ProxyEvent.taskScoped(kind: .rotated, from: account.alias, to: alternative.alias, limit: limit, resetAt: resetAt, mode: mode))
                         account = alternative
                         await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -2167,7 +2322,19 @@ public actor ProxyServer {
                             accountTelemetryID: account.telemetryID
                         ))
                         await sink.handle(ProxyEvent.taskScoped(kind: .exhausted, from: account.alias, to: nil, limit: limit, resetAt: resetAt, mode: mode))
-                        try await streamClassifiedResponse(outbound, status: resp.status, headers: resp.headers, classified: classified)
+                        try await self.streamClassifiedResponse(
+                        outbound,
+                        status: resp.status,
+                        headers: resp.headers,
+                        classified: classified,
+                        account: account,
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        attemptStartedAt: attemptStartedAt,
+                        requestModel: requestModel,
+                        requestCategory: requestCategory,
+                        hasUsageLimit: hasUsageLimit
+                    )
                         return .completed(outcome: .failure, status: Int(resp.status.code))
                     }
                 }
@@ -2188,14 +2355,32 @@ public actor ProxyServer {
                         reason: .genericRetryAfter,
                         accountTelemetryID: account.telemetryID
                     ))
+                    await self.recordTelemetryAttempt(
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        startedAt: attemptStartedAt,
+                        finishedAt: Date(),
+                        account: account,
+                        model: requestModel,
+                        category: requestCategory,
+                        outcome: .httpError,
+                        status: Int(resp.status.code),
+                        errorClass: .rateLimit
+                    )
                     await self.upstreamRateLimitBackoff.note(retryAfter: retryAfter)
                     return .retryTransient(account: account, retries: transientRateLimitRetries + 1)
                 }
-                try await streamClassifiedResponse(
+                try await self.streamClassifiedResponse(
                     outbound,
                     status: resp.status,
                     headers: resp.headers,
-                    classified: classified
+                    classified: classified,
+                    account: account,
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    attemptStartedAt: attemptStartedAt,
+                    requestModel: requestModel,
+                    requestCategory: requestCategory
                 )
                 return .completed(outcome: .failure, status: Int(resp.status.code))
             }
@@ -2225,11 +2410,32 @@ public actor ProxyServer {
                     upstreamCatalogBody: Data(buffer: upstreamCatalog),
                     dispatcherModels: dispatcherModels
                 ) {
+                    await self.recordTelemetryAttempt(
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        startedAt: attemptStartedAt,
+                        finishedAt: Date(),
+                        account: account,
+                        model: requestModel,
+                        category: requestCategory,
+                        outcome: .success,
+                        status: Int(resp.status.code),
+                        errorClass: nil
+                    )
                     try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: ByteBuffer(data: merged))
                     return .completed(outcome: .success, status: Int(resp.status.code))
                 }
             }
-            try await self.streamResponse(outbound, response: resp, accountAlias: account.alias)
+            try await self.streamResponse(
+                outbound,
+                response: resp,
+                account: account,
+                rootRequestID: rootRequestID,
+                attemptIndex: attemptIndex,
+                attemptStartedAt: attemptStartedAt,
+                requestModel: requestModel,
+                requestCategory: requestCategory
+            )
             return .completed(
                 outcome: resp.status.code >= 200 && resp.status.code < 300 ? .success : .failure,
                 status: Int(resp.status.code)
@@ -2303,12 +2509,18 @@ public actor ProxyServer {
         attemptIndex: Int,
         startedAt: Date,
         finishedAt: Date,
+        firstChunkAt: Date? = nil,
         account: Account,
         model: String,
         category: UsageTelemetryRequestCategory,
         outcome: UsageTelemetryAttemptOutcome,
         status: Int?,
-        errorClass: UsageTelemetryErrorClass?
+        errorClass: UsageTelemetryErrorClass?,
+        inputTokens: Int? = nil,
+        cachedInputTokens: Int? = nil,
+        cacheWriteInputTokens: Int? = nil,
+        outputTokens: Int? = nil,
+        sample: ProxyUsageSample? = nil
     ) async {
         let diagnosticOutcome: DiagnosticOutcome = outcome == .cancelled ? .cancelled : outcome == .success ? .succeeded : .failed
         let diagnosticCode: DiagnosticCode
@@ -2324,20 +2536,67 @@ public actor ProxyServer {
         case nil:
             diagnosticCode = status == 401 || status == 403 ? .unauthorized : status == 429 ? .rateLimited : outcome == .transportError ? .network : .none
         }
+        if var set = self.recordedTelemetryAttempts[rootRequestID] {
+            if set.contains(attemptIndex) { return }
+            set.insert(attemptIndex)
+            self.recordedTelemetryAttempts[rootRequestID] = set
+        } else {
+            self.recordedTelemetryAttempts[rootRequestID] = [attemptIndex]
+        }
+
         DiagnosticsLog.shared.record(component: .proxy, operation: .request, outcome: diagnosticOutcome, level: diagnosticOutcome == .failed ? .warning : .info, code: diagnosticCode, correlationID: rootRequestID, status: status, durationMilliseconds: Int(max(0, finishedAt.timeIntervalSince(startedAt)) * 1_000), count: attemptIndex)
         guard let telemetry else { return }
+
+        let resolvedInput = inputTokens ?? sample?.inputTokens
+        let resolvedCached = cachedInputTokens ?? (sample?.cachedInputPresence == .present ? sample?.cachedInputTokens : nil)
+        let resolvedCacheWrite = cacheWriteInputTokens ?? (sample?.cacheWriteInputPresence == .present ? sample?.cacheWriteInputTokens : nil)
+        let resolvedOutput = outputTokens ?? sample?.outputTokens
+        let resolvedModel = sample?.model ?? model
+
+        let estimatedCost: Double?
+        let costCompleteness: CostAvailability?
+        if let inp = resolvedInput, let out = resolvedOutput {
+            if let price = UsageAnalytics.knownPrice(for: resolvedModel) {
+                estimatedCost = UsageAnalytics.estimatedCost(
+                    inputTokens: inp,
+                    cachedInputTokens: resolvedCached,
+                    cacheWriteInputTokens: resolvedCacheWrite,
+                    outputTokens: out,
+                    price: price
+                )
+                if resolvedCached != nil && resolvedCacheWrite != nil {
+                    costCompleteness = .complete
+                } else {
+                    costCompleteness = .partial
+                }
+            } else {
+                estimatedCost = nil
+                costCompleteness = .unavailable
+            }
+        } else {
+            estimatedCost = nil
+            costCompleteness = nil
+        }
+
         let event = UsageTelemetryAttemptEvent(
             rootRequestID: rootRequestID,
             attemptIndex: max(0, attemptIndex - 1),
             startedAt: startedAt,
             finishedAt: finishedAt,
+            firstChunkAt: firstChunkAt,
             accountTelemetryID: account.telemetryID,
             provider: .openAI,
-            model: model,
+            model: resolvedModel,
             category: category,
             outcome: outcome,
             httpStatusCode: status,
-            errorClass: errorClass
+            errorClass: errorClass,
+            inputTokens: resolvedInput,
+            cachedInputTokens: resolvedCached,
+            cacheWriteInputTokens: resolvedCacheWrite,
+            outputTokens: resolvedOutput,
+            estimatedCostUSD: estimatedCost,
+            costCompleteness: costCompleteness
         )
         await telemetry.recordAttempt(event)
     }
@@ -2349,6 +2608,7 @@ public actor ProxyServer {
         account: Account?,
         outcome: UsageTelemetryRootOutcome
     ) async {
+        self.recordedTelemetryAttempts.removeValue(forKey: rootRequestID)
         await routingLog.write(RoutingDecisionLogRecord(
             event: .requestTerminal,
             rootRequestID: rootRequestID,
@@ -2511,35 +2771,88 @@ public actor ProxyServer {
     private func streamResponse(
         _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         response: HTTPClientResponse,
-        accountAlias: String
+        account: Account,
+        rootRequestID: UUID,
+        attemptIndex: Int,
+        attemptStartedAt: Date,
+        requestModel: String,
+        requestCategory: UsageTelemetryRequestCategory
     ) async throws {
-        let headers = filteredResponseHeaders(response.headers)
+        var headers = filteredResponseHeaders(response.headers)
+        if headers.first(name: "Content-Length") == nil {
+            headers.add(name: "Transfer-Encoding", value: "chunked")
+        }
         let respHead = HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)
         do {
             try await outbound.write(.head(respHead))
         } catch {
+            await self.recordTelemetryAttempt(
+                rootRequestID: rootRequestID,
+                attemptIndex: attemptIndex,
+                startedAt: attemptStartedAt,
+                finishedAt: Date(),
+                firstChunkAt: nil,
+                account: account,
+                model: requestModel,
+                category: requestCategory,
+                outcome: Task.isCancelled ? .cancelled : .transportError,
+                status: Int(response.status.code),
+                errorClass: Task.isCancelled ? .cancelled : .network
+            )
             throw ProxyStreamRelayFailure.downstreamHead(cancelled: Task.isCancelled)
         }
         var scanner = SSEUsageScanner()
         var iterator = response.body.makeAsyncIterator()
+        var firstChunkAt: Date?
+        var lastSample: ProxyUsageSample?
         while true {
             let chunk: ByteBuffer?
             do {
                 chunk = try await iterator.next()
             } catch {
+                await self.recordTelemetryAttempt(
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    startedAt: attemptStartedAt,
+                    finishedAt: Date(),
+                    firstChunkAt: firstChunkAt,
+                    account: account,
+                    model: lastSample?.model ?? requestModel,
+                    category: requestCategory,
+                    outcome: Task.isCancelled ? .cancelled : .transportError,
+                    status: Int(response.status.code),
+                    errorClass: Task.isCancelled ? .cancelled : .network,
+                    sample: lastSample
+                )
                 throw ProxyStreamRelayFailure.upstreamBody(cancelled: Task.isCancelled)
             }
             guard let chunk else { break }
+            if firstChunkAt == nil { firstChunkAt = Date() }
             do {
                 try await outbound.write(.body(.byteBuffer(chunk)))
             } catch {
+                await self.recordTelemetryAttempt(
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    startedAt: attemptStartedAt,
+                    finishedAt: Date(),
+                    firstChunkAt: firstChunkAt,
+                    account: account,
+                    model: lastSample?.model ?? requestModel,
+                    category: requestCategory,
+                    outcome: Task.isCancelled ? .cancelled : .transportError,
+                    status: Int(response.status.code),
+                    errorClass: Task.isCancelled ? .cancelled : .network,
+                    sample: lastSample
+                )
                 throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
             }
             scanner.feed(chunk)
             if let sample = scanner.consume() {
+                lastSample = sample
                 await sink.handle(ProxyEvent(
                     kind: .usage,
-                    from: accountAlias,
+                    from: account.alias,
                     to: nil,
                     limit: nil,
                     resetAt: nil,
@@ -2549,9 +2862,10 @@ public actor ProxyServer {
         }
         // Streams may end without a trailing newline; flush any tail line.
         if let sample = scanner.finish() {
+            lastSample = sample
             await sink.handle(ProxyEvent(
                 kind: .usage,
-                from: accountAlias,
+                from: account.alias,
                 to: nil,
                 limit: nil,
                 resetAt: nil,
@@ -2561,8 +2875,37 @@ public actor ProxyServer {
         do {
             try await outbound.write(.end(nil))
         } catch {
+            await self.recordTelemetryAttempt(
+                rootRequestID: rootRequestID,
+                attemptIndex: attemptIndex,
+                startedAt: attemptStartedAt,
+                finishedAt: Date(),
+                firstChunkAt: firstChunkAt,
+                account: account,
+                model: lastSample?.model ?? requestModel,
+                category: requestCategory,
+                outcome: Task.isCancelled ? .cancelled : .transportError,
+                status: Int(response.status.code),
+                errorClass: Task.isCancelled ? .cancelled : .network,
+                sample: lastSample
+            )
             throw ProxyStreamRelayFailure.downstreamEnd(cancelled: Task.isCancelled)
         }
+
+        await self.recordTelemetryAttempt(
+            rootRequestID: rootRequestID,
+            attemptIndex: attemptIndex,
+            startedAt: attemptStartedAt,
+            finishedAt: Date(),
+            firstChunkAt: firstChunkAt,
+            account: account,
+            model: lastSample?.model ?? requestModel,
+            category: requestCategory,
+            outcome: response.status.code >= 200 && response.status.code < 300 ? .success : .httpError,
+            status: Int(response.status.code),
+            errorClass: self.telemetryErrorClass(for: response.status),
+            sample: lastSample
+        )
     }
 
     private func deliverBuffered(_ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, status: HTTPResponseStatus, headers upstreamHeaders: HTTPHeaders, body: ByteBuffer) async throws {
@@ -2608,6 +2951,7 @@ public actor ProxyServer {
     private struct ClassifiedResponseBody {
         let prefix: ByteBuffer
         let boundaryRemainder: ByteBuffer?
+        let isExhausted: Bool
         var iterator: HTTPClientResponse.Body.AsyncIterator
     }
 
@@ -2617,7 +2961,12 @@ public actor ProxyServer {
     ) async throws -> sending ClassifiedResponseBody {
         var prefix = ByteBuffer()
         var iterator = body.makeAsyncIterator()
-        while prefix.readableBytes < cap, var chunk = try await iterator.next() {
+        var isExhausted = false
+        while prefix.readableBytes < cap {
+            guard var chunk = try await iterator.next() else {
+                isExhausted = true
+                break
+            }
             let remaining = cap - prefix.readableBytes
             if chunk.readableBytes <= remaining {
                 prefix.writeImmutableBuffer(chunk)
@@ -2625,58 +2974,171 @@ public actor ProxyServer {
                 if let prefixSlice = chunk.readSlice(length: remaining) {
                     prefix.writeImmutableBuffer(prefixSlice)
                 }
-                return ClassifiedResponseBody(prefix: prefix, boundaryRemainder: chunk, iterator: iterator)
+                return ClassifiedResponseBody(prefix: prefix, boundaryRemainder: chunk, isExhausted: false, iterator: iterator)
             }
         }
-        return ClassifiedResponseBody(prefix: prefix, boundaryRemainder: nil, iterator: iterator)
+        return ClassifiedResponseBody(prefix: prefix, boundaryRemainder: nil, isExhausted: isExhausted, iterator: iterator)
     }
 
-    nonisolated private func streamClassifiedResponse(
+    private func streamClassifiedResponse(
         _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
         status: HTTPResponseStatus,
         headers upstreamHeaders: HTTPHeaders,
-        classified: sending ClassifiedResponseBody
+        classified: sending ClassifiedResponseBody,
+        account: Account,
+        rootRequestID: UUID,
+        attemptIndex: Int,
+        attemptStartedAt: Date,
+        requestModel: String,
+        requestCategory: UsageTelemetryRequestCategory,
+        hasUsageLimit: Bool = false
     ) async throws {
-        let headers = filteredResponseHeaders(upstreamHeaders)
+        var headers = filteredResponseHeaders(upstreamHeaders)
+        if headers.first(name: "Content-Length") == nil {
+            headers.add(name: "Transfer-Encoding", value: "chunked")
+        }
         do {
             try await outbound.write(.head(HTTPResponseHead(version: .http1_1, status: status, headers: headers)))
         } catch {
+            await self.recordTelemetryAttempt(
+                rootRequestID: rootRequestID,
+                attemptIndex: attemptIndex,
+                startedAt: attemptStartedAt,
+                finishedAt: Date(),
+                account: account,
+                model: requestModel,
+                category: requestCategory,
+                outcome: Task.isCancelled ? .cancelled : .transportError,
+                status: Int(status.code),
+                errorClass: Task.isCancelled ? .cancelled : .network
+            )
             throw ProxyStreamRelayFailure.downstreamHead(cancelled: Task.isCancelled)
         }
+        var firstChunkAt: Date?
+        var scanner = SSEUsageScanner()
         if classified.prefix.readableBytes > 0 {
+            if firstChunkAt == nil { firstChunkAt = Date() }
+            scanner.feed(classified.prefix)
             do {
                 try await outbound.write(.body(.byteBuffer(classified.prefix)))
             } catch {
+                await self.recordTelemetryAttempt(
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    startedAt: attemptStartedAt,
+                    finishedAt: Date(),
+                    firstChunkAt: firstChunkAt,
+                    account: account,
+                    model: requestModel,
+                    category: requestCategory,
+                    outcome: Task.isCancelled ? .cancelled : .transportError,
+                    status: Int(status.code),
+                    errorClass: Task.isCancelled ? .cancelled : .network
+                )
                 throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
             }
         }
         if let remainder = classified.boundaryRemainder, remainder.readableBytes > 0 {
+            if firstChunkAt == nil { firstChunkAt = Date() }
+            scanner.feed(remainder)
             do {
                 try await outbound.write(.body(.byteBuffer(remainder)))
             } catch {
+                await self.recordTelemetryAttempt(
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    startedAt: attemptStartedAt,
+                    finishedAt: Date(),
+                    firstChunkAt: firstChunkAt,
+                    account: account,
+                    model: requestModel,
+                    category: requestCategory,
+                    outcome: Task.isCancelled ? .cancelled : .transportError,
+                    status: Int(status.code),
+                    errorClass: Task.isCancelled ? .cancelled : .network
+                )
                 throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
             }
         }
-        var iterator = classified.iterator
-        while true {
-            let chunk: ByteBuffer?
-            do {
-                chunk = try await iterator.next()
-            } catch {
-                throw ProxyStreamRelayFailure.upstreamBody(cancelled: Task.isCancelled)
-            }
-            guard let chunk else { break }
-            do {
-                try await outbound.write(.body(.byteBuffer(chunk)))
-            } catch {
-                throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
+        if !classified.isExhausted {
+            var iterator = classified.iterator
+            while true {
+                let chunk: ByteBuffer?
+                do {
+                    chunk = try await iterator.next()
+                } catch {
+                    await self.recordTelemetryAttempt(
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        startedAt: attemptStartedAt,
+                        finishedAt: Date(),
+                        firstChunkAt: firstChunkAt,
+                        account: account,
+                        model: requestModel,
+                        category: requestCategory,
+                        outcome: Task.isCancelled ? .cancelled : .transportError,
+                        status: Int(status.code),
+                        errorClass: Task.isCancelled ? .cancelled : .network
+                    )
+                    throw ProxyStreamRelayFailure.upstreamBody(cancelled: Task.isCancelled)
+                }
+                guard let chunk else { break }
+                if firstChunkAt == nil { firstChunkAt = Date() }
+                scanner.feed(chunk)
+                do {
+                    try await outbound.write(.body(.byteBuffer(chunk)))
+                } catch {
+                    await self.recordTelemetryAttempt(
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        startedAt: attemptStartedAt,
+                        finishedAt: Date(),
+                        firstChunkAt: firstChunkAt,
+                        account: account,
+                        model: requestModel,
+                        category: requestCategory,
+                        outcome: Task.isCancelled ? .cancelled : .transportError,
+                        status: Int(status.code),
+                        errorClass: Task.isCancelled ? .cancelled : .network
+                    )
+                    throw ProxyStreamRelayFailure.downstreamBody(cancelled: Task.isCancelled)
+                }
             }
         }
+        let sample = scanner.finish()
         do {
             try await outbound.write(.end(nil))
         } catch {
+            await self.recordTelemetryAttempt(
+                rootRequestID: rootRequestID,
+                attemptIndex: attemptIndex,
+                startedAt: attemptStartedAt,
+                finishedAt: Date(),
+                firstChunkAt: firstChunkAt,
+                account: account,
+                model: sample?.model ?? requestModel,
+                category: requestCategory,
+                outcome: Task.isCancelled ? .cancelled : .transportError,
+                status: Int(status.code),
+                errorClass: Task.isCancelled ? .cancelled : .network,
+                sample: sample
+            )
             throw ProxyStreamRelayFailure.downstreamEnd(cancelled: Task.isCancelled)
         }
+        await self.recordTelemetryAttempt(
+            rootRequestID: rootRequestID,
+            attemptIndex: attemptIndex,
+            startedAt: attemptStartedAt,
+            finishedAt: Date(),
+            firstChunkAt: firstChunkAt,
+            account: account,
+            model: sample?.model ?? requestModel,
+            category: requestCategory,
+            outcome: status.code >= 200 && status.code < 300 ? .success : .httpError,
+            status: Int(status.code),
+            errorClass: (hasUsageLimit && status == .tooManyRequests) ? .quotaExhausted : self.telemetryErrorClass(for: status),
+            sample: sample
+        )
     }
 }
 
@@ -2689,7 +3151,9 @@ struct SSEUsageScanner {
     static let maxLineBytes = 1024 * 1024
 
     private var pending = [UInt8]()
+    private var rawBody = [UInt8]()
     private var oversizedLine = false
+    private var didExtractUsage = false
     /// Set when a completed response's usage has been parsed; consume via `consume()`.
     private var extracted: ProxyUsageSample?
 
@@ -2700,19 +3164,30 @@ struct SSEUsageScanner {
         return sample
     }
 
-    /// Processes any unterminated tail line when the stream ends without a newline.
+    /// Processes any unterminated tail line when the stream ends without a newline,
+    /// or parses the accumulated buffered JSON payload if not already extracted.
     mutating func finish() -> ProxyUsageSample? {
+        guard !didExtractUsage else { return consume() }
         if !oversizedLine, !pending.isEmpty {
             processLine(pending)
             pending.removeAll(keepingCapacity: true)
         }
         oversizedLine = false
+        if extracted == nil, !rawBody.isEmpty {
+            if let object = try? JSONSerialization.jsonObject(with: Data(rawBody), options: [.fragmentsAllowed]) as? [String: Any] {
+                _ = extractUsage(from: object)
+            }
+        }
         return consume()
     }
 
     mutating func feed(_ chunk: ByteBuffer) {
-        guard extracted == nil else { return }
+        guard !didExtractUsage else { return }
         let bytes = chunk.getBytes(at: chunk.readerIndex, length: chunk.readableBytes) ?? []
+        if rawBody.count < Self.maxLineBytes {
+            let available = Self.maxLineBytes - rawBody.count
+            rawBody.append(contentsOf: bytes.prefix(available))
+        }
         for byte in bytes {
             if byte == UInt8(ascii: "\n") {
                 if !oversizedLine { processLine(pending) }
@@ -2729,8 +3204,54 @@ struct SSEUsageScanner {
         }
     }
 
+    private mutating func extractUsage(from object: [String: Any]) -> Bool {
+        let responseObj = (object["response"] as? [String: Any]) ?? object
+        let model = (responseObj["model"] as? String) ?? (object["model"] as? String)
+        guard let model, !model.isEmpty else { return false }
+
+        let usage = (responseObj["usage"] as? [String: Any]) ?? (object["usage"] as? [String: Any])
+        guard let usage else { return false }
+
+        func intField(_ name: String, in source: [String: Any]) -> Int? {
+            UsageSafety.nonNegativeInteger(source[name])
+        }
+
+        guard let input = intField("input_tokens", in: usage) ?? intField("prompt_tokens", in: usage),
+              let output = intField("output_tokens", in: usage) ?? intField("completion_tokens", in: usage) else {
+            return false
+        }
+
+        let inputDetails = (usage["input_tokens_details"] as? [String: Any])
+            ?? (usage["prompt_tokens_details"] as? [String: Any])
+
+        let cached = intField("cached_tokens", in: inputDetails ?? [:])
+            ?? intField("cached_input_tokens", in: usage)
+            ?? intField("cache_read_tokens", in: usage)
+
+        let requestedCacheWrite = intField("cache_write_tokens", in: inputDetails ?? [:])
+            ?? intField("cache_write_input_tokens", in: usage)
+            ?? intField("cache_write_tokens", in: usage)
+            ?? intField("cache_creation_input_tokens", in: usage)
+            ?? intField("cache_creation_tokens", in: usage)
+
+        let totalInput = max(0, input)
+        let cachedSubset = min(cached ?? 0, totalInput)
+        let cacheWriteSubset = min(requestedCacheWrite ?? 0, totalInput - cachedSubset)
+
+        extracted = ProxyUsageSample(
+            model: model,
+            inputTokens: totalInput,
+            cachedInputTokens: cachedSubset,
+            cacheWriteInputTokens: cacheWriteSubset,
+            outputTokens: output,
+            cachedInputPresence: cached == nil ? .absent : .present,
+            cacheWriteInputPresence: requestedCacheWrite == nil ? .absent : .present
+        )
+        didExtractUsage = true
+        return true
+    }
+
     private mutating func processLine(_ raw: [UInt8]) {
-        // SSE frames the payload after "data:"; plain JSON bodies also parse fine here.
         var line = raw
         if line.count > 5, line[0] == UInt8(ascii: "d"), line[1] == UInt8(ascii: "a"),
            line[2] == UInt8(ascii: "t"), line[3] == UInt8(ascii: "a") {
@@ -2744,39 +3265,7 @@ struct SSEUsageScanner {
             with: Data(line),
             options: [.fragmentsAllowed]
         ) as? [String: Any] else { return }
-        guard (object["type"] as? String) == "response.completed" else { return }
-        guard let response = object["response"] as? [String: Any],
-              let model = response["model"] as? String,
-              !model.isEmpty,
-              let usage = response["usage"] as? [String: Any] else { return }
-        func intField(_ name: String, in source: [String: Any]) -> Int? {
-            UsageSafety.nonNegativeInteger(source[name])
-        }
-        guard let input = intField("input_tokens", in: usage),
-              let output = intField("output_tokens", in: usage) else { return }
-        let inputDetails = usage["input_tokens_details"] as? [String: Any]
-        // Current Responses usage nests cache reads and writes under input details;
-        // retain the legacy top-level aliases used by older Codex releases.
-        let cached = intField("cached_tokens", in: inputDetails ?? [:])
-            ?? intField("cached_input_tokens", in: usage)
-            ?? intField("cache_read_tokens", in: usage)
-        let requestedCacheWrite = intField("cache_write_tokens", in: inputDetails ?? [:])
-            ?? intField("cache_write_input_tokens", in: usage)
-            ?? intField("cache_write_tokens", in: usage)
-            ?? intField("cache_creation_input_tokens", in: usage)
-            ?? intField("cache_creation_tokens", in: usage)
-        let totalInput = max(0, input)
-        let cachedSubset = min(cached ?? 0, totalInput)
-        let cacheWriteSubset = min(requestedCacheWrite ?? 0, totalInput - cachedSubset)
-        extracted = ProxyUsageSample(
-            model: model,
-            inputTokens: totalInput,
-            cachedInputTokens: cachedSubset,
-            cacheWriteInputTokens: cacheWriteSubset,
-            outputTokens: output,
-            cachedInputPresence: cached == nil ? .absent : .present,
-            cacheWriteInputPresence: requestedCacheWrite == nil ? .absent : .present
-        )
+        _ = extractUsage(from: object)
     }
 }
 

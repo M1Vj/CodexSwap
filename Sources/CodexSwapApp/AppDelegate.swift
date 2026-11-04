@@ -561,10 +561,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             statusTitle = "○ Offline — proxy not running"
         }
-        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
-
         let activeAccounts = AccountArchiveMenuPresentation.activeAccounts(from: latest.accounts)
         let archivedAccounts = latest.accounts.filter(\.isArchived)
         let activeAlias = latest.activeAlias.flatMap { alias in
@@ -575,19 +571,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             accounts: activeAccounts,
             drainingAliases: latest.drainingAliases.intersection(activeAliases)
         )
-        if !activeAccounts.isEmpty {
-            var poolParts = ["\(pool.healthyCount)/\(pool.accountCount) healthy"]
-            if settings.smartSwitchEnabled {
-                poolParts.append("\(pool.drainingCount) draining by others")
-            }
-            let poolLine = NSMenuItem(
-                title: "Pool · \(poolParts.joined(separator: " · "))",
-                action: nil,
-                keyEquivalent: ""
-            )
-            poolLine.isEnabled = false
-            menu.addItem(poolLine)
+        var poolParts = [MenuAccountPresentation.poolCaption(pool)]
+        if settings.smartSwitchEnabled, pool.drainingCount > 0 {
+            poolParts.append("\(pool.drainingCount) draining by others")
         }
+        let activeTasks = latest.tasks.filter { $0.archivedAt == nil }
+        let runningCount = activeTasks.filter { latest.runningTaskIDs.contains($0.id) }.count
+        let failedCount = activeTasks.filter { $0.phase == .failed }.count
+        if runningCount > 0 { poolParts.append("\(runningCount) tasks running") }
+        if failedCount > 0 { poolParts.append("\(failedCount) tasks failed") }
+        let summary = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        let summaryView = MenuSummaryView(
+            title: statusTitle,
+            detail: poolParts.joined(separator: " · ")
+        ).makeMenuView(width: 360)
+        summary.view = summaryView
+        menu.addItem(summary)
+        let details = NSMenu()
 
         let selectionPresentation = AccountMenuSelectionPresentation.resolve(
             defaultAlias: activeAlias,
@@ -596,37 +596,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let lastRouted = NSMenuItem(title: selectionPresentation.lastRoutedTitle, action: nil, keyEquivalent: "")
         lastRouted.isEnabled = false
-        menu.addItem(lastRouted)
+        details.addItem(lastRouted)
         let defaultItem = NSMenuItem(title: selectionPresentation.defaultTitle, action: nil, keyEquivalent: "")
         defaultItem.isEnabled = false
-        menu.addItem(defaultItem)
+        details.addItem(defaultItem)
         if let stickyAlias = latest.stickyAlias {
             let sticky = NSMenuItem(title: "Sticky account: \(stickyAlias) · until quota error", action: nil, keyEquivalent: "")
             sticky.isEnabled = false
-            menu.addItem(sticky)
+            details.addItem(sticky)
         }
 
-        let activeTasks = latest.tasks.filter { $0.archivedAt == nil }
         if !activeTasks.isEmpty {
             let runningTasks = activeTasks.filter { latest.runningTaskIDs.contains($0.id) }
             let waitingTasks = activeTasks.filter {
                 ($0.column == .queued && $0.phase == .idle)
                     || ($0.column == .inProgress && ($0.phase == .pausedQuota || $0.phase == .retryWaiting))
             }
-            let failedCount = activeTasks.filter { $0.phase == .failed }.count
             let taskStatus = NSMenuItem(
                 title: "Tasks: \(runningTasks.count) running",
                 action: nil,
                 keyEquivalent: ""
             )
             taskStatus.isEnabled = false
-            menu.addItem(taskStatus)
+            details.addItem(taskStatus)
 
             for task in runningTasks
                 .sorted(by: { $0.title.localizedStandardCompare($1.title) == .orderedAscending }) {
                 let runningTask = NSMenuItem(title: runningTaskMenuTitle(task), action: nil, keyEquivalent: "")
                 runningTask.isEnabled = false
-                menu.addItem(runningTask)
+                details.addItem(runningTask)
             }
 
             let resetAt = TaskBoardMenuStatus.nextQuotaReset(
@@ -646,11 +644,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     keyEquivalent: ""
                 )
                 waiting.isEnabled = false
-                menu.addItem(waiting)
+                details.addItem(waiting)
             }
-            let failed = NSMenuItem(title: "Failed: \(failedCount)", action: nil, keyEquivalent: "")
-            failed.isEnabled = false
-            menu.addItem(failed)
+            if failedCount > 0 {
+                let failed = NSMenuItem(title: "Failed: \(failedCount)", action: nil, keyEquivalent: "")
+                failed.isEnabled = false
+                details.addItem(failed)
+            }
         }
 
         menu.addItem(.separator())
@@ -681,13 +681,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isDraining: activeAliases.contains(acc.alias) && latest.drainingAliases.contains(acc.alias),
                 cooldownUntil: acc.cooldownUntil(now: Date()),
                 windows: acc.usage,
-                costEstimate: acc.usageStats.map { UsageAnalytics.estimatedCost($0) },
+                costEstimate: acc.usageStats.flatMap {
+                    UsageAnalytics.costAvailability($0) == .complete ? UsageAnalytics.estimatedCost($0) : nil
+                },
                 usageLimitSettings: acc.usageLimitSettings,
                 selectionLabel: acc.alias == latest.lastActivityAlias ? "Last routed" : "Default for new tasks"
             )
             let item = NSMenuItem(title: label(for: acc), action: nil, keyEquivalent: "")
             let alias = acc.alias
-            item.view = MenuRowContainer(row: row, width: 340, isEnabled: true, onSelect: { [weak self] in
+            let container = MenuRowContainer(row: row, width: 360, isEnabled: true, onSelect: { [weak self] in
                 self?.activateAccount(alias)
             }, onDoubleClick: { [weak self] in
                 Task { @MainActor in
@@ -696,6 +698,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await self.refreshSnapshot()
                 }
             })
+            item.view = container
+            item.target = container
+            item.action = #selector(MenuRowContainer.selectFromMenu(_:))
             menu.addItem(item)
         }
 
@@ -726,6 +731,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        let detailsItem = NSMenuItem(title: "Routing & Task Details", action: nil, keyEquivalent: "")
+        detailsItem.submenu = details
+        menu.addItem(detailsItem)
         addAction("Refresh Usage", #selector(refreshUsage))
         let warmTitle = latest.warmupInProgress ? "Warming Quota Windows…" : "Warm Quota Windows…"
         let warm = NSMenuItem(title: warmTitle, action: #selector(warmAllAccountsNow), keyEquivalent: "")
@@ -849,6 +857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             addStandaloneAccount: { [weak self] in self?.addStandaloneAccount() },
             setAutomaticWarmup: { [weak self] enabled in self?.setAutomaticWarmup(enabled) },
             setAutomaticReset: { [weak self] enabled in self?.updateSettings { $0.automaticallyResetExhaustedAccounts = enabled } },
+            setAutomaticExpiryReset: { [weak self] enabled in self?.updateSettings { $0.automaticallyResetExpiringCredits = enabled } },
             setInteractiveExhaustionPolicy: { [weak self] policy in self?.updateSettings { $0.interactiveExhaustionPolicy = policy } },
             setTaskBoardExhaustionPolicy: { [weak self] policy in self?.updateSettings { $0.taskBoardExhaustionPolicy = policy } },
             setWarmupExcludedAccounts: { [weak self] aliases in
@@ -1470,6 +1479,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension AppDelegate: NSMenuDelegate {
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        for candidate in menu.items {
+            (candidate.view as? MenuRowContainer)?.setMenuHighlighted(candidate === item)
+        }
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         Task { @MainActor in await refreshSnapshot() }
     }

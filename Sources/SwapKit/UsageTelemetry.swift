@@ -290,8 +290,10 @@ public struct UsageTelemetryAttemptEvent: Codable, Sendable, Equatable, Identifi
                 || ($0.value >= 0x61 && $0.value <= 0x7A)
                 || $0.value == 0x2D || $0.value == 0x2E || $0.value == 0x5F
         }) else { return "other" }
-        let known = Set(UsageAnalytics.modelPricing.keys)
-        return known.contains(normalized) ? normalized : "other"
+        if let canonical = UsageAnalytics.canonicalModel(for: normalized) {
+            return canonical
+        }
+        return "other"
     }
 
     private static func boundMetadata(_ raw: String) -> String {
