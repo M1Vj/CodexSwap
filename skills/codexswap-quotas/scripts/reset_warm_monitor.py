@@ -367,9 +367,9 @@ def parse_quota_report(value: Any) -> list[AccountSnapshot]:
         refs.add(ref)
         state = raw_account["state"]
         usage_status = raw_account["usageStatus"]
-        if state not in {"active", "available", "paused", "signInRequired"}:
+        if not isinstance(state, str) or state not in {"active", "available", "paused", "signInRequired"}:
             raise MonitorError("invalid_account_state")
-        if usage_status not in {
+        if not isinstance(usage_status, str) or usage_status not in {
             "ok",
             "signInRequired",
             "unauthorized",
@@ -449,7 +449,10 @@ def parse_warmup_success(value: Any) -> tuple[bool, set[str]]:
         allowed_data = {"status", "accounts", "counts", "startedAt", "finishedAt"}
         if set(data) - allowed_data or "accounts" not in data:
             raise MonitorError("unexpected_warmup_shape")
-        if "status" in data and data["status"] not in {"ok", "proxyUnavailable", "failed", "dryRun"}:
+        if "status" in data and (
+            not isinstance(data["status"], str)
+            or data["status"] not in {"ok", "proxyUnavailable", "failed", "dryRun"}
+        ):
             raise MonitorError("unexpected_warmup_shape")
         if "startedAt" in data:
             parse_timestamp(data["startedAt"])
@@ -463,7 +466,12 @@ def parse_warmup_success(value: Any) -> tuple[bool, set[str]]:
                 raise MonitorError("unexpected_warmup_shape")
             ref = item["ref"]
             status = item["status"]
-            if not isinstance(ref, str) or not REF_PATTERN.fullmatch(ref) or status not in SAFE_WARM_STATUSES:
+            if (
+                not isinstance(ref, str)
+                or not REF_PATTERN.fullmatch(ref)
+                or not isinstance(status, str)
+                or status not in SAFE_WARM_STATUSES
+            ):
                 raise MonitorError("unexpected_warmup_shape")
             if status == "warmed":
                 warmed_refs.add(ref)
@@ -480,13 +488,13 @@ def parse_targeted_warmup_success(value: Any, expected_ref: str) -> tuple[bool, 
     allowed_data = {"status", "ref", "accountStatus", "counts", "startedAt", "finishedAt"}
     if set(data) - allowed_data or not {"status", "ref", "accountStatus"}.issubset(data):
         raise MonitorError("unexpected_warmup_shape")
-    if data["status"] not in {"ok", "proxyUnavailable", "failed", "dryRun"}:
+    if not isinstance(data["status"], str) or data["status"] not in {"ok", "proxyUnavailable", "failed", "dryRun"}:
         raise MonitorError("unexpected_warmup_shape")
     ref = data["ref"]
     account_status = data["accountStatus"]
     if not isinstance(ref, str) or not REF_PATTERN.fullmatch(ref) or ref != expected_ref:
         raise MonitorError("unexpected_warmup_shape")
-    if account_status not in SAFE_WARM_STATUSES:
+    if not isinstance(account_status, str) or account_status not in SAFE_WARM_STATUSES:
         raise MonitorError("unexpected_warmup_shape")
     counts = data.get("counts")
     if not isinstance(counts, Mapping):
@@ -586,11 +594,10 @@ def validate_state(value: Any) -> dict[str, Any]:
         raise MonitorError("state_invalid")
     for key in ("lastPollAt", "lastWarmAt", "nextAttemptAfter"):
         parse_timestamp(value[key], required=False)
-    if value["lastWarmStatus"] is not None and value["lastWarmStatus"] not in {
-        "succeeded",
-        "failed",
-        "proxyUnavailable",
-    }:
+    if value["lastWarmStatus"] is not None and (
+        not isinstance(value["lastWarmStatus"], str)
+        or value["lastWarmStatus"] not in {"succeeded", "failed", "proxyUnavailable"}
+    ):
         raise MonitorError("state_invalid")
 
     accounts: dict[str, Any] = {}
