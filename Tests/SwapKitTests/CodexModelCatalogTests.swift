@@ -275,7 +275,7 @@ final class CodexModelCatalogTests: XCTestCase {
         let maxOutputBytes = await runner.maxOutputBytes
         XCTAssertEqual(arguments, ["debug", "models"])
         XCTAssertLessThanOrEqual(timeout ?? .zero, .seconds(15))
-        XCTAssertEqual(maxOutputBytes, 8 * 1024 * 1024)
+        XCTAssertEqual(maxOutputBytes, 32 * 1024 * 1024)
     }
 
     func testServiceRethrowsCancellationWithoutWrappingIt() async throws {
@@ -520,6 +520,26 @@ final class CodexModelCatalogTests: XCTestCase {
         ).load()
 
         XCTAssertEqual(models.map(\.modelID), ["gpt-5.6-luna"])
+    }
+
+    func testHiddenVisibilityIsTrackedWithoutDroppingModel() async throws {
+        let raw = #"""
+        {
+          "models": [
+            {"slug": "gpt-6.2-sol", "display_name": "GPT-6.2 Sol", "visibility": "list", "supported_reasoning_levels": [{"effort": "high"}]},
+            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide", "supported_reasoning_levels": [{"effort": "high"}]},
+            {"slug": "gpt-6-luna", "display_name": "GPT-6 Luna", "supported_reasoning_levels": [{"effort": "max"}]}
+          ]
+        }
+        """#
+        let models = try await CodexModelCatalogService(
+            runner: StubRunner(result: .success(.init(stdout: Data(raw.utf8), exitCode: 0)))
+        ).load()
+        let byID = Dictionary(uniqueKeysWithValues: models.map { ($0.modelID, $0) })
+
+        XCTAssertEqual(byID["gpt-6.2-sol"]?.isHidden, false)
+        XCTAssertEqual(byID["gpt-reserve"]?.isHidden, true)
+        XCTAssertEqual(byID["gpt-6-luna"]?.isHidden, false)
     }
 
     private func assertCatalogError(

@@ -790,6 +790,36 @@ final class SubagentPolicyPresentationTests: XCTestCase {
         )
     }
 
+    func testResolverAllowsLiveCatalogConfigWithoutModelCatalogJsonAndAppliesRoles() throws {
+        let fixture = try ResolverFixture()
+        defer { fixture.cleanup() }
+        try Data("model = \"gpt-6.2-sol\"\n".utf8).write(to: fixture.root.appendingPathComponent("config.toml"))
+
+        let context = try CodexSubagentPolicyRuntimeResolver.resolve(codexHome: fixture.root)
+        XCTAssertNil(context.catalogOverlayURL)
+        XCTAssertEqual(context.parentModelID, "gpt-6.2-sol")
+
+        let catalog = [
+            descriptor(id: "gpt-6.2-sol", efforts: [.medium, .high, .max]),
+            descriptor(id: "gpt-6-luna", efforts: [.high, .max]),
+        ]
+        let policy = SubagentModelPolicy(
+            eligibleModelIDs: ["gpt-6-luna"],
+            roleAssignments: [SubagentRoleAssignment(roleID: "worker", modelID: "gpt-6-luna", reasoningEffort: .max)]
+        )
+        try context.manager.apply(
+            policy: policy,
+            catalog: catalog,
+            roleFiles: context.roleFiles,
+            parentProviderFamily: .openAI
+        )
+
+        XCTAssertEqual(
+            try CodexSubagentPolicyRuntimeResolver.readManagedAssignments(roleFiles: context.roleFiles),
+            [SubagentRoleAssignment(roleID: "worker", modelID: "gpt-6-luna", reasoningEffort: .max)]
+        )
+    }
+
     func testUnknownConfiguredParentProviderFailsClosedBeforeCrossProviderApply() throws {
         let fixture = try ResolverFixture()
         defer { fixture.cleanup() }
