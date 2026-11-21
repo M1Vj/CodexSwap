@@ -914,14 +914,14 @@ public struct SubagentPolicyPresentationState: Sendable, Equatable {
 /// underscored logical role IDs without any filename guessing.
 public struct CodexSubagentPolicyRuntimeContext: Sendable {
     public let codexHome: URL
-    public let catalogOverlayURL: URL
+    public let catalogOverlayURL: URL?
     public let parentModelID: String
     public let roleFiles: [CodexSubagentRoleFile]
     public let manager: CodexSubagentPolicyManager
 
     public init(
         codexHome: URL,
-        catalogOverlayURL: URL,
+        catalogOverlayURL: URL?,
         parentModelID: String = "",
         roleFiles: [CodexSubagentRoleFile]
     ) {
@@ -990,21 +990,26 @@ public enum CodexSubagentPolicyRuntimeResolver {
         guard isSafeRegularFile(configURL),
               let configData = try? Data(contentsOf: configURL),
               let config = String(data: configData, encoding: .utf8),
-              let reference = try rootTOMLString(key: "model_catalog_json", in: config),
               let parentModelID = try rootTOMLString(key: "model", in: config),
               !parentModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CodexSubagentPolicyRuntimeError.configurationUnavailable
         }
-        let expanded = (reference as NSString).expandingTildeInPath
-        guard expanded.hasPrefix("/"), !expanded.isEmpty else {
-            throw CodexSubagentPolicyRuntimeError.catalogOverlayUnavailable
-        }
-        let overlayURL = URL(fileURLWithPath: expanded).standardizedFileURL
-        let catalogDirectory = home.appendingPathComponent("model-catalogs", isDirectory: true).standardizedFileURL
-        guard isSafeDirectory(catalogDirectory),
-              overlayURL.deletingLastPathComponent().standardizedFileURL.path == catalogDirectory.path,
-              isSafeRegularFile(overlayURL) else {
-            throw CodexSubagentPolicyRuntimeError.catalogOverlayUnavailable
+        let overlayURL: URL?
+        if let reference = try rootTOMLString(key: "model_catalog_json", in: config) {
+            let expanded = (reference as NSString).expandingTildeInPath
+            guard expanded.hasPrefix("/"), !expanded.isEmpty else {
+                throw CodexSubagentPolicyRuntimeError.catalogOverlayUnavailable
+            }
+            let resolvedOverlay = URL(fileURLWithPath: expanded).standardizedFileURL
+            let catalogDirectory = home.appendingPathComponent("model-catalogs", isDirectory: true).standardizedFileURL
+            guard isSafeDirectory(catalogDirectory),
+                  resolvedOverlay.deletingLastPathComponent().standardizedFileURL.path == catalogDirectory.path,
+                  isSafeRegularFile(resolvedOverlay) else {
+                throw CodexSubagentPolicyRuntimeError.catalogOverlayUnavailable
+            }
+            overlayURL = resolvedOverlay
+        } else {
+            overlayURL = nil
         }
 
         let roleFiles = try discoverRoleFiles(codexHome: home)

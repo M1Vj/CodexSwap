@@ -257,6 +257,85 @@ final class DispatcherRouterTests: XCTestCase {
         XCTAssertTrue(models.allSatisfy { $0.baseURL.hasSuffix("/zen/v1") })
         XCTAssertTrue(models.allSatisfy { $0.enabled })
     }
+
+    func testProxyUpstreamHeadersForcesIdentityEncodingWhenRequested() {
+        var incoming = HTTPHeaders()
+        incoming.add(name: "Accept-Encoding", value: "gzip, br, zstd")
+        let account = Account(alias: "acct", accountID: "acct-id", accessToken: "tok")
+
+        let normal = proxyUpstreamHeaders(incoming, account: account)
+        XCTAssertEqual(normal.first(name: "Accept-Encoding"), "gzip, br, zstd")
+
+        let forced = proxyUpstreamHeaders(incoming, account: account, forceIdentityEncoding: true)
+        XCTAssertEqual(forced.first(name: "Accept-Encoding"), "identity")
+    }
+
+    func testProxyCodexModelsForcesIdentityEncodingAndDeliversCatalog() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-models-identity-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let catalogBody = #"{"models":[{"slug":"gpt-6.2-sol","visibility":"list","list":null}]}"#
+        let upstream = RecordingUpstream()
+        let upstreamURL = try await upstream.start(responseBody: catalogBody, contentType: "application/json")
+        defer { Task { await upstream.stop() } }
+
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "catalog-test", accountID: "catalog-test", accessToken: "test-token"))
+        let server = ProxyServer(store: store, config: config, settingsProvider: { .default })
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        var req = HTTPClientRequest(url: "http://127.0.0.1:\(port)/backend-api/codex/models?client_version=0.171.0")
+        req.method = .GET
+        req.headers.add(name: "Accept-Encoding", value: "gzip, br")
+
+        let resp = try await HTTPClient.shared.execute(req, timeout: .seconds(10))
+        let body = try await resp.body.collect(upTo: 1024 * 1024)
+        XCTAssertEqual(resp.status, .ok)
+        let recordedOpt = await upstream.waitForRecorded()
+        let recorded = try XCTUnwrap(recordedOpt)
+        XCTAssertEqual(recorded.headers["accept-encoding"], "identity")
+        let decoded = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(buffer: body)) as? [String: Any])
+        let models = try XCTUnwrap(decoded["models"] as? [[String: Any]])
+        XCTAssertTrue(models.contains { ($0["slug"] as? String) == "gpt-6.2-sol" })
+    }
+
+    func testProxyCodexModelsFallbackBuffersNonJSONWithoutCrashing() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-models-fallback-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let nonJSON = "not-a-json-catalog-payload"
+        let upstream = RecordingUpstream()
+        let upstreamURL = try await upstream.start(responseBody: nonJSON, contentType: "application/octet-stream")
+        defer { Task { await upstream.stop() } }
+
+        var config = ProxyServer.Config()
+        config.upstream = upstreamURL
+        let store = AccountStore(url: root.appendingPathComponent("accounts.json"))
+        await store.upsert(Account(alias: "fallback-test", accountID: "fallback-test", accessToken: "test-token"))
+        let server = ProxyServer(store: store, config: config, settingsProvider: { .default })
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let boundPort = await server.port()
+        let port = try XCTUnwrap(boundPort)
+        var req = HTTPClientRequest(url: "http://127.0.0.1:\(port)/backend-api/codex/models?client_version=0.171.0")
+        req.method = .GET
+        req.headers.add(name: "Accept-Encoding", value: "gzip, br")
+
+        let resp = try await HTTPClient.shared.execute(req, timeout: .seconds(10))
+        let body = try await resp.body.collect(upTo: 1024 * 1024)
+        XCTAssertEqual(resp.status, .ok)
+        XCTAssertEqual(String(buffer: body), nonJSON)
+    }
 }
 
 // MARK: - Recording upstream

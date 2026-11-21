@@ -994,6 +994,8 @@ private struct TaskBadge: View {
 private struct TaskEditorView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft: AutomationTask
+    @State private var availableCatalog: [CodexModelDescriptor] = []
+    @State private var availableModels: [String]
     @State private var modelSelection: String
     @State private var customModel: String
     @State private var fallbackModelsText: String
@@ -1005,19 +1007,19 @@ private struct TaskEditorView: View {
     let isNew: Bool
     let onSave: (AutomationTask) -> Void
 
-    private static let builtInModels = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-
     init(task: AutomationTask, accounts: [Account], isNew: Bool, onSave: @escaping (AutomationTask) -> Void) {
         _draft = State(initialValue: task)
-        if Self.builtInModels.contains(task.model) {
-            _modelSelection = State(initialValue: task.model)
-            _customModel = State(initialValue: "")
-            _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
-        } else {
+        let initialModel = task.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if initialModel.isEmpty {
+            _availableModels = State(initialValue: [])
             _modelSelection = State(initialValue: "custom")
-            _customModel = State(initialValue: task.model)
-            _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
+            _customModel = State(initialValue: "")
+        } else {
+            _availableModels = State(initialValue: [initialModel])
+            _modelSelection = State(initialValue: initialModel)
+            _customModel = State(initialValue: "")
         }
+        _fallbackModelsText = State(initialValue: task.fallbackModels.joined(separator: ", "))
         _branchWasEdited = State(initialValue: !isNew && !task.branch.isEmpty)
         _branchIsValid = State(initialValue: TaskRepositoryValidator.isValidBranchName(task.branch))
         _repositoryIsValid = State(initialValue: TaskRepositoryValidator.isGitWorkingTree(at: task.repoPath))
@@ -1062,7 +1064,7 @@ private struct TaskEditorView: View {
                 TextField("Branch", text: branchBinding)
 
                 Picker("Model", selection: $modelSelection) {
-                    ForEach(Self.builtInModels, id: \.self) { Text($0).tag($0) }
+                    ForEach(availableModels, id: \.self) { Text($0).tag($0) }
                     Divider()
                     Text("Custom…").tag("custom")
                 }
@@ -1073,10 +1075,9 @@ private struct TaskEditorView: View {
                 TextField("Fallback models (comma-separated)", text: $fallbackModelsText)
 
                 Picker("Reasoning Effort", selection: $draft.reasoningEffort) {
-                    Text("Low").tag("low")
-                    Text("Medium").tag("medium")
-                    Text("High").tag("high")
-                    Text("X-High (model dependent)").tag("xhigh")
+                    ForEach(availableEffortOptions, id: \.self) { effort in
+                        Text(effortLabel(for: effort)).tag(effort)
+                    }
                 }
 
                 LabeledContent("Accounts") {
@@ -1151,6 +1152,56 @@ private struct TaskEditorView: View {
         }
         .padding(24)
         .frame(width: 680, height: 620)
+        .task {
+            await loadDynamicCodexModels()
+        }
+    }
+
+    private var availableEffortOptions: [String] {
+        let current = draft.reasoningEffort
+        var efforts: [String]
+        if let descriptor = availableCatalog.first(where: { $0.modelID == selectedModel }) {
+            efforts = descriptor.supportedReasoningEfforts.map(\.rawValue)
+        } else {
+            efforts = ["low", "medium", "high", "xhigh", "max"]
+        }
+        if !current.isEmpty, !efforts.contains(current) {
+            efforts.append(current)
+        }
+        return efforts
+    }
+
+    private func effortLabel(for raw: String) -> String {
+        switch raw {
+        case "low": "Low"
+        case "medium": "Medium"
+        case "high": "High"
+        case "xhigh": "X-High"
+        case "max": "Max"
+        case "ultra": "Ultra"
+        default: raw
+        }
+    }
+
+    private func loadDynamicCodexModels() async {
+        guard let catalog = try? await CodexModelCatalogService().load() else { return }
+        let visible = catalog.filter { !$0.isHidden }
+        let openAI = visible.filter { $0.providerFamily == .openAI }.map(\.modelID)
+        let others = visible.filter { $0.providerFamily != .openAI }.map(\.modelID)
+        var ordered = openAI + others
+        let current = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty, !ordered.contains(current) {
+            ordered.insert(current, at: 0)
+        }
+        guard !ordered.isEmpty else { return }
+        availableCatalog = visible
+        availableModels = ordered
+        if modelSelection == "custom", ordered.contains(current) {
+            modelSelection = current
+            customModel = ""
+        } else if !ordered.contains(modelSelection), modelSelection != "custom" {
+            modelSelection = ordered[0]
+        }
     }
 
     private var branchBinding: Binding<String> {

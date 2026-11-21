@@ -26,19 +26,22 @@ public struct CodexModelDescriptor: Codable, Sendable, Equatable {
     public let supportedReasoningEfforts: [CodexReasoningEffort]
     public let providerFamily: CodexModelProviderFamily
     public let syntheticUltra: Bool
+    public let isHidden: Bool
 
     public init(
         modelID: String,
         displayName: String,
         supportedReasoningEfforts: [CodexReasoningEffort],
         providerFamily: CodexModelProviderFamily,
-        syntheticUltra: Bool = false
+        syntheticUltra: Bool = false,
+        isHidden: Bool = false
     ) {
         self.modelID = modelID
         self.displayName = displayName
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.providerFamily = providerFamily
         self.syntheticUltra = syntheticUltra
+        self.isHidden = isHidden
     }
 
     public func providerEffort(for effort: CodexReasoningEffort) -> CodexReasoningEffort {
@@ -118,7 +121,7 @@ public enum CodexModelCatalogError: Error, Sendable, Equatable, LocalizedError {
 
 public struct CodexModelCatalogService: Sendable {
     public static let commandTimeout: Duration = .seconds(15)
-    public static let maximumOutputBytes = 8 * 1024 * 1024
+    public static let maximumOutputBytes = 32 * 1024 * 1024
 
     private let runner: any CodexCommandRunning
     private let bridgedModels: [BridgedModel]
@@ -260,7 +263,8 @@ public struct CodexModelCatalogService: Sendable {
                 displayName: nonEmpty(model.displayName) ?? modelID,
                 advertisedEfforts: efforts,
                 providerFamily: providerFamily,
-                alphaUltraEnabled: alphaUltraEnabled
+                alphaUltraEnabled: alphaUltraEnabled,
+                isHidden: nonEmpty(model.visibility)?.lowercased() == "hide"
             )
             rawDescriptors[modelID, default: []].append(descriptor)
         }
@@ -298,7 +302,8 @@ public struct CodexModelCatalogService: Sendable {
         displayName: String,
         advertisedEfforts: [CodexReasoningEffort],
         providerFamily: CodexModelProviderFamily,
-        alphaUltraEnabled: Bool
+        alphaUltraEnabled: Bool,
+        isHidden: Bool = false
     ) -> CodexModelDescriptor {
         var efforts = canonicalizeEfforts(advertisedEfforts)
         if modelID == "x-preview-f-free" && providerFamily == .bridged {
@@ -313,7 +318,8 @@ public struct CodexModelCatalogService: Sendable {
             displayName: displayName,
             supportedReasoningEfforts: efforts,
             providerFamily: providerFamily,
-            syntheticUltra: syntheticUltra
+            syntheticUltra: syntheticUltra,
+            isHidden: isHidden
         )
     }
 
@@ -328,7 +334,8 @@ public struct CodexModelCatalogService: Sendable {
             ),
             supportedReasoningEfforts: efforts,
             providerFamily: descriptors.map(\.providerFamily).sorted { $0.rawValue < $1.rawValue }.first ?? first.providerFamily,
-            syntheticUltra: descriptors.contains(where: \.syntheticUltra)
+            syntheticUltra: descriptors.contains(where: \.syntheticUltra),
+            isHidden: descriptors.allSatisfy(\.isHidden)
         )
     }
 
@@ -392,11 +399,13 @@ public struct CodexModelCatalogService: Sendable {
     private struct RawModel: Decodable {
         let slug: String?
         let displayName: String?
+        let visibility: String?
         let supportedReasoningLevels: LossyArray<RawReasoningLevel>
 
         private enum CodingKeys: String, CodingKey {
             case slug
             case displayName = "display_name"
+            case visibility
             case supportedReasoningLevels = "supported_reasoning_levels"
         }
 
@@ -404,6 +413,7 @@ public struct CodexModelCatalogService: Sendable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             slug = try? container.decodeIfPresent(String.self, forKey: .slug)
             displayName = try? container.decodeIfPresent(String.self, forKey: .displayName)
+            visibility = try? container.decodeIfPresent(String.self, forKey: .visibility)
             supportedReasoningLevels = (try? container.decodeIfPresent(LossyArray<RawReasoningLevel>.self, forKey: .supportedReasoningLevels)) ?? LossyArray()
         }
     }

@@ -273,7 +273,7 @@ public struct CodexSubagentPolicyManager: Sendable {
     public typealias MutationHook = @Sendable (CodexSubagentPolicyMutationStage) throws -> Void
 
     public let codexHome: URL
-    public let catalogOverlayURL: URL
+    public let catalogOverlayURL: URL?
 
     private let fileSystem: CodexSubagentPolicyFileSystem
     private let mutationHook: MutationHook
@@ -281,7 +281,7 @@ public struct CodexSubagentPolicyManager: Sendable {
 
     public init(
         codexHome: URL,
-        catalogOverlayURL: URL,
+        catalogOverlayURL: URL?,
         fileSystem: CodexSubagentPolicyFileSystem = .live,
         mutationHook: @escaping MutationHook = { _ in }
     ) {
@@ -295,7 +295,7 @@ public struct CodexSubagentPolicyManager: Sendable {
     /// lowercase `filesystem` label.
     public init(
         codexHome: URL,
-        catalogOverlayURL: URL,
+        catalogOverlayURL: URL?,
         filesystem: CodexSubagentPolicyFileSystem,
         mutationHook: @escaping MutationHook = { _ in }
     ) {
@@ -449,37 +449,41 @@ public struct CodexSubagentPolicyManager: Sendable {
             ))
         }
 
-        try ensurePathChainSafe(catalogOverlayURL, kind: .overlay)
-        guard fileExists(catalogOverlayURL) else {
+        if let catalogOverlayURL {
+            try ensurePathChainSafe(catalogOverlayURL, kind: .overlay)
+            guard fileExists(catalogOverlayURL) else {
+                throw CodexSubagentPolicyManagerError.overlay(.unreadable)
+            }
+            let overlayMetadata: CodexSubagentPolicyFileMetadata
+            do {
+                overlayMetadata = try fileSystem.metadata(catalogOverlayURL)
+            } catch {
+                throw CodexSubagentPolicyManagerError.overlay(.unreadable)
+            }
+            guard !overlayMetadata.isSymbolicLink, !overlayMetadata.isDirectory, overlayMetadata.isRegularFile else {
+                throw CodexSubagentPolicyManagerError.overlay(.malformed)
+            }
+            let overlayOriginal: Data
+            do {
+                overlayOriginal = try fileSystem.readData(catalogOverlayURL)
+            } catch {
+                throw CodexSubagentPolicyManagerError.overlay(.unreadable)
+            }
+            let overlayRewrite = try rewriteOverlay(
+                overlayOriginal,
+                alphaUltraEnabled: policy.alphaUltraEnabled,
+                catalog: catalog
+            )
+            staged.append(StagedFile(
+                target: .overlay,
+                url: catalogOverlayURL,
+                original: overlayOriginal,
+                staged: overlayRewrite,
+                permissions: overlayMetadata.posixPermissions
+            ))
+        } else if policy.alphaUltraEnabled {
             throw CodexSubagentPolicyManagerError.overlay(.unreadable)
         }
-        let overlayMetadata: CodexSubagentPolicyFileMetadata
-        do {
-            overlayMetadata = try fileSystem.metadata(catalogOverlayURL)
-        } catch {
-            throw CodexSubagentPolicyManagerError.overlay(.unreadable)
-        }
-        guard !overlayMetadata.isSymbolicLink, !overlayMetadata.isDirectory, overlayMetadata.isRegularFile else {
-            throw CodexSubagentPolicyManagerError.overlay(.malformed)
-        }
-        let overlayOriginal: Data
-        do {
-            overlayOriginal = try fileSystem.readData(catalogOverlayURL)
-        } catch {
-            throw CodexSubagentPolicyManagerError.overlay(.unreadable)
-        }
-        let overlayRewrite = try rewriteOverlay(
-            overlayOriginal,
-            alphaUltraEnabled: policy.alphaUltraEnabled,
-            catalog: catalog
-        )
-        staged.append(StagedFile(
-            target: .overlay,
-            url: catalogOverlayURL,
-            original: overlayOriginal,
-            staged: overlayRewrite,
-            permissions: overlayMetadata.posixPermissions
-        ))
 
         try commit(staged)
     }
