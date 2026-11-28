@@ -728,6 +728,182 @@ else:
         self.assertIsNotNone(saved["accounts"][REF]["lastWarmAt"])
 
 
+    def test_quota_enums_reject_nonstring_json_values(self) -> None:
+        for field, error_code in (("state", "invalid_account_state"), ("usageStatus", "invalid_usage_status")):
+            for invalid in ([], {}, ["available"], {"value": "ok"}, None, True, 1, 0.5, "unknown"):
+                with self.subTest(field=field, invalid=invalid):
+                    payload = quota_report()
+                    payload["data"]["accounts"][0][field] = invalid
+                    decoded = monitor.decode_json(json.dumps(payload))
+                    with self.assertRaises(monitor.MonitorError) as caught:
+                        monitor.parse_quota_report(decoded)
+                    self.assertEqual(caught.exception.code, error_code)
+
+    def test_bulk_warm_enums_reject_nonstring_json_values(self) -> None:
+        for field in ("status", "accountStatus"):
+            for invalid in ([], {}, ["warmed"], {"value": "ok"}, None, True, 1, 0.5, "unknown"):
+                with self.subTest(field=field, invalid=invalid):
+                    data = {"status": "ok", "accounts": [{"ref": REF, "status": "warmed"}]}
+                    if field == "status":
+                        data["status"] = invalid
+                    else:
+                        data["accounts"][0]["status"] = invalid
+                    decoded = monitor.decode_json(json.dumps(envelope("agent warmup all", data)))
+                    with self.assertRaises(monitor.MonitorError) as caught:
+                        monitor.parse_warmup_success(decoded)
+                    self.assertEqual(caught.exception.code, "unexpected_warmup_shape")
+
+    def test_targeted_warm_enums_reject_nonstring_json_values(self) -> None:
+        for field in ("status", "accountStatus"):
+            for invalid in ([], {}, ["warmed"], {"value": "ok"}, None, True, 1, 0.5, "unknown"):
+                with self.subTest(field=field, invalid=invalid):
+                    payload = warm_report()
+                    payload["data"][field] = invalid
+                    decoded = monitor.decode_json(json.dumps(payload))
+                    with self.assertRaises(monitor.MonitorError) as caught:
+                        monitor.parse_targeted_warmup_success(decoded, REF)
+                    self.assertEqual(caught.exception.code, "unexpected_warmup_shape")
+
+    def test_durable_warm_enum_rejects_nonstring_json_values(self) -> None:
+        for invalid in ([], {}, ["succeeded"], {"value": "failed"}, True, 1, 0.5, "unknown"):
+            with self.subTest(invalid=invalid):
+                payload = monitor._default_state()
+                payload["lastWarmStatus"] = invalid
+                with self.assertRaises(monitor.MonitorError) as caught:
+                    monitor.validate_state(monitor.decode_json(json.dumps(payload)))
+                self.assertEqual(caught.exception.code, "state_invalid")
+
+    def test_enum_guards_preserve_all_valid_values_and_optional_fields(self) -> None:
+        for state in ("active", "available", "paused", "signInRequired"):
+            for usage in ("ok", "signInRequired", "unauthorized", "timeout", "network", "serviceError", "malformedResponse"):
+                with self.subTest(state=state, usage=usage):
+                    parsed = monitor.parse_quota_report(quota_report(state=state, usage_status=usage))
+                    self.assertEqual((parsed[0].state, parsed[0].usage_status), (state, usage))
+        for status in ("ok", "proxyUnavailable", "failed", "dryRun"):
+            for account_status in monitor.SAFE_WARM_STATUSES:
+                with self.subTest(status=status, account_status=account_status):
+                    targeted = warm_report(account_status=account_status)
+                    targeted["data"]["status"] = status
+                    self.assertEqual(monitor.parse_targeted_warmup_success(targeted, REF), (True, account_status == "warmed"))
+                    data = {"status": status, "accounts": [{"ref": REF, "status": account_status}]}
+                    self.assertEqual(monitor.parse_warmup_success(envelope("agent warmup all", data)), (True, {REF} if account_status == "warmed" else set()))
+        # The bulk status is optional, while the durable status is nullable.
+        self.assertEqual(monitor.parse_warmup_success(envelope("agent warmup all", {"accounts": []})), (True, set()))
+        for status in (None, "succeeded", "failed", "proxyUnavailable"):
+            with self.subTest(lastWarmStatus=status):
+                state = monitor._default_state()
+                state["lastWarmStatus"] = status
+                self.assertEqual(monitor.validate_state(state)["lastWarmStatus"], status)
+
+    def test_malformed_quota_enum_preserves_state_and_recovers_next_poll(self) -> None:
+        now = instant("2026-08-30T23:00:00Z")
+        monitor.monitor_once(self.config, now=now)
+        state_file = self.state_dir / "state.json"
+        before = state_file.read_bytes()
+        for field in ("state", "usageStatus"):
+            for invalid in ([], {}):
+                with self.subTest(field=field, invalid=invalid):
+                    payload = quota_report(reset_at="2026-08-31T00:10:00Z")
+                    payload["data"]["accounts"][0][field] = invalid
+                    self.fixtures.joinpath("baseline.quota.json").write_text(json.dumps(payload), encoding="utf-8")
+                    calls_before = len(self.calls())
+                    code, result = monitor.monitor_once(self.config, now=now)
+                    self.assertEqual((code, result["status"]), (monitor.EXIT_DATA, "quotaInvalid"))
+                    self.assertEqual(state_file.read_bytes(), before)
+                    self.assertEqual(self.calls()[calls_before:], [["agent", "quota", "report", "--json"]])
+                    events = [json.loads(line) for line in (self.state_dir / "monitor.log").read_text().splitlines()]
+                    self.assertEqual([event["event"] for event in events if event["runId"] == result["runId"]],
+                                     ["monitor_started", "quota_report_invalid", "monitor_completed"])
+        self.write_phase("recovered", reset_at="2026-08-31T00:10:00Z")
+        code, result = monitor.monitor_once(self.config, now=now)
+        self.assertEqual((code, result["status"]), (monitor.EXIT_OK, "noReset"))
+        self.assertFalse(any(call[:2] == ["agent", "warmup"] for call in self.calls()))
+
+    def test_malformed_durable_enum_returns_state_invalid_without_commands(self) -> None:
+        now = instant("2026-08-30T23:00:00Z")
+        monitor.monitor_once(self.config, now=now)
+        state_file = self.state_dir / "state.json"
+        original = state_file.read_bytes()
+        calls_before = self.calls()
+        for invalid in ([], {}):
+            with self.subTest(invalid=invalid):
+                payload = json.loads(original)
+                payload["lastWarmStatus"] = invalid
+                corrupt = json.dumps(payload).encode()
+                state_file.write_bytes(corrupt)
+                code, result = monitor.monitor_once(self.config, now=now)
+                self.assertEqual((code, result["status"]), (monitor.EXIT_DATA, "stateInvalid"))
+                self.assertEqual(state_file.read_bytes(), corrupt)
+                self.assertEqual(self.calls(), calls_before)
+                events = [json.loads(line) for line in (self.state_dir / "monitor.log").read_text().splitlines()]
+                self.assertEqual([event["event"] for event in events if event["runId"] == result["runId"]],
+                                 ["monitor_started", "state_invalid", "monitor_completed"])
+        state_file.write_bytes(original)
+        code, result = monitor.monitor_once(self.config, now=now)
+        self.assertEqual((code, result["status"]), (monitor.EXIT_OK, "noReset"))
+
+    def test_malformed_targeted_enum_preserves_pending_and_cooldown(self) -> None:
+        for index, (field, invalid) in enumerate((field, value) for field in ("status", "accountStatus") for value in ([], {})):
+            with self.subTest(field=field, invalid=invalid):
+                config = monitor.dataclasses.replace(self.config, state_dir=self.root / f"state-{index}")
+                self.write_phase("baseline", reset_at="2026-08-31T00:10:00Z")
+                monitor.monitor_once(config, now=instant("2026-08-30T23:00:00Z"))
+                self.write_phase("reset", used=0, reset_at="2026-08-31T01:00:00Z")
+                payload = warm_report()
+                payload["data"][field] = invalid
+                self.fixtures.joinpath("warm.json").write_text(json.dumps(payload), encoding="utf-8")
+                calls_before = len(self.calls())
+                code, result = monitor.monitor_once(config, now=instant("2026-08-31T00:20:00Z"))
+                self.assertEqual((code, result["status"], result["pendingCount"], result["warmedCount"]),
+                                 (monitor.EXIT_TEMPORARY, "warmFailed", 1, 0))
+                self.assertEqual(self.calls()[calls_before:], [["agent", "quota", "report", "--json"],
+                    ["agent", "status", "--json"], ["agent", "warmup", "account", REF, "--confirm", "--json"]])
+                saved = json.loads((config.state_dir / "state.json").read_text())
+                self.assertEqual(saved["lastWarmStatus"], "failed")
+                self.assertEqual(saved["nextAttemptAfter"], "2026-08-31T00:35:00Z")
+                self.assertIsNotNone(saved["accounts"][REF]["pendingFingerprint"])
+                self.assertIsNone(saved["accounts"][REF]["lastWarmFingerprint"])
+                events = [json.loads(line) for line in (config.state_dir / "monitor.log").read_text().splitlines()]
+                run_events = [event for event in events if event["runId"] == result["runId"]]
+                self.assertTrue(any(event["event"] == "warm_attempt_failed" and event["reason"] == "invalid_response" for event in run_events))
+                self.assertEqual(run_events[-1]["event"], "monitor_completed")
+                calls_before = len(self.calls())
+                code, result = monitor.monitor_once(config, now=instant("2026-08-31T00:21:00Z"))
+                self.assertEqual((code, result["status"]), (monitor.EXIT_OK, "cooldown"))
+                self.assertEqual(self.calls()[calls_before:], [["agent", "quota", "report", "--json"]])
+
+    def test_watch_continues_after_malformed_quota_enum(self) -> None:
+        # Exercise the CLI loop without wall-clock sleeps or real services.
+        import contextlib
+        import io
+
+        payload = quota_report()
+        payload["data"]["accounts"][0]["state"] = []
+        self.fixtures.joinpath("baseline.quota.json").write_text(json.dumps(payload), encoding="utf-8")
+        real_poll = monitor.monitor_once
+        handlers = {}
+        polls = 0
+
+        def poll(config):
+            nonlocal polls
+            polls += 1
+            if polls == 2:
+                handlers[monitor.signal.SIGTERM](monitor.signal.SIGTERM, None)
+            return real_poll(config, now=instant("2026-08-30T23:00:00Z"))
+
+        output = io.StringIO()
+        with mock.patch.object(monitor.signal, "signal", side_effect=lambda signum, handler: handlers.update({signum: handler})), \
+             mock.patch.object(monitor.time, "monotonic", side_effect=[0, 2]), \
+             mock.patch.object(monitor, "monitor_once", side_effect=poll), \
+             contextlib.redirect_stdout(output):
+            code = monitor.main(["--watch", "--interval-seconds", "1", "--binary", str(self.binary), "--state-dir", str(self.state_dir)])
+        self.assertEqual(code, monitor.EXIT_DATA)
+        results = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([result["status"] for result in results], ["quotaInvalid", "quotaInvalid"])
+        self.assertEqual(self.calls(), [["agent", "quota", "report", "--json"]] * 2)
+
+
+
 if __name__ == "__main__":
     unittest.main()
 
