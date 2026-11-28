@@ -74,7 +74,9 @@ public extension Account {
 
 }
 
-private extension UsageWindow {
+/// Window-kind classification shared by the hard-cap gate above and the proxy's
+/// advisory `Retry-After` estimate, which must agree on what "capped" means.
+extension UsageWindow {
     var isFiveHourUsageWindow: Bool {
         if windowSeconds == 18_000 { return true }
         let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

@@ -295,6 +295,84 @@ func refusesInteractiveTraffic(mode: ProxyRequestMode, routingEnabled: Bool) -> 
     mode == .normal && !routingEnabled
 }
 
+/// Upper bound for the advisory `Retry-After` value. The longest quota window a
+/// Codex plan reports is one week, so anything beyond it is clock skew or a
+/// corrupt reset timestamp rather than a real wait.
+let maxNoEligibleAccountRetryAfterSeconds = 604_800
+
+/// Whether one account is a candidate for the current routing mode. Mirrors the
+/// structural half of `Account.isEligible(now:)` (archived, routing disabled,
+/// missing token, or a pending login never recover on a timer) plus the mode
+/// scoping `reserveProxyAccount` applies before selection.
+func isNoEligibleAccountCandidate(_ account: Account, mode: ProxyRequestMode) -> Bool {
+    guard account.isRoutableIgnoringCooldown else { return false }
+    switch mode {
+    case .normal:
+        return true
+    case .warmup(let alias):
+        return account.alias == alias
+    case .task(let allowed, _):
+        return allowed.contains(account.alias)
+    }
+}
+
+/// A retained usage window that currently forbids routing. Soft rotation
+/// thresholds are intentionally absent: `AccountStore.bestEligible` falls back to
+/// the best over-threshold account, so only a fully consumed window or a reached
+/// configured hard cap actually stops traffic.
+func usageWindowBlocksRouting(_ window: UsageWindow, account: Account) -> Bool {
+    if window.usedPercent >= 100 { return true }
+    let caps = account.usageLimitSettings
+    guard caps.enabled else { return false }
+    if window.isFiveHourUsageWindow, window.usedPercent >= caps.fiveHourPercent { return true }
+    if window.isWeeklyUsageWindow, window.usedPercent >= caps.weeklyPercent { return true }
+    return false
+}
+
+/// The instant a single account becomes routable again, or `nil` when it is not
+/// blocked at all or its recovery cannot be predicted (a blocking window with no
+/// reset timestamp, or a structural block the caller already filtered out).
+func noEligibleAccountRecoveryDate(_ account: Account, now: Date) -> Date? {
+    var deadlines: [Date] = []
+    if let cooldown = account.cooldownUntil(now: now) { deadlines.append(cooldown) }
+    for window in account.usage where usageWindowBlocksRouting(window, account: account) {
+        // A cap with no reset date has no predictable recovery. Never invent one:
+        // the whole account drops out instead of producing a fabricated delay.
+        guard let resetAt = window.resetAt else { return nil }
+        // A reset already in the past means the retained reading is stale; the
+        // window has rolled over and no longer blocks.
+        if resetAt > now { deadlines.append(resetAt) }
+    }
+    return deadlines.max()
+}
+
+/// Seconds a client should wait before retrying after the proxy answers
+/// `503 CodexSwap has no eligible account`.
+///
+/// Returns the earliest moment any candidate account becomes routable again,
+/// rounded up to whole seconds and clamped to a sane positive range. `nil` means
+/// no candidate has a finite future recovery (all archived, routing disabled,
+/// awaiting login, missing tokens, or holding a cap with no reset date), in which
+/// case the response carries no `Retry-After` and keeps today's behavior.
+func noEligibleAccountRetryAfterSeconds(
+    accounts: [Account],
+    mode: ProxyRequestMode,
+    now: Date = Date()
+) -> Int? {
+    var earliest: Date?
+    for account in accounts where isNoEligibleAccountCandidate(account, mode: mode) {
+        guard let recovery = noEligibleAccountRecoveryDate(account, now: now) else { continue }
+        if let current = earliest {
+            earliest = min(current, recovery)
+        } else {
+            earliest = recovery
+        }
+    }
+    guard let earliest else { return nil }
+    let seconds = Int(ceil(earliest.timeIntervalSince(now)))
+    return min(maxNoEligibleAccountRetryAfterSeconds, max(1, seconds))
+}
+
 func isWebSocketPrewarmRequest(headers: HTTPHeaders, method: HTTPMethod, path: String) -> Bool {
     guard method == .GET, splitPathQuery(path).0.hasSuffix("/responses") else { return false }
     return headers[canonicalForm: "upgrade"].contains { value in
@@ -1537,7 +1615,18 @@ public actor ProxyServer {
                 account: nil,
                 outcome: .failure
             )
-            try await writeError(outbound, status: .serviceUnavailable, message: "CodexSwap has no eligible account")
+            // Tell clients when the roster can serve again instead of leaving them
+            // to guess. No account identity, alias, or token ever reaches the header.
+            let retryAfter = noEligibleAccountRetryAfterSeconds(
+                accounts: await store.activeAccounts(),
+                mode: mode
+            )
+            try await writeError(
+                outbound,
+                status: .serviceUnavailable,
+                message: "CodexSwap has no eligible account",
+                extraHeaders: retryAfter.map { [("Retry-After", String($0))] } ?? []
+            )
             return
         }
         await recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
@@ -2954,12 +3043,20 @@ public actor ProxyServer {
         try await outbound.write(.end(nil))
     }
 
-    private func writeError(_ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>, status: HTTPResponseStatus, message: String) async throws {
+    private func writeError(
+        _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        status: HTTPResponseStatus,
+        message: String,
+        extraHeaders: [(String, String)] = []
+    ) async throws {
         var buf = ByteBuffer()
         buf.writeString(message)
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "text/plain; charset=utf-8")
         headers.add(name: "Content-Length", value: String(buf.readableBytes))
+        for (name, value) in extraHeaders {
+            headers.add(name: name, value: value)
+        }
         let respHead = HTTPResponseHead(version: .http1_1, status: status, headers: headers)
         try await outbound.write(.head(respHead))
         try await outbound.write(.body(.byteBuffer(buf)))
