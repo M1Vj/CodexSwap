@@ -32,11 +32,6 @@ struct MenuAccountRow: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .layoutPriority(1)
-                    if isActive {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(Color.accentColor)
-                            .help(selectionLabel)
-                    }
                     if isSticky {
                         Image(systemName: "pin.fill")
                             .font(.caption2.weight(.semibold))
@@ -74,6 +69,7 @@ struct MenuAccountRow: View {
             }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
+        .background(isActive ? Color.accentColor.opacity(0.10) : Color.clear)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilitySummary)

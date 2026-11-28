@@ -100,6 +100,10 @@ public actor QuotaResetCoordinator {
         for operation in operations { _ = await operation.value }
     }
 
+    public func isLatestRefreshGeneration(_ generation: UInt64) -> Bool {
+        generation == latestRefreshGeneration
+    }
+
     public func reserveOperationGeneration() -> UInt64 {
         latestRefreshGeneration &+= 1
         return latestRefreshGeneration

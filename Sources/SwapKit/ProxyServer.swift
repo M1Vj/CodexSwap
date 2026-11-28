@@ -490,7 +490,11 @@ func withRoutingLease<T>(
     }
 }
 
-func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHeaders {
+func proxyUpstreamHeaders(
+    _ incoming: HTTPHeaders,
+    account: Account,
+    forceIdentityEncoding: Bool = false
+) -> HTTPHeaders {
     var headers = incoming
     headers.remove(name: "Host")
     headers.remove(name: "Connection")
@@ -498,6 +502,9 @@ func proxyUpstreamHeaders(_ incoming: HTTPHeaders, account: Account) -> HTTPHead
     headers.remove(name: ProxyRequestMode.warmupHeader)
     headers.remove(name: ProxyRequestMode.taskHeader)
     headers.remove(name: ProxyRequestMode.taskRunHeader)
+    if forceIdentityEncoding {
+        headers.replaceOrAdd(name: "Accept-Encoding", value: "identity")
+    }
     headers.replaceOrAdd(name: "Authorization", value: "Bearer \(account.accessToken)")
     if !account.accountID.isEmpty {
         headers.replaceOrAdd(name: "ChatGPT-Account-Id", value: account.accountID)
@@ -1855,27 +1862,20 @@ public actor ProxyServer {
                 }
                 if head.method == .GET, path == "/backend-api/codex/models",
                    resp.status.code >= 200, resp.status.code < 300 {
-                    let upstreamCatalog = try await collect(resp.body, cap: 8 * 1024 * 1024)
-                let dispatcherModels = await DispatcherCatalogCache.shared.routableDispatcherModels(httpClient: self.httpClient)
-                if let merged = DispatcherUpstream.mergingDispatcherSlugs(
-                    upstreamCatalogBody: Data(buffer: upstreamCatalog),
-                    dispatcherModels: dispatcherModels
-                ) {
-                        await self.recordTelemetryAttempt(
-                            rootRequestID: rootRequestID,
-                            attemptIndex: attemptIndex,
-                            startedAt: attemptStartedAt,
-                            finishedAt: Date(),
-                            account: account,
-                            model: requestModel,
-                            category: requestCategory,
-                            outcome: .success,
-                            status: Int(resp.status.code),
-                            errorClass: nil
-                        )
-                        try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: ByteBuffer(data: merged))
-                        return .completed(outcome: .success, status: Int(resp.status.code))
+                    await self.publishServedActivity(account.alias, mode: mode)
+                    if bindSelectionOnSuccess {
+                        await self.recordSelection(account.alias, mode: mode, interactiveKey: interactiveKey)
                     }
+                    return try await self.deliverCodexModelsCatalog(
+                        outbound,
+                        response: resp,
+                        account: account,
+                        rootRequestID: rootRequestID,
+                        attemptIndex: attemptIndex,
+                        attemptStartedAt: attemptStartedAt,
+                        requestModel: requestModel,
+                        requestCategory: requestCategory
+                    )
                 }
                 await self.publishServedActivity(account.alias, mode: mode)
                 if bindSelectionOnSuccess, resp.status.code >= 200, resp.status.code < 300 {
@@ -2404,27 +2404,16 @@ public actor ProxyServer {
             )
             if head.method == .GET, path == "/backend-api/codex/models",
                resp.status.code >= 200, resp.status.code < 300 {
-                let upstreamCatalog = try await collect(resp.body, cap: 8 * 1024 * 1024)
-                let dispatcherModels = await DispatcherCatalogCache.shared.routableDispatcherModels(httpClient: self.httpClient)
-                if let merged = DispatcherUpstream.mergingDispatcherSlugs(
-                    upstreamCatalogBody: Data(buffer: upstreamCatalog),
-                    dispatcherModels: dispatcherModels
-                ) {
-                    await self.recordTelemetryAttempt(
-                        rootRequestID: rootRequestID,
-                        attemptIndex: attemptIndex,
-                        startedAt: attemptStartedAt,
-                        finishedAt: Date(),
-                        account: account,
-                        model: requestModel,
-                        category: requestCategory,
-                        outcome: .success,
-                        status: Int(resp.status.code),
-                        errorClass: nil
-                    )
-                    try await deliverBuffered(outbound, status: resp.status, headers: resp.headers, body: ByteBuffer(data: merged))
-                    return .completed(outcome: .success, status: Int(resp.status.code))
-                }
+                return try await self.deliverCodexModelsCatalog(
+                    outbound,
+                    response: resp,
+                    account: account,
+                    rootRequestID: rootRequestID,
+                    attemptIndex: attemptIndex,
+                    attemptStartedAt: attemptStartedAt,
+                    requestModel: requestModel,
+                    requestCategory: requestCategory
+                )
             }
             try await self.streamResponse(
                 outbound,
@@ -2758,10 +2747,57 @@ public actor ProxyServer {
         return hydrated
     }
 
+    private static let codexModelsCatalogByteCap = 32 * 1024 * 1024
+
+    private func deliverCodexModelsCatalog(
+        _ outbound: NIOAsyncChannelOutboundWriter<HTTPServerResponsePart>,
+        response resp: HTTPClientResponse,
+        account: Account,
+        rootRequestID: UUID,
+        attemptIndex: Int,
+        attemptStartedAt: Date,
+        requestModel: String,
+        requestCategory: UsageTelemetryRequestCategory
+    ) async throws -> ProxyAttemptResult {
+        let upstreamCatalog = try await collect(resp.body, cap: Self.codexModelsCatalogByteCap)
+        let dispatcherModels = await DispatcherCatalogCache.shared.routableDispatcherModels(httpClient: self.httpClient)
+        let bodyToDeliver: ByteBuffer
+        var headersToDeliver = resp.headers
+        if let merged = DispatcherUpstream.mergingDispatcherSlugs(
+            upstreamCatalogBody: Data(buffer: upstreamCatalog),
+            dispatcherModels: dispatcherModels
+        ) {
+            headersToDeliver.remove(name: "Content-Encoding")
+            bodyToDeliver = ByteBuffer(data: merged)
+        } else {
+            bodyToDeliver = upstreamCatalog
+        }
+        await self.recordTelemetryAttempt(
+            rootRequestID: rootRequestID,
+            attemptIndex: attemptIndex,
+            startedAt: attemptStartedAt,
+            finishedAt: Date(),
+            account: account,
+            model: requestModel,
+            category: requestCategory,
+            outcome: .success,
+            status: Int(resp.status.code),
+            errorClass: nil
+        )
+        try await deliverBuffered(outbound, status: resp.status, headers: headersToDeliver, body: bodyToDeliver)
+        return .completed(outcome: .success, status: Int(resp.status.code))
+    }
+
     private func forward(head: HTTPRequestHead, body: Data, account: Account, target: URL) async throws -> HTTPClientResponse {
         var request = HTTPClientRequest(url: target.absoluteString)
         request.method = head.method
-        request.headers = proxyUpstreamHeaders(head.headers, account: account)
+        let forceIdentityEncoding = head.method == .GET
+            && splitPathQuery(head.uri).0 == "/backend-api/codex/models"
+        request.headers = proxyUpstreamHeaders(
+            head.headers,
+            account: account,
+            forceIdentityEncoding: forceIdentityEncoding
+        )
         if !body.isEmpty { request.body = .bytes(ByteBuffer(bytes: body)) }
         return try await httpClient.execute(request, timeout: .seconds(600))
     }

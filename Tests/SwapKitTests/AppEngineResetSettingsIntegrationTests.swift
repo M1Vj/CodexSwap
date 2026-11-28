@@ -417,6 +417,20 @@ final class AppEngineResetSettingsIntegrationTests: XCTestCase {
         XCTAssertEqual(status, .noCredit)
     }
 
+    func testPersistentCreditFailureBacksOffInsteadOfSpinning() async throws {
+        let fixture = try await makeFixture(availableCount: 1)
+        await fixture.service.failAllCredits(with: .transport(.timeout))
+
+        await fixture.engine.setPriority("alpha", priority: 4)
+        try await Task.sleep(nanoseconds: 700_000_000)
+
+        // An offline network fails each fetch in milliseconds. Without a backoff the
+        // refresh loop retried at full speed (thousands of fetches per second).
+        let fetchCount = await fixture.service.creditFetchCount()
+        XCTAssertGreaterThanOrEqual(fetchCount, 1)
+        XCTAssertLessThanOrEqual(fetchCount, 3)
+    }
+
     func testSupersededAllAccountRefreshRetriesUnaffectedAccountAfterManualReset() async throws {
         let fixture = try await makeFixture(availableCount: 1)
         await fixture.store.upsert(Account(alias: "beta", accountID: "beta-id", accessToken: "beta-token"))
@@ -1097,6 +1111,7 @@ private actor ResetSettingsService: QuotaResetServing {
     private var suspendedConsumeContinuation: CheckedContinuation<Void, Never>?
     private var shouldSuspendNextConsume = false
     private var nextCreditsError: QuotaResetClientError?
+    private var persistentCreditsError: QuotaResetClientError?
     private var nextConsumeError: Error?
     private var suspensionsReleased = false
 
@@ -1107,6 +1122,7 @@ private actor ResetSettingsService: QuotaResetServing {
 
     func credits(accessToken: String, accountID: String) async throws -> ResetCreditSnapshot {
         fetches += 1
+        if let error = persistentCreditsError { throw error }
         if let error = nextCreditsError {
             nextCreditsError = nil
             throw error
@@ -1155,6 +1171,7 @@ private actor ResetSettingsService: QuotaResetServing {
     func setAvailableCount(_ count: Int) { availableCount = count }
     func setAvailableCount(_ count: Int, accountID: String) { accountAvailableCounts[accountID] = count }
     func failNextCredits(with error: QuotaResetClientError) { nextCreditsError = error }
+    func failAllCredits(with error: QuotaResetClientError?) { persistentCreditsError = error }
     func suspendNextFetch() {
         suspensionsReleased = false
         suspendedFetchCount += 1

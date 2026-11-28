@@ -646,6 +646,8 @@ public actor AppEngine {
         }
     }
 
+    static let resetRefreshFailureBackoffNanoseconds: UInt64 = 60_000_000_000
+
     private func drainResetCreditStatusRefreshes() async {
         while resetRefreshPending {
             let generation = resetRefreshGeneration
@@ -653,9 +655,23 @@ public actor AppEngine {
             resetRefreshPending = false
             resetRefreshAllAccounts = false
             resetRefreshAliases.removeAll()
-            let committed = await quotaResetCoordinator.refreshCredits(aliases: aliases, generation: generation)
+            // Offline, every request fails in milliseconds. Skip the requests and let the
+            // backoff below pace the retries instead of spinning on the failure.
+            let committed: Bool
+            if networkCheck() {
+                committed = await quotaResetCoordinator.refreshCredits(aliases: aliases, generation: generation)
+            } else {
+                committed = false
+            }
             if !committed {
                 await quotaResetCoordinator.waitForInFlightResets()
+                // A superseded refresh retries at once. A refresh that was still current
+                // genuinely failed (offline, HTTP error), so retrying immediately would
+                // loop at full speed; wait before the next attempt.
+                if await quotaResetCoordinator.isLatestRefreshGeneration(generation), !resetRefreshPending {
+                    try? await Task.sleep(nanoseconds: Self.resetRefreshFailureBackoffNanoseconds)
+                    guard !Task.isCancelled else { break }
+                }
                 await scheduleResetCreditStatusRefresh(aliases: aliases)
             } else if generation == resetRefreshGeneration {
                 emit(.snapshotChanged)
